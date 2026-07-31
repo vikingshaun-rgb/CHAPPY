@@ -1,6 +1,6 @@
 /*
  * Simple Live Stream View
- * 简化的直播视图 - 用于抖音/快手等平台
+ * Simplified live-stream view for screen-record streaming
  */
 
 import SwiftUI
@@ -8,7 +8,7 @@ import SwiftUI
 struct SimpleLiveStreamView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var showUI = true // 控制 UI 显示/隐藏
+    @State private var showUI = true // Toggle UI visibility
 
     var body: some View {
         ZStack {
@@ -31,13 +31,13 @@ struct SimpleLiveStreamView: View {
                     ProgressView()
                         .scaleEffect(1.5)
                         .foregroundColor(.white)
-                    Text("正在连接视频流...")
+                    Text("Connecting to the video stream...")
                         .font(AppTypography.body)
                         .foregroundColor(.white)
                 }
             }
 
-            // UI 元素 - 点击屏幕可隐藏
+            // UI elements — tap the screen to hide
             if showUI {
                 VStack {
                     HStack {
@@ -57,7 +57,7 @@ struct SimpleLiveStreamView: View {
                             Circle()
                                 .fill(streamViewModel.isStreaming ? Color.red : Color.gray)
                                 .frame(width: 8, height: 8)
-                            Text(streamViewModel.isStreaming ? "直播中" : "未连接")
+                            Text(streamViewModel.isStreaming ? "Live" : "Not connected")
                                 .font(AppTypography.caption)
                                 .foregroundColor(.white)
                         }
@@ -72,19 +72,19 @@ struct SimpleLiveStreamView: View {
 
                     // Instructions
                     VStack(spacing: AppSpacing.md) {
-                        Text("直播提示")
+                        Text("Streaming tips")
                             .font(AppTypography.headline)
                             .foregroundColor(.white)
 
-                        Text("1. 打开抖音/快手等直播平台")
+                        Text("1. Open your live-streaming platform")
                             .font(AppTypography.caption)
                             .foregroundColor(.white.opacity(0.8))
 
-                        Text("2. 选择屏幕录制功能")
+                        Text("2. Choose the screen-recording feature")
                             .font(AppTypography.caption)
                             .foregroundColor(.white.opacity(0.8))
 
-                        Text("3. 开始录制此画面即可直播")
+                        Text("3. Start screen recording this view to go live")
                             .font(AppTypography.caption)
                             .foregroundColor(.white.opacity(0.8))
                     }
@@ -102,16 +102,16 @@ struct SimpleLiveStreamView: View {
             }
         }
         .onAppear {
-            // 启动视频流
+            // Start the video stream
             Task {
-                print("🎥 SimpleLiveStreamView: 启动视频流")
+                print("🎥 SimpleLiveStreamView: Start the video stream")
                 await streamViewModel.handleStartStreaming()
             }
         }
         .onDisappear {
-            // 停止视频流
+            // Stop the video stream
             Task {
-                print("🎥 SimpleLiveStreamView: 停止视频流")
+                print("🎥 SimpleLiveStreamView: Stop the video stream")
                 if streamViewModel.streamingStatus != .stopped {
                     await streamViewModel.stopSession()
                 }

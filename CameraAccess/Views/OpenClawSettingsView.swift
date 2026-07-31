@@ -1,6 +1,6 @@
 /*
  * OpenClaw Settings View
- * 配置 OpenClaw Gateway 连接
+ * Configure the OpenClaw Gateway connection
  */
 
 import SwiftUI

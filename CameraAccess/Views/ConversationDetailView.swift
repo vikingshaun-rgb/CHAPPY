@@ -1,6 +1,6 @@
 /*
  * Conversation Detail View
- * 对话详情页面
+ * Conversation detail screen
  */
 
 import SwiftUI
@@ -25,11 +25,11 @@ struct ConversationDetailView: View {
                     .padding()
                 }
             }
-            .navigationTitle("对话详情")
+            .navigationTitle("Conversation details")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") {
+                    Button("Done") {
                         dismiss()
                     }
                 }
@@ -50,7 +50,7 @@ struct ConversationDetailView: View {
                         Image(systemName: "bubble.left.and.bubble.right")
                             .font(AppTypography.caption)
                             .foregroundColor(AppColors.textSecondary)
-                        Text("\(conversation.messageCount) 条消息")
+                        Text("\(conversation.messageCount)  messages")
                             .font(AppTypography.caption)
                             .foregroundColor(AppColors.textSecondary)
                     }

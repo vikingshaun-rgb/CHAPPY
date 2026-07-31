@@ -1,7 +1,7 @@
 /*
  * Vision API Configuration
- * Centralized configuration for Vision API
- * Supports multiple providers: Alibaba Cloud Dashscope, OpenRouter
+ * Centralized configuration for the Vision API
+ * Supported providers: Claude (Anthropic), OpenRouter, Alibaba Cloud Dashscope
  */
 
 import Foundation
@@ -31,6 +31,9 @@ struct VisionAPIConfig {
 
     // MARK: - Provider-specific URLs
 
+    /// Anthropic (Claude) OpenAI-compatible API URL
+    static let anthropicURL = "https://api.anthropic.com/v1"
+
     /// Alibaba Cloud Dashscope API URLs
     static let alibabaBeijingURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     static let alibabaSingaporeURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -40,6 +43,7 @@ struct VisionAPIConfig {
 
     // MARK: - Default Models
 
+    static let defaultAnthropicModel = "claude-sonnet-4-6"
     static let defaultAlibabaModel = "qwen3-vl-plus"
     static let defaultOpenRouterModel = "google/gemini-3-flash-preview"
 
@@ -54,8 +58,8 @@ struct VisionAPIConfig {
 
         // Add OpenRouter-specific headers
         if provider == .openrouter {
-            headers["HTTP-Referer"] = "https://turbometa.app"
-            headers["X-Title"] = "TurboMeta"
+            headers["HTTP-Referer"] = "https://chappy.app"
+            headers["X-Title"] = "Chappy"
         }
 
         return headers

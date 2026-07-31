@@ -75,14 +75,14 @@ class GeminiLiveService: NSObject {
 
         guard let playbackEngine = playbackEngine,
               let playerNode = playerNode else {
-            print("❌ [Gemini] 无法初始化播放引擎")
+            print("❌ [Gemini] Failed to initialize the playback engine")
             return
         }
 
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackAudioFormat)
         playbackEngine.prepare()
-        print("✅ [Gemini] 播放引擎初始化完成")
+        print("✅ [Gemini] Playback engine initialized")
     }
 
     private func configureAudioSession() {
@@ -91,7 +91,7 @@ class GeminiLiveService: NSObject {
             try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
             try audioSession.setActive(true, options: [.notifyOthersOnDeactivation])
         } catch {
-            print("⚠️ [Gemini] Audio session 配置失败: \(error)")
+            print("⚠️ [Gemini] Audio session Configuration failed: \(error)")
         }
     }
 
@@ -102,9 +102,9 @@ class GeminiLiveService: NSObject {
             configureAudioSession()
             try playbackEngine.start()
             isPlaybackEngineRunning = true
-            print("▶️ [Gemini] 播放引擎已启动")
+            print("▶️ [Gemini] Playback engine started")
         } catch {
-            print("❌ [Gemini] 播放引擎启动失败: \(error)")
+            print("❌ [Gemini] Playback engine failed to start: \(error)")
         }
     }
 
@@ -115,7 +115,7 @@ class GeminiLiveService: NSObject {
         playerNode?.reset()
         playbackEngine.stop()
         isPlaybackEngineRunning = false
-        print("⏹️ [Gemini] 播放引擎已停止并清除队列")
+        print("⏹️ [Gemini] Playback engine stopped and queue cleared")
     }
 
     // MARK: - WebSocket Connection
@@ -125,10 +125,10 @@ class GeminiLiveService: NSObject {
         let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         let urlString = "\(baseURL)?key=\(apiKey)"
 
-        print("🔌 [Gemini] 准备连接 WebSocket")
+        print("🔌 [Gemini] Preparing WebSocket connection")
 
         guard let url = URL(string: urlString) else {
-            print("❌ [Gemini] 无效的 URL")
+            print("❌ [Gemini] Invalid URL")
             onError?("Invalid URL")
             return
         }
@@ -139,12 +139,12 @@ class GeminiLiveService: NSObject {
         webSocket = urlSession?.webSocketTask(with: url)
         webSocket?.resume()
 
-        print("🔌 [Gemini] WebSocket 任务已启动")
+        print("🔌 [Gemini] WebSocket Task started")
         receiveMessage()
     }
 
     func disconnect() {
-        print("🔌 [Gemini] 断开 WebSocket 连接")
+        print("🔌 [Gemini] Disconnect the WebSocket")
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -159,7 +159,7 @@ class GeminiLiveService: NSObject {
     private func configureSession() {
         guard !isSessionConfigured else { return }
 
-        // 根据当前 Live AI 模式获取系统提示词
+        // Get the system prompt for the current Live AI mode
         let instructions = LiveAIModeManager.staticSystemPrompt
 
         // Gemini Live API setup message
@@ -185,7 +185,7 @@ class GeminiLiveService: NSObject {
         ]
 
         sendJSON(setupMessage)
-        print("⚙️ [Gemini] 发送会话配置")
+        print("⚙️ [Gemini] Send session configuration")
     }
 
     // MARK: - Audio Recording
@@ -194,7 +194,7 @@ class GeminiLiveService: NSObject {
         guard !isRecording else { return }
 
         do {
-            print("🎤 [Gemini] 开始录音")
+            print("🎤 [Gemini] Start recording")
 
             let audioSession = AVAudioSession.sharedInstance()
             switch audioSession.recordPermission {
@@ -226,7 +226,7 @@ class GeminiLiveService: NSObject {
             configureAudioSession()
 
             guard let engine = audioEngine else {
-                print("❌ [Gemini] 音频引擎未初始化")
+                print("❌ [Gemini] Audio engine not initialized")
                 return
             }
 
@@ -246,10 +246,10 @@ class GeminiLiveService: NSObject {
             try engine.start()
 
             isRecording = true
-            print("✅ [Gemini] 录音已启动")
+            print("✅ [Gemini] Recording started")
 
         } catch {
-            print("❌ [Gemini] 启动录音失败: \(error.localizedDescription)")
+            print("❌ [Gemini] Failed to start recording: \(error.localizedDescription)")
             onError?("Failed to start recording: \(error.localizedDescription)")
         }
     }
@@ -257,7 +257,7 @@ class GeminiLiveService: NSObject {
     func stopRecording() {
         guard isRecording else { return }
 
-        print("🛑 [Gemini] 停止录音")
+        print("🛑 [Gemini] Stop recording")
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         isRecording = false
@@ -307,7 +307,7 @@ class GeminiLiveService: NSObject {
 
         if !hasAudioBeenSent {
             hasAudioBeenSent = true
-            print("✅ [Gemini] 第一次音频已发送")
+            print("✅ [Gemini] First audio sent")
             DispatchQueue.main.async { [weak self] in
                 self?.onFirstAudioSent?()
             }
@@ -319,14 +319,14 @@ class GeminiLiveService: NSObject {
     private func sendJSON(_ json: [String: Any]) {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: json),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            print("❌ [Gemini] 无法序列化 JSON")
+            print("❌ [Gemini] Failed to serialize JSON")
             return
         }
 
         let message = URLSessionWebSocketTask.Message.string(jsonString)
         webSocket?.send(message) { [weak self] error in
             if let error = error {
-                print("❌ [Gemini] 发送失败: \(error.localizedDescription)")
+                print("❌ [Gemini] Send failed: \(error.localizedDescription)")
                 self?.onError?("Send error: \(error.localizedDescription)")
             }
         }
@@ -349,12 +349,12 @@ class GeminiLiveService: NSObject {
 
     func sendImageInput(_ image: UIImage) {
         guard let imageData = image.jpegData(compressionQuality: 0.6) else {
-            print("❌ [Gemini] 无法压缩图片")
+            print("❌ [Gemini] Failed to compress image")
             return
         }
         let base64Image = imageData.base64EncodedString()
 
-        print("📸 [Gemini] 发送图片: \(imageData.count) bytes")
+        print("📸 [Gemini] Sending image: \(imageData.count) bytes")
 
         let message: [String: Any] = [
             "realtime_input": [
@@ -379,7 +379,7 @@ class GeminiLiveService: NSObject {
                 self?.receiveMessage()
 
             case .failure(let error):
-                print("❌ [Gemini] 接收消息失败: \(error.localizedDescription)")
+                print("❌ [Gemini] Failed to receive message: \(error.localizedDescription)")
                 self?.onError?("Receive error: \(error.localizedDescription)")
             }
         }
@@ -409,7 +409,7 @@ class GeminiLiveService: NSObject {
 
             // Handle setup complete
             if json["setupComplete"] != nil {
-                print("✅ [Gemini] 会话配置完成")
+                print("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
                 return
@@ -430,7 +430,7 @@ class GeminiLiveService: NSObject {
             // Handle errors
             if let error = json["error"] as? [String: Any] {
                 let message = error["message"] as? String ?? "Unknown error"
-                print("❌ [Gemini] 服务器错误: \(message)")
+                print("❌ [Gemini] Server error: \(message)")
                 self.onError?(message)
                 return
             }
@@ -445,7 +445,7 @@ class GeminiLiveService: NSObject {
             for part in parts {
                 // Handle text response
                 if let text = part["text"] as? String {
-                    print("💬 [Gemini] AI回复: \(text)")
+                    print("💬 [Gemini] AIReply: \(text)")
                     onTranscriptDelta?(text)
                 }
 
@@ -464,14 +464,14 @@ class GeminiLiveService: NSObject {
 
         // Check if turn is complete
         if let turnComplete = content["turnComplete"] as? Bool, turnComplete {
-            print("✅ [Gemini] AI回复完成")
+            print("✅ [Gemini] AIReply complete")
             finishAudioPlayback()
             onTranscriptDone?("")
         }
 
         // Check for interrupted flag
         if let interrupted = content["interrupted"] as? Bool, interrupted {
-            print("⚠️ [Gemini] 回复被中断")
+            print("⚠️ [Gemini] Reply interrupted")
             stopPlaybackEngine()
             setupPlaybackEngine()
         }
@@ -479,14 +479,14 @@ class GeminiLiveService: NSObject {
         // Handle input transcription (user speech)
         if let inputTranscription = content["inputTranscription"] as? [String: Any],
            let text = inputTranscription["text"] as? String {
-            print("👤 [Gemini] 用户说: \(text)")
+            print("👤 [Gemini] User said: \(text)")
             onUserTranscript?(text)
         }
 
         // Handle output transcription (AI speech text)
         if let outputTranscription = content["outputTranscription"] as? [String: Any],
            let text = outputTranscription["text"] as? String {
-            print("💬 [Gemini] AI文字: \(text)")
+            print("💬 [Gemini] AIText: \(text)")
             onTranscriptDelta?(text)
         }
     }
@@ -505,7 +505,7 @@ class GeminiLiveService: NSObject {
                 setupPlaybackEngine()
                 startPlaybackEngine()
                 playerNode?.play()
-                print("🔄 [Gemini] 重新初始化播放引擎")
+                print("🔄 [Gemini] Re-initialize the playback engine")
             }
         }
 
@@ -584,7 +584,7 @@ class GeminiLiveService: NSObject {
 
 extension GeminiLiveService: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        print("✅ [Gemini] WebSocket 连接已建立")
+        print("✅ [Gemini] WebSocket Connection established")
         DispatchQueue.main.async {
             self.configureSession()
         }
@@ -592,6 +592,6 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
-        print("🔌 [Gemini] WebSocket 已断开, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        print("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
     }
 }

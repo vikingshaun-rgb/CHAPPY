@@ -1,6 +1,6 @@
 /*
  * Quick Vision Mode Manager
- * 快速识图模式管理器 - 管理当前模式、自定义提示词、翻译目标语言
+ * Quick Vision mode manager — current mode, custom prompt, translation target language
  */
 
 import Foundation
@@ -17,7 +17,7 @@ class QuickVisionModeManager: ObservableObject {
     @Published var currentMode: QuickVisionMode {
         didSet {
             userDefaults.set(currentMode.rawValue, forKey: modeKey)
-            print("📋 [QuickVisionModeManager] 模式已切换: \(currentMode.displayName)")
+            print("📋 [QuickVisionModeManager] Mode switched: \(currentMode.displayName)")
         }
     }
 
@@ -33,11 +33,11 @@ class QuickVisionModeManager: ObservableObject {
         }
     }
 
-    // 支持的翻译目标语言
+    // Supported translation target languages
     static let supportedLanguages: [(code: String, name: String)] = [
-        ("zh-CN", "中文"),
+        ("zh-CN", "Chinese"),
         ("en-US", "English"),
-        ("ja-JP", "日本語"),
+        ("ja-JP", "Japanese"),
         ("ko-KR", "한국어"),
         ("fr-FR", "Français"),
         ("de-DE", "Deutsch"),
@@ -48,7 +48,7 @@ class QuickVisionModeManager: ObservableObject {
     ]
 
     private init() {
-        // 加载保存的模式
+        // Load the saved mode
         if let savedMode = userDefaults.string(forKey: modeKey),
            let mode = QuickVisionMode(rawValue: savedMode) {
             self.currentMode = mode
@@ -56,10 +56,10 @@ class QuickVisionModeManager: ObservableObject {
             self.currentMode = .standard
         }
 
-        // 加载自定义提示词
+        // Load the custom prompt
         self.customPrompt = userDefaults.string(forKey: customPromptKey) ?? "quickvision.custom.default".localized
 
-        // 加载翻译目标语言（默认跟随系统语言）
+        // Load translation target language (defaults to system language)
         if let savedLanguage = userDefaults.string(forKey: translateTargetLanguageKey) {
             self.translateTargetLanguage = savedLanguage
         } else {
@@ -69,7 +69,7 @@ class QuickVisionModeManager: ObservableObject {
 
     // MARK: - Get Current Prompt
 
-    /// 获取当前模式的完整提示词
+    /// Get the full prompt for the current mode
     func getPrompt() -> String {
         switch currentMode {
         case .custom:
@@ -81,7 +81,7 @@ class QuickVisionModeManager: ObservableObject {
         }
     }
 
-    /// 获取指定模式的提示词
+    /// Get the prompt for a given mode
     func getPrompt(for mode: QuickVisionMode) -> String {
         switch mode {
         case .custom:
@@ -93,9 +93,9 @@ class QuickVisionModeManager: ObservableObject {
         }
     }
 
-    /// 获取翻译模式的提示词（包含目标语言）
+    /// Get the translate-mode prompt (includes target language)
     private func getTranslatePrompt() -> String {
-        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "中文"
+        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "Chinese"
         let basePrompt = "prompt.quickvision.translate".localized
         return basePrompt.replacingOccurrences(of: "{LANGUAGE}", with: targetLanguageName)
     }

@@ -1,6 +1,6 @@
 /*
  * Quick Vision Storage Service
- * 快速识图历史记录持久化服务
+ * Quick Vision history persistence service
  */
 
 import Foundation
@@ -10,7 +10,7 @@ class QuickVisionStorage {
 
     private let userDefaults = UserDefaults.standard
     private let recordsKey = "quickVisionRecords"
-    private let maxRecords = 100 // 最多保存100条记录
+    private let maxRecords = 100 // Keep at most 100 records
 
     private init() {}
 
@@ -30,9 +30,9 @@ class QuickVisionStorage {
         // Encode and save
         if let encoded = try? JSONEncoder().encode(records) {
             userDefaults.set(encoded, forKey: recordsKey)
-            print("💾 [QuickVisionStorage] 保存记录成功: \(record.id), 总数: \(records.count)")
+            print("💾 [QuickVisionStorage] Record saved: \(record.id), total: \(records.count)")
         } else {
-            print("❌ [QuickVisionStorage] 保存记录失败")
+            print("❌ [QuickVisionStorage] Failed to save record")
         }
     }
 
@@ -65,13 +65,13 @@ class QuickVisionStorage {
 
         if let encoded = try? JSONEncoder().encode(records) {
             userDefaults.set(encoded, forKey: recordsKey)
-            print("🗑️ [QuickVisionStorage] 删除记录成功: \(id)")
+            print("🗑️ [QuickVisionStorage] Record deleted: \(id)")
         }
     }
 
     func deleteAllRecords() {
         userDefaults.removeObject(forKey: recordsKey)
-        print("🗑️ [QuickVisionStorage] 清空所有记录")
+        print("🗑️ [QuickVisionStorage] Cleared all records")
     }
 
     // MARK: - Get Record

@@ -1,6 +1,6 @@
 /*
  * Permissions Request View
- * 应用启动时的权限请求界面
+ * Permission request screen shown at app launch
  */
 
 import SwiftUI
@@ -31,11 +31,11 @@ struct PermissionsRequestView: View {
 
                 // Title
                 VStack(spacing: AppSpacing.sm) {
-                    Text("需要您的授权")
+                    Text("Your permission is needed")
                         .font(AppTypography.title)
                         .foregroundColor(AppColors.textPrimary)
 
-                    Text("TurboMeta 需要以下权限才能正常工作")
+                    Text("TurboMeta Chappy needs these permissions to work properly")
                         .font(AppTypography.body)
                         .foregroundColor(AppColors.textSecondary)
                         .multilineTextAlignment(.center)
@@ -46,14 +46,14 @@ struct PermissionsRequestView: View {
                 VStack(spacing: AppSpacing.md) {
                     PermissionRow(
                         icon: "mic.fill",
-                        title: "麦克风",
-                        description: "语音对话和录音"
+                        title: "Microphone",
+                        description: "Voice conversations and recording"
                     )
 
                     PermissionRow(
                         icon: "photo.fill",
-                        title: "相册",
-                        description: "保存眼镜拍摄的照片"
+                        title: "Photo Library",
+                        description: "Save photos captured by your glasses"
                     )
                 }
                 .padding(.horizontal, AppSpacing.xl)
@@ -68,7 +68,7 @@ struct PermissionsRequestView: View {
                             .scaleEffect(1.5)
                     } else if showSettings {
                         VStack(spacing: AppSpacing.sm) {
-                            Text("部分权限未授予")
+                            Text("Some permissions were not granted")
                                 .font(AppTypography.caption)
                                 .foregroundColor(.red)
 
@@ -77,7 +77,7 @@ struct PermissionsRequestView: View {
                             } label: {
                                 HStack {
                                     Image(systemName: "gear")
-                                    Text("前往设置")
+                                    Text("Open Settings")
                                         .font(AppTypography.headline)
                                 }
                                 .frame(maxWidth: .infinity)
@@ -87,7 +87,7 @@ struct PermissionsRequestView: View {
                                 .cornerRadius(AppCornerRadius.lg)
                             }
 
-                            Button("继续使用（功能受限）") {
+                            Button("Continue anyway (limited features)") {
                                 onComplete(false)
                             }
                             .font(AppTypography.body)
@@ -99,7 +99,7 @@ struct PermissionsRequestView: View {
                         } label: {
                             HStack {
                                 Image(systemName: "checkmark.circle.fill")
-                                Text("授予权限")
+                                Text("Grant Permissions")
                                     .font(AppTypography.headline)
                             }
                             .frame(maxWidth: .infinity)
@@ -115,7 +115,7 @@ struct PermissionsRequestView: View {
             }
         }
         .onAppear {
-            // 检查是否已有权限
+            // Check whether permissions are already granted
             if permissionsManager.checkAllPermissions() {
                 onComplete(true)
             }
@@ -129,10 +129,10 @@ struct PermissionsRequestView: View {
             isRequesting = false
 
             if allGranted {
-                // 所有权限已授予，继续
+                // All permissions granted — continuing
                 onComplete(true)
             } else {
-                // 部分权限未授予，显示设置按钮
+                // Some permissions denied — show the Settings button
                 showSettings = true
             }
         }

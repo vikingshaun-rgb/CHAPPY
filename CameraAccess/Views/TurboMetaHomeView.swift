@@ -1,6 +1,6 @@
 /*
  * TurboMeta Home View
- * 主页 - 功能入口
+ * Home — feature entry points
  */
 
 import SwiftUI
@@ -153,19 +153,19 @@ struct TurboMetaHomeView: View {
             }
         }
         .onAppear {
-            // 确保 QuickVisionManager 有 streamViewModel 引用
+            // Ensure QuickVisionManager has the streamViewModel reference
             quickVisionManager.setStreamViewModel(streamViewModel)
-            // 确保 LiveAIManager 有 streamViewModel 引用
+            // Ensure LiveAIManager has the streamViewModel reference
             liveAIManager.setStreamViewModel(streamViewModel)
 
-            // OpenClaw 自动连接（如果有保存的配置）
+            // OpenClaw Auto-connect (if a saved configuration exists)
             if openClawService.connectionState == .disconnected,
                openClawService.loadGatewayToken() != nil {
                 openClawService.connect()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .liveAITriggered)) { _ in
-            // 从快捷指令触发，自动打开 Live AI 界面
+            // Triggered from Shortcuts — auto-open the Live AI screen
             showLiveAI = true
         }
     }

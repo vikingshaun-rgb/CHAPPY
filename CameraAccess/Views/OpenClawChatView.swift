@@ -1,7 +1,7 @@
 /*
  * OpenClaw Chat View
- * 与 OpenClaw AI 聊天
- * 支持: 语音转录、眼镜拍照、文字输入
+ * Chat with OpenClaw AI
+ * Supports voice transcription, glasses photos, and text input
  */
 
 import SwiftUI

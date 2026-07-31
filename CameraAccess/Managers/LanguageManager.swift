@@ -1,6 +1,6 @@
 /*
  * Language Manager
- * App 语言管理器 - 支持中英文切换
+ * App App language manager
  */
 
 import Foundation
@@ -13,8 +13,8 @@ enum AppLanguage: String, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .system: return "跟随系统 / System"
-        case .chinese: return "中文"
+        case .system: return "System"
+        case .chinese: return "Chinese"
         case .english: return "English"
         }
     }

@@ -1,6 +1,6 @@
 /*
  * API Provider Manager
- * 管理不同的 API 提供商 (阿里云 Dashscope / OpenRouter)
+ * Manages AI providers: Claude (Anthropic), Gemini/OpenRouter, Alibaba Dashscope
  */
 
 import Foundation
@@ -14,8 +14,8 @@ enum AlibabaEndpoint: String, CaseIterable, Codable {
 
     var displayName: String {
         switch self {
-        case .beijing: return "北京 (中国大陆)"
-        case .singapore: return "新加坡 (国际)"
+        case .beijing: return "Beijing (China)"
+        case .singapore: return "Singapore (International)"
         }
     }
 
@@ -37,20 +37,23 @@ enum AlibabaEndpoint: String, CaseIterable, Codable {
 // MARK: - API Provider Enum (Vision API)
 
 enum APIProvider: String, CaseIterable, Codable {
-    case alibaba = "alibaba"
+    case anthropic = "anthropic"
     case openrouter = "openrouter"
+    case alibaba = "alibaba"
 
     var displayName: String {
         switch self {
-        case .alibaba: return "阿里云 Dashscope"
+        case .anthropic: return "Claude"
         case .openrouter: return "OpenRouter"
+        case .alibaba: return "Alibaba Cloud"
         }
     }
 
     func baseURL(endpoint: AlibabaEndpoint = .beijing) -> String {
         switch self {
-        case .alibaba: return endpoint.baseURL
+        case .anthropic: return "https://api.anthropic.com/v1"
         case .openrouter: return "https://openrouter.ai/api/v1"
+        case .alibaba: return endpoint.baseURL
         }
     }
 
@@ -60,54 +63,68 @@ enum APIProvider: String, CaseIterable, Codable {
 
     var defaultModel: String {
         switch self {
-        case .alibaba: return "qwen3-vl-plus"
+        case .anthropic: return "claude-sonnet-4-6"
         case .openrouter: return "google/gemini-3-flash-preview"
+        case .alibaba: return "qwen3-vl-plus"
         }
     }
 
     var apiKeyHelpURL: String {
         switch self {
-        case .alibaba: return "https://help.aliyun.com/zh/model-studio/get-api-key"
+        case .anthropic: return "https://console.anthropic.com/settings/keys"
         case .openrouter: return "https://openrouter.ai/keys"
+        case .alibaba: return "https://help.aliyun.com/zh/model-studio/get-api-key"
         }
     }
 
     var supportsVision: Bool {
         return true
     }
+
+    /// Models offered in the picker for providers with a fixed model list
+    var availableModels: [String] {
+        switch self {
+        case .anthropic:
+            return ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+        case .openrouter:
+            return [] // fetched dynamically
+        case .alibaba:
+            return ["qwen3-vl-plus"]
+        }
+    }
 }
 
 // MARK: - Live AI Provider Enum
 
 enum LiveAIProvider: String, CaseIterable, Codable {
-    case alibaba = "alibaba"
     case google = "google"
+    case alibaba = "alibaba"
 
     var displayName: String {
         switch self {
-        case .alibaba: return "阿里云 Qwen Omni"
-        case .google: return "Google Gemini Live"
+        case .google: return "Gemini Live"
+        case .alibaba: return "Alibaba Qwen Omni"
         }
     }
 
     var defaultModel: String {
         switch self {
-        case .alibaba: return "qwen3-omni-flash-realtime"
         case .google: return "gemini-2.0-flash-exp"
+        case .alibaba: return "qwen3-omni-flash-realtime"
         }
     }
 
     var apiKeyHelpURL: String {
         switch self {
-        case .alibaba: return "https://help.aliyun.com/zh/model-studio/get-api-key"
         case .google: return "https://aistudio.google.com/apikey"
+        case .alibaba: return "https://help.aliyun.com/zh/model-studio/get-api-key"
         }
     }
 
     func websocketURL(endpoint: AlibabaEndpoint = .beijing) -> String {
         switch self {
-        case .alibaba: return endpoint.websocketURL
         case .google: return "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        case .alibaba: return endpoint.websocketURL
         }
     }
 }
@@ -235,20 +252,20 @@ class APIProviderManager: ObservableObject {
 
     private init() {
         // Alibaba Endpoint
-        let savedEndpoint = UserDefaults.standard.string(forKey: alibabaEndpointKey) ?? "beijing"
-        self.alibabaEndpoint = AlibabaEndpoint(rawValue: savedEndpoint) ?? .beijing
+        let savedEndpoint = UserDefaults.standard.string(forKey: alibabaEndpointKey) ?? "singapore"
+        self.alibabaEndpoint = AlibabaEndpoint(rawValue: savedEndpoint) ?? .singapore
 
-        // Vision API Provider
-        let savedProvider = UserDefaults.standard.string(forKey: providerKey) ?? "alibaba"
-        let provider = APIProvider(rawValue: savedProvider) ?? .alibaba
+        // Vision API Provider — Claude is Chappy's default brain
+        let savedProvider = UserDefaults.standard.string(forKey: providerKey) ?? "anthropic"
+        let provider = APIProvider(rawValue: savedProvider) ?? .anthropic
         self.currentProvider = provider
 
         let savedModel = UserDefaults.standard.string(forKey: selectedModelKey)
         self.selectedModel = savedModel ?? provider.defaultModel
 
-        // Live AI Provider
-        let savedLiveAIProvider = UserDefaults.standard.string(forKey: liveAIProviderKey) ?? "alibaba"
-        let liveProvider = LiveAIProvider(rawValue: savedLiveAIProvider) ?? .alibaba
+        // Live AI Provider — Gemini Live is Chappy's default realtime engine
+        let savedLiveAIProvider = UserDefaults.standard.string(forKey: liveAIProviderKey) ?? "google"
+        let liveProvider = LiveAIProvider(rawValue: savedLiveAIProvider) ?? .google
         self.liveAIProvider = liveProvider
 
         let savedLiveAIModel = UserDefaults.standard.string(forKey: liveAIModelKey)
@@ -303,7 +320,7 @@ class APIProviderManager: ObservableObject {
     func fetchOpenRouterModels() async {
         guard currentProvider == .openrouter else { return }
         guard let apiKey = APIKeyManager.shared.getAPIKey(for: .openrouter), !apiKey.isEmpty else {
-            modelsError = "请先配置 OpenRouter API Key"
+            modelsError = "Please configure your OpenRouter API key first"
             return
         }
 
@@ -315,13 +332,13 @@ class APIProviderManager: ObservableObject {
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("TurboMeta", forHTTPHeaderField: "X-Title")
+            request.setValue("Chappy", forHTTPHeaderField: "X-Title")
             request.timeoutInterval = 30
 
             let (data, response) = try await URLSession.shared.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                throw NSError(domain: "OpenRouter", code: -1, userInfo: [NSLocalizedDescriptionKey: "获取模型列表失败"])
+                throw NSError(domain: "OpenRouter", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch model list"])
             }
 
             let decoder = JSONDecoder()
@@ -364,18 +381,18 @@ class APIProviderManager: ObservableObject {
 
 extension APIProviderManager {
     nonisolated static var staticCurrentProvider: APIProvider {
-        let savedProvider = UserDefaults.standard.string(forKey: "api_provider") ?? "alibaba"
-        return APIProvider(rawValue: savedProvider) ?? .alibaba
+        let savedProvider = UserDefaults.standard.string(forKey: "api_provider") ?? "anthropic"
+        return APIProvider(rawValue: savedProvider) ?? .anthropic
     }
 
     nonisolated static var staticAlibabaEndpoint: AlibabaEndpoint {
-        let savedEndpoint = UserDefaults.standard.string(forKey: "alibaba_endpoint") ?? "beijing"
-        return AlibabaEndpoint(rawValue: savedEndpoint) ?? .beijing
+        let savedEndpoint = UserDefaults.standard.string(forKey: "alibaba_endpoint") ?? "singapore"
+        return AlibabaEndpoint(rawValue: savedEndpoint) ?? .singapore
     }
 
     nonisolated static var staticLiveAIProvider: LiveAIProvider {
-        let savedProvider = UserDefaults.standard.string(forKey: "liveai_provider") ?? "alibaba"
-        return LiveAIProvider(rawValue: savedProvider) ?? .alibaba
+        let savedProvider = UserDefaults.standard.string(forKey: "liveai_provider") ?? "google"
+        return LiveAIProvider(rawValue: savedProvider) ?? .google
     }
 
     nonisolated static var staticLiveAIAPIKey: String {
