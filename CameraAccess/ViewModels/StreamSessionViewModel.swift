@@ -59,7 +59,7 @@ class StreamSessionViewModel: ObservableObject {
   // capability added to a *started* session. Sessions are single-use — once
   // stopped they are terminal, so we create a fresh session on every start.
   private var deviceSession: DeviceSession?
-  private var stream: Stream?
+  private var stream: MWDATCamera.Stream?
 
   // Listener tokens manage DAT SDK event subscriptions
   private var streamStateListenerToken: AnyListenerToken?
