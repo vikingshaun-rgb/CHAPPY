@@ -1,6 +1,6 @@
 /*
  * Live AI Settings View
- * 实时对话设置 - 模式选择、自定义提示词、翻译目标语言
+ * Live AI settings — mode, custom prompt, translation target language
  */
 
 import SwiftUI
@@ -12,7 +12,7 @@ struct LiveAISettingsView: View {
     var body: some View {
         NavigationView {
             List {
-                // 对话模式选择
+                // Conversation mode selection
                 Section {
                     ForEach(LiveAIMode.allCases) { mode in
                         Button {
@@ -46,7 +46,7 @@ struct LiveAISettingsView: View {
                     Text("liveai.settings.mode.footer".localized)
                 }
 
-                // 翻译目标语言（仅在翻译模式显示）
+                // Translation target language (shown in translate mode only)
                 if modeManager.currentMode == .translate {
                     Section {
                         ForEach(LiveAIModeManager.supportedLanguages, id: \.code) { language in
@@ -69,7 +69,7 @@ struct LiveAISettingsView: View {
                     }
                 }
 
-                // 自定义提示词（仅在自定义模式显示）
+                // Custom prompt (shown in custom mode only)
                 if modeManager.currentMode == .custom {
                     Section {
                         TextEditor(text: $modeManager.customPrompt)

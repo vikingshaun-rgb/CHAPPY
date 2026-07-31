@@ -1,6 +1,6 @@
 /*
  * Main Tab View
- * 主 Tab 导航视图
+ * Main tab navigation view
  */
 
 import SwiftUI

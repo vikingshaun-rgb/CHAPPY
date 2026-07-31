@@ -49,7 +49,7 @@ struct HomeScreenView: View {
             .font(AppTypography.largeTitle)
             .foregroundColor(AppColors.textPrimary)
 
-          Text("Rayban Meta助手")
+          Text("Rayban MetaAssistant")
             .font(AppTypography.callout)
             .foregroundColor(AppColors.textSecondary)
         }
@@ -58,18 +58,18 @@ struct HomeScreenView: View {
         VStack(spacing: AppSpacing.md) {
           FeatureTipView(
             icon: "video.fill",
-            title: "实时视频",
-            text: "从眼镜视角直接录制视频，捕捉你的所见所闻"
+            title: "Live video",
+            text: "Record straight from your glasses' point of view"
           )
           FeatureTipView(
             icon: "brain.head.profile",
-            title: "AI 对话",
-            text: "实时 AI 助手，随时随地为你提供智能帮助"
+            title: "AI Chat",
+            text: "A realtime AI assistant, wherever you are"
           )
           FeatureTipView(
             icon: "waveform",
-            title: "开放式音频",
-            text: "保持耳朵对周围世界的开放，同时接收通知"
+            title: "Open-ear audio",
+            text: "Stay aware of the world around you while getting notifications"
           )
         }
 
@@ -77,7 +77,7 @@ struct HomeScreenView: View {
 
         // Connection Button
         VStack(spacing: AppSpacing.md) {
-          Text("将跳转到 Meta AI 应用确认连接")
+          Text("You'll be taken to the Meta AI app to confirm the connection")
             .font(AppTypography.footnote)
             .foregroundColor(AppColors.textSecondary)
             .multilineTextAlignment(.center)
@@ -90,11 +90,11 @@ struct HomeScreenView: View {
               if viewModel.registrationState == .registering {
                 ProgressView()
                   .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                Text("连接中...")
+                Text("Connecting...")
               } else {
                 Image(systemName: "eye.circle.fill")
                   .font(.title3)
-                Text("连接 Ray-Ban Meta")
+                Text("Connect Ray-Ban Meta")
               }
             }
             .font(AppTypography.headline)
@@ -129,10 +129,10 @@ struct HomeScreenView: View {
               .foregroundColor(.green)
 
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
-              Text("连接成功")
+              Text("Connected")
                 .font(AppTypography.headline)
                 .foregroundColor(.white)
-              Text("正在进入 TurboMeta...")
+              Text("Entering Chappy...")
                 .font(AppTypography.caption)
                 .foregroundColor(.white.opacity(0.9))
             }

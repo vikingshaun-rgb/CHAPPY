@@ -1,6 +1,6 @@
 /*
  * Live Translate View
- * 实时翻译主界面
+ * Live translation main screen
  */
 
 import SwiftUI
@@ -13,30 +13,30 @@ struct LiveTranslateView: View {
 
     var body: some View {
         ZStack {
-            // 背景
+            // Background
             Color.black.ignoresSafeArea()
 
-            // 视频预览（如果启用图像增强）
+            // Video preview (if image input is enabled)
             if viewModel.imageEnhanceEnabled {
                 videoBackground
             }
 
-            // 主内容
+            // Main content
             VStack(spacing: 0) {
                 // Header
                 headerView
 
                 Spacer()
 
-                // 语言选择栏
+                // Language selection bar
                 languageBar
 
-                // 翻译结果区域
+                // Translation result area
                 translationArea
 
                 Spacer()
 
-                // 控制栏
+                // Control bar
                 controlBar
             }
             .padding()
@@ -72,7 +72,7 @@ struct LiveTranslateView: View {
 
     private var headerView: some View {
         HStack {
-            // 标题
+            // Title
             HStack(spacing: 8) {
                 Image(systemName: "globe")
                     .font(.title2)
@@ -83,10 +83,10 @@ struct LiveTranslateView: View {
 
             Spacer()
 
-            // 连接状态
+            // Connection status
             connectionIndicator
 
-            // 设置按钮
+            // Settings button
             Button {
                 showSettings = true
             } label: {
@@ -96,7 +96,7 @@ struct LiveTranslateView: View {
             }
             .padding(.horizontal, 8)
 
-            // 关闭按钮
+            // Close button
             Button {
                 dismiss()
             } label: {
@@ -123,16 +123,16 @@ struct LiveTranslateView: View {
 
     private var languageBar: some View {
         HStack(spacing: 16) {
-            // 源语言
+            // Source language
             languageButton(
                 language: viewModel.sourceLanguage,
                 label: "livetranslate.source".localized
             ) {
-                // 源语言选择（通过设置页面）
+                // Source language selection (via settings)
                 showSettings = true
             }
 
-            // 交换按钮
+            // Swap button
             Button {
                 viewModel.swapLanguages()
             } label: {
@@ -143,7 +143,7 @@ struct LiveTranslateView: View {
                     .background(Circle().fill(Color.white.opacity(0.2)))
             }
 
-            // 目标语言
+            // Target language
             languageButton(
                 language: viewModel.targetLanguage,
                 label: "livetranslate.target".localized
@@ -181,9 +181,9 @@ struct LiveTranslateView: View {
 
     private var translationArea: some View {
         VStack(spacing: 16) {
-            // 翻译结果卡片
+            // Translation result card
             VStack(alignment: .leading, spacing: 12) {
-                // 流式翻译
+                // Streaming translation
                 if !viewModel.streamingTranslation.isEmpty {
                     Text(viewModel.streamingTranslation)
                         .font(AppTypography.body)
@@ -191,7 +191,7 @@ struct LiveTranslateView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                // 最终翻译结果
+                // Final translation result
                 if !viewModel.currentTranslation.isEmpty {
                     Text(viewModel.currentTranslation)
                         .font(AppTypography.title2)
@@ -199,7 +199,7 @@ struct LiveTranslateView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                // 占位文本
+                // Placeholder text
                 if viewModel.currentTranslation.isEmpty && viewModel.streamingTranslation.isEmpty {
                     Text("livetranslate.placeholder".localized)
                         .font(AppTypography.body)
@@ -215,7 +215,7 @@ struct LiveTranslateView: View {
                     .fill(Color.white.opacity(0.1))
             )
 
-            // 历史记录（最近一条）
+            // History (most recent)
             if let lastRecord = viewModel.translationHistory.first {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -246,7 +246,7 @@ struct LiveTranslateView: View {
 
     private var controlBar: some View {
         VStack(spacing: 16) {
-            // 录音状态提示
+            // Recording status hint
             if viewModel.isRecording {
                 HStack(spacing: 8) {
                     Circle()
@@ -258,7 +258,7 @@ struct LiveTranslateView: View {
                 }
             }
 
-            // 录音按钮
+            // Record button
             Button {
                 viewModel.toggleRecording()
             } label: {
@@ -275,7 +275,7 @@ struct LiveTranslateView: View {
             .disabled(!viewModel.isConnected)
             .opacity(viewModel.isConnected ? 1.0 : 0.5)
 
-            // 清除按钮
+            // Clear button
             if !viewModel.currentTranslation.isEmpty || !viewModel.streamingTranslation.isEmpty {
                 Button {
                     viewModel.clearTranslation()

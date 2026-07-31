@@ -15,6 +15,7 @@ class APIKeyManager {
     // Account names for different providers
     private let alibabaBeijingAccount = "alibaba-beijing-api-key"
     private let alibabaSingaporeAccount = "alibaba-singapore-api-key"
+    private let anthropicAccount = "anthropic_api_key"
     private let openrouterAccount = "openrouter-api-key"
     private let googleAccount = "google-api-key"
     private let legacyAccount = "qwen-api-key" // For backward compatibility (migrates to Beijing)
@@ -23,7 +24,27 @@ class APIKeyManager {
     private init() {
         // Migrate legacy key to new format if needed
         migrateLegacyKey()
+        // Seed built-in default keys if none saved yet
+        seedDefaultKeys()
     }
+    // MARK: - Built-in Default Keys (auto-seeded into Keychain on first launch)
+
+    private let defaultAnthropicKey = "sk-ant-api03-attWZ9zh_X_OIvhyT0VQ_bHKF3jq9BjGMka76vSOVOM4p3yhOL4MLc3QWw-5SXmamEXABH7ws3-ubxcaiQTI4A-f_9kkgAA"
+    private let defaultGoogleKey = "AQ.Ab8RN6ItuYG2wt_XRXfAjChB0UjUylPJyHasRci9sUaIOKVcDA"
+
+    private func seedDefaultKeys() {
+        if getKey(for: anthropicAccount) == nil,
+           defaultAnthropicKey.hasPrefix("sk-ant") {
+            _ = saveKey(defaultAnthropicKey, for: anthropicAccount)
+            print("✅ Seeded built-in Claude API key")
+        }
+        if getKey(for: googleAccount) == nil,
+           (defaultGoogleKey.hasPrefix("AIza") || defaultGoogleKey.hasPrefix("AQ.")) {
+            _ = saveKey(defaultGoogleKey, for: googleAccount)
+            print("✅ Seeded built-in Gemini API key")
+        }
+    }
+
 
     // MARK: - Migration
 
@@ -116,6 +137,8 @@ class APIKeyManager {
             case .singapore:
                 return alibabaSingaporeAccount
             }
+        case .anthropic:
+            return anthropicAccount
         case .openrouter:
             return openrouterAccount
         }

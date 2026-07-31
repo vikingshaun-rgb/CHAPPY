@@ -84,8 +84,8 @@ struct OmniRealtimeView: View {
         .onDisappear {
             viewModel.disconnect()
         }
-        .alert("错误", isPresented: $viewModel.showError) {
-            Button("确定") {
+        .alert("Error", isPresented: $viewModel.showError) {
+            Button("OK") {
                 viewModel.dismissError()
             }
         } message: {
@@ -99,7 +99,7 @@ struct OmniRealtimeView: View {
 
     private var headerView: some View {
         HStack {
-            Text("AI 实时对话")
+            Text("AI Live Conversation")
                 .font(.headline)
                 .foregroundColor(.white)
 
@@ -110,7 +110,7 @@ struct OmniRealtimeView: View {
                 Circle()
                     .fill(viewModel.isConnected ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
-                Text(viewModel.isConnected ? "已连接" : "未连接")
+                Text(viewModel.isConnected ? "Connected" : "Not connected")
                     .font(.caption)
                     .foregroundColor(.white)
             }
@@ -136,7 +136,7 @@ struct OmniRealtimeView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "waveform")
                         .foregroundColor(.green)
-                    Text("正在说话...")
+                    Text("Speaking...")
                         .font(.caption)
                         .foregroundColor(.white)
                 }
@@ -152,14 +152,14 @@ struct OmniRealtimeView: View {
                     Circle()
                         .fill(Color.red)
                         .frame(width: 8, height: 8)
-                    Text("录音中")
+                    Text("Recording")
                         .font(.caption)
                         .foregroundColor(.white)
                 } else {
                     Circle()
                         .fill(Color.gray)
                         .frame(width: 8, height: 8)
-                    Text("未录音")
+                    Text("Not recording")
                         .font(.caption)
                         .foregroundColor(.white)
                 }
@@ -182,7 +182,7 @@ struct OmniRealtimeView: View {
                     VStack(spacing: 4) {
                         Image(systemName: viewModel.isRecording ? "mic.fill" : "mic.slash.fill")
                             .font(.title)
-                        Text(viewModel.isRecording ? "停止" : "开始")
+                        Text(viewModel.isRecording ? "Stop" : "Start")
                             .font(.caption)
                     }
                     .frame(width: 80, height: 80)

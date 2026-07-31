@@ -1,6 +1,6 @@
 /*
  * Quick Vision View
- * 快速识图界面 - 一键拍照识别
+ * Quick Vision screen — one-tap capture & recognize
  */
 
 import SwiftUI
@@ -36,18 +36,18 @@ struct QuickVisionView: View {
                 Color.black.ignoresSafeArea()
 
                 VStack(spacing: AppSpacing.xl) {
-                    // 视频预览区域
+                    // Video preview area
                     videoPreviewSection
 
-                    // 状态和结果
+                    // Status and result
                     statusSection
 
-                    // 操作按钮
+                    // Action buttons
                     actionButtons
 
                     Spacer()
 
-                    // Siri 提示
+                    // Siri Tips
                     siriTipSection
                 }
                 .padding()
@@ -58,8 +58,8 @@ struct QuickVisionView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("close".localized) {
                         Task {
-                            tts.stop() // 停止播报
-                            await quickVisionManager.stopStream() // 停止视频流
+                            tts.stop() // Stop speaking
+                            await quickVisionManager.stopStream() // Stop the video stream
                         }
                         dismiss()
                     }
@@ -79,13 +79,13 @@ struct QuickVisionView: View {
         }
         .preferredColorScheme(.dark)
         .task {
-            // 确保 streamViewModel 已设置
+            // Ensure streamViewModel is set
             quickVisionManager.setStreamViewModel(streamViewModel)
 
-            // 等待设备连接（最多 2 秒）
+            // Wait for the device (max 2 s)
             var deviceWait = 0
             while !streamViewModel.hasActiveDevice && deviceWait < 20 {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1秒
+                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
                 deviceWait += 1
             }
 
@@ -94,7 +94,7 @@ struct QuickVisionView: View {
                 return
             }
 
-            // 自动开始识图（包含启动流、拍照、停止流、识别、TTS）
+            // Auto-run Quick Vision (start stream, capture, stop stream, recognize, speak)
             await quickVisionManager.performQuickVision()
         }
     }
@@ -103,22 +103,22 @@ struct QuickVisionView: View {
 
     private var videoPreviewSection: some View {
         ZStack {
-            // 优先显示 QuickVisionManager 保存的照片（不会因流停止而清除）
-            // 其次显示 streamViewModel 的照片，最后显示视频流
+            // Prefer the photo saved by QuickVisionManager (survives stream stop)
+            // then the streamViewModel photo, finally the live video stream
             if let photo = quickVisionManager.lastImage {
-                // 显示 QuickVisionManager 保存的照片
+                // Show the photo saved by QuickVisionManager
                 Image(uiImage: photo)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .cornerRadius(AppCornerRadius.lg)
             } else if let photo = streamViewModel.capturedPhoto {
-                // 显示 streamViewModel 的照片
+                // Show the streamViewModel photo
                 Image(uiImage: photo)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .cornerRadius(AppCornerRadius.lg)
             } else if let frame = streamViewModel.currentVideoFrame {
-                // 显示视频流
+                // Show the video stream
                 Image(uiImage: frame)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -128,7 +128,7 @@ struct QuickVisionView: View {
                     .fill(Color.gray.opacity(0.3))
                     .overlay {
                         if !streamViewModel.hasActiveDevice {
-                            // 设备未连接
+                            // Device not connected
                             VStack(spacing: AppSpacing.md) {
                                 Image(systemName: "antenna.radiowaves.left.and.right.slash")
                                     .font(.system(size: 50))
@@ -160,7 +160,7 @@ struct QuickVisionView: View {
                     }
             }
 
-            // 处理中遮罩（仅在有图片时显示）
+            // Processing overlay (only when an image is shown)
             if quickVisionManager.isProcessing && (quickVisionManager.lastImage != nil || streamViewModel.capturedPhoto != nil || streamViewModel.currentVideoFrame != nil) {
                 RoundedRectangle(cornerRadius: AppCornerRadius.lg)
                     .fill(Color.black.opacity(0.6))
@@ -183,7 +183,7 @@ struct QuickVisionView: View {
 
     private var statusSection: some View {
         VStack(spacing: AppSpacing.md) {
-            // 识别结果
+            // Result
             if let result = quickVisionManager.lastResult {
                 VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     HStack {
@@ -194,7 +194,7 @@ struct QuickVisionView: View {
                             .foregroundColor(.white)
                         Spacer()
 
-                        // 重新播报按钮
+                        // Replay-speech button
                         Button {
                             tts.speak(result)
                         } label: {
@@ -216,7 +216,7 @@ struct QuickVisionView: View {
                 }
             }
 
-            // 错误信息
+            // Error message
             if let error = quickVisionManager.errorMessage {
                 HStack {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -236,7 +236,7 @@ struct QuickVisionView: View {
 
     private var actionButtons: some View {
         VStack(spacing: AppSpacing.md) {
-            // 主按钮 - 快速识图
+            // Primary button — Quick Vision
             Button {
                 quickVisionManager.triggerQuickVision()
             } label: {
@@ -264,7 +264,7 @@ struct QuickVisionView: View {
             }
             .disabled(buttonDisabled)
 
-            // 停止播报按钮
+            // Stop-speech button
             if tts.isSpeaking {
                 Button {
                     tts.stop()

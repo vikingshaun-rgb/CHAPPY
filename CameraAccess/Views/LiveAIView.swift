@@ -1,6 +1,6 @@
 /*
  * Live AI View
- * 自动启动的实时 AI 对话界面
+ * Auto-starting realtime AI conversation screen
  */
 
 import SwiftUI
@@ -9,7 +9,7 @@ struct LiveAIView: View {
     @StateObject private var viewModel: OmniRealtimeViewModel
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var showConversation = true // 控制对话内容显示/隐藏
+    @State private var showConversation = true // Toggle conversation visibility
     @State private var frameTimer: Timer?
 
     init(streamViewModel: StreamSessionViewModel, apiKey: String) {
@@ -25,7 +25,7 @@ struct LiveAIView: View {
             Color.black
                 .ignoresSafeArea()
 
-            // 未连接设备提醒
+            // Device-not-connected notice
             if !streamViewModel.hasActiveDevice {
                 deviceNotConnectedView
             } else {
@@ -42,11 +42,11 @@ struct LiveAIView: View {
                 }
 
                 VStack(spacing: 0) {
-                // Header (紧贴状态栏)
+                // Header (flush with the status bar)
                 headerView
-                    .padding(.top, 8) // 状态栏下方一点点
+                    .padding(.top, 8) // just below the status bar
 
-                // Conversation history (可隐藏)
+                // Conversation history (hideable)
                 if showConversation {
                     ScrollViewReader { proxy in
                         ScrollView {
@@ -93,22 +93,22 @@ struct LiveAIView: View {
             }
         }
         .onAppear {
-            // 只有设备连接时才启动功能
+            // Only start when a device is connected
             guard streamViewModel.hasActiveDevice else {
-                print("⚠️ LiveAIView: 未连接RayBan Meta眼镜，跳过启动")
+                print("⚠️ LiveAIView: Ray-Ban Meta glasses not connected — skipping start")
                 return
             }
 
-            // 启动视频流
+            // Start the video stream
             Task {
-                print("🎥 LiveAIView: 启动视频流")
+                print("🎥 LiveAIView: Start the video stream")
                 await streamViewModel.handleStartStreaming()
             }
 
-            // 自动连接并开始录音
+            // Auto-connect and start recording
             viewModel.connect()
 
-            // 更新视频帧
+            // Update the video frame
             frameTimer?.invalidate()
             frameTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
                 if let frame = streamViewModel.currentVideoFrame {
@@ -117,8 +117,8 @@ struct LiveAIView: View {
             }
         }
         .onDisappear {
-            // 停止 AI 对话和视频流
-            print("🎥 LiveAIView: 停止 AI 对话和视频流")
+            // Stop the AI conversation and video stream
+            print("🎥 LiveAIView: Stop the AI conversation and video stream")
             frameTimer?.invalidate()
             frameTimer = nil
             viewModel.disconnect()

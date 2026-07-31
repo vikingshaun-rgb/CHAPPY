@@ -1,6 +1,6 @@
 /*
  * Live Translate Settings View
- * 实时翻译设置界面
+ * Live translation settings screen
  */
 
 import SwiftUI
@@ -12,7 +12,7 @@ struct LiveTranslateSettingsView: View {
     var body: some View {
         NavigationView {
             List {
-                // 源语言
+                // Source language
                 Section {
                     ForEach(TranslateLanguage.sourceLanguages) { language in
                         Button {
@@ -35,7 +35,7 @@ struct LiveTranslateSettingsView: View {
                     Text("livetranslate.settings.sourceLanguage".localized)
                 }
 
-                // 目标语言
+                // Target language
                 Section {
                     ForEach(TranslateLanguage.targetLanguages) { language in
                         Button {
@@ -60,7 +60,7 @@ struct LiveTranslateSettingsView: View {
                     Text("livetranslate.settings.targetLanguage.footer".localized)
                 }
 
-                // 音色选择
+                // Voice selection
                 Section {
                     ForEach(TranslateVoice.allCases) { voice in
                         Button {
@@ -90,7 +90,7 @@ struct LiveTranslateSettingsView: View {
                     Text("livetranslate.settings.voice.footer".localized)
                 }
 
-                // 麦克风选择
+                // Microphone selection
                 Section {
                     Toggle(isOn: $viewModel.usePhoneMic) {
                         HStack {
@@ -105,7 +105,7 @@ struct LiveTranslateSettingsView: View {
                     Text("livetranslate.settings.microphone.footer".localized)
                 }
 
-                // 输出选项
+                // Output options
                 Section {
                     Toggle(isOn: $viewModel.audioOutputEnabled) {
                         HStack {
@@ -128,7 +128,7 @@ struct LiveTranslateSettingsView: View {
                     Text("livetranslate.settings.imageEnhance.footer".localized)
                 }
 
-                // 历史记录
+                // History
                 if !viewModel.translationHistory.isEmpty {
                     Section {
                         Button(role: .destructive) {

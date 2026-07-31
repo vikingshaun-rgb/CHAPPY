@@ -33,32 +33,32 @@ struct MainAppView: View {
 
   var body: some View {
     if viewModel.registrationState == .registered || viewModel.hasMockDevice {
-      // 已注册/连接设备
+      // Registered / device connected
       if !hasCheckedPermissions {
-        // 首次启动，请求权限
+        // First launch — request permissions
         PermissionsRequestView { granted in
           permissionsGranted = granted
           hasCheckedPermissions = true
         }
       } else {
-        // 权限已检查，显示主界面
+        // Permissions checked — show the main UI
         MainTabView(streamViewModel: streamViewModel, wearablesViewModel: viewModel)
           .onAppear {
-            // 设置 QuickVisionManager 的 StreamViewModel 引用
+            // Set the StreamViewModel reference on QuickVisionManager
             quickVisionManager.setStreamViewModel(streamViewModel)
 
-            // 设置 OpenClaw Node 命令路由
+            // Set up OpenClaw node command routing
             let router = OpenClawCommandRouter(streamViewModel: streamViewModel)
             OpenClawNodeService.shared.setCommandRouter(router)
 
-            // 如果之前启用了 OpenClaw，自动重连
+            // Auto-reconnect if OpenClaw was previously enabled
             if OpenClawNodeService.shared.isEnabled {
               OpenClawNodeService.shared.connect()
             }
           }
       }
     } else {
-      // 未注册 - 显示注册/引导流程
+      // Not registered — show the registration/onboarding flow
       HomeScreenView(viewModel: viewModel)
     }
   }

@@ -1,6 +1,6 @@
 /*
  * Conversation Storage Service
- * 对话记录持久化服务
+ * Conversation persistence service
  */
 
 import Foundation
@@ -10,7 +10,7 @@ class ConversationStorage {
 
     private let userDefaults = UserDefaults.standard
     private let conversationsKey = "savedConversations"
-    private let maxConversations = 100 // 最多保存100条对话
+    private let maxConversations = 100 // Keep at most 100 conversations
 
     private init() {}
 
@@ -30,9 +30,9 @@ class ConversationStorage {
         // Encode and save
         if let encoded = try? JSONEncoder().encode(conversations) {
             userDefaults.set(encoded, forKey: conversationsKey)
-            print("💾 [Storage] 保存对话成功: \(record.id), 总数: \(conversations.count)")
+            print("💾 [Storage] Conversation saved: \(record.id), total: \(conversations.count)")
         } else {
-            print("❌ [Storage] 保存对话失败")
+            print("❌ [Storage] Failed to save conversation")
         }
     }
 
@@ -41,11 +41,11 @@ class ConversationStorage {
     func loadAllConversations() -> [ConversationRecord] {
         guard let data = userDefaults.data(forKey: conversationsKey),
               let conversations = try? JSONDecoder().decode([ConversationRecord].self, from: data) else {
-            print("📂 [Storage] 无对话记录或解码失败")
+            print("📂 [Storage] No conversation records, or decode failed")
             return []
         }
 
-        print("📂 [Storage] 加载对话成功: \(conversations.count) 条")
+        print("📂 [Storage] Conversations loaded: \(conversations.count) ")
         return conversations
     }
 
@@ -68,13 +68,13 @@ class ConversationStorage {
 
         if let encoded = try? JSONEncoder().encode(conversations) {
             userDefaults.set(encoded, forKey: conversationsKey)
-            print("🗑️ [Storage] 删除对话成功: \(id)")
+            print("🗑️ [Storage] Conversation deleted: \(id)")
         }
     }
 
     func deleteAllConversations() {
         userDefaults.removeObject(forKey: conversationsKey)
-        print("🗑️ [Storage] 清空所有对话")
+        print("🗑️ [Storage] Cleared all conversations")
     }
 
     // MARK: - Get Conversation

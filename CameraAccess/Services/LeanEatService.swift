@@ -1,6 +1,6 @@
 /*
  * LeanEat Service
- * 食物营养分析AI服务
+ * Food nutrition analysis — uses the currently selected AI provider (Claude by default)
  */
 
 import Foundation
@@ -8,11 +8,19 @@ import UIKit
 
 class LeanEatService {
     private let apiKey: String
-    private let baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    private let model = "qwen3-vl-plus"
+    private let baseURL: String
+    private let model: String
 
+    /// Initialize with explicit API key (uses current provider's URL + model)
     init(apiKey: String) {
         self.apiKey = apiKey
+        self.baseURL = VisionAPIConfig.baseURL
+        self.model = VisionAPIConfig.model
+    }
+
+    /// Initialize with current provider configuration
+    convenience init() {
+        self.init(apiKey: VisionAPIConfig.apiKey)
     }
 
     // MARK: - API Request/Response Models
@@ -66,41 +74,41 @@ class LeanEatService {
         let base64String = imageData.base64EncodedString()
         let dataURL = "data:image/jpeg;base64,\(base64String)"
 
-        // Create specialized nutrition analysis prompt
+        // Nutrition analysis prompt — strict JSON, English output
         let nutritionPrompt = """
-你是一位专业的营养师AI。请分析图片中的食物，并返回纯JSON格式的营养信息。
+You are a professional nutritionist AI. Analyze the food in the image and return the nutrition information as pure JSON.
 
-**严格要求：必须返回纯JSON格式，不要任何额外文字！**
-**重要：所有文字内容（包括name字段）必须用中文！**
+**STRICT REQUIREMENT: return ONLY pure JSON — no extra text, no markdown fences.**
+**All text values (including the name field) must be in English.**
 
-JSON格式如下：
+JSON format:
 {
   "foods": [
     {
-      "name": "食物名称（中文）",
-      "portion": "份量（如：1碗、100克等）",
-      "calories": 热量数字（整数，单位：千卡）,
-      "protein": 蛋白质（浮点数，单位：克）,
-      "fat": 脂肪（浮点数，单位：克）,
-      "carbs": 碳水化合物（浮点数，单位：克）,
-      "fiber": 膳食纤维（浮点数，单位：克，可选）,
-      "sugar": 糖分（浮点数，单位：克，可选）,
-      "health_rating": "健康评级（优秀/良好/一般/较差）"
+      "name": "food name",
+      "portion": "portion size (e.g. 1 bowl, 100 g)",
+      "calories": integer calories in kcal,
+      "protein": protein in grams (number),
+      "fat": fat in grams (number),
+      "carbs": carbohydrates in grams (number),
+      "fiber": dietary fiber in grams (number, optional),
+      "sugar": sugar in grams (number, optional),
+      "health_rating": "one of: Excellent / Good / Fair / Poor"
     }
   ],
-  "total_calories": 总热量（整数）,
-  "total_protein": 总蛋白质（浮点数）,
-  "total_fat": 总脂肪（浮点数）,
-  "total_carbs": 总碳水化合物（浮点数）,
-  "health_score": 健康评分（0-100整数）,
+  "total_calories": integer total calories,
+  "total_protein": total protein (number),
+  "total_fat": total fat (number),
+  "total_carbs": total carbohydrates (number),
+  "health_score": integer health score 0-100,
   "suggestions": [
-    "营养建议1",
-    "营养建议2",
-    "营养建议3"
+    "nutrition tip 1",
+    "nutrition tip 2",
+    "nutrition tip 3"
   ]
 }
 
-请严格按照上述JSON格式返回，不要添加任何其他文字说明。
+Return strictly in the JSON format above with no additional commentary.
 """
 
         // Create API request
@@ -135,12 +143,19 @@ JSON格式如下：
     // MARK: - Private Methods
 
     private func makeRequest(_ request: ChatCompletionRequest) async throws -> String {
-        let url = URL(string: "\(baseURL)/chat/completions")!
+        guard let url = URL(string: "\(baseURL)/chat/completions") else {
+            throw LeanEatError.invalidResponse
+        }
 
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        // Provider-aware headers
+        let headers = VisionAPIConfig.headers(with: apiKey)
+        for (key, value) in headers {
+            urlRequest.setValue(value, forHTTPHeaderField: key)
+        }
+        urlRequest.timeoutInterval = 60
 
         let encoder = JSONEncoder()
         urlRequest.httpBody = try encoder.encode(request)
@@ -167,7 +182,7 @@ JSON格式如下：
     }
 
     private func parseNutritionResponse(_ text: String) throws -> FoodNutritionResponse {
-        // Extract JSON from response (in case AI added extra text)
+        // Extract JSON from response (in case AI added extra text or fences)
         var jsonText = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Try to find JSON object in the response
@@ -184,8 +199,8 @@ JSON格式如下：
         do {
             return try decoder.decode(FoodNutritionResponse.self, from: jsonData)
         } catch {
-            print("❌ [LeanEat] JSON解析失败: \(error)")
-            print("📝 [LeanEat] 原始响应: \(text)")
+            print("❌ [LeanEat] JSON parse failed: \(error)")
+            print("📝 [LeanEat] Raw response: \(text)")
             throw LeanEatError.invalidJSON
         }
     }
@@ -203,15 +218,15 @@ enum LeanEatError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidImage:
-            return "无法处理图片"
+            return "Unable to process the image"
         case .emptyResponse:
-            return "API 返回空响应"
+            return "The API returned an empty response"
         case .invalidResponse:
-            return "无效的响应格式"
+            return "Invalid response format"
         case .invalidJSON:
-            return "无法解析营养数据，请重试"
+            return "Couldn't parse the nutrition data — please try again"
         case .apiError(let statusCode, let message):
-            return "API 错误 (\(statusCode)): \(message)"
+            return "API error (\(statusCode)): \(message)"
         }
     }
 }

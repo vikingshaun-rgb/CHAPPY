@@ -1,6 +1,6 @@
 /*
  * Records View
- * 记录页面 - 包含各类记录的 Tab
+ * Records screen — tabs for each record type
  */
 
 import SwiftUI
@@ -18,7 +18,7 @@ struct RecordsView: View {
                             selectedTab = 0
                         }
 
-                        RecordTabButton(title: "实时翻译", isSelected: selectedTab == 1) {
+                        RecordTabButton(title: "Live Translate", isSelected: selectedTab == 1) {
                             selectedTab = 1
                         }
 
@@ -58,7 +58,7 @@ struct RecordsView: View {
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
             }
-            .navigationTitle("记录")
+            .navigationTitle("Records")
         }
     }
 }
@@ -118,11 +118,11 @@ struct LiveAIRecordsView: View {
                         .font(.system(size: 64))
                         .foregroundColor(AppColors.liveAI.opacity(0.6))
 
-                    Text("暂无 Live AI 对话记录")
+                    Text("No Live AI conversations yet")
                         .font(AppTypography.title2)
                         .foregroundColor(AppColors.textPrimary)
 
-                    Text("使用 Live AI 功能后记录将显示在这里")
+                    Text("Records will appear here after you use Live AI")
                         .font(AppTypography.subheadline)
                         .foregroundColor(AppColors.textSecondary)
                         .multilineTextAlignment(.center)
@@ -142,7 +142,7 @@ struct LiveAIRecordsView: View {
                                     Button(role: .destructive) {
                                         viewModel.deleteConversation(conversation.id)
                                     } label: {
-                                        Label("删除", systemImage: "trash")
+                                        Label("Delete", systemImage: "trash")
                                     }
                                 }
                         }
@@ -173,7 +173,7 @@ class ConversationListViewModel: ObservableObject {
 
     func loadConversations() {
         conversations = ConversationStorage.shared.loadAllConversations()
-        print("📱 [RecordsView] 加载对话: \(conversations.count) 条")
+        print("📱 [RecordsView] Loaded conversations: \(conversations.count) ")
     }
 
     func deleteConversation(_ id: UUID) {
@@ -228,7 +228,7 @@ struct ConversationCell: View {
                 HStack(spacing: AppSpacing.xs) {
                     Image(systemName: "bubble.left.and.bubble.right")
                         .font(AppTypography.caption)
-                    Text("\(conversation.messageCount) 条消息")
+                    Text("\(conversation.messageCount)  messages")
                         .font(AppTypography.caption)
                 }
                 .foregroundColor(AppColors.textSecondary)
@@ -256,11 +256,11 @@ struct TranslationRecordsView: View {
                     .font(.system(size: 64))
                     .foregroundColor(AppColors.translate.opacity(0.6))
 
-                Text("暂无翻译记录")
+                Text("No translation records yet")
                     .font(AppTypography.title2)
                     .foregroundColor(AppColors.textPrimary)
 
-                Text("功能即将上线")
+                Text("Coming soon")
                     .font(AppTypography.subheadline)
                     .foregroundColor(AppColors.textSecondary)
             }
@@ -281,11 +281,11 @@ struct LeanEatRecordsView: View {
                     .font(.system(size: 64))
                     .foregroundColor(AppColors.leanEat.opacity(0.6))
 
-                Text("暂无卡路里识别记录")
+                Text("No nutrition records yet")
                     .font(AppTypography.title2)
                     .foregroundColor(AppColors.textPrimary)
 
-                Text("功能即将上线")
+                Text("Coming soon")
                     .font(AppTypography.subheadline)
                     .foregroundColor(AppColors.textSecondary)
             }
@@ -306,11 +306,11 @@ struct WordLearnRecordsView: View {
                     .font(.system(size: 64))
                     .foregroundColor(AppColors.wordLearn.opacity(0.6))
 
-                Text("暂无单词学习记录")
+                Text("No word-learning records yet")
                     .font(AppTypography.title2)
                     .foregroundColor(AppColors.textPrimary)
 
-                Text("功能即将上线")
+                Text("Coming soon")
                     .font(AppTypography.subheadline)
                     .foregroundColor(AppColors.textSecondary)
             }

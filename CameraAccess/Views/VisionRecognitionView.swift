@@ -37,11 +37,11 @@ struct VisionRecognitionView: View {
                 }
                 .padding()
             }
-            .navigationTitle("AI 视觉识别")
+            .navigationTitle("AI Vision Recognition")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("关闭") {
+                    Button("Close") {
                         dismiss()
                     }
                 }
@@ -62,11 +62,11 @@ struct VisionRecognitionView: View {
 
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("提问内容")
+            Text("Your question")
                 .font(.headline)
                 .foregroundColor(.primary)
 
-            TextField("输入你的问题...", text: $viewModel.customPrompt, axis: .vertical)
+            TextField("Type your question...", text: $viewModel.customPrompt, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(3...6)
                 .disabled(viewModel.isAnalyzing)
@@ -75,7 +75,7 @@ struct VisionRecognitionView: View {
 
     private var quickPromptsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("快捷提问")
+            Text("Quick prompts")
                 .font(.headline)
                 .foregroundColor(.primary)
 
@@ -120,7 +120,7 @@ struct VisionRecognitionView: View {
                         .progressViewStyle(CircularProgressViewStyle(tint: .white))
                         .scaleEffect(0.8)
                 }
-                Text(viewModel.isAnalyzing ? "分析中..." : "开始分析")
+                Text(viewModel.isAnalyzing ? "Analyzing..." : "Analyze")
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -137,7 +137,7 @@ struct VisionRecognitionView: View {
             if let result = viewModel.recognitionResult {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
-                        Text("识别结果")
+                        Text("Result")
                             .font(.headline)
                             .foregroundColor(.primary)
 
@@ -164,7 +164,7 @@ struct VisionRecognitionView: View {
                     } label: {
                         HStack {
                             Image(systemName: "doc.on.doc")
-                            Text("复制结果")
+                            Text("Copy result")
                         }
                         .font(.caption)
                         .padding(.horizontal, 12)
@@ -176,7 +176,7 @@ struct VisionRecognitionView: View {
                 }
             } else if let error = viewModel.errorMessage {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("错误")
+                    Text("Error")
                         .font(.headline)
                         .foregroundColor(.red)
 
@@ -195,7 +195,7 @@ struct VisionRecognitionView: View {
                     } label: {
                         HStack {
                             Image(systemName: "arrow.clockwise")
-                            Text("重试")
+                            Text("Retry")
                         }
                         .font(.caption)
                         .padding(.horizontal, 12)

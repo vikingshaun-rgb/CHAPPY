@@ -1,6 +1,6 @@
 /*
  * Quick Vision Settings View
- * 快速识图设置 - 模式选择、自定义提示词、历史记录
+ * Quick Vision settings — mode, custom prompt, history
  */
 
 import SwiftUI
@@ -13,7 +13,7 @@ struct QuickVisionSettingsView: View {
     var body: some View {
         NavigationView {
             List {
-                // 识图模式选择
+                // Vision mode selection
                 Section {
                     ForEach(QuickVisionMode.allCases) { mode in
                         Button {
@@ -45,7 +45,7 @@ struct QuickVisionSettingsView: View {
                     Text("quickvision.settings.mode".localized)
                 }
 
-                // 翻译目标语言（仅在翻译模式显示）
+                // Translation target language (shown in translate mode only)
                 if modeManager.currentMode == .translate {
                     Section {
                         ForEach(QuickVisionModeManager.supportedLanguages, id: \.code) { language in
@@ -68,7 +68,7 @@ struct QuickVisionSettingsView: View {
                     }
                 }
 
-                // 自定义提示词（仅在自定义模式显示）
+                // Custom prompt (shown in custom mode only)
                 if modeManager.currentMode == .custom {
                     Section {
                         TextEditor(text: $modeManager.customPrompt)
@@ -79,7 +79,7 @@ struct QuickVisionSettingsView: View {
                     }
                 }
 
-                // 识图历史
+                // Vision history
                 Section {
                     Button {
                         showHistory = true
@@ -230,7 +230,7 @@ struct QuickVisionRecordRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            // 缩略图
+            // Thumbnail
             if let thumbnail = record.thumbnail {
                 Image(uiImage: thumbnail)
                     .resizable()
@@ -281,7 +281,7 @@ struct QuickVisionRecordDetailView: View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // 缩略图
+                    // Thumbnail
                     if let thumbnail = record.thumbnail {
                         Image(uiImage: thumbnail)
                             .resizable()
@@ -291,7 +291,7 @@ struct QuickVisionRecordDetailView: View {
                             .frame(maxWidth: .infinity)
                     }
 
-                    // 模式和时间
+                    // Mode and time
                     HStack {
                         HStack(spacing: 4) {
                             Image(systemName: record.mode.icon)
@@ -310,7 +310,7 @@ struct QuickVisionRecordDetailView: View {
 
                     Divider()
 
-                    // 识图结果
+                    // Result
                     VStack(alignment: .leading, spacing: 8) {
                         Text("quickvision.result".localized)
                             .font(.headline)
