@@ -27,6 +27,9 @@
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
+				<string>chappy</string>
+				<string>chappy</string>
+				<string>chappy</string>
 				<string>Chappy</string>
 			</array>
 		</dict>
