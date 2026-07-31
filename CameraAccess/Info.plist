@@ -33,6 +33,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSApplicationCategoryType</key>
+	<string></string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>fb-viewapp</string>
@@ -41,10 +43,10 @@
 	<dict>
 		<key>AppLinkURLScheme</key>
 		<string>chappy://</string>
-		<key>MetaAppID</key>
-		<string>27838828645779157</string>
 		<key>ClientToken</key>
-		<string>AR|27838828645779157|3041b305979c10d91cbc30d3e72fb9d3</string>
+		<string>AR|1979732252680228|894e777a18590672116eba7d5c2111b8</string>
+		<key>MetaAppID</key>
+		<string>1979732252680228</string>
 		<key>TeamID</key>
 		<string>$(DEVELOPMENT_TEAM)</string>
 	</dict>
@@ -53,18 +55,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSSiriUsageDescription</key>
-	<string>Chappy needs Needs siri to talk to chappy</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Chappy need blutoooth usage to connect to Meta</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Chappy needs camera to capture photos</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Chappy needs Mic to speak to meta</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Chappy needs photo library to save photos</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Chappy needs camera to capture photos</string>
-	<key>LSApplicationCategoryType</key>
-	<string></string>
+	<key>NSSiriUsageDescription</key>
+	<string>Chappy needs Needs siri to talk to chappy</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
