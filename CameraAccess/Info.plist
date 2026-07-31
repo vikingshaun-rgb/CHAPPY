@@ -27,7 +27,7 @@
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>turbometa</string>
+				<string>Chappy</string>
 			</array>
 		</dict>
 	</array>
@@ -40,11 +40,11 @@
 	<key>MWDAT</key>
 	<dict>
 		<key>AppLinkURLScheme</key>
-		<string>turbometa://</string>
+		<string>chappy://</string>
 		<key>MetaAppID</key>
-		<string>$(META_APP_ID)</string>
+		<string>27838828645779157</string>
 		<key>ClientToken</key>
-		<string>$(CLIENT_TOKEN)</string>
+		<string>AR|27838828645779157|3041b305979c10d91cbc30d3e72fb9d3</string>
 		<key>TeamID</key>
 		<string>$(DEVELOPMENT_TEAM)</string>
 	</dict>
@@ -53,14 +53,18 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Needed to connect to Meta AI Glasses</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>TurboMeta 需要访问麦克风以实现与智能眼镜的实时语音对话功能。</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>TurboMeta 需要访问相册以保存从智能眼镜拍摄的照片。</string>
 	<key>NSSiriUsageDescription</key>
-	<string>TurboMeta 需要 Siri 权限以支持语音快捷指令触发快速识图功能。</string>
+	<string>Chappy needs Needs siri to talk to chappy</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Chappy need blutoooth usage to connect to Meta</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Chappy needs Mic to speak to meta</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Chappy needs photo library to save photos</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Chappy needs camera to capture photos</string>
+	<key>LSApplicationCategoryType</key>
+	<string></string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
