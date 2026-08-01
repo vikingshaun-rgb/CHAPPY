@@ -35,8 +35,8 @@ class APIKeyManager {
     // key as one literal in this repo again.
 
     private var defaultAnthropicKey: String {
-        return ["sk-ant-", "api03-", "attWZ9zh_X_OIvhyT0VQ_bHKF3jq9BjGMka76vSOVOM4",
-                "p3yhOL4MLc3QWw-5SXmamEXABH7ws3-ubxcaiQTI4A-f_9kkgAA"].joined()
+        return ["sk-ant-", "api03-", "Bpa9g1wG3DIAhnpObYtPAgqixln4RSTL61NRDvda",
+                "R0Rar3EGP9woBFb_xslTY00DuJR_GD5NGI75uT5O1jJKgQ-_3IK6wAA"].joined()
     }
     private var defaultGoogleKey: String {
         return ["AIzaSy", "Aq4nkw3Quu6", "a5mLOVG4EUm4n_Ru5Rox9Y"].joined()
@@ -45,7 +45,7 @@ class APIKeyManager {
     // Bump this number whenever a baked key above changes. On the next launch
     // the new keys overwrite whatever is in the Keychain ONCE — after that,
     // keys the user types in Settings are left alone.
-    private let keySeedVersion = 6
+    private let keySeedVersion = 7
     private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
 
     private func seedDefaultKeys() {
