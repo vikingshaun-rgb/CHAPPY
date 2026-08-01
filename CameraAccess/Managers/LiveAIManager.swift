@@ -400,7 +400,7 @@ class LiveAIManager: ObservableObject {
         case .alibaba:
             aiModel = "qwen3-omni-flash-realtime"
         case .google:
-            aiModel = "gemini-2.0-flash-exp"
+            aiModel = "gemini-live-2.5-flash-native-audio"
         }
 
         let record = ConversationRecord(

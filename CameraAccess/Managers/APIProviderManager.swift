@@ -109,7 +109,7 @@ enum LiveAIProvider: String, CaseIterable, Codable {
 
     var defaultModel: String {
         switch self {
-        case .google: return "gemini-2.0-flash-exp"
+        case .google: return "gemini-live-2.5-flash-native-audio"
         case .alibaba: return "qwen3-omni-flash-realtime"
         }
     }

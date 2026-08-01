@@ -266,7 +266,7 @@ class TTSService: NSObject, ObservableObject {
         synthesizer.delegate = self
 
         let utterance = AVSpeechUtterance(string: text)
-        let language = LanguageManager.shared.currentLanguage == .chinese ? "zh-CN" : "en-AU"
+        let language = await MainActor.run { LanguageManager.shared.currentLanguage == .chinese ? "zh-CN" : "en-AU" }
         utterance.voice = AVSpeechSynthesisVoice(language: language)
             ?? AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
