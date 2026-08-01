@@ -167,7 +167,7 @@ class TTSService: NSObject, ObservableObject {
     }
 
     private func requestGeminiAudio(text: String, model: String, apiKey: String) async throws -> Data {
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
         guard let url = URL(string: urlString) else { throw TTSError.invalidURL }
 
         let body: [String: Any] = [
@@ -185,6 +185,7 @@ class TTSService: NSObject, ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 30
 
