@@ -123,7 +123,7 @@ class GeminiLiveService: NSObject {
     func connect() {
         // Gemini Live WebSocket URL with API key
         let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        let urlString = "\(baseURL)?key=\(apiKey)"
+        let urlString = baseURL
 
         print("🔌 [Gemini] Preparing WebSocket connection")
 
@@ -136,7 +136,9 @@ class GeminiLiveService: NSObject {
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
 
-        webSocket = urlSession?.webSocketTask(with: url)
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
+        webSocket = urlSession?.webSocketTask(with: request)
         webSocket?.resume()
 
         print("🔌 [Gemini] WebSocket Task started")

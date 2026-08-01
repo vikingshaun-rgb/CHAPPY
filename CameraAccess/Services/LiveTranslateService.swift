@@ -142,7 +142,7 @@ class LiveTranslateService: NSObject {
     // MARK: - WebSocket Connection
 
     func connect() {
-        let urlString = "\(baseURL)?key=\(apiKey)"
+        let urlString = baseURL
         print("🔌 [Translate] Preparing WebSocket connection (Gemini Live)")
 
         guard let url = URL(string: urlString) else {
@@ -151,7 +151,8 @@ class LiveTranslateService: NSObject {
             return
         }
 
-        let request = URLRequest(url: url)
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
 
