@@ -4,7 +4,7 @@
  */
 
 // MARK: - App General
-"app.name" = "TurboMeta";
+"app.name" = "Chappy";
 "app.subtitle" = "RayBan Meta Assistant";
 "ok" = "OK";
 "cancel" = "Cancel";
@@ -59,7 +59,7 @@
 "quickvision.glasses.notconnected" = "Glasses Not Connected";
 "quickvision.siri.tip.title" = "Siri Shortcuts";
 "quickvision.siri.tip.description" = "You can trigger Quick Vision in the following ways:";
-"quickvision.siri.tip.voice" = "Hey Siri, TurboMeta Quick Vision";
+"quickvision.siri.tip.voice" = "Hey Siri, Chappy Quick Vision";
 "quickvision.siri.tip.action" = "Add to Shortcuts app lock screen widget";
 "quickvision.siri.support" = "Supports Siri and Shortcuts";
 "quickvision.stop.speaking" = "Stop Speaking";
