@@ -1,6 +1,6 @@
 /*
  * Permissions Manager
- * 统一管理应用所需的所有权限
+ * Central manager for every permission the app needs
  */
 
 import Foundation
@@ -15,48 +15,48 @@ class PermissionsManager: ObservableObject {
 
     private init() {}
 
-    // MARK: - 请求所有权限
+    // MARK: - Request all permissions
 
     func requestAllPermissions(completion: @escaping (Bool) -> Void) {
-        print("📋 [Permissions] 开始请求所有权限...")
+        print("📋 [Permissions] Requesting all permissions...")
 
-        // 使用 DispatchGroup 等待所有权限请求完成
+        // Use DispatchGroup to wait for all permission requests to finish
         let group = DispatchGroup()
         var microphoneGranted = false
         var photoLibraryGranted = false
 
-        // 1. 请求麦克风权限
+        // 1. Request microphone permission
         group.enter()
         requestMicrophonePermission { granted in
             microphoneGranted = granted
             group.leave()
         }
 
-        // 2. 请求相册权限
+        // 2. Request photo-library permission
         group.enter()
         requestPhotoLibraryPermission { granted in
             photoLibraryGranted = granted
             group.leave()
         }
 
-        // 所有权限请求完成
+        // All permission requests finished
         group.notify(queue: .main) {
             let allGranted = microphoneGranted && photoLibraryGranted
             self.allPermissionsGranted = allGranted
 
             if allGranted {
-                print("✅ [Permissions] 所有权限已授予")
+                print("✅ [Permissions] All permissions granted")
             } else {
-                print("⚠️ [Permissions] 部分权限未授予:")
-                print("   麦克风: \(microphoneGranted ? "✅" : "❌")")
-                print("   相册: \(photoLibraryGranted ? "✅" : "❌")")
+                print("⚠️ [Permissions] Some permissions were not granted:")
+                print("   Microphone: \(microphoneGranted ? "✅" : "❌")")
+                print("   Photo Library: \(photoLibraryGranted ? "✅" : "❌")")
             }
 
             completion(allGranted)
         }
     }
 
-    // MARK: - 检查所有权限状态
+    // MARK: - Check all permission states
 
     func checkAllPermissions() -> Bool {
         let microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -69,27 +69,27 @@ class PermissionsManager: ObservableObject {
         return allPermissionsGranted
     }
 
-    // MARK: - 麦克风权限
+    // MARK: - Microphone permission
 
     private func requestMicrophonePermission(completion: @escaping (Bool) -> Void) {
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
 
         switch status {
         case .authorized:
-            print("✅ [Permissions] 麦克风权限已授予")
+            print("✅ [Permissions] Microphone permission granted")
             completion(true)
 
         case .notDetermined:
-            print("🎤 [Permissions] 请求麦克风权限...")
+            print("🎤 [Permissions] Request microphone permission...")
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 DispatchQueue.main.async {
-                    print(granted ? "✅ [Permissions] 麦克风权限已授予" : "❌ [Permissions] 麦克风权限被拒绝")
+                    print(granted ? "✅ [Permissions] Microphone permission granted" : "❌ [Permissions] Microphone permission denied")
                     completion(granted)
                 }
             }
 
         case .denied, .restricted:
-            print("❌ [Permissions] 麦克风权限被拒绝或受限")
+            print("❌ [Permissions] Microphone permission denied or restricted")
             completion(false)
 
         @unknown default:
@@ -97,28 +97,28 @@ class PermissionsManager: ObservableObject {
         }
     }
 
-    // MARK: - 相册权限
+    // MARK: - Photo-library permission
 
     private func requestPhotoLibraryPermission(completion: @escaping (Bool) -> Void) {
         let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
 
         switch status {
         case .authorized, .limited:
-            print("✅ [Permissions] 相册权限已授予")
+            print("✅ [Permissions] Photo-library permission granted")
             completion(true)
 
         case .notDetermined:
-            print("📷 [Permissions] 请求相册权限...")
+            print("📷 [Permissions] Request photo-library permission...")
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
                 DispatchQueue.main.async {
                     let granted = newStatus == .authorized || newStatus == .limited
-                    print(granted ? "✅ [Permissions] 相册权限已授予" : "❌ [Permissions] 相册权限被拒绝")
+                    print(granted ? "✅ [Permissions] Photo-library permission granted" : "❌ [Permissions] Photo-library permission denied")
                     completion(granted)
                 }
             }
 
         case .denied, .restricted:
-            print("❌ [Permissions] 相册权限被拒绝或受限")
+            print("❌ [Permissions] Photo-library permission denied or restricted")
             completion(false)
 
         @unknown default:
@@ -126,7 +126,7 @@ class PermissionsManager: ObservableObject {
         }
     }
 
-    // MARK: - 打开系统设置
+    // MARK: - Open system Settings
 
     func openSettings() {
         if let settingsUrl = URL(string: UIApplication.openSettingsURLString) {
