@@ -1,7 +1,9 @@
 /*
  * Gemini Live WebSocket Service
  * Provides real-time audio chat with Google Gemini AI
- * Uses gemini-live-2.5-flash-native-audio model for real-time audio conversation
+ * Model is HARD-PINNED below (liveModel) — callers cannot override it
+ * until the socket layer is proven stable.
+ * All socket failures are surfaced to the UI via onError (TestFlight has no console).
  */
 
 import Foundation
@@ -12,9 +14,14 @@ import AVFoundation
 
 class GeminiLiveService: NSObject {
 
+    // The one known-good Live model (verified 2026-08). Pinned here so a stale
+    // value at any call site can no longer break the socket.
+    static let liveModel = "gemini-3.1-flash-live-preview"
+
     // WebSocket
     private var webSocket: URLSessionWebSocketTask?
     private var urlSession: URLSession?
+    private var didReportSocketError = false
 
     // Configuration
     private let apiKey: String
@@ -57,7 +64,9 @@ class GeminiLiveService: NSObject {
 
     init(apiKey: String, model: String? = nil) {
         self.apiKey = apiKey
-        self.model = model ?? "gemini-live-2.5-flash-native-audio"
+        // HARD PIN: ignore whatever the caller passes — builds 12-14 may still
+        // hand in a retired model name. Remove the pin once Live is stable.
+        self.model = GeminiLiveService.liveModel
         super.init()
         setupAudioEngine()
     }
@@ -125,7 +134,8 @@ class GeminiLiveService: NSObject {
         let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         let urlString = baseURL
 
-        print("🔌 [Gemini] Preparing WebSocket connection")
+        let keyPreview = apiKey.count > 10 ? "\(apiKey.prefix(6))…\(apiKey.suffix(4))" : "TOO-SHORT(\(apiKey.count))"
+        print("🔌 [Gemini] Preparing WebSocket connection — model: \(model), key: \(keyPreview)")
 
         guard let url = URL(string: urlString) else {
             print("❌ [Gemini] Invalid URL")
@@ -133,11 +143,14 @@ class GeminiLiveService: NSObject {
             return
         }
 
+        didReportSocketError = false
+
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
 
         var request = URLRequest(url: url)
-        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.timeoutInterval = 15
         webSocket = urlSession?.webSocketTask(with: request)
         webSocket?.resume()
 
@@ -381,8 +394,9 @@ class GeminiLiveService: NSObject {
                 self?.receiveMessage()
 
             case .failure(let error):
-                print("❌ [Gemini] Failed to receive message: \(error.localizedDescription)")
-                self?.onError?("Receive error: \(error.localizedDescription)")
+                let nsError = error as NSError
+                print("❌ [Gemini] Failed to receive message: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
+                self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)")
             }
         }
     }
@@ -582,6 +596,21 @@ class GeminiLiveService: NSObject {
     }
 }
 
+// MARK: - Error Reporting
+
+extension GeminiLiveService {
+    /// Surfaces the FIRST socket failure to the UI (TestFlight has no console,
+    /// so prints alone are useless in the field). Subsequent errors from the
+    /// same collapse are suppressed to avoid stacked alerts.
+    fileprivate func reportSocketError(_ message: String) {
+        guard !didReportSocketError else { return }
+        didReportSocketError = true
+        DispatchQueue.main.async { [weak self] in
+            self?.onError?(message)
+        }
+    }
+}
+
 // MARK: - URLSessionWebSocketDelegate
 
 extension GeminiLiveService: URLSessionWebSocketDelegate {
@@ -593,7 +622,29 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
+        let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason given"
         print("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        // 1000/1001 = normal shutdown (our own disconnect) — everything else is a failure worth showing
+        if closeCode != .normalClosure && closeCode != .goingAway {
+            reportSocketError("Socket closed — code \(closeCode.rawValue): \(reasonString)")
+        }
+    }
+
+    /// Fires when the connection dies at the HTTP upgrade stage (didOpen never runs).
+    /// This is where a 401/403/404 from Google shows up — the exact thing we've
+    /// been blind to on TestFlight builds.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        var details: [String] = []
+        if let http = task.response as? HTTPURLResponse {
+            details.append("HTTP \(http.statusCode)")
+        }
+        if let error = error {
+            let nsError = error as NSError
+            details.append("\(error.localizedDescription) [\(nsError.code)]")
+        }
+        guard !details.isEmpty else { return }
+        let message = "Connection failed: " + details.joined(separator: " — ")
+        print("❌ [Gemini] \(message)")
+        reportSocketError(message)
     }
 }
