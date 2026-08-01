@@ -304,6 +304,26 @@ struct SettingsView: View {
                     Text("settings.liveai".localized)
                 }
 
+                // Chappy Voice
+                Section {
+                    NavigationLink {
+                        ChappyVoiceSettingsView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "waveform.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("Chappy's Voice")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Text(UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                } header: {
+                    Text("Voice")
+                }
+
                 // OpenClaw
                 Section {
                     Button {
@@ -335,7 +355,7 @@ struct SettingsView: View {
                 // About
                 Section {
                     InfoRow(title: "settings.version".localized, value: "2.0.0")
-                    InfoRow(title: "settings.sdkversion".localized, value: "0.5.0")
+                    InfoRow(title: "settings.sdkversion".localized, value: "0.7.0")
                 } header: {
                     Text("settings.about".localized)
                 }
@@ -1233,5 +1253,74 @@ struct GoogleAPIKeySettingsView: View {
             errorMessage = "settings.apikey.deletefailed".localized
             showError = true
         }
+    }
+}
+
+
+// MARK: - Chappy Voice Settings
+
+struct ChappyVoiceSettingsView: View {
+    @AppStorage("chappy_tts_voice") private var selectedVoice: String = "Kore"
+    @ObservedObject private var tts = TTSService.shared
+
+    private let voices: [(name: String, description: String)] = [
+        ("Kore", "Warm, friendly female - the Chappy default"),
+        ("Aoede", "Bright, upbeat female"),
+        ("Leda", "Calm, soothing female"),
+        ("Puck", "Energetic male"),
+        ("Charon", "Deep, steady male"),
+        ("Fenrir", "Strong, confident male"),
+        ("System", "Apple voice - instant and works offline")
+    ]
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(voices, id: \.name) { voice in
+                    Button {
+                        selectedVoice = voice.name
+                        let sample = voice.name == "System"
+                            ? "G'day Shaun, this is the offline Apple voice."
+                            : "G'day Shaun, I'm Chappy - this is my \(voice.name) voice."
+                        TTSService.shared.speak(sample)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(voice.name)
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(voice.description)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                            Spacer()
+                            if selectedVoice == voice.name {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("Pick a voice - tap to preview")
+            } footer: {
+                Text("Gemini voices need internet and your Gemini key. When offline, Chappy automatically falls back to the Apple voice.")
+            }
+
+            Section {
+                Button {
+                    TTSService.shared.speak("No worries - I'll read your answers, translations and alerts in this voice.")
+                } label: {
+                    HStack {
+                        Image(systemName: tts.isSpeaking ? "speaker.wave.3.fill" : "play.circle.fill")
+                        Text(tts.isSpeaking ? "Speaking..." : "Play a longer sample")
+                    }
+                }
+                if tts.isSpeaking {
+                    Button("Stop") { TTSService.shared.stop() }
+                        .foregroundColor(.red)
+                }
+            }
+        }
+        .navigationTitle("Chappy's Voice")
     }
 }
