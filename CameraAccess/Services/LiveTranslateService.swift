@@ -22,8 +22,11 @@ class LiveTranslateService: NSObject {
 
     // Configuration
     private let apiKey: String
-    private let model = "gemini-3.1-flash-live-preview"
+    // HARD PIN: same known-good Live model as GeminiLiveService (old
+    // gemini-live-2.5-flash-native-audio is retired and kills the socket).
+    private let model = GeminiLiveService.liveModel
     private let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    private var didReportSocketError = false
 
     // Audio Engine (for recording)
     private var audioEngine: AVAudioEngine?
@@ -59,6 +62,11 @@ class LiveTranslateService: NSObject {
     private var isRecording = false
     private var isConnected = false
     private var accumulatedText = ""
+
+    // Reconnect bookkeeping: recording may only resume AFTER setupComplete,
+    // never straight after connect() — audio sent before setup kills the socket.
+    private var shouldResumeRecordingAfterSetup = false
+    private var lastUsePhoneMic = false
 
     // Image sending
     private var lastImageSendTime: Date?
@@ -151,8 +159,11 @@ class LiveTranslateService: NSObject {
             return
         }
 
+        didReportSocketError = false
+
         var request = URLRequest(url: url)
-        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.timeoutInterval = 15
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
 
@@ -161,7 +172,8 @@ class LiveTranslateService: NSObject {
 
         print("🔌 [Translate] WebSocket task started")
         receiveMessage()
-        sendSetup()
+        // NOTE: sendSetup() now happens in didOpenWithProtocol — sending it
+        // here raced the connection handshake and could be dropped/rejected.
     }
 
     func disconnect() {
@@ -189,17 +201,17 @@ class LiveTranslateService: NSObject {
         self.audioOutputEnabled = audioEnabled
 
         // Gemini Live sets system instructions at session start only —
-        // if we're already connected, reconnect with the new settings.
-        if webSocket != nil, isConnected {
+        // if a session exists (even one mid-handshake or half-dead),
+        // reconnect with the new settings.
+        if webSocket != nil {
             print("🔄 [Translate] Settings changed - reconnecting session")
             let wasRecording = isRecording
             disconnect()
+            // Resume recording only AFTER the new session's setupComplete —
+            // starting it here pushed audio into an unconfigured socket, which
+            // the server kills (this was the language-change crash).
+            shouldResumeRecordingAfterSetup = wasRecording
             connect()
-            if wasRecording {
-                // recording restarts once the new session is up; the caller's
-                // recording state is preserved by the view model
-                startRecording()
-            }
         }
     }
 
@@ -245,6 +257,7 @@ class LiveTranslateService: NSObject {
 
     func startRecording(usePhoneMic: Bool = false) {
         guard !isRecording else { return }
+        lastUsePhoneMic = usePhoneMic
 
         do {
             print("🎤 [Translate] Start recording, using \(usePhoneMic ? "iPhone" : "Bluetooth") microphone")
@@ -466,8 +479,9 @@ class LiveTranslateService: NSObject {
                 self?.receiveMessage()
 
             case .failure(let error):
-                print("❌ [Translate] Receive failed: \(error.localizedDescription)")
-                self?.onError?("Receive error: \(error.localizedDescription)")
+                let nsError = error as NSError
+                print("❌ [Translate] Receive failed: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
+                self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)")
             }
         }
     }
@@ -498,6 +512,11 @@ class LiveTranslateService: NSObject {
                 self.isConnected = true
                 self.accumulatedText = ""
                 self.onConnected?()
+                // Safe point to resume recording after a settings reconnect
+                if self.shouldResumeRecordingAfterSetup {
+                    self.shouldResumeRecordingAfterSetup = false
+                    self.startRecording(usePhoneMic: self.lastUsePhoneMic)
+                }
                 return
             }
 
@@ -610,21 +629,55 @@ class LiveTranslateService: NSObject {
     }
 }
 
+// MARK: - Error Reporting
+
+extension LiveTranslateService {
+    /// Surfaces the FIRST socket failure to the UI and suppresses the follow-on
+    /// cascade (close + receive-failure both fire for one collapse).
+    fileprivate func reportSocketError(_ message: String) {
+        guard !didReportSocketError else { return }
+        didReportSocketError = true
+        DispatchQueue.main.async { [weak self] in
+            self?.onError?(message)
+        }
+    }
+}
+
 // MARK: - URLSessionWebSocketDelegate
 
 extension LiveTranslateService: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        print("🔌 [Translate] WebSocket opened")
+        print("🔌 [Translate] WebSocket opened — sending setup")
+        DispatchQueue.main.async { [weak self] in
+            self?.sendSetup()
+        }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason given"
         print("🔌 [Translate] WebSocket closed: \(closeCode.rawValue) \(reasonText)")
         DispatchQueue.main.async { [weak self] in
             self?.isConnected = false
-            if closeCode != .goingAway && closeCode != .normalClosure {
-                self?.onError?("Socket closed (\(closeCode.rawValue)) \(reasonText)")
-            }
         }
+        if closeCode != .goingAway && closeCode != .normalClosure {
+            reportSocketError("Socket closed — code \(closeCode.rawValue): \(reasonText)")
+        }
+    }
+
+    /// Catches failures at the HTTP upgrade stage (didOpen never fires) —
+    /// 401/403/404 from Google shows up here, visible on TestFlight at last.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        var details: [String] = []
+        if let http = task.response as? HTTPURLResponse {
+            details.append("HTTP \(http.statusCode)")
+        }
+        if let error = error {
+            let nsError = error as NSError
+            details.append("\(error.localizedDescription) [\(nsError.code)]")
+        }
+        guard !details.isEmpty else { return }
+        let message = "Connection failed: " + details.joined(separator: " — ")
+        print("❌ [Translate] \(message)")
+        reportSocketError(message)
     }
 }
