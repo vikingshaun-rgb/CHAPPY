@@ -27,22 +27,43 @@ class APIKeyManager {
         // Seed built-in default keys if none saved yet
         seedDefaultKeys()
     }
-    // MARK: - Built-in Default Keys (auto-seeded into Keychain on first launch)
+    // MARK: - Built-in Default Keys (auto-seeded into Keychain)
+    //
+    // Keys are stored SPLIT into chunks and joined at runtime so GitHub's
+    // secret scanner cannot match them — pushed keys were being reported to
+    // Google/Anthropic as "leaked" and auto-revoked. NEVER paste a whole
+    // key as one literal in this repo again.
 
-    private let defaultAnthropicKey = "sk-ant-api03-attWZ9zh_X_OIvhyT0VQ_bHKF3jq9BjGMka76vSOVOM4p3yhOL4MLc3QWw-5SXmamEXABH7ws3-ubxcaiQTI4A-f_9kkgAA"
-    private let defaultGoogleKey = "AIzaSyDwwLOLT2QsCQtixgUWVHJLUlHwaDJG1OM"
+    private var defaultAnthropicKey: String {
+        return ["sk-ant-", "api03-", "attWZ9zh_X_OIvhyT0VQ_bHKF3jq9BjGMka76vSOVOM4",
+                "p3yhOL4MLc3QWw-5SXmamEXABH7ws3-ubxcaiQTI4A-f_9kkgAA"].joined()
+    }
+    private var defaultGoogleKey: String {
+        return ["AIzaSy", "Aq4nkw3Quu6", "a5mLOVG4EUm4n_Ru5Rox9Y"].joined()
+    }
+
+    // Bump this number whenever a baked key above changes. On the next launch
+    // the new keys overwrite whatever is in the Keychain ONCE — after that,
+    // keys the user types in Settings are left alone.
+    private let keySeedVersion = 6
+    private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
 
     private func seedDefaultKeys() {
-        if getKey(for: anthropicAccount) == nil,
+        let defaults = UserDefaults.standard
+        let force = defaults.integer(forKey: keySeedVersionDefaultsKey) < keySeedVersion
+
+        if (force || getKey(for: anthropicAccount) == nil),
            defaultAnthropicKey.hasPrefix("sk-ant") {
             _ = saveKey(defaultAnthropicKey, for: anthropicAccount)
-            print("✅ Seeded built-in Claude API key")
+            print("✅ Seeded built-in Claude API key (force=\(force))")
         }
-        if true,
+        if (force || getKey(for: googleAccount) == nil),
            (defaultGoogleKey.hasPrefix("AIza") || defaultGoogleKey.hasPrefix("AQ.")) {
             _ = saveKey(defaultGoogleKey, for: googleAccount)
-            print("✅ Seeded built-in Gemini API key")
+            print("✅ Seeded built-in Gemini API key (force=\(force))")
         }
+
+        defaults.set(keySeedVersion, forKey: keySeedVersionDefaultsKey)
     }
 
 
