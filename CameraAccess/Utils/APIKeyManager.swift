@@ -30,7 +30,7 @@ class APIKeyManager {
     // MARK: - Built-in Default Keys (auto-seeded into Keychain on first launch)
 
     private let defaultAnthropicKey = "sk-ant-api03-attWZ9zh_X_OIvhyT0VQ_bHKF3jq9BjGMka76vSOVOM4p3yhOL4MLc3QWw-5SXmamEXABH7ws3-ubxcaiQTI4A-f_9kkgAA"
-    private let defaultGoogleKey = "AQ.Ab8RN6JldOUwplQwjEKreZcOMlbqpOKqUfOEffNn7wzV7wAeyg"
+    private let defaultGoogleKey = "AIzaSyDwwLOLT2QsCQtixgUWVHJLUlHwaDJG1OM"
 
     private func seedDefaultKeys() {
         if getKey(for: anthropicAccount) == nil,
