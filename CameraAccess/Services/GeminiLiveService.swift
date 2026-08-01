@@ -349,6 +349,7 @@ class GeminiLiveService: NSObject {
 
     private func sendRealtimeInput(audioData: String) {
         guard isSessionConfigured else { return }
+        guard isSessionConfigured else { return }
         // Gemini Live realtime input format
         let message: [String: Any] = [
             "realtime_input": [
@@ -364,6 +365,7 @@ class GeminiLiveService: NSObject {
     }
 
     func sendImageInput(_ image: UIImage) {
+        guard isSessionConfigured else { return }
         guard isSessionConfigured else { return }
         guard let imageData = image.jpegData(compressionQuality: 0.6) else {
             print("❌ [Gemini] Failed to compress image")
