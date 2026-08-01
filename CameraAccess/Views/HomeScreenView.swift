@@ -45,7 +45,7 @@ struct HomeScreenView: View {
             .frame(width: 100)
             .shadow(color: AppShadow.medium(), radius: 10, x: 0, y: 5)
 
-          Text("TurboMeta")
+          Text("Chappy")
             .font(AppTypography.largeTitle)
             .foregroundColor(AppColors.textPrimary)
 

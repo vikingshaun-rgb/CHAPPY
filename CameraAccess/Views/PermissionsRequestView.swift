@@ -35,7 +35,7 @@ struct PermissionsRequestView: View {
                         .font(AppTypography.title)
                         .foregroundColor(AppColors.textPrimary)
 
-                    Text("TurboMeta Chappy needs these permissions to work properly")
+                    Text("Chappy needs these permissions to work properly")
                         .font(AppTypography.body)
                         .foregroundColor(AppColors.textSecondary)
                         .multilineTextAlignment(.center)
