@@ -1,6 +1,11 @@
 /*
  * Live Translate WebSocket Service
- * Live translation service (realtime websocket)
+ * Realtime speech translation powered by the Gemini Live API
+ * (native audio: speech in -> translated speech out)
+ *
+ * Drop-in replacement for the previous Alibaba implementation:
+ * same class name, callbacks and public methods, so the existing
+ * LiveTranslateViewModel and views work unchanged.
  */
 
 import Foundation
@@ -17,11 +22,8 @@ class LiveTranslateService: NSObject {
 
     // Configuration
     private let apiKey: String
-    private let model = "qwen3-livetranslate-flash-realtime"
-    // Get the WebSocket URL dynamically from the user's region setting
-    private var baseURL: String {
-        return APIProviderManager.staticLiveAIWebsocketURL
-    }
+    private let model = "gemini-live-2.5-flash-native-audio"
+    private let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
     // Audio Engine (for recording)
     private var audioEngine: AVAudioEngine?
@@ -32,10 +34,6 @@ class LiveTranslateService: NSObject {
     private let playbackFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
 
     // Audio buffer management
-    private var audioBuffer = Data()
-    private var isCollectingAudio = false
-    private var audioChunkCount = 0
-    private let minChunksBeforePlay = 2
     private var hasStartedPlaying = false
     private var isPlaybackEngineRunning = false
 
@@ -47,23 +45,24 @@ class LiveTranslateService: NSObject {
 
     // Audio resampling
     private var audioConverter: AVAudioConverter?
-    private let targetSampleRate: Double = 16000  // API expects 16kHz
+    private let targetSampleRate: Double = 16000  // Gemini expects 16 kHz input
 
-    // Callbacks
+    // Callbacks (unchanged interface)
     var onConnected: (() -> Void)?
-    var onTranslationText: ((String) -> Void)?    // Translation result text
-    var onTranslationDelta: ((String) -> Void)?   // Incremental translation text
+    var onTranslationText: ((String) -> Void)?    // final translation text
+    var onTranslationDelta: ((String) -> Void)?   // incremental translation text
     var onAudioDelta: ((Data) -> Void)?
     var onAudioDone: (() -> Void)?
     var onError: ((String) -> Void)?
 
     // State
     private var isRecording = false
-    private var eventIdCounter = 0
+    private var isConnected = false
+    private var accumulatedText = ""
 
     // Image sending
     private var lastImageSendTime: Date?
-    private let imageInterval: TimeInterval = 0.5  // every 0.5s max between image sends
+    private let imageInterval: TimeInterval = 0.5  // at most one image every 0.5 s
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -98,7 +97,6 @@ class LiveTranslateService: NSObject {
 
     private func startPlaybackEngine() {
         guard let playbackEngine = playbackEngine, !isPlaybackEngineRunning else { return }
-
         do {
             try playbackEngine.start()
             isPlaybackEngineRunning = true
@@ -110,7 +108,6 @@ class LiveTranslateService: NSObject {
 
     private func stopPlaybackEngine() {
         guard let playbackEngine = playbackEngine, isPlaybackEngineRunning else { return }
-
         playerNode?.stop()
         playerNode?.reset()
         playbackEngine.stop()
@@ -118,11 +115,35 @@ class LiveTranslateService: NSObject {
         print("⏹️ [Translate] Playback engine stopped")
     }
 
+    // MARK: - Language helpers
+
+    private func languageName(_ code: String) -> String {
+        let map: [String: String] = [
+            "en": "English", "zh": "Chinese (Mandarin)", "ja": "Japanese",
+            "ko": "Korean", "fr": "French", "de": "German", "es": "Spanish",
+            "it": "Italian", "pt": "Portuguese", "ru": "Russian",
+            "vi": "Vietnamese", "th": "Thai", "id": "Indonesian",
+            "ms": "Malay", "hi": "Hindi", "ar": "Arabic",
+            "yue": "Cantonese", "auto": "the language being spoken"
+        ]
+        if let name = map[code] { return name }
+        return Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code
+    }
+
+    /// Map the app's voice setting onto a Gemini prebuilt voice
+    private var geminiVoiceName: String {
+        // Alibaba voices don't exist on Gemini; pick a natural default,
+        // roughly matching feminine/masculine choices where possible.
+        let raw = voice.rawValue.lowercased()
+        if raw.contains("ethan") || raw.contains("male") { return "Puck" }
+        return "Kore"
+    }
+
     // MARK: - WebSocket Connection
 
     func connect() {
-        let urlString = "\(baseURL)?model=\(model)"
-        print("🔌 [Translate] Preparing WebSocket connection: \(urlString)")
+        let urlString = "\(baseURL)?key=\(apiKey)"
+        print("🔌 [Translate] Preparing WebSocket connection (Gemini Live)")
 
         guard let url = URL(string: urlString) else {
             print("❌ [Translate] Invalid URL")
@@ -130,21 +151,21 @@ class LiveTranslateService: NSObject {
             return
         }
 
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-
+        let request = URLRequest(url: url)
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
 
         webSocket = urlSession?.webSocketTask(with: request)
         webSocket?.resume()
 
-        print("🔌 [Translate] WebSocket Task started")
+        print("🔌 [Translate] WebSocket task started")
         receiveMessage()
+        sendSetup()
     }
 
     func disconnect() {
-        print("🔌 [Translate] Disconnect the WebSocket")
+        print("🔌 [Translate] Disconnecting WebSocket")
+        isConnected = false
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -166,43 +187,57 @@ class LiveTranslateService: NSObject {
         self.voice = voice
         self.audioOutputEnabled = audioEnabled
 
-        // If connected, reconfigure the session
-        if webSocket != nil {
-            configureSession()
+        // Gemini Live sets system instructions at session start only —
+        // if we're already connected, reconnect with the new settings.
+        if webSocket != nil, isConnected {
+            print("🔄 [Translate] Settings changed - reconnecting session")
+            let wasRecording = isRecording
+            disconnect()
+            connect()
+            if wasRecording {
+                // recording restarts once the new session is up; the caller's
+                // recording state is preserved by the view model
+                startRecording()
+            }
         }
     }
 
-    private func configureSession() {
-        var modalities: [String] = ["text"]
-        if audioOutputEnabled {
-            modalities.append("audio")
-        }
+    private func sendSetup() {
+        let source = languageName(sourceLanguage.rawValue)
+        let target = languageName(targetLanguage.rawValue)
 
-        let sessionConfig: [String: Any] = [
-            "event_id": generateEventId(),
-            "type": TranslateClientEvent.sessionUpdate.rawValue,
-            "session": [
-                "modalities": modalities,
-                "voice": voice.rawValue,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm24",
-                "input_audio_transcription": [
-                    "language": sourceLanguage.rawValue
-                ],
-                "translation": [
-                    "language": targetLanguage.rawValue
-                ],
-                "turn_detection": [
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
-                ]
-            ]
+        let systemPrompt = """
+        You are a professional simultaneous interpreter. \
+        Listen to the incoming speech in \(source) and translate it into \(target). \
+        Speak ONLY the \(target) translation of what was said - no commentary, \
+        no explanations, no questions, no extra words. Keep the tone and intent \
+        of the speaker. If speech is unclear, translate what you understood. \
+        If an image is provided, use it only as context to improve the translation.
+        """
+
+        var setup: [String: Any] = [
+            "model": "models/\(model)",
+            "systemInstruction": [
+                "parts": [["text": systemPrompt]]
+            ],
+            "outputAudioTranscription": [:]
         ]
 
-        sendEvent(sessionConfig)
-        print("📤 [Translate] Configuring session: \(sourceLanguage.rawValue) → \(targetLanguage.rawValue), Voice: \(voice.rawValue)")
+        var generationConfig: [String: Any] = [:]
+        if audioOutputEnabled {
+            generationConfig["responseModalities"] = ["AUDIO"]
+            generationConfig["speechConfig"] = [
+                "voiceConfig": [
+                    "prebuiltVoiceConfig": ["voiceName": geminiVoiceName]
+                ]
+            ]
+        } else {
+            generationConfig["responseModalities"] = ["TEXT"]
+        }
+        setup["generationConfig"] = generationConfig
+
+        sendEvent(["setup": setup])
+        print("📤 [Translate] Session setup sent: \(source) → \(target), voice: \(geminiVoiceName)")
     }
 
     // MARK: - Audio Recording
@@ -211,7 +246,7 @@ class LiveTranslateService: NSObject {
         guard !isRecording else { return }
 
         do {
-            print("🎤 [Translate] Start recording, Use\(usePhoneMic ? "iPhone" : "Bluetooth")Microphone")
+            print("🎤 [Translate] Start recording, using \(usePhoneMic ? "iPhone" : "Bluetooth") microphone")
 
             if let engine = audioEngine, engine.isRunning {
                 engine.stop()
@@ -221,15 +256,15 @@ class LiveTranslateService: NSObject {
             let audioSession = AVAudioSession.sharedInstance()
 
             if usePhoneMic {
-                // Use the iPhone microphone — best for translating the other person
+                // iPhone microphone - best for translating the other person
                 try audioSession.setCategory(
                     .playAndRecord,
                     mode: .default,
-                    options: [.defaultToSpeaker]  // Bluetooth disabled — force the iPhone microphone
+                    options: [.defaultToSpeaker]
                 )
                 print("🎙️ [Translate] Using iPhone mic (translate the other person)")
             } else {
-                // Use the Bluetooth mic (glasses) — best for translating yourself
+                // Bluetooth mic (glasses) - best for translating yourself
                 try audioSession.setCategory(
                     .playAndRecord,
                     mode: .default,
@@ -239,7 +274,6 @@ class LiveTranslateService: NSObject {
             }
             try audioSession.setActive(true)
 
-            // Log the current audio input device
             if let inputRoute = audioSession.currentRoute.inputs.first {
                 print("🎙️ [Translate] Current input device: \(inputRoute.portName) (\(inputRoute.portType.rawValue))")
             }
@@ -255,7 +289,7 @@ class LiveTranslateService: NSObject {
             print("🎵 [Translate] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
             print("🎵 [Translate] Target format: \(targetSampleRate) Hz (will auto-resample)")
 
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
                 self?.processAudioBuffer(buffer)
             }
 
@@ -273,7 +307,6 @@ class LiveTranslateService: NSObject {
 
     func stopRecording() {
         guard isRecording else { return }
-
         print("🛑 [Translate] Stop recording")
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
@@ -281,15 +314,12 @@ class LiveTranslateService: NSObject {
     }
 
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        guard let floatChannelData = buffer.floatChannelData else { return }
+        guard buffer.floatChannelData != nil else { return }
 
         let inputSampleRate = buffer.format.sampleRate
 
-        // Resample if the sample rate isn't 16 kHz
         if inputSampleRate != targetSampleRate {
-            guard let resampledBuffer = resampleBuffer(buffer) else {
-                return
-            }
+            guard let resampledBuffer = resampleBuffer(buffer) else { return }
             sendBufferAsPCM16(resampledBuffer)
         } else {
             sendBufferAsPCM16(buffer)
@@ -302,7 +332,6 @@ class LiveTranslateService: NSObject {
             return nil
         }
 
-        // Create or update the converter
         if audioConverter == nil || audioConverter?.inputFormat != inputFormat {
             audioConverter = AVAudioConverter(from: inputFormat, to: outputFormat)
         }
@@ -312,7 +341,6 @@ class LiveTranslateService: NSObject {
             return nil
         }
 
-        // Compute output frame count
         let ratio = targetSampleRate / inputFormat.sampleRate
         let outputFrameCount = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio)
 
@@ -322,7 +350,7 @@ class LiveTranslateService: NSObject {
 
         var error: NSError?
         var hasProvidedInput = false
-        let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
             if hasProvidedInput {
                 outStatus.pointee = .noDataNow
                 return nil
@@ -342,13 +370,14 @@ class LiveTranslateService: NSObject {
         return outputBuffer
     }
 
+    private var audioSendCount = 0
+
     private func sendBufferAsPCM16(_ buffer: AVAudioPCMBuffer) {
         guard let floatChannelData = buffer.floatChannelData else { return }
 
         let frameLength = Int(buffer.frameLength)
         let channel = floatChannelData.pointee
 
-        // Float32 → PCM16
         var int16Data = [Int16](repeating: 0, count: frameLength)
         for i in 0..<frameLength {
             let sample = channel[i]
@@ -359,13 +388,25 @@ class LiveTranslateService: NSObject {
         let data = Data(bytes: int16Data, count: frameLength * MemoryLayout<Int16>.size)
         let base64Audio = data.base64EncodedString()
 
-        sendAudioAppend(base64Audio)
+        audioSendCount += 1
+        if audioSendCount == 1 || audioSendCount % 50 == 0 {
+            print("🎵 [Translate] Sending audio chunk #\(audioSendCount)")
+        }
+
+        let event: [String: Any] = [
+            "realtimeInput": [
+                "audio": [
+                    "data": base64Audio,
+                    "mimeType": "audio/pcm;rate=16000"
+                ]
+            ]
+        ]
+        sendEvent(event)
     }
 
     // MARK: - Image Sending
 
     func sendImageFrame(_ image: UIImage) {
-        // Rate-limit sends: every 0.5s max per image
         let now = Date()
         if let lastTime = lastImageSendTime, now.timeIntervalSince(lastTime) < imageInterval {
             return
@@ -377,9 +418,8 @@ class LiveTranslateService: NSObject {
             return
         }
 
-        // Cap image size at 500 KB
         guard imageData.count <= 500 * 1024 else {
-            print("⚠️ [Translate] Image too large — skipping send")
+            print("⚠️ [Translate] Image too large - skipping send")
             return
         }
 
@@ -387,9 +427,12 @@ class LiveTranslateService: NSObject {
         print("📸 [Translate] Sending image: \(imageData.count) bytes")
 
         let event: [String: Any] = [
-            "event_id": generateEventId(),
-            "type": TranslateClientEvent.inputImageBufferAppend.rawValue,
-            "image": base64Image
+            "realtimeInput": [
+                "video": [
+                    "data": base64Image,
+                    "mimeType": "image/jpeg"
+                ]
+            ]
         ]
         sendEvent(event)
     }
@@ -406,26 +449,10 @@ class LiveTranslateService: NSObject {
         let message = URLSessionWebSocketTask.Message.string(jsonString)
         webSocket?.send(message) { [weak self] error in
             if let error = error {
-                print("❌ [Translate] Failed to send event: \(error.localizedDescription)")
+                print("❌ [Translate] Send failed: \(error.localizedDescription)")
                 self?.onError?("Send error: \(error.localizedDescription)")
             }
         }
-    }
-
-    private var audioSendCount = 0
-
-    private func sendAudioAppend(_ base64Audio: String) {
-        audioSendCount += 1
-        if audioSendCount == 1 || audioSendCount % 50 == 0 {
-            print("🎵 [Translate] Send audio chunk #\(audioSendCount), size: \(base64Audio.count) bytes")
-        }
-
-        let event: [String: Any] = [
-            "event_id": generateEventId(),
-            "type": TranslateClientEvent.inputAudioBufferAppend.rawValue,
-            "audio": base64Audio
-        ]
-        sendEvent(event)
     }
 
     // MARK: - Receive Messages
@@ -438,7 +465,7 @@ class LiveTranslateService: NSObject {
                 self?.receiveMessage()
 
             case .failure(let error):
-                print("❌ [Translate] Failed to receive message: \(error.localizedDescription)")
+                print("❌ [Translate] Receive failed: \(error.localizedDescription)")
                 self?.onError?("Receive error: \(error.localizedDescription)")
             }
         }
@@ -447,160 +474,138 @@ class LiveTranslateService: NSObject {
     private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
         switch message {
         case .string(let text):
-            handleServerEvent(text)
+            if let data = text.data(using: .utf8) { handleServerData(data) }
         case .data(let data):
-            if let text = String(data: data, encoding: .utf8) {
-                handleServerEvent(text)
-            }
+            handleServerData(data)
         @unknown default:
             break
         }
     }
 
-    private func handleServerEvent(_ jsonString: String) {
-        guard let data = jsonString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = json["type"] as? String else {
-            print("⚠️ [Translate] Received an unparseable message: \(jsonString.prefix(200))")
+    private func handleServerData(_ data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("⚠️ [Translate] Received an unparseable message")
             return
         }
-
-        // Log every received event type
-        print("📥 [Translate] Event received: \(type)")
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
 
-            switch type {
-            case TranslateServerEvent.sessionCreated.rawValue,
-                 TranslateServerEvent.sessionUpdated.rawValue:
-                print("✅ [Translate] Session established")
+            // Session established
+            if json["setupComplete"] != nil {
+                print("✅ [Translate] Session established (Gemini Live)")
+                self.isConnected = true
+                self.accumulatedText = ""
                 self.onConnected?()
+                return
+            }
 
-            case TranslateServerEvent.responseAudioTranscriptText.rawValue:
-                // Incremental translation text
-                if let delta = json["delta"] as? String {
-                    print("💬 [Translate] Translation chunk: \(delta)")
-                    self.onTranslationDelta?(delta)
+            // Server content: audio chunks, transcription, turn completion
+            if let serverContent = json["serverContent"] as? [String: Any] {
+
+                // Translated-speech transcription (text of what is being spoken)
+                if let transcription = serverContent["outputTranscription"] as? [String: Any],
+                   let text = transcription["text"] as? String, !text.isEmpty {
+                    self.accumulatedText += text
+                    self.onTranslationDelta?(text)
                 }
 
-            case TranslateServerEvent.responseAudioTranscriptDone.rawValue:
-                // Translation text complete (audio output+text mode)
-                if let text = json["text"] as? String {
-                    print("✅ [Translate] Translation complete: \(text)")
-                    self.onTranslationText?(text)
+                // Audio chunks
+                if let modelTurn = serverContent["modelTurn"] as? [String: Any],
+                   let parts = modelTurn["parts"] as? [[String: Any]] {
+                    for part in parts {
+                        if let inline = part["inlineData"] as? [String: Any],
+                           let b64 = inline["data"] as? String,
+                           let audioData = Data(base64Encoded: b64) {
+                            self.handleAudioChunk(audioData)
+                        }
+                        if let text = part["text"] as? String, !text.isEmpty {
+                            self.accumulatedText += text
+                            self.onTranslationDelta?(text)
+                        }
+                    }
                 }
 
-            case TranslateServerEvent.responseTextDone.rawValue:
-                // Translation text complete (text-only mode)
-                if let text = json["text"] as? String {
-                    print("✅ [Translate] Translation complete (text): \(text)")
-                    self.onTranslationText?(text)
+                // Interruption: clear queued audio
+                if (serverContent["interrupted"] as? Bool) == true {
+                    print("⏸️ [Translate] Reply interrupted")
+                    self.playerNode?.stop()
+                    self.playerNode?.reset()
+                    self.hasStartedPlaying = false
                 }
 
-            case TranslateServerEvent.responseAudioDelta.rawValue:
-                if let base64Audio = json["delta"] as? String,
-                   let audioData = Data(base64Encoded: base64Audio) {
-                    self.onAudioDelta?(audioData)
-                    self.handleAudioChunk(audioData)
+                // Turn complete: finalize text
+                if (serverContent["turnComplete"] as? Bool) == true {
+                    let final = self.accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !final.isEmpty {
+                        print("✅ [Translate] Translation complete: \(final.prefix(80))")
+                        self.onTranslationText?(final)
+                    }
+                    self.accumulatedText = ""
+                    self.onAudioDone?()
                 }
+                return
+            }
 
-            case TranslateServerEvent.responseAudioDone.rawValue:
-                self.isCollectingAudio = false
-                if !self.audioBuffer.isEmpty {
-                    self.playAudio(self.audioBuffer)
-                    self.audioBuffer = Data()
-                }
-                self.audioChunkCount = 0
-                self.hasStartedPlaying = false
-                self.onAudioDone?()
-
-            case TranslateServerEvent.error.rawValue:
-                if let error = json["error"] as? [String: Any],
-                   let message = error["message"] as? String {
-                    print("❌ [Translate] Server error: \(message)")
-                    self.onError?(message)
-                }
-
-            default:
-                break
+            // Errors / server-initiated disconnect
+            if let goAway = json["goAway"] as? [String: Any] {
+                print("⚠️ [Translate] Server goAway: \(goAway)")
+                self.onError?("Connection ending (server)")
+                return
+            }
+            if let error = json["error"] as? [String: Any] {
+                let msg = (error["message"] as? String) ?? "\(error)"
+                print("❌ [Translate] Server error: \(msg)")
+                self.onError?(msg)
+                return
             }
         }
     }
 
-    // MARK: - Audio Playback
+    // MARK: - Audio Playback (24 kHz PCM16 from Gemini)
 
     private func handleAudioChunk(_ audioData: Data) {
-        if !isCollectingAudio {
-            isCollectingAudio = true
-            audioBuffer = Data()
-            audioChunkCount = 0
-            hasStartedPlaying = false
+        onAudioDelta?(audioData)
+        guard audioOutputEnabled else { return }
 
-            if isPlaybackEngineRunning {
-                stopPlaybackEngine()
-                setupPlaybackEngine()
-                startPlaybackEngine()
-                playerNode?.play()
-            }
-        }
-
-        audioChunkCount += 1
+        startPlaybackEngine()
+        guard isPlaybackEngineRunning else { return }
 
         if !hasStartedPlaying {
-            audioBuffer.append(audioData)
-            if audioChunkCount >= minChunksBeforePlay {
-                hasStartedPlaying = true
-                playAudio(audioBuffer)
-                audioBuffer = Data()
-            }
-        } else {
-            playAudio(audioData)
+            playerNode?.play()
+            hasStartedPlaying = true
         }
+
+        playAudio(audioData)
     }
 
     private func playAudio(_ audioData: Data) {
-        guard let playerNode = playerNode,
-              let playbackFormat = playbackFormat else { return }
-
-        if !isPlaybackEngineRunning {
-            startPlaybackEngine()
-            playerNode.play()
-        } else if !playerNode.isPlaying {
-            playerNode.play()
+        guard let playbackFormat = playbackFormat,
+              let buffer = createPCMBuffer(from: audioData, format: playbackFormat) else {
+            return
         }
-
-        guard let pcmBuffer = createPCMBuffer(from: audioData, format: playbackFormat) else { return }
-        playerNode.scheduleBuffer(pcmBuffer)
+        playerNode?.scheduleBuffer(buffer, completionHandler: nil)
     }
 
     private func createPCMBuffer(from data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        // Server sends PCM16, 2 bytes per frame
         let frameCount = data.count / 2
-        guard frameCount > 0 else { return nil }
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
-              let channelData = buffer.floatChannelData else { return nil }
-
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            return nil
+        }
         buffer.frameLength = AVAudioFrameCount(frameCount)
 
-        // PCM16 → Float32
-        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            guard let baseAddress = bytes.baseAddress else { return }
-            let int16Pointer = baseAddress.assumingMemoryBound(to: Int16.self)
-            let floatData = channelData[0]
+        guard let floatData = buffer.floatChannelData?.pointee else { return nil }
+
+        data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
+            let int16Buffer = rawBuffer.bindMemory(to: Int16.self)
             for i in 0..<frameCount {
-                floatData[i] = Float(int16Pointer[i]) / 32768.0
+                floatData[i] = Float(Int16(littleEndian: int16Buffer[i])) / 32768.0
             }
         }
 
         return buffer
-    }
-
-    // MARK: - Helpers
-
-    private func generateEventId() -> String {
-        eventIdCounter += 1
-        return "translate_\(eventIdCounter)_\(UUID().uuidString.prefix(8))"
     }
 }
 
@@ -608,14 +613,17 @@ class LiveTranslateService: NSObject {
 
 extension LiveTranslateService: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        print("✅ [Translate] WebSocket Connection established")
-        DispatchQueue.main.async {
-            self.configureSession()
-        }
+        print("🔌 [Translate] WebSocket opened")
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
-        print("🔌 [Translate] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        print("🔌 [Translate] WebSocket closed: \(closeCode.rawValue) \(reasonText)")
+        DispatchQueue.main.async { [weak self] in
+            self?.isConnected = false
+            if closeCode != .goingAway && closeCode != .normalClosure {
+                self?.onError?("Socket closed (\(closeCode.rawValue)) \(reasonText)")
+            }
+        }
     }
 }
