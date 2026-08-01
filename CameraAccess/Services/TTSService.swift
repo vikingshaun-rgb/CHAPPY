@@ -1,47 +1,44 @@
 /*
- * TTS Service
- * Text-to-speech service
- * plays via AVAudioEngine, same approach as OmniRealtimeService
+ * Text-to-Speech Service
+ * Default voice: Gemini TTS (natural, expressive) using the Gemini API key.
+ * Fallback: Apple system TTS (free, offline) when no key / no network / error.
  */
 
-import AVFoundation
 import Foundation
+import AVFoundation
 
-@MainActor
 class TTSService: NSObject, ObservableObject {
     static let shared = TTSService()
 
     @Published var isSpeaking = false
 
-    private let baseURL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-    private let model = "qwen3-tts-flash"
+    // Gemini TTS models — primary, with fallback name if Google renames tiers
+    private let ttsModels = ["gemini-2.5-flash-tts", "gemini-2.5-flash-preview-tts"]
 
-    // Get the voice from the current language setting
-    private var voice: String {
-        return LanguageManager.staticTtsVoice
+    /// Gemini prebuilt voice. Change via UserDefaults key "chappy_tts_voice".
+    /// Nice options: Kore (warm female), Puck (male), Aoede, Charon, Fenrir, Leda.
+    private var voiceName: String {
+        UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore"
     }
 
-    // Get language type from the current language setting
-    private var languageType: String {
-        return LanguageManager.staticApiLanguageCode
-    }
-
-    // same AVAudioEngine approach as OmniRealtimeService
+    // Playback engine (24 kHz PCM16 from Gemini)
     private var playbackEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
-    // Use standard Float32 format, iOS 18-compatible+
     private let playbackFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
     private var isPlaybackEngineRunning = false
 
-    private var currentTask: Task<Void, Never>?
+    // System TTS fallback
     private var systemSynthesizer: AVSpeechSynthesizer?
+    private var systemTTSContinuation: CheckedContinuation<Void, Never>?
 
-    private override init() {
+    private var currentTask: Task<Void, Never>?
+
+    override private init() {
         super.init()
         setupPlaybackEngine()
     }
 
-    // MARK: - Audio Engine Setup (same as OmniRealtimeService)
+    // MARK: - Playback Engine
 
     private func setupPlaybackEngine() {
         playbackEngine = AVAudioEngine()
@@ -57,39 +54,25 @@ class TTSService: NSObject, ObservableObject {
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
         playbackEngine.prepare()
-
         print("✅ [TTS] Playback engine initialized: Float32 @ 24kHz")
     }
 
-    /// Configure the audio session (call before starting the playback engine)
     private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
         do {
-            let audioSession = AVAudioSession.sharedInstance()
-
-            // Check the current session state
-            print("🔊 [TTS] Current audio session: category=\(audioSession.category.rawValue), mode=\(audioSession.mode.rawValue)")
-
-            // Configure only when needed to avoid clashing with the existing session
-            // use the exact same settings as OmniRealtimeService (no defaultToSpeaker)
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP])
-            try audioSession.setPreferredSampleRate(24000)
-            try audioSession.setActive(true, options: [.notifyOthersOnDeactivation])
-            print("✅ [TTS] Audio session configured")
+            // Playback mode keeps glasses/Bluetooth output working for spoken replies
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try session.setActive(true)
         } catch {
-            print("⚠️ [TTS] Audio session Configuration failed: \(error), continuing to attempt playback...")
-            // Don't throw — try playing with the existing session
+            print("⚠️ [TTS] Audio session configuration failed: \(error.localizedDescription) — continuing")
         }
     }
 
     private func startPlaybackEngine() {
         guard let playbackEngine = playbackEngine, !isPlaybackEngineRunning else { return }
-
-        configureAudioSession()
         do {
             try playbackEngine.start()
-            playerNode?.play()
             isPlaybackEngineRunning = true
-            print("✅ [TTS] Playback engine started")
         } catch {
             print("❌ [TTS] Playback engine failed to start: \(error)")
         }
@@ -98,20 +81,9 @@ class TTSService: NSObject, ObservableObject {
     private func stopPlaybackEngine() {
         playerNode?.stop()
         playerNode?.reset()
-        playbackEngine?.stop()
-        isPlaybackEngineRunning = false
-    }
-
-    // MARK: - API Request Models
-
-    struct TTSRequest: Codable {
-        let model: String
-        let input: Input
-
-        struct Input: Codable {
-            let text: String
-            let voice: String
-            let language_type: String
+        if isPlaybackEngineRunning {
+            playbackEngine?.stop()
+            isPlaybackEngineRunning = false
         }
     }
 
@@ -123,55 +95,40 @@ class TTSService: NSObject, ObservableObject {
         print("🔊 [TTS] Audio session pre-configured")
     }
 
-    /// Speak text
-    /// - Cloud TTS path
-    /// - OpenRouter API: using system TTS
+    /// Speak text.
+    /// Priority: Gemini TTS (natural voice) → Apple system TTS (offline fallback).
+    /// The apiKey parameter is accepted for backward compatibility but ignored;
+    /// the Gemini key is read from the key store.
     func speak(_ text: String, apiKey: String? = nil) {
-        // Cancel the previous task
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        // Cancel any previous speech
         currentTask?.cancel()
         stop()
 
-        // OpenRouter using system TTS
-        if APIProviderManager.staticCurrentProvider != .alibaba {
-            print("🔊 [TTS] OpenRouter mode, using system TTS")
-            isSpeaking = true
-            currentTask = Task {
-                await fallbackToSystemTTS(text: text)
-                isSpeaking = false
-            }
-            return
-        }
-
-        // Cloud TTS path
-        let key = apiKey ?? APIKeyManager.shared.getAPIKey(for: .alibaba)
-
-        guard let finalKey = key, !finalKey.isEmpty else {
-            print("❌ [TTS] No Alibaba API key, falling back to system TTS")
-            isSpeaking = true
-            currentTask = Task {
-                await fallbackToSystemTTS(text: text)
-                isSpeaking = false
-            }
-            return
-        }
-
-        print("🔊 [TTS] Speaking with qwen3-tts-flash: \(text.prefix(50))...")
-
         isSpeaking = true
+        currentTask = Task { [weak self] in
+            guard let self else { return }
 
-        currentTask = Task {
-            do {
-                try await synthesizeAndPlay(text: text, apiKey: finalKey)
-            } catch {
-                if !Task.isCancelled {
-                    print("❌ [TTS] Error: \(error)")
-                    // Fall back to system TTS on failure
-                    await fallbackToSystemTTS(text: text)
+            let googleKey = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+            let wantsSystemVoice = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
+
+            if !googleKey.isEmpty && !wantsSystemVoice {
+                do {
+                    try await self.speakWithGemini(text: trimmed, apiKey: googleKey)
+                    if !Task.isCancelled { await MainActor.run { self.isSpeaking = false } }
+                    return
+                } catch {
+                    if Task.isCancelled { return }
+                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — falling back to system TTS")
                 }
+            } else {
+                print("🔊 [TTS] No Gemini key — using system TTS")
             }
-            if !Task.isCancelled {
-                isSpeaking = false
-            }
+
+            await self.fallbackToSystemTTS(text: trimmed)
+            if !Task.isCancelled { await MainActor.run { self.isSpeaking = false } }
         }
     }
 
@@ -180,257 +137,182 @@ class TTSService: NSObject, ObservableObject {
         currentTask?.cancel()
         currentTask = nil
         stopPlaybackEngine()
+        systemSynthesizer?.stopSpeaking(at: .immediate)
+        systemTTSContinuation?.resume()
+        systemTTSContinuation = nil
         isSpeaking = false
-        print("🔊 [TTS] Stopped")
     }
 
-    // MARK: - Private Methods
+    // MARK: - Gemini TTS
 
-    private func synthesizeAndPlay(text: String, apiKey: String) async throws {
-        guard let url = URL(string: baseURL) else {
-            throw TTSError.invalidResponse
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("enable", forHTTPHeaderField: "X-DashScope-SSE")
-        request.timeoutInterval = 30
+    private func speakWithGemini(text: String, apiKey: String) async throws {
+        var lastError: Error = TTSError.unknown
 
-        let ttsRequest = TTSRequest(
-            model: model,
-            input: TTSRequest.Input(
-                text: text,
-                voice: voice,
-                language_type: languageType
-            )
-        )
-
-        request.httpBody = try JSONEncoder().encode(ttsRequest)
-
-        print("📡 [TTS] Sending request to qwen3-tts-flash...")
-
-        // Use URLSession's bytes API to handle SSE
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw TTSError.invalidResponse
-        }
-
-        guard httpResponse.statusCode == 200 else {
-            print("❌ [TTS] API error: \(httpResponse.statusCode)")
-            throw TTSError.apiError(statusCode: httpResponse.statusCode)
-        }
-
-        // Stop current playback and reset the playerNode queue
-        playerNode?.stop()
-        playerNode?.reset()
-
-        // Ensure the playback engine is running
-        if !isPlaybackEngineRunning {
-            startPlaybackEngine()
-        }
-
-        // Call play() early so playerNode is ready to receive buffers
-        playerNode?.play()
-        print("▶️ [TTS] Playback engine and playerNode ready")
-
-        guard isPlaybackEngineRunning else {
-            print("❌ [TTS] Playback engine not running")
-            throw TTSError.playbackFailed
-        }
-
-        var chunkCount = 0
-        var totalBytes = 0
-
-        for try await line in bytes.lines {
-            if Task.isCancelled { return }
-
-            // SSE format: "data: {...}"
-            if line.hasPrefix("data:") {
-                let jsonString = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-
-                if jsonString == "[DONE]" {
-                    break
-                }
-
-                if let jsonData = jsonString.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                   let output = json["output"] as? [String: Any],
-                   let audio = output["audio"] as? [String: Any],
-                   let audioString = audio["data"] as? String,
-                   !audioString.isEmpty,
-                   let audioData = Data(base64Encoded: audioString),
-                   !audioData.isEmpty {
-                    chunkCount += 1
-                    totalBytes += audioData.count
-                    if chunkCount == 1 {
-                        print("🔊 [TTS] First audio chunk received: \(audioData.count) bytes")
-                    }
-                    // Stream-play each audio chunk
-                    playAudioChunk(audioData)
-                }
+        for model in ttsModels {
+            do {
+                let audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
+                try Task.checkCancellation()
+                print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
+                await playPCM(audio)
+                return
+            } catch TTSError.modelNotFound {
+                print("⚠️ [TTS] Model \(model) not found — trying next")
+                lastError = TTSError.modelNotFound
+                continue
+            } catch {
+                throw error
             }
         }
-
-        if Task.isCancelled { return }
-
-        print("🔊 [TTS] Received \(chunkCount) chunks, \(totalBytes) bytes total")
-
-        // Wait for playback to finish
-        await waitForPlaybackCompletion()
-
-        print("🔊 [TTS] Finished playing")
+        throw lastError
     }
 
-    private func playAudioChunk(_ audioData: Data) {
-        // Skip empty data
-        guard !audioData.isEmpty else {
+    private func requestGeminiAudio(text: String, model: String, apiKey: String) async throws -> Data {
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        guard let url = URL(string: urlString) else { throw TTSError.invalidURL }
+
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": text]]]],
+            "generationConfig": [
+                "responseModalities": ["AUDIO"],
+                "speechConfig": [
+                    "voiceConfig": [
+                        "prebuiltVoiceConfig": ["voiceName": voiceName]
+                    ]
+                ]
+            ]
+        ]
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 30
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
+
+        if http.statusCode == 404 { throw TTSError.modelNotFound }
+        guard http.statusCode == 200 else {
+            let msg = String(data: data, encoding: .utf8) ?? ""
+            print("❌ [TTS] Gemini TTS HTTP \(http.statusCode): \(msg.prefix(200))")
+            throw TTSError.httpError(http.statusCode)
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]] else {
+            throw TTSError.invalidResponse
+        }
+
+        for part in parts {
+            if let inline = part["inlineData"] as? [String: Any],
+               let b64 = inline["data"] as? String,
+               let audio = Data(base64Encoded: b64) {
+                return audio
+            }
+        }
+        throw TTSError.noAudio
+    }
+
+    /// Play raw PCM16 @ 24 kHz and wait for playback to finish
+    private func playPCM(_ audioData: Data) async {
+        configureAudioSession()
+        startPlaybackEngine()
+        guard isPlaybackEngineRunning,
+              let playbackFormat = playbackFormat,
+              let buffer = createPCMBuffer(from: audioData, format: playbackFormat) else {
+            print("❌ [TTS] Could not prepare audio for playback")
             return
         }
 
-        guard let playerNode = playerNode,
-              let playbackFormat = playbackFormat else {
-            print("⚠️ [TTS] playerNode or playbackFormat not initialized")
-            return
-        }
+        playerNode?.play()
 
-        guard let pcmBuffer = createPCMBuffer(from: audioData, format: playbackFormat) else {
-            print("⚠️ [TTS] Failed to create PCM buffer, audioData.count=\(audioData.count)")
-            return
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            playerNode?.scheduleBuffer(buffer) {
+                cont.resume()
+            }
         }
-
-        // Ensure the playback engine is running
-        if !isPlaybackEngineRunning {
-            startPlaybackEngine()
-        }
-
-        // ensure playerNode is playing (consistent with OmniRealtimeService)
-        if !playerNode.isPlaying {
-            playerNode.play()
-            print("▶️ [TTS] playerNode.play() called")
-        }
-
-        // Schedule the audio buffer for playback
-        playerNode.scheduleBuffer(pcmBuffer)
+        // small tail so the last samples aren't clipped
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        stopPlaybackEngine()
     }
 
     private func createPCMBuffer(from data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
-        // Server sends PCM16, 2 bytes per frame
         let frameCount = data.count / 2
-        guard frameCount > 0 else {
-            print("⚠️ [TTS] createPCMBuffer: frameCount is 0, data.count=\(data.count)")
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else {
             return nil
         }
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else {
-            print("⚠️ [TTS] createPCMBuffer: Failed to create AVAudioPCMBuffer, format=\(format), frameCount=\(frameCount)")
-            return nil
-        }
-
-        guard let channelData = buffer.floatChannelData else {
-            print("⚠️ [TTS] createPCMBuffer: floatChannelData is nil")
-            return nil
-        }
-
         buffer.frameLength = AVAudioFrameCount(frameCount)
+        guard let floatData = buffer.floatChannelData?.pointee else { return nil }
 
-        // Convert PCM16 to Float32 (iOS 18-compatible+) 
-        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            guard let baseAddress = bytes.baseAddress else { return }
-            let int16Pointer = baseAddress.assumingMemoryBound(to: Int16.self)
-            let floatData = channelData[0]
+        data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
+            let int16Buffer = rawBuffer.bindMemory(to: Int16.self)
             for i in 0..<frameCount {
-                // Int16 range -32768..32767, converted to -1.0 to 1.0
-                floatData[i] = Float(int16Pointer[i]) / 32768.0
+                floatData[i] = Float(Int16(littleEndian: int16Buffer[i])) / 32768.0
             }
         }
-
         return buffer
     }
 
-    private func waitForPlaybackCompletion() async {
-        guard let playerNode = playerNode else { return }
+    // MARK: - System TTS Fallback (offline)
 
-        // Wait for all audio to finish playing
-        while playerNode.isPlaying {
-            if Task.isCancelled { return }
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
-        }
-
-        // Extra wait to ensure playback fully completes
-        try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
-    }
-
-    /// Falling back to system TTS
     private func fallbackToSystemTTS(text: String) async {
-        print("🔊 [TTS] Falling back to system TTS")
+        configureAudioSession()
 
-        // System TTS uses Playback mode (not PlayAndRecord)
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
-            try audioSession.setActive(true)
-            print("✅ [TTS] System TTS audio session configured")
-        } catch {
-            print("⚠️ [TTS] System TTS audio session error: \(error)")
-        }
-
-        // Keep a strong reference via an instance variable so it isn't deallocated
-        systemSynthesizer = AVSpeechSynthesizer()
-
-        guard let synthesizer = systemSynthesizer else { return }
+        let synthesizer = AVSpeechSynthesizer()
+        systemSynthesizer = synthesizer
+        synthesizer.delegate = self
 
         let utterance = AVSpeechUtterance(string: text)
-        // Pick the system voice from the current language setting
-        let voiceLanguage = LanguageManager.staticIsChinese ? "zh-CN" : "en-US"
-        utterance.voice = AVSpeechSynthesisVoice(language: voiceLanguage)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 1.0
-        utterance.volume = 1.0
-        utterance.pitchMultiplier = 1.0
+        let language = LanguageManager.shared.currentLanguage == .chinese ? "zh-CN" : "en-AU"
+        utterance.voice = AVSpeechSynthesisVoice(language: language)
+            ?? AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
 
-        print("🔊 [TTS] System TTS speaking: \(text.prefix(30))...")
-        synthesizer.speak(utterance)
+        print("🔊 [TTS] System TTS speaking: \(text.prefix(30))…")
 
-        // Wait briefly for playback to begin
-        try? await Task.sleep(nanoseconds: 100_000_000)
-
-        // Wait for playback to finish
-        while synthesizer.isSpeaking {
-            if Task.isCancelled {
-                synthesizer.stopSpeaking(at: .immediate)
-                systemSynthesizer = nil
-                return
-            }
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            systemTTSContinuation = cont
+            synthesizer.speak(utterance)
         }
-
-        print("✅ [TTS] System TTS finished")
-        systemSynthesizer = nil
+        systemTTSContinuation = nil
     }
 }
 
-// MARK: - Error Types
+// MARK: - AVSpeechSynthesizerDelegate
 
-enum TTSError: LocalizedError {
-    case noAPIKey
+extension TTSService: AVSpeechSynthesizerDelegate {
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        systemTTSContinuation?.resume()
+        systemTTSContinuation = nil
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        systemTTSContinuation?.resume()
+        systemTTSContinuation = nil
+    }
+}
+
+// MARK: - Errors
+
+private enum TTSError: LocalizedError {
+    case invalidURL
     case invalidResponse
-    case apiError(statusCode: Int)
-    case noAudioData
-    case playbackFailed
+    case modelNotFound
+    case noAudio
+    case httpError(Int)
+    case unknown
 
     var errorDescription: String? {
         switch self {
-        case .noAPIKey:
-            return "No API key configured"
-        case .invalidResponse:
-            return "Invalid response"
-        case .apiError(let statusCode):
-            return "API Error: \(statusCode)"
-        case .noAudioData:
-            return "No audio data received"
-        case .playbackFailed:
-            return "Audio playback failed"
+        case .invalidURL: return "Invalid TTS URL"
+        case .invalidResponse: return "Invalid TTS response"
+        case .modelNotFound: return "TTS model not found"
+        case .noAudio: return "No audio in TTS response"
+        case .httpError(let code): return "TTS HTTP error \(code)"
+        case .unknown: return "Unknown TTS error"
         }
     }
 }
