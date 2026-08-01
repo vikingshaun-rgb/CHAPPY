@@ -618,6 +618,17 @@ struct APIKeySettingsView: View {
         return provider.displayName
     }
 
+    private var apiKeyHelpText: String {
+        switch provider {
+        case .anthropic:
+            return "Paste your Claude API key (starts with sk-ant). Create one at console.anthropic.com under API Keys."
+        case .openrouter:
+            return "settings.apikey.openrouter.help".localized
+        case .alibaba:
+            return "settings.apikey.alibaba.help".localized
+        }
+    }
+
     var body: some View {
         NavigationView {
             Form {
@@ -629,7 +640,7 @@ struct APIKeySettingsView: View {
                     Text("\(displayTitle) API Key")
                 } footer: {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(provider == .alibaba ? "settings.apikey.alibaba.help".localized : "settings.apikey.openrouter.help".localized)
+                        Text(apiKeyHelpText)
                         Link("settings.apikey.get".localized, destination: URL(string: provider.apiKeyHelpURL)!)
                             .font(.caption)
                     }
