@@ -266,7 +266,7 @@ class OmniRealtimeViewModel: ObservableObject {
         case .alibaba:
             aiModel = "qwen3-omni-flash-realtime"
         case .google:
-            aiModel = "gemini-live-2.5-flash-native-audio"
+            aiModel = "gemini-3.1-flash-live-preview"
         }
 
         let record = ConversationRecord(

@@ -22,7 +22,7 @@ class LiveTranslateService: NSObject {
 
     // Configuration
     private let apiKey: String
-    private let model = "gemini-live-2.5-flash-native-audio"
+    private let model = "gemini-3.1-flash-live-preview"
     private let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
     // Audio Engine (for recording)

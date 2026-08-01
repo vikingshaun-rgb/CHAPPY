@@ -1,7 +1,7 @@
 /*
  * Gemini Live WebSocket Service
  * Provides real-time audio chat with Google Gemini AI
- * Uses gemini-live-2.5-flash-native-audio model for real-time audio conversation
+ * Uses gemini-3.1-flash-live-preview model for real-time audio conversation
  */
 
 import Foundation
@@ -57,7 +57,7 @@ class GeminiLiveService: NSObject {
 
     init(apiKey: String, model: String? = nil) {
         self.apiKey = apiKey
-        self.model = model ?? "gemini-live-2.5-flash-native-audio"
+        self.model = model ?? "gemini-3.1-flash-live-preview"
         super.init()
         setupAudioEngine()
     }
