@@ -387,6 +387,7 @@ class LiveTranslateService: NSObject {
     private var audioSendCount = 0
 
     private func sendBufferAsPCM16(_ buffer: AVAudioPCMBuffer) {
+        guard isConnected else { return }
         guard let floatChannelData = buffer.floatChannelData else { return }
 
         let frameLength = Int(buffer.frameLength)
@@ -421,6 +422,7 @@ class LiveTranslateService: NSObject {
     // MARK: - Image Sending
 
     func sendImageFrame(_ image: UIImage) {
+        guard isConnected else { return }
         let now = Date()
         if let lastTime = lastImageSendTime, now.timeIntervalSince(lastTime) < imageInterval {
             return
