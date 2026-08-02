@@ -219,13 +219,18 @@ class LiveTranslateService: NSObject {
         let source = languageName(sourceLanguage.rawValue)
         let target = languageName(targetLanguage.rawValue)
 
+        // TWO-WAY AUTO-DETECT INTERPRETER: the model detects which language is
+        // being spoken and translates in the appropriate direction — a whole
+        // conversation works with no buttons and no language switching.
         let systemPrompt = """
-        You are a professional simultaneous interpreter. \
-        Listen to the incoming speech in \(source) and translate it into \(target). \
-        Speak ONLY the \(target) translation of what was said - no commentary, \
-        no explanations, no questions, no extra words. Keep the tone and intent \
-        of the speaker. If speech is unclear, translate what you understood. \
-        If an image is provided, use it only as context to improve the translation.
+        You are a professional two-way simultaneous interpreter between \(source) and \(target). \
+        Listen to each utterance and detect its language automatically. \
+        If the speech is in \(target), speak the \(source) translation. \
+        Otherwise (including \(source) or any other language), speak the \(target) translation. \
+        Speak ONLY the translation - no commentary, no explanations, no questions, \
+        no extra words. Keep the tone and intent of the speaker. If speech is \
+        unclear, translate what you understood. If an image is provided, use it \
+        only as context to improve the translation.
         """
 
         var setup: [String: Any] = [
@@ -236,21 +241,21 @@ class LiveTranslateService: NSObject {
             "outputAudioTranscription": [:]
         ]
 
+        // NOTE: this Live model supports AUDIO responses ONLY — requesting TEXT
+        // kills the session (1007). We always request AUDIO; when the user turns
+        // voice output off, handleAudioChunk simply skips playback and the
+        // transcription still provides the on-screen text.
         var generationConfig: [String: Any] = [:]
-        if audioOutputEnabled {
-            generationConfig["responseModalities"] = ["AUDIO"]
-            generationConfig["speechConfig"] = [
-                "voiceConfig": [
-                    "prebuiltVoiceConfig": ["voiceName": geminiVoiceName]
-                ]
+        generationConfig["responseModalities"] = ["AUDIO"]
+        generationConfig["speechConfig"] = [
+            "voiceConfig": [
+                "prebuiltVoiceConfig": ["voiceName": geminiVoiceName]
             ]
-        } else {
-            generationConfig["responseModalities"] = ["TEXT"]
-        }
+        ]
         setup["generationConfig"] = generationConfig
 
         sendEvent(["setup": setup])
-        print("📤 [Translate] Session setup sent: \(source) → \(target), voice: \(geminiVoiceName)")
+        print("📤 [Translate] Session setup sent: two-way \(source) ↔ \(target), voice: \(geminiVoiceName)")
     }
 
     // MARK: - Audio Recording
@@ -388,7 +393,6 @@ class LiveTranslateService: NSObject {
 
     private func sendBufferAsPCM16(_ buffer: AVAudioPCMBuffer) {
         guard isConnected else { return }
-        guard isConnected else { return }
         guard let floatChannelData = buffer.floatChannelData else { return }
 
         let frameLength = Int(buffer.frameLength)
@@ -423,7 +427,6 @@ class LiveTranslateService: NSObject {
     // MARK: - Image Sending
 
     func sendImageFrame(_ image: UIImage) {
-        guard isConnected else { return }
         guard isConnected else { return }
         let now = Date()
         if let lastTime = lastImageSendTime, now.timeIntervalSince(lastTime) < imageInterval {
@@ -467,8 +470,11 @@ class LiveTranslateService: NSObject {
         let message = URLSessionWebSocketTask.Message.string(jsonString)
         webSocket?.send(message) { [weak self] error in
             if let error = error {
+                let nsError = error as NSError
                 print("❌ [Translate] Send failed: \(error.localizedDescription)")
-                self?.onError?("Send error: \(error.localizedDescription)")
+                if nsError.code != 57 && nsError.code != -999 {
+                    self?.reportSocketError("Send error: \(error.localizedDescription)")
+                }
             }
         }
     }
