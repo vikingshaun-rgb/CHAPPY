@@ -256,6 +256,14 @@ class LiveAIManager: ObservableObject {
             }
         }
 
+        geminiService.onReadRequest = { [weak self] in
+            Task { @MainActor in
+                guard let self, let frame = self.currentVideoFrame else { return }
+                print("📖 [LiveAIManager] Read request — sending high-res frame")
+                self.geminiService?.sendHighResImageInput(frame)
+            }
+        }
+
         geminiService.onFirstAudioSent = { [weak self] in
             Task { @MainActor in
                 print("✅ [LiveAIManager] First-audio-sent callback received — enabling image sending")
