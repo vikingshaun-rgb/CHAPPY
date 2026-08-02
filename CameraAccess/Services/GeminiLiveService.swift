@@ -353,12 +353,7 @@ class GeminiLiveService: NSObject {
         // Gemini Live realtime input format
         let message: [String: Any] = [
             "realtime_input": [
-                "media_chunks": [
-                    [
-                        "mime_type": "audio/pcm;rate=16000",
-                        "data": audioData
-                    ]
-                ]
+                "audio": ["data": audioData, "mime_type": "audio/pcm;rate=16000"]
             ]
         ]
         sendJSON(message)
@@ -377,12 +372,7 @@ class GeminiLiveService: NSObject {
 
         let message: [String: Any] = [
             "realtime_input": [
-                "media_chunks": [
-                    [
-                        "mime_type": "image/jpeg",
-                        "data": base64Image
-                    ]
-                ]
+                "video": ["data": base64Image, "mime_type": "image/jpeg"]
             ]
         ]
         sendJSON(message)
