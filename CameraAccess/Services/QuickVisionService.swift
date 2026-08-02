@@ -87,18 +87,35 @@ class QuickVisionService {
     /// - Parameters:
     ///   - image: The image to recognize
     ///   - customPrompt: Custom prompt (optional; falls back to the current mode's prompt when nil)
+    ///   - deepAnalysis: escalate to the big model with extended thinking for a careful look
     /// - Returns: Concise description text suitable for TTS
-    func analyzeImage(_ image: UIImage, customPrompt: String? = nil) async throws -> String {
-        // Convert image to base64
+    func analyzeImage(_ image: UIImage, customPrompt: String? = nil, deepAnalysis: Bool = false) async throws -> String {
+        // Use the custom prompt, the mode manager's prompt, or the default
+        let prompt = customPrompt ?? QuickVisionModeManager.staticPrompt
+
+        // CLAUDE NATIVE PATH: the OpenAI-compatible endpoint locks out
+        // Anthropic's native powers (web search, thinking, prompt caching,
+        // proper vision). When the provider is Claude, use the real
+        // Messages API instead.
+        if provider == .anthropic {
+            // Higher quality for Claude — it reads fine print happily
+            guard let imageData = image.jpegData(compressionQuality: 0.85) else {
+                throw QuickVisionError.invalidImage
+            }
+            return try await makeAnthropicRequest(
+                imageB64: imageData.base64EncodedString(),
+                prompt: prompt,
+                deep: deepAnalysis
+            )
+        }
+
+        // Convert image to base64 (OpenAI-compatible providers)
         guard let imageData = image.jpegData(compressionQuality: 0.7) else {
             throw QuickVisionError.invalidImage
         }
 
         let base64String = imageData.base64EncodedString()
         let dataURL = "data:image/jpeg;base64,\(base64String)"
-
-        // Use the custom prompt, the mode manager's prompt, or the default
-        let prompt = customPrompt ?? QuickVisionModeManager.staticPrompt
 
         // Create API request
         let request = ChatCompletionRequest(
@@ -124,6 +141,105 @@ class QuickVisionService {
 
         // Make API call
         return try await makeRequest(request)
+    }
+
+    // MARK: - Anthropic Native Messages API
+
+    private static let chappySystemPrompt = """
+    You are Chappy, the personal assistant of Shaun, an Australian traveller, \
+    looking at a photo taken through his smart glasses. NEVER mention Claude, \
+    Anthropic, or being an AI model - you are simply Chappy. Answer concisely \
+    and speak-ably (your answer is read aloud): lead with the answer, exact \
+    words and numbers when text is visible, verbatim reading when asked. \
+    When asked about food or products, read labels and flag allergens. \
+    When text is in a foreign language, translate it and give the original \
+    name too. Use web search when current real-world facts would improve \
+    the answer (prices, opening hours, reviews, what a place or product is).
+    """
+
+    private func makeAnthropicRequest(imageB64: String, prompt: String, deep: Bool) async throws -> String {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            throw QuickVisionError.invalidResponse
+        }
+
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        urlRequest.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "content-type")
+        urlRequest.timeoutInterval = deep ? 120 : 60
+
+        // DEEP LOOK: escalate to the big model with extended thinking
+        let useModel = deep ? "claude-opus-4-8" : model
+
+        var body: [String: Any] = [
+            "model": useModel,
+            "max_tokens": deep ? 8192 : 1024,
+            // cache_control: the system prompt is cached server-side —
+            // repeat snaps get faster and ~90% cheaper
+            "system": [[
+                "type": "text",
+                "text": QuickVisionService.chappySystemPrompt,
+                "cache_control": ["type": "ephemeral"]
+            ]],
+            "messages": [[
+                "role": "user",
+                "content": [
+                    ["type": "image",
+                     "source": ["type": "base64", "media_type": "image/jpeg", "data": imageB64]],
+                    ["type": "text", "text": prompt]
+                ]
+            ]],
+            "tools": [[
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 3
+            ]]
+        ]
+        if deep {
+            body["thinking"] = ["type": "enabled", "budget_tokens": 4096]
+        }
+
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        print("📡 [QuickVision] Claude native request → \(useModel)\(deep ? " (deep)" : "")")
+        var (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+        // Graceful degrade: if this API version rejects the web_search tool,
+        // retry once without tools rather than failing the whole snap.
+        if let http = response as? HTTPURLResponse, http.statusCode == 400,
+           let bodyText = String(data: data, encoding: .utf8), bodyText.contains("web_search") {
+            print("⚠️ [QuickVision] web_search tool rejected — retrying without tools")
+            body["tools"] = nil
+            urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+            (data, response) = try await URLSession.shared.data(for: urlRequest)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw QuickVisionError.invalidResponse
+        }
+        guard httpResponse.statusCode == 200 else {
+            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
+            print("❌ [QuickVision] Claude error \(httpResponse.statusCode): \(errorMessage.prefix(300))")
+            throw QuickVisionError.apiError(statusCode: httpResponse.statusCode, message: errorMessage)
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else {
+            throw QuickVisionError.invalidResponse
+        }
+
+        // Join all text blocks (skips thinking/tool blocks automatically)
+        let text = content.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text" else { return nil }
+            return block["text"] as? String
+        }.joined(separator: " ")
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw QuickVisionError.emptyResponse }
+
+        print("✅ [QuickVision] Claude result: \(trimmed.prefix(120))")
+        return trimmed
     }
 
     // MARK: - Private Methods
