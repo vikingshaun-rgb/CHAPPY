@@ -27,6 +27,10 @@ class LiveAIManager: ObservableObject {
     private var currentVideoFrame: UIImage?
     private var isImageSendingEnabled = false
     private var frameUpdateTimer: Timer?
+    // Counts 0.1s ticks; every 10th tick (~1 s) the frame is SENT to Gemini.
+    // The old speech-triggered send relied on onSpeechStarted, which the
+    // Gemini service never fires — Gemini was receiving zero images.
+    private var frameTickCount = 0
 
     // Conversation history
     private var conversationHistory: [ConversationMessage] = []
@@ -345,6 +349,15 @@ class LiveAIManager: ObservableObject {
     private func updateVideoFrame() {
         if let frame = streamViewModel?.currentVideoFrame {
             currentVideoFrame = frame
+
+            // Steady 1 fps frame drip to Gemini so it can actually SEE
+            frameTickCount += 1
+            if frameTickCount >= 10 {
+                frameTickCount = 0
+                if provider == .google, isConnected {
+                    geminiService?.sendImageInput(frame)
+                }
+            }
         }
     }
 
