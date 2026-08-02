@@ -1,34 +1,34 @@
 /*
  * Live Translate Models
- * 实时翻译数据模型：语种、音色、翻译记录
+ * Live translation data models: languages, voices, translation records
  */
 
 import Foundation
 
-// MARK: - 支持的语种
+// MARK: - Supported Languages
 
 enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
-    // 支持音频+文本输出的语种
-    case en = "en"      // 英语
-    case zh = "zh"      // 中文
-    case ja = "ja"      // 日语
-    case ko = "ko"      // 韩语
-    case fr = "fr"      // 法语
-    case de = "de"      // 德语
-    case ru = "ru"      // 俄语
-    case es = "es"      // 西班牙语
-    case pt = "pt"      // 葡萄牙语
-    case it = "it"      // 意大利语
-    case yue = "yue"    // 粤语
+    // Languages that support audio + text output
+    case en = "en"      // English
+    case zh = "zh"      // Chinese
+    case ja = "ja"      // Japanese
+    case ko = "ko"      // Korean
+    case fr = "fr"      // French
+    case de = "de"      // German
+    case ru = "ru"      // Russian
+    case es = "es"      // Spanish
+    case pt = "pt"      // Portuguese
+    case it = "it"      // Italian
+    case yue = "yue"    // Cantonese
 
-    // 仅支持输入（作为源语言）的语种
-    case id = "id"      // 印尼语
-    case vi = "vi"      // 越南语
-    case th = "th"      // 泰语
-    case ar = "ar"      // 阿拉伯语
-    case hi = "hi"      // 印地语
-    case el = "el"      // 希腊语
-    case tr = "tr"      // 土耳其语
+    // Languages that support input only (as source language)
+    case id = "id"      // Indonesian
+    case vi = "vi"      // Vietnamese
+    case th = "th"      // Thai
+    case ar = "ar"      // Arabic
+    case hi = "hi"      // Hindi
+    case el = "el"      // Greek
+    case tr = "tr"      // Turkish
     case fil = "fil"
     case km = "km"
     case lo = "lo"
@@ -87,7 +87,7 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         }
     }
 
-    /// 是否支持作为目标语言（输出音频+文本）
+    /// Whether this language can be a target language (audio + text output)
     var supportsAudioOutput: Bool {
         switch self {
         case .en, .zh, .ja, .ko, .fr, .de, .ru, .es, .pt, .it, .yue:
@@ -97,18 +97,18 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         }
     }
 
-    /// 可作为目标语言的语种
+    /// Languages that can be used as target languages
     static var targetLanguages: [TranslateLanguage] {
         allCases.filter { $0.supportsAudioOutput }
     }
 
-    /// 所有源语言
+    /// All source languages
     static var sourceLanguages: [TranslateLanguage] {
         allCases
     }
 }
 
-// MARK: - 翻译音色
+// MARK: - Translation Voices
 
 enum TranslateVoice: String, CaseIterable, Codable, Identifiable {
     case cherry = "Cherry"
@@ -148,36 +148,36 @@ enum TranslateVoice: String, CaseIterable, Codable, Identifiable {
         }
     }
 
-    /// 支持的语种（音色可能只支持部分语种）
+    /// Supported languages (a voice may only support some languages)
     var supportedLanguages: [TranslateLanguage] {
         switch self {
         case .cherry, .nofish:
-            // 支持多语种
+            // Supports multiple languages
             return [.zh, .en, .fr, .de, .ru, .it, .es, .pt, .ja, .ko]
         case .jada, .dylan, .sunny, .peter, .eric:
-            // 仅支持中文
+            // Chinese only
             return [.zh]
         case .kiki:
-            // 仅支持粤语
+            // Cantonese only
             return [.yue]
         }
     }
 
-    /// 检查音色是否支持指定语种
+    /// Check whether this voice supports the given language
     func supports(language: TranslateLanguage) -> Bool {
         true
     }
 }
 
-// MARK: - 翻译记录
+// MARK: - Translation Record
 
 struct TranslateRecord: Codable, Identifiable {
     let id: UUID
     let timestamp: Date
     let sourceLanguage: TranslateLanguage
     let targetLanguage: TranslateLanguage
-    let originalText: String      // 识别的原文
-    let translatedText: String    // 翻译结果
+    let originalText: String      // recognized original text
+    let translatedText: String    // translation result
 
     init(
         id: UUID = UUID(),
@@ -196,7 +196,7 @@ struct TranslateRecord: Codable, Identifiable {
     }
 }
 
-// MARK: - WebSocket 事件
+// MARK: - WebSocket Events
 
 enum TranslateClientEvent: String {
     case sessionUpdate = "session.update"

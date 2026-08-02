@@ -1,6 +1,6 @@
 /*
  * Conversation Record Model
- * 对话记录数据模型
+ * Conversation record data model
  */
 
 import Foundation
@@ -17,7 +17,7 @@ struct ConversationRecord: Identifiable, Codable {
         timestamp: Date = Date(),
         messages: [ConversationMessage],
         aiModel: String = "qwen3-omni-flash-realtime",
-        language: String = "zh-CN"
+        language: String = "en-US"
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -32,7 +32,7 @@ struct ConversationRecord: Identifiable, Codable {
             let content = firstUserMessage.content
             return content.count > 30 ? String(content.prefix(30)) + "..." : content
         }
-        return "AI 对话"
+        return "AI Conversation"
     }
 
     var summary: String {
@@ -53,10 +53,10 @@ struct ConversationRecord: Identifiable, Codable {
 
         if calendar.isDateInToday(timestamp) {
             formatter.dateFormat = "HH:mm"
-            return "今天 " + formatter.string(from: timestamp)
+            return "Today " + formatter.string(from: timestamp)
         } else if calendar.isDateInYesterday(timestamp) {
             formatter.dateFormat = "HH:mm"
-            return "昨天 " + formatter.string(from: timestamp)
+            return "Yesterday " + formatter.string(from: timestamp)
         } else if calendar.isDate(timestamp, equalTo: Date(), toGranularity: .weekOfYear) {
             formatter.dateFormat = "EEEE HH:mm"
             return formatter.string(from: timestamp)
