@@ -56,6 +56,9 @@ class GeminiLiveService: NSObject {
     var onError: ((String) -> Void)?
     var onConnected: (() -> Void)?
     var onFirstAudioSent: (() -> Void)?
+    /// Fired when the user asks Chappy to READ something — the view model
+    /// responds by sending one full-sharpness frame for fine print.
+    var onReadRequest: (() -> Void)?
 
     // State
     private var isRecording = false
@@ -426,6 +429,36 @@ class GeminiLiveService: NSObject {
         }
     }
 
+    /// One-shot FULL-SHARPNESS frame for reading fine print ("read this").
+    /// Bypasses the 768px live-stream downscale — only caps extreme sizes —
+    /// and jumps the in-flight queue because the user is waiting on it.
+    func sendHighResImageInput(_ image: UIImage) {
+        guard isSessionConfigured else { return }
+
+        let prepared = resizedForLive(image, maxDimension: 1600)
+        guard var imageData = prepared.jpegData(compressionQuality: 0.9) else {
+            print("❌ [Gemini] Failed to compress high-res frame")
+            return
+        }
+        if imageData.count > 800 * 1024,
+           let smaller = prepared.jpegData(compressionQuality: 0.7) {
+            imageData = smaller
+        }
+        guard imageData.count <= 1200 * 1024 else {
+            print("⚠️ [Gemini] High-res frame too large - skipping")
+            return
+        }
+
+        print("📖 [Gemini] Sending HIGH-RES frame: \(imageData.count) bytes")
+
+        let message: [String: Any] = [
+            "realtime_input": [
+                "video": ["data": imageData.base64EncodedString(), "mime_type": "image/jpeg"]
+            ]
+        ]
+        sendJSON(message)
+    }
+
     // MARK: - Receive Messages
 
     private func receiveMessage() {
@@ -539,6 +572,16 @@ class GeminiLiveService: NSObject {
            let text = inputTranscription["text"] as? String {
             print("👤 [Gemini] User said: \(text)")
             onUserTranscript?(text)
+
+            // "READ THIS" DETECTION: when the user asks for reading, ship one
+            // full-sharpness frame so fine print is actually legible.
+            let lower = text.lowercased()
+            if lower.contains("read th") || lower.contains("read it")
+                || lower.contains("read me") || lower.contains("what does")
+                || lower.contains("what do these") {
+                print("📖 [Gemini] Read request detected — requesting high-res frame")
+                onReadRequest?()
+            }
         }
 
         // Handle output transcription (AI speech text)
