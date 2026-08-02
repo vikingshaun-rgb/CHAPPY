@@ -343,11 +343,19 @@ class OmniRealtimeViewModel: ObservableObject {
         frameSendTimer?.invalidate()
         frameSendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.isConnected, let frame = self.currentVideoFrame else { return }
+                guard let self, self.isConnected else { return }
+                // POCKET MODE: view-driven frame updates STOP when the screen
+                // locks (SwiftUI stops rendering), freezing vision on the last
+                // image. Pull straight from the stream source so Chappy keeps
+                // seeing with the phone locked in a pocket.
+                if let liveFrame = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
+                    self.currentVideoFrame = liveFrame
+                }
+                guard let frame = self.currentVideoFrame else { return }
                 self.geminiService?.sendImageInput(frame)
             }
         }
-        print("📸 [GeminiVM] Frame drip started (1 fps)")
+        print("📸 [GeminiVM] Frame drip started (1 fps, pocket-safe)")
     }
 
     // MARK: - Manual Mode (if needed)
