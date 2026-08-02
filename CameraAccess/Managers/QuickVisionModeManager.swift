@@ -35,8 +35,12 @@ class QuickVisionModeManager: ObservableObject {
 
     // Supported translation target languages
     static let supportedLanguages: [(code: String, name: String)] = [
-        ("zh-CN", "Chinese"),
         ("en-US", "English"),
+        ("id-ID", "Indonesian"),
+        ("vi-VN", "Vietnamese"),
+        ("th-TH", "Thai"),
+        ("fil-PH", "Filipino"),
+        ("zh-CN", "Chinese"),
         ("ja-JP", "Japanese"),
         ("ko-KR", "한국어"),
         ("fr-FR", "Français"),
@@ -95,7 +99,7 @@ class QuickVisionModeManager: ObservableObject {
 
     /// Get the translate-mode prompt (includes target language)
     private func getTranslatePrompt() -> String {
-        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "Chinese"
+        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "English"
         let basePrompt = "prompt.quickvision.translate".localized
         return basePrompt.replacingOccurrences(of: "{LANGUAGE}", with: targetLanguageName)
     }
