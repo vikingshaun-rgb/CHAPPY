@@ -175,7 +175,7 @@ class GeminiLiveService: NSObject {
         guard !isSessionConfigured else { return }
 
         // Get the system prompt for the current Live AI mode
-        let instructions = LiveAIModeManager.staticSystemPrompt
+        let instructions = LiveAIModeManager.staticSystemPrompt + "\n\nVISION RULES: You are seeing live through smart glasses worn by the user as they move through the world. Describe scenes in rich, specific detail. Whenever any text is visible - signs, menus, screens, labels, prices - read it aloud verbatim. Proactively mention notable things such as restaurants, shops, street names, prices and warnings without being asked. Always name the exact words, numbers, colors and brands you can see. Speak naturally and briefly, like a sharp-eyed friend narrating."
 
         // Gemini Live API setup message
         let setupMessage: [String: Any] = [
