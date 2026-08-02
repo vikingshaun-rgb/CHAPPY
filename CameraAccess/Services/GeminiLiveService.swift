@@ -178,7 +178,7 @@ class GeminiLiveService: NSObject {
         guard !isSessionConfigured else { return }
 
         // Get the system prompt for the current Live AI mode
-        let instructions = LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the user's personal assistant. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy.\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: speak naturally and briefly like a trusted friend; lead with the answer; more detail only when asked. Always answer in the language the user speaks to you."
+        let instructions = LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the user's personal assistant. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy.\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: speak naturally and briefly like a trusted friend; lead with the answer; more detail only when asked. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers in the MOST RECENT frame, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked."
 
         // Use the voice chosen in Settings → Voice (was hardcoded to Aoede,
         // which silently ignored the user's picker). "System" (Apple TTS)
@@ -204,6 +204,36 @@ class GeminiLiveService: NSObject {
                     "parts": [
                         ["text": instructions]
                     ]
+                ],
+                // PROACTIVE AUDIO: lets the model speak up on its own when it
+                // notices something — the "constant viewing and reporting"
+                // behavior. If connect suddenly fails with a setup error
+                // mentioning proactivity, this field is the first thing to pull.
+                "proactivity": [
+                    "proactive_audio": true
+                ],
+                // Transcripts of BOTH sides — the app's history and the
+                // "read this" trigger depend on these arriving.
+                "input_audio_transcription": [:],
+                "output_audio_transcription": [:],
+                // FASTER TURNS: respond ~half a second after you stop talking
+                // instead of waiting out a long silence.
+                "realtime_input_config": [
+                    "automatic_activity_detection": [
+                        "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+                        "silence_duration_ms": 500
+                    ]
+                ],
+                // LONG SESSIONS: sliding-window compression stops the session
+                // dying when the context fills up on a long walk.
+                "context_window_compression": [
+                    "sliding_window": [:]
+                ],
+                // GOOGLE SEARCH GROUNDING: Chappy can search the live web
+                // mid-conversation — opening hours, prices, "what is this
+                // place" — executed server-side, no browser needed.
+                "tools": [
+                    ["google_search": [:]]
                 ]
             ]
         ]
@@ -392,14 +422,18 @@ class GeminiLiveService: NSObject {
         guard isSessionConfigured else { return }
         guard !isFrameSendInFlight else { return }
 
-        let prepared = resizedForLive(image, maxDimension: 768)
-        guard var imageData = prepared.jpegData(compressionQuality: 0.72) else {
+        // EAGLE MODE: small fast frames win for reactivity — a 512px frame
+        // uploads 3-4x faster than 768px, so vision stays CURRENT even on a
+        // slow/VPN connection. Fine detail comes from the on-demand high-res
+        // "read this" frame, not the live drip.
+        let prepared = resizedForLive(image, maxDimension: 512)
+        guard var imageData = prepared.jpegData(compressionQuality: 0.6) else {
             print("❌ [Gemini] Failed to compress image")
             return
         }
         // Safety net: if still heavy, recompress harder rather than drop
-        if imageData.count > 250 * 1024,
-           let smaller = prepared.jpegData(compressionQuality: 0.45) {
+        if imageData.count > 150 * 1024,
+           let smaller = prepared.jpegData(compressionQuality: 0.4) {
             imageData = smaller
         }
         guard imageData.count <= 500 * 1024 else {
