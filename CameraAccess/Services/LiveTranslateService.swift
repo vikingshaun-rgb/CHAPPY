@@ -138,12 +138,13 @@ class LiveTranslateService: NSObject {
         return Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code
     }
 
-    /// Map the app's voice setting onto a Gemini prebuilt voice
+    /// SYSTEM-WIDE VOICE: Translate follows the one voice chosen in
+    /// Settings → Voice, same as Live AI and spoken replies. The legacy
+    /// Alibaba voice picker in Translate settings is ignored (those voices
+    /// never existed on Gemini anyway).
     private var geminiVoiceName: String {
-        // Alibaba voices don't exist on Gemini; pick a natural default,
-        // roughly matching feminine/masculine choices where possible.
-        let raw = voice.rawValue.lowercased()
-        if raw.contains("ethan") || raw.contains("male") { return "Puck" }
+        let stored = UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore"
+        if stored != "System" && !stored.isEmpty { return stored }
         return "Kore"
     }
 
