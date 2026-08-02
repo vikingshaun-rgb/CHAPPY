@@ -390,7 +390,7 @@ class GeminiLiveService: NSObject {
             case .failure(let error):
                 let nsError = error as NSError
                 print("❌ [Gemini] Failed to receive message: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
-                self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)")
+                if nsError.code != 57 && nsError.code != -999 { self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)") }
             }
         }
     }

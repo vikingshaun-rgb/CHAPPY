@@ -485,7 +485,7 @@ class LiveTranslateService: NSObject {
             case .failure(let error):
                 let nsError = error as NSError
                 print("❌ [Translate] Receive failed: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
-                self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)")
+                if nsError.code != 57 && nsError.code != -999 { self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)") }
             }
         }
     }
