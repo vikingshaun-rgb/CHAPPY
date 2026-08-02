@@ -349,7 +349,6 @@ class GeminiLiveService: NSObject {
 
     private func sendRealtimeInput(audioData: String) {
         guard isSessionConfigured else { return }
-        guard isSessionConfigured else { return }
         // Gemini Live realtime input format
         let message: [String: Any] = [
             "realtime_input": [
@@ -359,16 +358,45 @@ class GeminiLiveService: NSObject {
         sendJSON(message)
     }
 
+    /// Downscale a frame so its long side is at most `maxDimension` —
+    /// keeps frames sharp enough to read signage while guaranteeing they
+    /// stay well under the websocket message size limit.
+    private func resizedForLive(_ image: UIImage, maxDimension: CGFloat = 1024) -> UIImage {
+        let size = image.size
+        let maxSide = max(size.width, size.height)
+        guard maxSide > maxDimension, maxSide > 0 else { return image }
+        let scale = maxDimension / maxSide
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: newSize)
+        return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
+    }
+
+    private var imageSendCount = 0
+
     func sendImageInput(_ image: UIImage) {
         guard isSessionConfigured else { return }
-        guard isSessionConfigured else { return }
-        guard let imageData = image.jpegData(compressionQuality: 0.6) else {
+
+        let prepared = resizedForLive(image)
+        guard var imageData = prepared.jpegData(compressionQuality: 0.8) else {
             print("❌ [Gemini] Failed to compress image")
             return
         }
+        // Safety net: if still heavy, recompress harder rather than drop
+        if imageData.count > 400 * 1024,
+           let smaller = prepared.jpegData(compressionQuality: 0.5) {
+            imageData = smaller
+        }
+        guard imageData.count <= 700 * 1024 else {
+            print("⚠️ [Gemini] Frame too large even after recompress - skipping")
+            return
+        }
+
         let base64Image = imageData.base64EncodedString()
 
-        print("📸 [Gemini] Sending image: \(imageData.count) bytes")
+        imageSendCount += 1
+        if imageSendCount == 1 || imageSendCount % 10 == 0 {
+            print("📸 [Gemini] Sent frame #\(imageSendCount): \(imageData.count) bytes")
+        }
 
         let message: [String: Any] = [
             "realtime_input": [
