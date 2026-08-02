@@ -1,6 +1,6 @@
 /*
  * Live AI Models
- * 实时对话数据模型 - 对话模式定义
+ * Real-time conversation data models - conversation mode definitions
  */
 
 import Foundation
@@ -8,12 +8,12 @@ import Foundation
 // MARK: - Live AI Mode
 
 enum LiveAIMode: String, CaseIterable, Codable, Identifiable {
-    case standard = "standard"          // 默认模式 - 自由对话
-    case museum = "museum"              // 博物馆模式
-    case blind = "blind"                // 盲人模式
-    case reading = "reading"            // 阅读模式
-    case translate = "translate"        // 翻译模式
-    case custom = "custom"              // 自定义提示词
+    case standard = "standard"          // Default mode - free conversation
+    case museum = "museum"              // Museum mode
+    case blind = "blind"                // Blind assistance mode
+    case reading = "reading"            // Reading mode
+    case translate = "translate"        // Translation mode
+    case custom = "custom"              // Custom prompt
 
     var id: String { rawValue }
 
@@ -68,7 +68,7 @@ enum LiveAIMode: String, CaseIterable, Codable, Identifiable {
         }
     }
 
-    /// 获取模式对应的系统提示词
+    /// Get the system prompt for this mode
     var systemPrompt: String {
         switch self {
         case .standard:
@@ -80,23 +80,23 @@ enum LiveAIMode: String, CaseIterable, Codable, Identifiable {
         case .reading:
             return "prompt.liveai.reading".localized
         case .translate:
-            // 翻译模式需要从 Manager 获取目标语言
+            // Translation mode needs to get the target language from the Manager
             return "prompt.liveai.translate".localized
         case .custom:
-            // 自定义模式需要从 Manager 获取
+            // Custom mode needs to get the prompt from the Manager
             return ""
         }
     }
 
-    /// 是否在用户说话时自动发送图片
+    /// Whether to automatically send an image when the user speaks
     var autoSendImageOnSpeech: Bool {
         switch self {
         case .standard:
-            return true  // 默认模式：语音触发时发送图片
+            return true  // Default mode: send an image when triggered by speech
         case .museum, .blind, .reading, .translate:
-            return true  // 这些模式都需要看图
+            return true  // These modes all need to see the image
         case .custom:
-            return true  // 自定义模式也支持图片
+            return true  // Custom mode also supports images
         }
     }
 }
