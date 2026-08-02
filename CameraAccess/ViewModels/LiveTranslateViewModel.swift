@@ -1,6 +1,6 @@
 /*
  * Live Translate ViewModel
- * 实时翻译状态管理
+ * Live Translate state management
  */
 
 import Foundation
@@ -15,16 +15,16 @@ class LiveTranslateViewModel: ObservableObject {
     @Published var isRecording = false
 
     // MARK: - Translation State
-    @Published var currentTranslation = ""       // 当前翻译结果
-    @Published var currentOriginal = ""          // 当前原文（暂不支持，保留字段）
-    @Published var streamingTranslation = ""     // 流式翻译片段
+    @Published var currentTranslation = ""       // current translation result
+    @Published var currentOriginal = ""          // current original text (not yet supported, reserved) 
+    @Published var streamingTranslation = ""     // streaming translation chunkchunk
     @Published var translationHistory: [TranslateRecord] = []
 
     // MARK: - Error State
     @Published var errorMessage: String?
     @Published var showError = false
 
-    // MARK: - Settings (持久化)
+    // MARK: - Settings (persisted)
     @Published var sourceLanguage: TranslateLanguage {
         didSet {
             UserDefaults.standard.set(sourceLanguage.rawValue, forKey: "translate_source_language")
@@ -59,8 +59,8 @@ class LiveTranslateViewModel: ObservableObject {
         }
     }
 
-    /// 使用 iPhone 麦克风（而非眼镜麦克风）
-    /// 眼镜麦克风适合翻译自己说的话，iPhone 麦克风适合翻译对方说的话
+    /// Use iPhone microphone (instead of the glasses mic) 
+    /// Glasses mic suits translating yourself; iPhone mic suits translating the other person
     @Published var usePhoneMic: Bool {
         didSet {
             UserDefaults.standard.set(usePhoneMic, forKey: "translate_use_phone_mic")
@@ -77,12 +77,30 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Init
 
     init() {
-        // 从 UserDefaults 加载设置
+        // Load settings from UserDefaults
         let savedSource = UserDefaults.standard.string(forKey: "translate_source_language") ?? "en"
-        self.sourceLanguage = TranslateLanguage(rawValue: savedSource) ?? .en
+        var loadedSource = TranslateLanguage(rawValue: savedSource) ?? .en
 
         let savedTarget = UserDefaults.standard.string(forKey: "translate_target_language") ?? "en"
-        self.targetLanguage = TranslateLanguage(rawValue: savedTarget) ?? .en
+        var loadedTarget = TranslateLanguage(rawValue: savedTarget) ?? .en
+
+        // ONE-TIME MIGRATION: older builds defaulted to Chinese and that value
+        // is still SAVED on phones that ran them (saved values survive updates).
+        // Scrub it once; after this the user's own choices always win.
+        if !UserDefaults.standard.bool(forKey: "translate_zh_scrubbed_v1") {
+            if loadedTarget == .zh {
+                loadedTarget = .en
+                UserDefaults.standard.set(loadedTarget.rawValue, forKey: "translate_target_language")
+            }
+            if loadedSource == .zh {
+                loadedSource = .en
+                UserDefaults.standard.set(loadedSource.rawValue, forKey: "translate_source_language")
+            }
+            UserDefaults.standard.set(true, forKey: "translate_zh_scrubbed_v1")
+        }
+
+        self.sourceLanguage = loadedSource
+        self.targetLanguage = loadedTarget
 
         let savedVoice = UserDefaults.standard.string(forKey: "translate_voice") ?? "Cherry"
         self.selectedVoice = TranslateVoice(rawValue: savedVoice) ?? .cherry
@@ -137,7 +155,7 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.startRecording(usePhoneMic: usePhoneMic)
         isRecording = true
 
-        // 如果启用图像增强，开始定时发送图片
+        // If image input enabled, start the periodic image timer
         if imageEnhanceEnabled {
             startImageTimer()
         }
@@ -148,7 +166,7 @@ class LiveTranslateViewModel: ObservableObject {
         isRecording = false
         stopImageTimer()
 
-        // 保存当前翻译到历史
+        // Save the current translation to history
         if !currentTranslation.isEmpty {
             let record = TranslateRecord(
                 sourceLanguage: sourceLanguage,
@@ -158,7 +176,7 @@ class LiveTranslateViewModel: ObservableObject {
             )
             translationHistory.insert(record, at: 0)
 
-            // 限制历史记录数量
+            // Cap the history count
             if translationHistory.count > 50 {
                 translationHistory = Array(translationHistory.prefix(50))
             }
@@ -168,7 +186,7 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Language Swap
 
     func swapLanguages() {
-        // 只有当两种语言都支持作为目标语言时才能交换
+        // Swap only when both languages are valid targets
         guard sourceLanguage.supportsAudioOutput && targetLanguage.supportsAudioOutput else {
             errorMessage = "livetranslate.error.cannotSwap".localized
             showError = true
@@ -179,7 +197,7 @@ class LiveTranslateViewModel: ObservableObject {
         sourceLanguage = targetLanguage
         targetLanguage = temp
 
-        // 清空当前翻译
+        // Clear the current translation
         currentTranslation = ""
         streamingTranslation = ""
     }
@@ -196,7 +214,7 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.onConnected = { [weak self] in
             DispatchQueue.main.async {
                 self?.isConnected = true
-                print("✅ [TranslateVM] 已连接")
+                print("✅ [TranslateVM] Connected")
             }
         }
 
@@ -215,7 +233,7 @@ class LiveTranslateViewModel: ObservableObject {
 
         translateService?.onAudioDone = { [weak self] in
             DispatchQueue.main.async {
-                print("🔊 [TranslateVM] 音频播放完成")
+                print("🔊 [TranslateVM] audio playback done")
             }
         }
 
