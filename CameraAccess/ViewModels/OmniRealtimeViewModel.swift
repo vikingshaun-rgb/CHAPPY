@@ -28,7 +28,13 @@ class OmniRealtimeViewModel: ObservableObject {
 
     // Video frame
     private var currentVideoFrame: UIImage?
-    private var isImageSendingEnabled = false // 是否已启用图片发送（第一次音频后）
+    private var isImageSendingEnabled = false // whether image sending is enabled (after first audio)
+
+    // Steady frame drip for Gemini: the old design only sent a frame on
+    // onSpeechStarted, which the Gemini service NEVER fires (it was an
+    // Alibaba server event) — so Gemini received zero images and hallucinated.
+    // A 1-second timer gives it true live vision.
+    private var frameSendTimer: Timer?
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -67,10 +73,10 @@ class OmniRealtimeViewModel: ObservableObject {
 
         omniService.onFirstAudioSent = { [weak self] in
             Task { @MainActor in
-                print("✅ [OmniVM] 收到第一次音频发送回调，启用图片发送")
+                print("✅ [OmniVM] First-audio-sent callback received — enabling image sending")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self?.isImageSendingEnabled = true
-                    print("📸 [OmniVM] 图片发送已启用（语音触发模式）")
+                    print("📸 [OmniVM] Image sending enabled (voice-trigger mode) ")
                 }
             }
         }
@@ -82,7 +88,7 @@ class OmniRealtimeViewModel: ObservableObject {
                 if let strongSelf = self,
                    strongSelf.isImageSendingEnabled,
                    let frame = strongSelf.currentVideoFrame {
-                    print("🎤📸 [OmniVM] 检测到用户语音，发送当前视频帧")
+                    print("🎤📸 [OmniVM] User speech detected — sending current video frame")
                     strongSelf.omniService?.sendImageAppend(frame)
                 }
             }
@@ -96,7 +102,7 @@ class OmniRealtimeViewModel: ObservableObject {
 
         omniService.onTranscriptDelta = { [weak self] delta in
             Task { @MainActor in
-                print("📝 [OmniVM] AI回复片段: \(delta)")
+                print("📝 [OmniVM] AIReply chunk: \(delta)")
                 self?.currentTranscript += delta
             }
         }
@@ -104,7 +110,7 @@ class OmniRealtimeViewModel: ObservableObject {
         omniService.onUserTranscript = { [weak self] userText in
             Task { @MainActor in
                 guard let self = self else { return }
-                print("💬 [OmniVM] 保存用户语音: \(userText)")
+                print("💬 [OmniVM] Saving user speech: \(userText)")
                 self.conversationHistory.append(
                     ConversationMessage(role: .user, content: userText)
                 )
@@ -116,10 +122,10 @@ class OmniRealtimeViewModel: ObservableObject {
                 guard let self = self else { return }
                 let textToSave = fullText.isEmpty ? self.currentTranscript : fullText
                 guard !textToSave.isEmpty else {
-                    print("⚠️ [OmniVM] AI回复为空，跳过保存")
+                    print("⚠️ [OmniVM] AI reply empty - skipping save")
                     return
                 }
-                print("💬 [OmniVM] 保存AI回复: \(textToSave)")
+                print("💬 [OmniVM] Saving AI reply: \(textToSave)")
                 self.conversationHistory.append(
                     ConversationMessage(role: .assistant, content: textToSave)
                 )
@@ -147,15 +153,16 @@ class OmniRealtimeViewModel: ObservableObject {
         geminiService.onConnected = { [weak self] in
             Task { @MainActor in
                 self?.isConnected = true
+                self?.startFrameSendTimer()
             }
         }
 
         geminiService.onFirstAudioSent = { [weak self] in
             Task { @MainActor in
-                print("✅ [GeminiVM] 收到第一次音频发送回调，启用图片发送")
+                print("✅ [GeminiVM] First-audio-sent callback received — enabling image sending")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self?.isImageSendingEnabled = true
-                    print("📸 [GeminiVM] 图片发送已启用（语音触发模式）")
+                    print("📸 [GeminiVM] Image sending enabled (voice-trigger mode) ")
                 }
             }
         }
@@ -167,7 +174,7 @@ class OmniRealtimeViewModel: ObservableObject {
                 if let strongSelf = self,
                    strongSelf.isImageSendingEnabled,
                    let frame = strongSelf.currentVideoFrame {
-                    print("🎤📸 [GeminiVM] 检测到用户语音，发送当前视频帧")
+                    print("🎤📸 [GeminiVM] User speech detected — sending current video frame")
                     strongSelf.geminiService?.sendImageInput(frame)
                 }
             }
@@ -181,7 +188,7 @@ class OmniRealtimeViewModel: ObservableObject {
 
         geminiService.onTranscriptDelta = { [weak self] (delta: String) in
             Task { @MainActor in
-                print("📝 [GeminiVM] AI回复片段: \(delta)")
+                print("📝 [GeminiVM] AIReply chunk: \(delta)")
                 self?.currentTranscript += delta
             }
         }
@@ -189,7 +196,7 @@ class OmniRealtimeViewModel: ObservableObject {
         geminiService.onUserTranscript = { [weak self] (userText: String) in
             Task { @MainActor in
                 guard let self = self else { return }
-                print("💬 [GeminiVM] 保存用户语音: \(userText)")
+                print("💬 [GeminiVM] Saving user speech: \(userText)")
                 self.conversationHistory.append(
                     ConversationMessage(role: .user, content: userText)
                 )
@@ -201,10 +208,10 @@ class OmniRealtimeViewModel: ObservableObject {
                 guard let self = self else { return }
                 let textToSave = fullText.isEmpty ? self.currentTranscript : fullText
                 guard !textToSave.isEmpty else {
-                    print("⚠️ [GeminiVM] AI回复为空，跳过保存")
+                    print("⚠️ [GeminiVM] AI reply empty - skipping save")
                     return
                 }
-                print("💬 [GeminiVM] 保存AI回复: \(textToSave)")
+                print("💬 [GeminiVM] Saving AI reply: \(textToSave)")
                 self.conversationHistory.append(
                     ConversationMessage(role: .assistant, content: textToSave)
                 )
@@ -241,6 +248,9 @@ class OmniRealtimeViewModel: ObservableObject {
         // Save conversation before disconnecting
         saveConversation()
 
+        frameSendTimer?.invalidate()
+        frameSendTimer = nil
+
         stopRecording()
 
         switch provider {
@@ -257,7 +267,7 @@ class OmniRealtimeViewModel: ObservableObject {
     private func saveConversation() {
         // Only save if there's meaningful conversation
         guard !conversationHistory.isEmpty else {
-            print("💬 [LiveAI] 无对话内容，跳过保存")
+            print("💬 [LiveAI] No conversation content — skipping save")
             return
         }
 
@@ -266,30 +276,30 @@ class OmniRealtimeViewModel: ObservableObject {
         case .alibaba:
             aiModel = "qwen3-omni-flash-realtime"
         case .google:
-            aiModel = "gemini-3.1-flash-live-preview"
+            aiModel = GeminiLiveService.liveModel
         }
 
         let record = ConversationRecord(
             messages: conversationHistory,
             aiModel: aiModel,
-            language: "zh-CN" // TODO: 从设置中获取
+            language: "zh-CN" // TODO: get from settings
         )
 
         ConversationStorage.shared.saveConversation(record)
-        print("💾 [LiveAI] 对话已保存: \(conversationHistory.count) 条消息")
+        print("💾 [LiveAI] Conversation saved: \(conversationHistory.count)  messages")
     }
 
     // MARK: - Recording
 
     func startRecording() {
         guard isConnected else {
-            print("⚠️ [LiveAI] 未连接，无法开始录音")
-            errorMessage = "请先连接服务器"
+            print("⚠️ [LiveAI] Not connected - can't start recording")
+            errorMessage = "Please connect to the server first"
             showError = true
             return
         }
 
-        print("🎤 [LiveAI] 开始录音（语音触发模式）- Provider: \(provider.displayName)")
+        print("🎤 [LiveAI] Start recording (voice-trigger mode) - Provider: \(provider.displayName)")
 
         switch provider {
         case .alibaba:
@@ -302,7 +312,7 @@ class OmniRealtimeViewModel: ObservableObject {
     }
 
     func stopRecording() {
-        print("🛑 [LiveAI] 停止录音")
+        print("🛑 [LiveAI] Stop recording")
 
         switch provider {
         case .alibaba:
@@ -318,6 +328,18 @@ class OmniRealtimeViewModel: ObservableObject {
 
     func updateVideoFrame(_ frame: UIImage) {
         currentVideoFrame = frame
+    }
+
+    /// Send the latest glasses frame to Gemini once per second while connected.
+    private func startFrameSendTimer() {
+        frameSendTimer?.invalidate()
+        frameSendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isConnected, let frame = self.currentVideoFrame else { return }
+                self.geminiService?.sendImageInput(frame)
+            }
+        }
+        print("📸 [GeminiVM] Frame drip started (1 fps)")
     }
 
     // MARK: - Manual Mode (if needed)
