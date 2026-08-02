@@ -29,6 +29,9 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
     case hi = "hi"      // 印地语
     case el = "el"      // 希腊语
     case tr = "tr"      // 土耳其语
+    case fil = "fil"
+    case km = "km"
+    case lo = "lo"
 
     var id: String { rawValue }
 
@@ -52,6 +55,9 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         case .hi: return "livetranslate.lang.hi".localized
         case .el: return "livetranslate.lang.el".localized
         case .tr: return "livetranslate.lang.tr".localized
+        case .fil: return "Filipino"
+        case .km: return "Khmer (Cambodia)"
+        case .lo: return "Lao"
         }
     }
 
@@ -75,6 +81,9 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         case .hi: return "🇮🇳"
         case .el: return "🇬🇷"
         case .tr: return "🇹🇷"
+        case .fil: return "🇵🇭"
+        case .km: return "🇰🇭"
+        case .lo: return "🇱🇦"
         }
     }
 
@@ -83,7 +92,7 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .en, .zh, .ja, .ko, .fr, .de, .ru, .es, .pt, .it, .yue:
             return true
-        case .id, .vi, .th, .ar, .hi, .el, .tr:
+        case .id, .vi, .th, .ar, .hi, .el, .tr, .fil, .km, .lo:
             return true
         }
     }
