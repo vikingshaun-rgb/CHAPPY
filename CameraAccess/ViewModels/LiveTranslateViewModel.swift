@@ -81,8 +81,8 @@ class LiveTranslateViewModel: ObservableObject {
         let savedSource = UserDefaults.standard.string(forKey: "translate_source_language") ?? "en"
         self.sourceLanguage = TranslateLanguage(rawValue: savedSource) ?? .en
 
-        let savedTarget = UserDefaults.standard.string(forKey: "translate_target_language") ?? "zh"
-        self.targetLanguage = TranslateLanguage(rawValue: savedTarget) ?? .zh
+        let savedTarget = UserDefaults.standard.string(forKey: "translate_target_language") ?? "en"
+        self.targetLanguage = TranslateLanguage(rawValue: savedTarget) ?? .en
 
         let savedVoice = UserDefaults.standard.string(forKey: "translate_voice") ?? "Cherry"
         self.selectedVoice = TranslateVoice(rawValue: savedVoice) ?? .cherry

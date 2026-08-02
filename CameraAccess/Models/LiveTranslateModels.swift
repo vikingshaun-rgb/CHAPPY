@@ -84,7 +84,7 @@ enum TranslateLanguage: String, CaseIterable, Codable, Identifiable {
         case .en, .zh, .ja, .ko, .fr, .de, .ru, .es, .pt, .it, .yue:
             return true
         case .id, .vi, .th, .ar, .hi, .el, .tr:
-            return false
+            return true
         }
     }
 
@@ -156,7 +156,7 @@ enum TranslateVoice: String, CaseIterable, Codable, Identifiable {
 
     /// 检查音色是否支持指定语种
     func supports(language: TranslateLanguage) -> Bool {
-        supportedLanguages.contains(language)
+        true
     }
 }
 
