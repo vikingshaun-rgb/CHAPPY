@@ -373,20 +373,27 @@ class GeminiLiveService: NSObject {
 
     private var imageSendCount = 0
 
+    // BACKPRESSURE CONTROL: never queue frames behind a slow upload.
+    // If the previous frame is still in flight, SKIP this one — the next
+    // tick sends a fresher frame instead. Queuing was making Gemini see
+    // 10-20 second old pictures on slow connections.
+    private var isFrameSendInFlight = false
+
     func sendImageInput(_ image: UIImage) {
         guard isSessionConfigured else { return }
+        guard !isFrameSendInFlight else { return }
 
-        let prepared = resizedForLive(image)
-        guard var imageData = prepared.jpegData(compressionQuality: 0.8) else {
+        let prepared = resizedForLive(image, maxDimension: 768)
+        guard var imageData = prepared.jpegData(compressionQuality: 0.72) else {
             print("❌ [Gemini] Failed to compress image")
             return
         }
         // Safety net: if still heavy, recompress harder rather than drop
-        if imageData.count > 400 * 1024,
-           let smaller = prepared.jpegData(compressionQuality: 0.5) {
+        if imageData.count > 250 * 1024,
+           let smaller = prepared.jpegData(compressionQuality: 0.45) {
             imageData = smaller
         }
-        guard imageData.count <= 700 * 1024 else {
+        guard imageData.count <= 500 * 1024 else {
             print("⚠️ [Gemini] Frame too large even after recompress - skipping")
             return
         }
@@ -403,7 +410,20 @@ class GeminiLiveService: NSObject {
                 "video": ["data": base64Image, "mime_type": "image/jpeg"]
             ]
         ]
-        sendJSON(message)
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            print("❌ [Gemini] Failed to serialize frame")
+            return
+        }
+
+        isFrameSendInFlight = true
+        webSocket?.send(.string(jsonString)) { [weak self] error in
+            self?.isFrameSendInFlight = false
+            if let error = error {
+                print("❌ [Gemini] Frame send failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Receive Messages
