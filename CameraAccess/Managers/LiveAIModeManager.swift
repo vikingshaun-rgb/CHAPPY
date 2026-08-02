@@ -95,7 +95,7 @@ class LiveAIModeManager: ObservableObject {
 
     /// Get the translate-mode prompt (includes target language)
     private func getTranslatePrompt() -> String {
-        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "Chinese"
+        let targetLanguageName = Self.supportedLanguages.first { $0.code == translateTargetLanguage }?.name ?? "English"
         let basePrompt = "prompt.liveai.translate".localized
         return basePrompt.replacingOccurrences(of: "{LANGUAGE}", with: targetLanguageName)
     }

@@ -42,7 +42,7 @@ class LiveTranslateService: NSObject {
 
     // Translation settings
     private var sourceLanguage: TranslateLanguage = .en
-    private var targetLanguage: TranslateLanguage = .zh
+    private var targetLanguage: TranslateLanguage = .en
     private var voice: TranslateVoice = .cherry
     private var audioOutputEnabled = true
 
