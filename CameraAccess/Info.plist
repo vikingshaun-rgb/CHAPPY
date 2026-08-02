@@ -68,6 +68,8 @@
 	<string>Chappy needs photo library to save photos</string>
 	<key>NSSiriUsageDescription</key>
 	<string>Chappy needs Needs siri to talk to chappy</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Chappy listens for the word stop to end continuous vision</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
