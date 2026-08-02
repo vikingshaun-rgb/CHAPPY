@@ -362,7 +362,7 @@ class GeminiLiveService: NSObject {
     func sendImageInput(_ image: UIImage) {
         guard isSessionConfigured else { return }
         guard isSessionConfigured else { return }
-        guard let imageData = image.jpegData(compressionQuality: 0.6) else {
+        guard let imageData = image.jpegData(compressionQuality: 0.85) else {
             print("❌ [Gemini] Failed to compress image")
             return
         }

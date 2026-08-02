@@ -431,7 +431,7 @@ class LiveTranslateService: NSObject {
         }
         lastImageSendTime = now
 
-        guard let imageData = image.jpegData(compressionQuality: 0.6) else {
+        guard let imageData = image.jpegData(compressionQuality: 0.85) else {
             print("❌ [Translate] Failed to compress image")
             return
         }
