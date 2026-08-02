@@ -671,6 +671,8 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
     /// Catches failures at the HTTP upgrade stage (didOpen never fires) —
     /// 401/403/404 from Google shows up here, visible on TestFlight at last.
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if error == nil { return }
+        if let nsError = error as NSError?, nsError.code == NSURLErrorCancelled { return }
         var details: [String] = []
         if let http = task.response as? HTTPURLResponse {
             details.append("HTTP \(http.statusCode)")

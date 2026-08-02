@@ -628,6 +628,8 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
     /// This is where a 401/403/404 from Google shows up — the exact thing we've
     /// been blind to on TestFlight builds.
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if error == nil { return }
+        if let nsError = error as NSError?, nsError.code == NSURLErrorCancelled { return }
         var details: [String] = []
         if let http = task.response as? HTTPURLResponse {
             details.append("HTTP \(http.statusCode)")
