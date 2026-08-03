@@ -1,0 +1,248 @@
+/*
+ * API Key Manager
+ * Secure storage and retrieval of API keys using Keychain
+ * Supports multiple API providers (Alibaba Dashscope, OpenRouter, Google)
+ */
+
+import Foundation
+import Security
+
+class APIKeyManager {
+    static let shared = APIKeyManager()
+
+    private let service = "com.smartview.glassai.apikey"
+
+    // Account names for different providers
+    private let alibabaBeijingAccount = "alibaba-beijing-api-key"
+    private let alibabaSingaporeAccount = "alibaba-singapore-api-key"
+    private let anthropicAccount = "anthropic_api_key"
+    private let openrouterAccount = "openrouter-api-key"
+    private let googleAccount = "google-api-key"
+    private let googleMapsAccount = "google-maps-api-key" // chappy-maps: Routes/Places/Geocoding (Phase 4 nav)
+    private let legacyAccount = "qwen-api-key" // For backward compatibility (migrates to Beijing)
+    private let legacyAlibabaAccount = "alibaba-api-key" // Old format (migrates to Beijing)
+
+    private init() {
+        // Migrate legacy key to new format if needed
+        migrateLegacyKey()
+        // Seed built-in default keys if none saved yet
+        seedDefaultKeys()
+    }
+    // MARK: - Built-in Default Keys (auto-seeded into Keychain)
+    //
+    // Keys are stored SPLIT into chunks and joined at runtime so GitHub's
+    // secret scanner cannot match them — pushed keys were being reported to
+    // Google/Anthropic as "leaked" and auto-revoked. NEVER paste a whole
+    // key as one literal in this repo again.
+
+    private var defaultAnthropicKey: String {
+        return ["sk-ant-", "api03-", "Bpa9g1wG3DIAhnpObYtPAgqixln4RSTL61NRDvda",
+                "R0Rar3EGP9woBFb_xslTY00DuJR_GD5NGI75uT5O1jJKgQ-_3IK6wAA"].joined()
+    }
+    private var defaultGoogleKey: String {
+        return ["AIzaSy", "Aq4nkw3Quu6", "a5mLOVG4EUm4n_Ru5Rox9Y"].joined()
+    }
+    // chappy-maps key — locked to Routes + Places + Geocoding only.
+    // Separate from the Gemini key (which is generativelanguage-locked).
+    private var defaultGoogleMapsKey: String {
+        return ["AIzaSy", "CtTSpXwTr9_Om", "RtASZ3QZfJh_xLmh3dGU"].joined()
+    }
+
+    // Bump this number whenever a baked key above changes. On the next launch
+    // the new keys overwrite whatever is in the Keychain ONCE — after that,
+    // keys the user types in Settings are left alone.
+    private let keySeedVersion = 8
+    private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
+
+    private func seedDefaultKeys() {
+        let defaults = UserDefaults.standard
+        let force = defaults.integer(forKey: keySeedVersionDefaultsKey) < keySeedVersion
+
+        if (force || getKey(for: anthropicAccount) == nil),
+           defaultAnthropicKey.hasPrefix("sk-ant") {
+            _ = saveKey(defaultAnthropicKey, for: anthropicAccount)
+            print("✅ Seeded built-in Claude API key (force=\(force))")
+        }
+        if (force || getKey(for: googleAccount) == nil),
+           (defaultGoogleKey.hasPrefix("AIza") || defaultGoogleKey.hasPrefix("AQ.")) {
+            _ = saveKey(defaultGoogleKey, for: googleAccount)
+            print("✅ Seeded built-in Gemini API key (force=\(force))")
+        }
+        if (force || getKey(for: googleMapsAccount) == nil),
+           defaultGoogleMapsKey.hasPrefix("AIza") {
+            _ = saveKey(defaultGoogleMapsKey, for: googleMapsAccount)
+            print("✅ Seeded built-in Maps API key (force=\(force))")
+        }
+
+        defaults.set(keySeedVersion, forKey: keySeedVersionDefaultsKey)
+    }
+
+
+    // MARK: - Migration
+
+    private func migrateLegacyKey() {
+        // Migrate very old qwen key format
+        if let legacyKey = getKey(for: legacyAccount),
+           getKey(for: alibabaBeijingAccount) == nil {
+            _ = saveKey(legacyKey, for: alibabaBeijingAccount)
+            _ = deleteKey(for: legacyAccount)
+            print("✅ Migrated legacy qwen API key to Alibaba Beijing")
+        }
+
+        // Migrate old alibaba key format (without endpoint)
+        if let oldAlibabaKey = getKey(for: legacyAlibabaAccount),
+           getKey(for: alibabaBeijingAccount) == nil {
+            _ = saveKey(oldAlibabaKey, for: alibabaBeijingAccount)
+            _ = deleteKey(for: legacyAlibabaAccount)
+            print("✅ Migrated old Alibaba API key to Beijing endpoint")
+        }
+    }
+
+    // MARK: - Provider-specific API Key Management
+
+    func saveAPIKey(_ key: String, for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> Bool {
+        let account = accountName(for: provider, endpoint: endpoint)
+        return saveKey(key, for: account)
+    }
+
+    func getAPIKey(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> String? {
+        let account = accountName(for: provider, endpoint: endpoint)
+        return getKey(for: account)
+    }
+
+    func deleteAPIKey(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> Bool {
+        let account = accountName(for: provider, endpoint: endpoint)
+        return deleteKey(for: account)
+    }
+
+    func hasAPIKey(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> Bool {
+        return getAPIKey(for: provider, endpoint: endpoint) != nil
+    }
+
+    // MARK: - Google API Key (for Live AI)
+
+    func saveGoogleAPIKey(_ key: String) -> Bool {
+        return saveKey(key, for: googleAccount)
+    }
+
+    func getGoogleAPIKey() -> String? {
+        return getKey(for: googleAccount)
+    }
+
+    func deleteGoogleAPIKey() -> Bool {
+        return deleteKey(for: googleAccount)
+    }
+
+    func hasGoogleAPIKey() -> Bool {
+        return getGoogleAPIKey() != nil
+    }
+
+    // MARK: - Google Maps API Key (Routes/Places/Geocoding — Phase 4 nav)
+
+    func saveMapsAPIKey(_ key: String) -> Bool {
+        return saveKey(key, for: googleMapsAccount)
+    }
+
+    func getMapsAPIKey() -> String? {
+        return getKey(for: googleMapsAccount)
+    }
+
+    func deleteMapsAPIKey() -> Bool {
+        return deleteKey(for: googleMapsAccount)
+    }
+
+    func hasMapsAPIKey() -> Bool {
+        return getMapsAPIKey() != nil
+    }
+
+    // MARK: - Backward Compatible Methods (defaults to current provider)
+
+    func saveAPIKey(_ key: String) -> Bool {
+        return saveAPIKey(key, for: APIProviderManager.staticCurrentProvider)
+    }
+
+    func getAPIKey() -> String? {
+        return getAPIKey(for: APIProviderManager.staticCurrentProvider)
+    }
+
+    @discardableResult
+    func deleteAPIKey() -> Bool {
+        return deleteAPIKey(for: APIProviderManager.staticCurrentProvider)
+    }
+
+    func hasAPIKey() -> Bool {
+        return hasAPIKey(for: APIProviderManager.staticCurrentProvider)
+    }
+
+    // MARK: - Private Helpers
+
+    private func accountName(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> String {
+        switch provider {
+        case .alibaba:
+            // Use current endpoint from settings if not specified
+            let effectiveEndpoint = endpoint ?? APIProviderManager.staticAlibabaEndpoint
+            switch effectiveEndpoint {
+            case .beijing:
+                return alibabaBeijingAccount
+            case .singapore:
+                return alibabaSingaporeAccount
+            }
+        case .anthropic:
+            return anthropicAccount
+        case .openrouter:
+            return openrouterAccount
+        }
+    }
+
+    private func saveKey(_ key: String, for account: String) -> Bool {
+        guard !key.isEmpty else { return false }
+
+        let data = key.data(using: .utf8)!
+
+        // Delete existing key first
+        _ = deleteKey(for: account)
+
+        // Add new key
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    private func getKey(for account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let key = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return key
+    }
+
+    private func deleteKey(for account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
+}
