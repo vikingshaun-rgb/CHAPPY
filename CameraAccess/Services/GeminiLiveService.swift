@@ -208,13 +208,6 @@ class GeminiLiveService: NSObject {
                         ["text": instructions]
                     ]
                 ],
-                // PROACTIVE AUDIO: lets the model speak up on its own when it
-                // notices something — the "constant viewing and reporting"
-                // behavior. If connect suddenly fails with a setup error
-                // mentioning proactivity, this field is the first thing to pull.
-                "proactivity": [
-                    "proactive_audio": true
-                ],
                 // Transcripts of BOTH sides — the app's history and the
                 // "read this" trigger depend on these arriving.
                 "input_audio_transcription": [:],
