@@ -33,7 +33,16 @@ enum StreamingStatus {
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
   @Published var hasReceivedFirstFrame: Bool = false
-  @Published var streamingStatus: StreamingStatus = .stopped
+  @Published var streamingStatus: StreamingStatus = .stopped {
+    // POCKET-MODE KEEPALIVE: while the glasses are streaming, hold the
+    // screen awake — iOS stalls the frame pipeline when the display
+    // sleeps (audio survives, video freezes). Auto-releases on stop so
+    // normal auto-lock returns. Covers every start/stop path because
+    // ALL of them flow through streamingStatus.
+    didSet {
+      UIApplication.shared.isIdleTimerDisabled = (streamingStatus != .stopped)
+    }
+  }
   @Published var showError: Bool = false
   @Published var errorMessage: String = ""
   @Published var hasActiveDevice: Bool = false
@@ -76,6 +85,19 @@ class StreamSessionViewModel: ObservableObject {
   init(wearables: WearablesInterface) {
     self.wearables = wearables
     logger.info("🟢 StreamSessionViewModel init (SDK 0.7)")
+
+    // One-time quality upgrade (the saved-value-beats-new-default lesson):
+    // an old saved "medium" was just the old default, not a user choice —
+    // scrub it once so the new "high" default applies. A saved "low" is
+    // left alone (deliberate bandwidth choice).
+    let defaults = UserDefaults.standard
+    if !defaults.bool(forKey: "video_quality_high_migrated_v1") {
+      if defaults.string(forKey: "video_quality") == "medium" {
+        defaults.set("high", forKey: "video_quality")
+        logger.info("🟢 Migrated video_quality medium → high (one-time)")
+      }
+      defaults.set(true, forKey: "video_quality_high_migrated_v1")
+    }
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
 
@@ -93,8 +115,13 @@ class StreamSessionViewModel: ObservableObject {
   // MARK: - Configuration
 
   private func makeStreamConfiguration() -> StreamConfiguration {
-    // Saved video quality setting from UserDefaults
-    let savedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "medium"
+    // Saved video quality setting from UserDefaults.
+    // DEFAULT RAISED medium → high (2026-08-03): the stream source was the
+    // sharpness ceiling — "read this" and eagle vision can only be as sharp
+    // as what the glasses send. Live AI still downsizes its 2fps frames to
+    // 512px before upload, so websocket latency is unaffected; the full-res
+    // frame benefits the hi-res "read this" grab and Quick Vision snaps.
+    let savedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "high"
     let resolution: StreamingResolution
     switch savedQuality {
     case "low":
