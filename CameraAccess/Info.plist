@@ -35,7 +35,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>21</string>
+	<string>22</string>
 	<key>LSApplicationCategoryType</key>
 	<string></string>
 	<key>LSApplicationQueriesSchemes</key>
@@ -63,13 +63,13 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Chappy needs camera to capture photos</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Chappy needs Mic to speak to meta</string>
+	<string>Chappy uses the microphone to hear your voice commands.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Chappy needs photo library to save photos</string>
 	<key>NSSiriUsageDescription</key>
 	<string>Chappy needs Needs siri to talk to chappy</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Chappy listens for the word stop to end continuous vision</string>
+	<string>Chappy listens for voice commands like stop during Continuous Vision.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
