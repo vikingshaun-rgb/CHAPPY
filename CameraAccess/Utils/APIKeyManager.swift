@@ -18,6 +18,7 @@ class APIKeyManager {
     private let anthropicAccount = "anthropic_api_key"
     private let openrouterAccount = "openrouter-api-key"
     private let googleAccount = "google-api-key"
+    private let googleMapsAccount = "google-maps-api-key" // chappy-maps: Routes/Places/Geocoding (Phase 4 nav)
     private let legacyAccount = "qwen-api-key" // For backward compatibility (migrates to Beijing)
     private let legacyAlibabaAccount = "alibaba-api-key" // Old format (migrates to Beijing)
 
@@ -41,11 +42,16 @@ class APIKeyManager {
     private var defaultGoogleKey: String {
         return ["AIzaSy", "Aq4nkw3Quu6", "a5mLOVG4EUm4n_Ru5Rox9Y"].joined()
     }
+    // chappy-maps key — locked to Routes + Places + Geocoding only.
+    // Separate from the Gemini key (which is generativelanguage-locked).
+    private var defaultGoogleMapsKey: String {
+        return ["AIzaSy", "CtTSpXwTr9_Om", "RtASZ3QZfJh_xLmh3dGU"].joined()
+    }
 
     // Bump this number whenever a baked key above changes. On the next launch
     // the new keys overwrite whatever is in the Keychain ONCE — after that,
     // keys the user types in Settings are left alone.
-    private let keySeedVersion = 7
+    private let keySeedVersion = 8
     private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
 
     private func seedDefaultKeys() {
@@ -61,6 +67,11 @@ class APIKeyManager {
            (defaultGoogleKey.hasPrefix("AIza") || defaultGoogleKey.hasPrefix("AQ.")) {
             _ = saveKey(defaultGoogleKey, for: googleAccount)
             print("✅ Seeded built-in Gemini API key (force=\(force))")
+        }
+        if (force || getKey(for: googleMapsAccount) == nil),
+           defaultGoogleMapsKey.hasPrefix("AIza") {
+            _ = saveKey(defaultGoogleMapsKey, for: googleMapsAccount)
+            print("✅ Seeded built-in Maps API key (force=\(force))")
         }
 
         defaults.set(keySeedVersion, forKey: keySeedVersionDefaultsKey)
@@ -124,6 +135,24 @@ class APIKeyManager {
 
     func hasGoogleAPIKey() -> Bool {
         return getGoogleAPIKey() != nil
+    }
+
+    // MARK: - Google Maps API Key (Routes/Places/Geocoding — Phase 4 nav)
+
+    func saveMapsAPIKey(_ key: String) -> Bool {
+        return saveKey(key, for: googleMapsAccount)
+    }
+
+    func getMapsAPIKey() -> String? {
+        return getKey(for: googleMapsAccount)
+    }
+
+    func deleteMapsAPIKey() -> Bool {
+        return deleteKey(for: googleMapsAccount)
+    }
+
+    func hasMapsAPIKey() -> Bool {
+        return getMapsAPIKey() != nil
     }
 
     // MARK: - Backward Compatible Methods (defaults to current provider)
