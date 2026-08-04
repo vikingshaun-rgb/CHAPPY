@@ -8,6 +8,7 @@
 import SwiftUI
 import AVFoundation
 import Speech
+import MapKit
 
 struct TurboMetaHomeView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
@@ -15,6 +16,8 @@ struct TurboMetaHomeView: View {
     @StateObject private var quickVisionManager = QuickVisionManager.shared
     @StateObject private var liveAIManager = LiveAIManager.shared
     @StateObject private var continuousVision = ContinuousVisionManager.shared
+    @StateObject private var navEngine = NavEngine.shared
+    @State private var showNavMap = false
     let apiKey: String
 
     @State private var showLiveAI = false
@@ -111,6 +114,49 @@ struct TurboMetaHomeView: View {
                                     continuousVision.stop()
                                 } else {
                                     continuousVision.start(streamViewModel: streamViewModel)
+                                }
+                            }
+
+                            // PHASE 4: Navigation status card — appears only while navigating
+                            if navEngine.isNavigating {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "location.north.circle.fill")
+                                            .font(.title)
+                                            .foregroundColor(.green)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("→ \(navEngine.destinationName)")
+                                                .font(.headline)
+                                                .foregroundColor(.white)
+                                            Text(navEngine.nextInstruction)
+                                                .font(.subheadline)
+                                                .foregroundColor(.white.opacity(0.85))
+                                                .lineLimit(2)
+                                        }
+                                        Spacer()
+                                        Text(navEngine.distanceText)
+                                            .font(.headline)
+                                            .foregroundColor(.green)
+                                    }
+                                    HStack(spacing: 10) {
+                                        Button { showNavMap = true } label: {
+                                            Label("Map", systemImage: "map")
+                                                .frame(maxWidth: .infinity)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.blue)
+                                        Button { navEngine.stop(announce: true) } label: {
+                                            Label("Stop", systemImage: "xmark.circle")
+                                                .frame(maxWidth: .infinity)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.red)
+                                    }
+                                }
+                                .padding(14)
+                                .background(RoundedRectangle(cornerRadius: 18).fill(Color.black.opacity(0.4)))
+                                .sheet(isPresented: $showNavMap) {
+                                    NavMapSheet(navEngine: navEngine)
                                 }
                             }
 
@@ -531,5 +577,66 @@ struct ScaleButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
             .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Navigation Map (Phase 4 Step 6)
+// On-demand map: appears ONLY when asked — voice-first always.
+// Route drawn on MapKit (display), routing data from Google (NavEngine).
+
+struct NavMapSheet: View {
+    @ObservedObject var navEngine: NavEngine
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            RouteMapView(coords: navEngine.routeCoords, destination: navEngine.destinationCoord)
+                .ignoresSafeArea(edges: .bottom)
+                .navigationTitle(navEngine.destinationName)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+        }
+    }
+}
+
+struct RouteMapView: UIViewRepresentable {
+    let coords: [CLLocationCoordinate2D]
+    let destination: CLLocationCoordinate2D?
+
+    func makeUIView(context: Context) -> MKMapView {
+        let map = MKMapView()
+        map.showsUserLocation = true
+        map.delegate = context.coordinator
+        if !coords.isEmpty {
+            let line = MKPolyline(coordinates: coords, count: coords.count)
+            map.addOverlay(line)
+            map.setVisibleMapRect(line.boundingMapRect.insetBy(dx: -600, dy: -600), animated: false)
+        }
+        if let d = destination {
+            let pin = MKPointAnnotation()
+            pin.coordinate = d
+            map.addAnnotation(pin)
+        }
+        return map
+    }
+
+    func updateUIView(_ map: MKMapView, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let line = overlay as? MKPolyline {
+                let r = MKPolylineRenderer(polyline: line)
+                r.strokeColor = .systemGreen
+                r.lineWidth = 5
+                return r
+            }
+            return MKOverlayRenderer(overlay: overlay)
+        }
     }
 }
