@@ -1177,6 +1177,32 @@ class GeminiLiveService: NSObject {
                     journalCommandFired = true
                     Task { @MainActor in NavEngine.shared.stop() }
                     sendAppReply("Navigation has been stopped. Briefly confirm to the user.")
+                } else if lower.contains("google maps") || lower.contains("open maps")
+                    || lower.contains("open the maps") || lower.contains("real maps") {
+                    // GOOGLE MAPS HANDOFF: launch the real Google Maps app
+                    // with the current/last destination pre-loaded.
+                    journalCommandFired = true
+                    Task { @MainActor in
+                        let nav = NavEngine.shared
+                        var url: URL?
+                        if let d = nav.destinationCoord {
+                            let mode = nav.lastDriving ? "driving" : "walking"
+                            let appURL = URL(string: "comgooglemaps://?daddr=\(d.latitude),\(d.longitude)&directionsmode=\(mode)")
+                            if let u = appURL, UIApplication.shared.canOpenURL(u) {
+                                url = u
+                            } else {
+                                url = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(d.latitude),\(d.longitude)&travelmode=\(mode)")
+                            }
+                        } else if let q = nav.lastQuery?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                            url = URL(string: "https://www.google.com/maps/search/?api=1&query=\(q)")
+                        }
+                        if let u = url {
+                            await UIApplication.shared.open(u)
+                            self.sendAppReply("Google Maps is opening on the phone with the destination loaded. Confirm this briefly.")
+                        } else {
+                            self.sendAppReply("Navigation: no destination known yet. Ask the user where they want to go first.")
+                        }
+                    }
                 } else if lower.contains("get me home") || lower.contains("take me home") {
                     journalCommandFired = true
                     Task { @MainActor in
