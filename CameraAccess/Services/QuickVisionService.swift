@@ -187,6 +187,8 @@ class QuickVisionService {
                 "content": [
                     ["type": "image",
                      "source": ["type": "base64", "media_type": "image/jpeg", "data": imageB64]],
+                    // PHASE 4: context rides in the USER text (not the system
+                    // prompt) so the cached system prompt stays cache-hittable
                     ["type": "text", "text": prompt + "\n\n[Context: " + ContextEngine.shared.contextHeader() + "]"]
                 ]
             ]],

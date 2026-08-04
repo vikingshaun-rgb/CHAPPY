@@ -37,12 +37,21 @@ class GeminiLiveService: NSObject {
 
     // SESSION CONTINUITY (Phase 4 Step 8, part 1): Gemini live sessions have
     // a max duration — the server warns with a goAway message, then aborts
-    // with 1008 if the client does not act. We store the rotating resumption
+    // with 1008 if the client doesn't act. We store the rotating resumption
     // handle and auto-reconnect into the SAME session (context intact).
     private var resumptionHandle: String?
     private var isRenewingSession = false
     private var renewalCount = 0
     private var speechFrameFired = false
+    private var journalCommandFired = false
+
+    // STEP 8 FUSION: the live session other modules can speak through
+    static weak var activeInstance: GeminiLiveService?
+
+    // STEP 8 CONTINUITY PART 2: rolling conversation memory for re-briefs
+    private var currentUserLine = ""
+    private var currentModelLine = ""
+    private var recentLines: [String] = []
     private let playbackAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
     private let recordTargetFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
     private var recordConverter: AVAudioConverter?
@@ -195,6 +204,7 @@ class GeminiLiveService: NSObject {
         }
 
         didReportSocketError = false
+        GeminiLiveService.activeInstance = self
 
         let configuration = URLSessionConfiguration.default
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
@@ -211,6 +221,7 @@ class GeminiLiveService: NSObject {
 
     func disconnect() {
         print("🔌 [Gemini] Disconnect the WebSocket")
+        if GeminiLiveService.activeInstance === self { GeminiLiveService.activeInstance = nil }
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -226,7 +237,8 @@ class GeminiLiveService: NSObject {
         guard !isSessionConfigured else { return }
 
         // Get the system prompt for the current Live AI mode
-        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers in the MOST RECENT frame, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked."
+        // PHASE 4: live context header — Chappy knows where/when it is
+        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers in the MOST RECENT frame, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked. TOOLS ARE YOUR HANDS: use your function tools freely and unprompted - navigate_to when the user wants to go somewhere, remember_spot to save places, save_observation whenever you notice something notable worth remembering, alert_when_near for stop-watching, deep_research for questions needing thorough current facts (say you are digging into it first), open_app or open_website to act on the phone, and emergency IMMEDIATELY if the user is in danger. Never say you cannot do these things - call the tool."
 
         // Use the voice chosen in Settings → Voice (was hardcoded to Aoede,
         // which silently ignored the user's picker). "System" (Apple TTS)
@@ -263,8 +275,8 @@ class GeminiLiveService: NSObject {
                 // "read this" trigger depend on these arriving.
                 "input_audio_transcription": [:],
                 "output_audio_transcription": [:],
-                // SESSION CONTINUITY: server sends resumption handles;
-                // on renew we pass the stored handle to resume the session.
+                // SESSION CONTINUITY: ask the server for resumption handles;
+                // on renew we pass the stored handle to resume the same session.
                 "session_resumption": (resumptionHandle != nil ? ["handle": resumptionHandle!] : [:]) as [String: Any],
                 // FASTER TURNS: respond ~half a second after you stop talking
                 // instead of waiting out a long silence.
@@ -284,7 +296,41 @@ class GeminiLiveService: NSObject {
                 // conversion, splitting bills, distances) — no client code needed.
                 "tools": [
                     ["google_search": [:]],
-                    ["code_execution": [:]]
+                    ["code_execution": [:]],
+                    // PHASE 4 STEP 7 — THE HANDS: real function tools.
+                    ["function_declarations": [
+                        ["name": "navigate_to",
+                         "description": "Start hands-free walking navigation to a destination: a place name, shop, address, or a remembered spot.",
+                         "parameters": ["type": "OBJECT", "properties": ["destination": ["type": "STRING", "description": "Where to go"]], "required": ["destination"]]],
+                        ["name": "get_me_home",
+                         "description": "Navigate the user back to their saved home or hotel spot."],
+                        ["name": "stop_navigation",
+                         "description": "Stop the current navigation."],
+                        ["name": "remember_spot",
+                         "description": "Save the user's current location as a named spot they can navigate back to later.",
+                         "parameters": ["type": "OBJECT", "properties": ["name": ["type": "STRING", "description": "Name for this spot, e.g. home, the good coffee place"]], "required": ["name"]]],
+                        ["name": "query_journal",
+                         "description": "Get today's travel journal: places passed through, remembered spots, observations."],
+                        ["name": "retrace_steps",
+                         "description": "Get the route back the way the user came today."],
+                        ["name": "save_observation",
+                         "description": "Save a notable observation to the travel journal - an interesting shop, price, landmark or fact worth remembering. Use this UNPROMPTED when you notice something notable.",
+                         "parameters": ["type": "OBJECT", "properties": ["text": ["type": "STRING"]], "required": ["text"]]],
+                        ["name": "alert_when_near",
+                         "description": "Watch the user's location and tell them when they get near a place (like their bus stop or a landmark).",
+                         "parameters": ["type": "OBJECT", "properties": ["place": ["type": "STRING"]], "required": ["place"]]],
+                        ["name": "open_website",
+                         "description": "Open a website on the user's phone.",
+                         "parameters": ["type": "OBJECT", "properties": ["url": ["type": "STRING"]], "required": ["url"]]],
+                        ["name": "open_app",
+                         "description": "Open an app on the phone by name: grab, gojek, whatsapp, google maps, youtube, instagram, telegram.",
+                         "parameters": ["type": "OBJECT", "properties": ["app": ["type": "STRING"]], "required": ["app"]]],
+                        ["name": "deep_research",
+                         "description": "Send a question to the deep research brain for a thorough, current-facts answer (visa rules, is this a scam, detailed history of a temple, comparing options). Takes ~20 seconds - tell the user you are digging into it first.",
+                         "parameters": ["type": "OBJECT", "properties": ["question": ["type": "STRING"]], "required": ["question"]]],
+                        ["name": "emergency",
+                         "description": "EMERGENCY: the user is in danger or urgently needs help. Speaks their exact location and the local emergency number, and opens a WhatsApp alert to their trusted contact."]
+                    ]]
                 ]
             ]
         ]
@@ -420,6 +466,155 @@ class GeminiLiveService: NSObject {
     }
 
     // MARK: - Send Events
+
+    // MARK: - Tool Dispatch (Phase 4 Step 7)
+
+    private func handleToolCall(_ toolCall: [String: Any]) {
+        guard let calls = toolCall["functionCalls"] as? [[String: Any]] else { return }
+        Task { @MainActor in
+            var responses: [[String: Any]] = []
+            for call in calls {
+                let name = call["name"] as? String ?? ""
+                let id = call["id"] as? String ?? ""
+                let args = call["args"] as? [String: Any] ?? [:]
+                let result = await self.runTool(name: name, args: args)
+                responses.append(["id": id, "name": name, "response": ["result": result]])
+            }
+            self.sendJSON(["tool_response": ["function_responses": responses]])
+        }
+    }
+
+    @MainActor
+    private func runTool(name: String, args: [String: Any]) async -> String {
+        print("🔧 [Gemini] Tool: \(name) args: \(args)")
+        switch name {
+        case "navigate_to":
+            return await NavEngine.shared.navigate(to: args["destination"] as? String ?? "")
+        case "get_me_home":
+            return await NavEngine.shared.getHome()
+        case "stop_navigation":
+            NavEngine.shared.stop()
+            return "Navigation stopped."
+        case "remember_spot":
+            let spot = TripRecorder.shared.rememberSpot(named: args["name"] as? String ?? "")
+            return "Saved current location as '\(spot.name)'."
+        case "query_journal":
+            return TripRecorder.shared.todaySummary()
+        case "retrace_steps":
+            return TripRecorder.shared.retraceGuidance()
+        case "save_observation":
+            TripRecorder.shared.addObservation(args["text"] as? String ?? "")
+            return "Noted in the journal."
+        case "alert_when_near":
+            return await NavEngine.shared.alertWhenNear(args["place"] as? String ?? "")
+        case "open_website":
+            if let s = args["url"] as? String, let u = URL(string: s.hasPrefix("http") ? s : "https://" + s) {
+                await UIApplication.shared.open(u)
+                return "Opened \(s) on the phone."
+            }
+            return "Invalid URL."
+        case "open_app":
+            return openApp(args["app"] as? String ?? "")
+        case "deep_research":
+            return await performDeepResearch(args["question"] as? String ?? "")
+        case "emergency":
+            return await runEmergency()
+        default:
+            return "Unknown tool \(name)."
+        }
+    }
+
+    @MainActor
+    private func openApp(_ app: String) -> String {
+        let map: [String: String] = [
+            "grab": "grab://", "gojek": "gojek://", "whatsapp": "whatsapp://",
+            "google maps": "comgooglemaps://", "maps": "maps://",
+            "youtube": "youtube://", "instagram": "instagram://", "telegram": "tg://"
+        ]
+        let key = app.lowercased()
+        guard let scheme = map.first(where: { key.contains($0.key) })?.value, let u = URL(string: scheme) else {
+            return "No link known for \(app)."
+        }
+        UIApplication.shared.open(u)
+        return "Opening \(app) on the phone."
+    }
+
+    /// STEP 7: deep_research → the Claude brain (thorough, current, speakable)
+    private func performDeepResearch(_ question: String) async -> String {
+        guard !question.isEmpty else { return "No question given." }
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            return "Research brain unavailable - no key configured."
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 90
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": 1500,
+            "system": "You are the deep-research brain of Chappy, a voice assistant for a traveller in Asia. Current context: \(ContextEngine.shared.contextHeader()) Answer thoroughly but SPEAKABLE: plain sentences, no markdown, no lists, under 250 words. Use web search for current facts.",
+            "messages": [["role": "user", "content": question]],
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 5]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else {
+            return "Research failed - the deep brain did not answer this time."
+        }
+        let text = content.compactMap { ($0["type"] as? String) == "text" ? ($0["text"] as? String) : nil }.joined(separator: " ")
+        return text.isEmpty ? "Research came back empty." : text
+    }
+
+    /// STEP 7: EMERGENCY PROTOCOL — location + local number + WhatsApp alert
+    @MainActor
+    private func runEmergency() async -> String {
+        let snap = ContextEngine.shared.snapshot
+        var address = ""
+        if let s = snap.street { address += s }
+        if let c = snap.city { address += address.isEmpty ? c : ", \(c)" }
+        if let co = snap.country { address += address.isEmpty ? co : ", \(co)" }
+        if address.isEmpty { address = "location unknown - GPS not fixed yet" }
+        let numbers: [String: String] = ["ID": "112", "TH": "191", "VN": "113", "PH": "911",
+                                         "KH": "117", "LA": "1191", "MY": "999", "SG": "995", "AU": "000"]
+        let emergencyNumber = numbers[snap.countryCode ?? ""] ?? "112"
+        var report = "EMERGENCY. The user is at \(address). The local emergency number is \(emergencyNumber)."
+        if let lat = snap.latitude, let lon = snap.longitude {
+            report += " Coordinates \(lat), \(lon)."
+            let contact = UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? ""
+            if !contact.isEmpty,
+               let u = URL(string: "https://wa.me/\(contact)?text=EMERGENCY%20-%20I%20need%20help.%20My%20location:%20https://maps.google.com/?q=\(lat),\(lon)") {
+                UIApplication.shared.open(u)
+                report += " A WhatsApp emergency message to the trusted contact is open on the phone - press send."
+            }
+        }
+        return report + " Read ALL of this to the user immediately, clearly and calmly, and repeat the emergency number."
+    }
+
+    /// STEP 8 FUSION: nav speaks THROUGH the live conversation — Chappy's
+    /// voice, camera-aware turns referencing what the user can actually see.
+    func announceNavStep(_ instruction: String) {
+        sendAppReply("Navigation instruction to deliver NOW: '\(instruction)'. Say it briefly in one sentence; if a distinctive landmark visible in the current camera frame marks the turn (a shop, sign or building), mention it - like: turn right at the 7-Eleven ahead.")
+    }
+
+    /// PHASE 4: hand the model an app-computed answer to speak (journal
+    /// results, saved-spot confirmations). Sent as a completed user turn
+    /// so Chappy replies out loud in its own voice.
+    private func sendAppReply(_ text: String) {
+        sendJSON([
+            "client_content": [
+                "turns": [[
+                    "role": "user",
+                    "parts": [["text": "[APP MESSAGE - this is from the app, not spoken by the user] " + text]]
+                ]],
+                "turn_complete": true
+            ]
+        ])
+    }
 
     private func sendJSON(_ json: [String: Any]) {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: json),
@@ -595,15 +790,16 @@ class GeminiLiveService: NSObject {
                 self.isSessionConfigured = true
                 self.onConnected?()
                 // POST-RENEWAL RE-BRIEF: resumed sessions can come back with
-                // amnesia. Re-inject identity as silent context and drop a
-                // visible marker in the chat so renewals show themselves.
+                // amnesia ("I'm just a language model"). Re-inject identity as
+                // silent context (turn_complete false = no spoken reply) and
+                // drop a visible marker in the chat so renewals show themselves.
                 if self.renewalCount > 0 {
                     self.onTranscriptDone?("🔁 [session renewed #\(self.renewalCount)]")
                     self.sendJSON([
                         "client_content": [
                             "turns": [[
                                 "role": "user",
-                                "parts": [["text": "SYSTEM REMINDER, do not reply to this: you are still Chappy, Shauns glasses assistant. All persona, identity and vision rules remain fully in force. Live camera frames keep streaming from the glasses - always describe what they show when asked. Never call yourself a language model. Current context: \(ContextEngine.shared.contextHeader())"]]
+                                "parts": [["text": "SYSTEM REMINDER, do not reply to this: you are still Chappy, Shaun's glasses assistant. All persona, identity and vision rules remain fully in force. Live camera frames keep streaming from the glasses - always describe what they show when asked. Never call yourself a language model. Current context: \(ContextEngine.shared.contextHeader())\(recentLines.isEmpty ? "" : " Recent conversation before the reconnect: " + recentLines.suffix(10).joined(separator: " | ") + " Continue naturally from there.")"]]
                             ]],
                             "turn_complete": false
                         ]
@@ -620,7 +816,7 @@ class GeminiLiveService: NSObject {
                 return
             }
 
-            // goAway: session clock expiring — reconnect gracefully now,
+            // goAway: session clock expiring — reconnect gracefully NOW,
             // resuming the same session via the stored handle.
             if json["goAway"] != nil {
                 print("⏳ [Gemini] goAway received — renewing session")
@@ -634,9 +830,9 @@ class GeminiLiveService: NSObject {
                 return
             }
 
-            // Handle tool calls (if any)
+            // PHASE 4 STEP 7: real tool dispatch — Chappy's hands
             if let toolCall = json["toolCall"] as? [String: Any] {
-                print("🔧 [Gemini] Tool call: \(toolCall)")
+                self.handleToolCall(toolCall)
                 return
             }
 
@@ -680,8 +876,19 @@ class GeminiLiveService: NSObject {
             print("✅ [Gemini] AIReply complete")
             finishAudioPlayback()
             onTranscriptDone?("")
-            // Re-arm the instant-eyes trigger for the next question
+            // Re-arm the instant-eyes + journal triggers for the next question
             speechFrameFired = false
+            journalCommandFired = false
+            // STEP 8: roll the finished turn into the conversation memory
+            if !currentUserLine.isEmpty {
+                recentLines.append("User: " + currentUserLine)
+                currentUserLine = ""
+            }
+            if !currentModelLine.isEmpty {
+                recentLines.append("Chappy: " + currentModelLine)
+                currentModelLine = ""
+            }
+            if recentLines.count > 20 { recentLines.removeFirst(recentLines.count - 20) }
         }
 
         // Check for interrupted flag
@@ -695,8 +902,10 @@ class GeminiLiveService: NSObject {
         if let inputTranscription = content["inputTranscription"] as? [String: Any],
            let text = inputTranscription["text"] as? String {
             print("👤 [Gemini] User said: \(text)")
-            // INSTANT EYES: fire a fresh frame the moment the user starts
-            // talking, so answers ground in what they see RIGHT NOW.
+            currentUserLine += text
+            // INSTANT EYES: the moment the user starts talking, fire a fresh
+            // frame immediately (no waiting for the next 0.5s tick) so the
+            // answer is grounded in what they are looking at RIGHT NOW.
             if !speechFrameFired {
                 speechFrameFired = true
                 onSpeechStarted?()
@@ -712,12 +921,74 @@ class GeminiLiveService: NSObject {
                 print("📖 [Gemini] Read request detected — requesting high-res frame")
                 onReadRequest?()
             }
+
+            // PHASE 4 STEP 4 — JOURNAL VOICE COMMANDS (pre-tool-calling
+            // bridge, same trick as "read this"): the app does the work,
+            // then hands Chappy the answer to speak in its own voice.
+            if !journalCommandFired {
+                if lower.contains("remember this spot") || lower.contains("remember this place")
+                    || lower.contains("remember where") {
+                    journalCommandFired = true
+                    var name = ""
+                    if let r = text.range(of: "call it ", options: .caseInsensitive) {
+                        name = String(text[r.upperBound...])
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .trimmingCharacters(in: .punctuationCharacters)
+                    }
+                    let spot = TripRecorder.shared.rememberSpot(named: name)
+                    sendAppReply("The app just saved this location as a remembered spot named '\(spot.name)'. Briefly confirm this to the user in one short sentence.")
+                } else if lower.contains("where was i") || lower.contains("where have i been")
+                    || lower.contains("where did i go") {
+                    journalCommandFired = true
+                    sendAppReply("Journal answer: \(TripRecorder.shared.todaySummary()) Relay this to the user naturally and briefly.")
+                } else if lower.contains("i'm lost") || lower.contains("im lost") || lower.contains("i am lost") {
+                    journalCommandFired = true
+                    sendAppReply("Location help: \(TripRecorder.shared.lostReport()) Relay this calmly and briefly, then offer to retrace their steps.")
+                } else if lower.contains("trace my steps") || lower.contains("retrace my steps")
+                    || lower.contains("way i came") {
+                    journalCommandFired = true
+                    sendAppReply("Retrace data: \(TripRecorder.shared.retraceGuidance()) Relay the route back to the user briefly.")
+                } else if lower.contains("chappy emergency") || lower.contains("emergency emergency") {
+                    journalCommandFired = true
+                    Task { @MainActor in
+                        let report = await self.runEmergency()
+                        self.sendAppReply(report)
+                    }
+                } else if lower.contains("stop navigation") || lower.contains("stop navigating")
+                    || lower.contains("cancel navigation") {
+                    journalCommandFired = true
+                    Task { @MainActor in NavEngine.shared.stop() }
+                    sendAppReply("Navigation has been stopped. Briefly confirm to the user.")
+                } else if lower.contains("get me home") || lower.contains("take me home") {
+                    journalCommandFired = true
+                    Task { @MainActor in
+                        let reply = await NavEngine.shared.getHome()
+                        self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+                    }
+                } else if let navRange = text.range(of: "navigate to ", options: .caseInsensitive)
+                    ?? text.range(of: "take me to ", options: .caseInsensitive)
+                    ?? text.range(of: "walk me to ", options: .caseInsensitive) {
+                    journalCommandFired = true
+                    let dest = String(text[navRange.upperBound...])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .trimmingCharacters(in: .punctuationCharacters)
+                    if dest.count > 2 {
+                        Task { @MainActor in
+                            let reply = await NavEngine.shared.navigate(to: dest)
+                            self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+                        }
+                    } else {
+                        journalCommandFired = false
+                    }
+                }
+            }
         }
 
         // Handle output transcription (AI speech text)
         if let outputTranscription = content["outputTranscription"] as? [String: Any],
            let text = outputTranscription["text"] as? String {
             print("💬 [Gemini] AIText: \(text)")
+            currentModelLine += text
             onTranscriptDelta?(text)
         }
     }
@@ -847,7 +1118,8 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
         let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason given"
         print("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
         // Session-duration abort (1008 after a missed goAway): reconnect
-        // silently instead of showing an error.
+        // silently instead of showing an error — the renewed session resumes
+        // where it left off via the resumption handle.
         if closeCode.rawValue == 1008 && reasonString.lowercased().contains("goaway") {
             print("⏳ [Gemini] Session-duration abort — auto-renewing")
             DispatchQueue.main.async { self.renewSession() }
@@ -861,7 +1133,7 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
 
     /// SESSION CONTINUITY: tear down just the socket and reconnect with the
     /// stored resumption handle. Mic and playback keep running — the send
-    /// gate holds frames and audio until the renewed session is configured.
+    /// gate holds frames/audio until the renewed session is configured.
     private func renewSession() {
         guard !isRenewingSession else { return }
         isRenewingSession = true
