@@ -541,14 +541,20 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         start()
         var bits: [String] = []
         let df = DateFormatter()
-        df.dateFormat = "EEEE h:mma"
-        bits.append("It is \(df.string(from: Date())) local time")
+        df.dateFormat = "EEEE d MMMM yyyy, h:mma"
+        let tz = TimeZone.current
+        bits.append("It is \(df.string(from: Date())) LOCAL time, timezone \(tz.abbreviation() ?? tz.identifier)")
         var place: [String] = []
         if let s = snapshot.street { place.append(s) }
         if let s = snapshot.suburb, s != snapshot.city { place.append(s) }
         if let c = snapshot.city { place.append(c) }
         if let c = snapshot.country { place.append(c) }
-        if !place.isEmpty { bits.append("the user is at " + place.joined(separator: ", ")) }
+        if !place.isEmpty {
+            bits.append("the user is at " + place.joined(separator: ", "))
+        } else if let la = snapshot.latitude, let lo = snapshot.longitude {
+            // GPS locked but street name not resolved yet — still useful
+            bits.append(String(format: "the user is at GPS %.4f, %.4f", la, lo))
+        }
         if let w = snapshot.weather, let t = snapshot.temperatureC {
             bits.append("weather \(w), \(Int(t.rounded())) degrees C")
         }
@@ -899,8 +905,13 @@ final class NavEngine: NSObject, ObservableObject {
         return "Could not find \(place) nearby to watch for."
     }
 
+    /// Last destination the user asked for — lets "navigate via car" work
+    /// as a follow-up without repeating the destination.
+    private(set) var lastQuery: String?
+
     /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
-    func navigate(to query: String) async -> String {
+    func navigate(to query: String, driving: Bool = false) async -> String {
+        lastQuery = query
         let snap = ContextEngine.shared.snapshot
         guard let lat = snap.latitude, let lon = snap.longitude else {
             return "No GPS fix yet - ask the user to try again in a few seconds."
@@ -919,10 +930,10 @@ final class NavEngine: NSObject, ObservableObject {
         guard let destination = dest else {
             return "Could not find '\(query)' nearby. Ask the user to try a different name."
         }
-        var routed = await googleRoute(fromLat: lat, fromLon: lon, to: destination)
-        if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: destination) }
+        var routed = await googleRoute(fromLat: lat, fromLon: lon, to: destination, driving: driving)
+        if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: destination, driving: driving) }
         guard let route = routed, !route.steps.isEmpty else {
-            return "Could not find a walking route to \(destName)."
+            return "Could not find a \(driving ? "driving" : "walking") route to \(destName)."
         }
         steps = route.steps
         routeCoords = route.coords
@@ -932,7 +943,10 @@ final class NavEngine: NSObject, ObservableObject {
         isNavigating = true
         updateCard()
         let mins = max(1, Int(route.durationSec / 60))
-        return "Route to \(destName) found: about \(Int(route.distanceMeters)) meters, roughly \(mins) minutes walking. First step: \(steps[0].instruction)."
+        let distText = route.distanceMeters >= 2000
+            ? String(format: "%.1f kilometers", route.distanceMeters / 1000)
+            : "\(Int(route.distanceMeters)) meters"
+        return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction)."
     }
 
     func getHome() async -> String {
@@ -998,7 +1012,7 @@ final class NavEngine: NSObject, ObservableObject {
         let durationSec: Double
     }
 
-    private func googleRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D) async -> Routed? {
+    private func googleRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D, driving: Bool = false) async -> Routed? {
         let key = APIKeyManager.shared.getMapsAPIKey() ?? ""
         guard !key.isEmpty, let url = URL(string: "https://routes.googleapis.com/directions/v2:computeRoutes") else { return nil }
         var req = URLRequest(url: url)
@@ -1009,7 +1023,7 @@ final class NavEngine: NSObject, ObservableObject {
         let body: [String: Any] = [
             "origin": ["location": ["latLng": ["latitude": fromLat, "longitude": fromLon]]],
             "destination": ["location": ["latLng": ["latitude": to.latitude, "longitude": to.longitude]]],
-            "travelMode": "WALK"
+            "travelMode": driving ? "DRIVE" : "WALK"
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return nil }
@@ -1038,11 +1052,11 @@ final class NavEngine: NSObject, ObservableObject {
         return Routed(steps: navSteps, coords: poly, distanceMeters: dist, durationSec: dur)
     }
 
-    private func mapKitRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D) async -> Routed? {
+    private func mapKitRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D, driving: Bool = false) async -> Routed? {
         let req = MKDirections.Request()
         req.source = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: fromLat, longitude: fromLon)))
         req.destination = MKMapItem(placemark: MKPlacemark(coordinate: to))
-        req.transportType = .walking
+        req.transportType = driving ? .automobile : .walking
         guard let resp = try? await MKDirections(request: req).calculate(), let route = resp.routes.first else { return nil }
         var navSteps: [NavStep] = []
         for s in route.steps where !s.instructions.isEmpty {
