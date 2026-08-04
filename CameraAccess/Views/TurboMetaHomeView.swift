@@ -32,168 +32,182 @@ struct TurboMetaHomeView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                // Background gradient
+                // THE FACE (Phase 4.9): dark-first, one accent, big targets.
+                // Re-skin only — every action fires the exact same wiring
+                // as the old grid (no-breakage law).
                 LinearGradient(
-                    colors: [
-                        AppColors.primary.opacity(0.1),
-                        AppColors.secondary.opacity(0.1)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+                    colors: [Color(red: 0.05, green: 0.08, blue: 0.11),
+                             Color(red: 0.02, green: 0.03, blue: 0.05)],
+                    startPoint: .top, endPoint: .bottom
                 )
                 .ignoresSafeArea()
 
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: AppSpacing.lg) {
-                        // Header
-                        VStack(spacing: AppSpacing.sm) {
-                            Text("app.name".localized)
-                                .font(AppTypography.largeTitle)
-                                .foregroundColor(AppColors.textPrimary)
-
-                            Text("app.subtitle".localized)
-                                .font(AppTypography.callout)
-                                .foregroundColor(AppColors.textSecondary)
+                    VStack(spacing: 16) {
+                        // ORB HEADER — glows when Chappy is live
+                        VStack(spacing: 8) {
+                            Circle()
+                                .fill(RadialGradient(
+                                    colors: [Color(red: 0.28, green: 0.9, blue: 0.63),
+                                             Color(red: 0.03, green: 0.36, blue: 0.25)],
+                                    center: .init(x: 0.35, y: 0.3),
+                                    startRadius: 2, endRadius: 34))
+                                .frame(width: 58, height: 58)
+                                .shadow(color: Color(red: 0.28, green: 0.9, blue: 0.63)
+                                    .opacity(liveAIManager.isRunning ? 0.8 : 0.35),
+                                    radius: liveAIManager.isRunning ? 18 : 10)
+                            Text("Chappy")
+                                .font(.system(size: 30, weight: .bold, design: .rounded))
+                                .foregroundColor(.white)
+                            Text(liveAIManager.isRunning ? "Listening — just talk"
+                                 : (continuousVision.isRunning ? "Watching — say chappy stop to end"
+                                    : "Ready when you are"))
+                                .font(.subheadline)
+                                .foregroundColor(.white.opacity(0.55))
                         }
-                        .padding(.top, AppSpacing.xl)
+                        .padding(.top, 18)
 
-                        // Feature Grid
-                        VStack(spacing: AppSpacing.md) {
-                            // Row 1
-                            HStack(spacing: AppSpacing.md) {
-                                FeatureCard(
-                                    title: "home.liveai.title".localized,
-                                    subtitle: "home.liveai.subtitle".localized,
-                                    icon: "brain.head.profile",
-                                    gradient: [AppColors.liveAI, AppColors.liveAI.opacity(0.7)]
-                                ) {
+                        // STATUS STRIP
+                        HStack(spacing: 8) {
+                            StatusChip(label: "Glasses", on: streamViewModel.hasActiveDevice)
+                            StatusChip(label: "Camera", on: streamViewModel.streamingStatus == .streaming)
+                            StatusChip(label: "Live AI", on: liveAIManager.isRunning)
+                            StatusChip(label: "Vision", on: continuousVision.isRunning)
+                        }
+
+                        // NAVIGATION CARD — appears only while navigating
+                        if navEngine.isNavigating {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "location.north.circle.fill")
+                                        .font(.title)
+                                        .foregroundColor(.green)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("→ \(navEngine.destinationName)")
+                                            .font(.headline)
+                                            .foregroundColor(.white)
+                                        Text(navEngine.nextInstruction)
+                                            .font(.subheadline)
+                                            .foregroundColor(.white.opacity(0.85))
+                                            .lineLimit(2)
+                                    }
+                                    Spacer()
+                                    Text(navEngine.distanceText)
+                                        .font(.headline)
+                                        .foregroundColor(.green)
+                                }
+                                HStack(spacing: 10) {
+                                    Button { showNavMap = true } label: {
+                                        Label("Map", systemImage: "map")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.blue)
+                                    Button { navEngine.stop(announce: true) } label: {
+                                        Label("Stop", systemImage: "xmark.circle")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.red)
+                                }
+                            }
+                            .padding(14)
+                            .background(RoundedRectangle(cornerRadius: 18).fill(Color.black.opacity(0.4)))
+                            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.green.opacity(0.5), lineWidth: 1))
+                            .sheet(isPresented: $showNavMap) {
+                                NavMapSheet(navEngine: navEngine)
+                            }
+                        }
+
+                        // THE FOUR MODES
+                        VStack(spacing: 12) {
+                            HStack(spacing: 12) {
+                                ModeTile(title: "Talk",
+                                         subtitle: "Live AI — eyes, ears and answers",
+                                         icon: "waveform.circle.fill",
+                                         accent: Color(red: 0.28, green: 0.9, blue: 0.63),
+                                         active: liveAIManager.isRunning) {
                                     showLiveAI = true
                                 }
-
-                                FeatureCard(
-                                    title: "home.quickvision.title".localized,
-                                    subtitle: "home.quickvision.subtitle".localized,
-                                    icon: "eye.circle.fill",
-                                    gradient: [Color.purple, Color.purple.opacity(0.7)]
-                                ) {
+                                ModeTile(title: "Look",
+                                         subtitle: "One snap, one answer",
+                                         icon: "eye.circle.fill",
+                                         accent: .purple,
+                                         active: false) {
                                     showQuickVision = true
                                 }
                             }
-
-                            // Row 2
-                            HStack(spacing: AppSpacing.md) {
-                                FeatureCard(
-                                    title: "home.translate.title".localized,
-                                    subtitle: "home.translate.subtitle".localized,
-                                    icon: "globe",
-                                    gradient: [Color.teal, Color.teal.opacity(0.7)]
-                                ) {
+                            HStack(spacing: 12) {
+                                ModeTile(title: "Translate",
+                                         subtitle: "Two-way interpreter",
+                                         icon: "globe",
+                                         accent: .teal,
+                                         active: false) {
                                     showLiveTranslate = true
                                 }
-
-                                FeatureCard(
-                                    title: "OpenClaw",
-                                    subtitle: openClawService.connectionState == .connected ? "home.openclaw.connected".localized : "home.openclaw.subtitle".localized,
-                                    icon: "link.circle.fill",
-                                    gradient: [Color.purple, Color.indigo]
-                                ) {
-                                    showOpenClaw = true
+                                ModeTile(title: "Navigate",
+                                         subtitle: navEngine.isNavigating ? "Navigating — tap for map" : "Talk, then say: navigate to...",
+                                         icon: "location.circle.fill",
+                                         accent: .blue,
+                                         active: navEngine.isNavigating) {
+                                    if navEngine.isNavigating { showNavMap = true } else { showLiveAI = true }
                                 }
                             }
+                        }
 
-                            // Continuous Vision — hands-free Quick Vision loop
-                            FeatureCardWide(
-                                title: continuousVision.isRunning ? "Continuous Vision — ON" : "Continuous Vision",
-                                subtitle: continuousVision.isRunning
-                                    ? (continuousVision.statusText.isEmpty ? "Say STOP to end" : continuousVision.statusText + " — say STOP to end")
-                                    : "Chappy keeps looking and describing until you say stop",
-                                icon: continuousVision.isRunning ? "eye.fill" : "eyes",
-                                gradient: continuousVision.isRunning ? [Color.green, Color.mint] : [Color.indigo, Color.blue]
-                            ) {
+                        // QUICK ACTIONS
+                        HStack(spacing: 10) {
+                            QuickActionButton(icon: "camera.fill", label: "Snap") {
+                                showQuickVision = true
+                            }
+                            QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
+                                let spot = TripRecorder.shared.rememberSpot(named: "")
+                                TTSService.shared.speak("Saved \(spot.name).")
+                            }
+                            QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
+                                              label: continuousVision.isRunning ? "Stop" : "Watch") {
                                 if continuousVision.isRunning {
                                     continuousVision.stop()
                                 } else {
                                     continuousVision.start(streamViewModel: streamViewModel)
                                 }
                             }
-
-                            // PHASE 4: Navigation status card — appears only while navigating
-                            if navEngine.isNavigating {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: "location.north.circle.fill")
-                                            .font(.title)
-                                            .foregroundColor(.green)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("→ \(navEngine.destinationName)")
-                                                .font(.headline)
-                                                .foregroundColor(.white)
-                                            Text(navEngine.nextInstruction)
-                                                .font(.subheadline)
-                                                .foregroundColor(.white.opacity(0.85))
-                                                .lineLimit(2)
-                                        }
-                                        Spacer()
-                                        Text(navEngine.distanceText)
-                                            .font(.headline)
-                                            .foregroundColor(.green)
-                                    }
-                                    HStack(spacing: 10) {
-                                        Button { showNavMap = true } label: {
-                                            Label("Map", systemImage: "map")
-                                                .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .tint(.blue)
-                                        Button { navEngine.stop(announce: true) } label: {
-                                            Label("Stop", systemImage: "xmark.circle")
-                                                .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .tint(.red)
-                                    }
-                                }
-                                .padding(14)
-                                .background(RoundedRectangle(cornerRadius: 18).fill(Color.black.opacity(0.4)))
-                                .sheet(isPresented: $showNavMap) {
-                                    NavMapSheet(navEngine: navEngine)
-                                }
+                            QuickActionButton(icon: "map.fill", label: "Map") {
+                                if navEngine.isNavigating { showNavMap = true }
                             }
+                        }
 
-                            // Row 3 - RTMP Streaming (Experimental)
-                            FeatureCardWide(
-                                title: "home.rtmp.title".localized,
-                                subtitle: "home.rtmp.subtitle".localized,
-                                icon: "antenna.radiowaves.left.and.right",
-                                gradient: [Color.red, Color.orange],
-                                badge: "home.experimental".localized
-                            ) {
+                        // TODAY — journal glance
+                        HStack {
+                            Image(systemName: "book.closed.fill")
+                                .foregroundColor(.white.opacity(0.5))
+                            Text("Today: \(TripRecorder.shared.crumbs.count) points · \(TripRecorder.shared.spots.filter { Calendar.current.isDateInToday($0.t) }.count) spots · \(TripRecorder.shared.notes.count) notes")
+                                .font(.footnote)
+                                .foregroundColor(.white.opacity(0.55))
+                            Spacer()
+                        }
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.05)))
+
+                        // MORE
+                        VStack(spacing: 8) {
+                            MoreRow(icon: "link.circle.fill", title: "OpenClaw",
+                                    detail: openClawService.connectionState == .connected ? "Connected" : "Home computer bridge") {
+                                showOpenClaw = true
+                            }
+                            MoreRow(icon: "antenna.radiowaves.left.and.right", title: "RTMP Streaming", detail: "Experimental") {
                                 showRTMPStreaming = true
                             }
-
-                            // Row 4 - Screen Recording Stream
-                            FeatureCardWide(
-                                title: "home.livestream.title".localized,
-                                subtitle: "home.livestream.subtitle".localized,
-                                icon: "video.fill",
-                                gradient: [AppColors.liveStream, AppColors.liveStream.opacity(0.7)]
-                            ) {
+                            MoreRow(icon: "video.fill", title: "Screen Stream", detail: "Record and stream") {
                                 showLiveStream = true
                             }
-
-                            // Row 5 - LeanEat
-                            FeatureCardWide(
-                                title: "home.leaneat.title".localized,
-                                subtitle: "home.leaneat.subtitle".localized,
-                                icon: "chart.bar.fill",
-                                gradient: [AppColors.leanEat, AppColors.leanEat.opacity(0.7)]
-                            ) {
+                            MoreRow(icon: "chart.bar.fill", title: "LeanEat", detail: "Food analysis") {
                                 showLeanEat = true
                             }
                         }
-                        .padding(.horizontal, AppSpacing.lg)
-                        .padding(.bottom, AppSpacing.xl)
+                        .padding(.bottom, 30)
                     }
+                    .padding(.horizontal, 18)
                 }
             }
             .navigationBarHidden(true)
@@ -638,5 +652,112 @@ struct RouteMapView: UIViewRepresentable {
             }
             return MKOverlayRenderer(overlay: overlay)
         }
+    }
+}
+
+
+// MARK: - The Face (Phase 4.9) building blocks
+
+struct StatusChip: View {
+    let label: String
+    let on: Bool
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(on ? Color(red: 0.28, green: 0.9, blue: 0.63) : Color.white.opacity(0.25))
+                .frame(width: 7, height: 7)
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(.white.opacity(on ? 0.9 : 0.45))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(Color.white.opacity(0.06)))
+    }
+}
+
+struct ModeTile: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    let accent: Color
+    let active: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 26))
+                    .foregroundColor(accent)
+                Spacer(minLength: 2)
+                Text(title)
+                    .font(.headline)
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.5))
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 110)
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 20).fill(Color.white.opacity(active ? 0.12 : 0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 20).stroke(active ? accent.opacity(0.7) : Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct QuickActionButton: View {
+    let icon: String
+    let label: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 20))
+                    .foregroundColor(.white.opacity(0.9))
+                Text(label)
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct MoreRow: View {
+    let icon: String
+    let title: String
+    let detail: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 18))
+                    .foregroundColor(.white.opacity(0.7))
+                    .frame(width: 26)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline)
+                        .foregroundColor(.white)
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundColor(.white.opacity(0.45))
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.05)))
+        }
+        .buttonStyle(.plain)
     }
 }
