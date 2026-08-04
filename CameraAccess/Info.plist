@@ -62,8 +62,14 @@
 	<string>Chappy need blutoooth usage to connect to Meta</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Chappy needs camera to capture photos</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Allowing Always lets Chappy keep your travel journal even when the app is in the background.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Chappy uses your location so answers, navigation and the travel journal know where you are.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Chappy uses the microphone to hear your voice commands.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>Chappy uses motion to know if you are walking, riding or in a vehicle.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Chappy needs photo library to save photos</string>
 	<key>NSSiriUsageDescription</key>

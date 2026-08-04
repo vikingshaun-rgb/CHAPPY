@@ -6,6 +6,8 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import CoreLocation
+import CoreMotion
 
 // MARK: - Live AI Manager
 
@@ -471,6 +473,155 @@ enum LiveAIError: LocalizedError {
             return "AI AI service connection failed — check your network"
         case .noAPIKey:
             return "Please configure an API key in Settings first"
+        }
+    }
+}
+
+
+// MARK: - Context Engine (Phase 4 Step 1)
+// Chappy's ambient awareness: WHERE the user is (street/city/country),
+// WHEN it is, the weather, and how they're moving. One snapshot, available
+// to every feature. Embedded here deliberately — no new .swift file means
+// no Xcode project registration risk. Weather via Open-Meteo (free, no
+// key, no WeatherKit entitlement needed).
+
+final class ContextEngine: NSObject, CLLocationManagerDelegate {
+    static let shared = ContextEngine()
+
+    struct Snapshot {
+        var timestamp = Date()
+        var latitude: Double?
+        var longitude: Double?
+        var street: String?
+        var suburb: String?
+        var city: String?
+        var country: String?
+        var countryCode: String?
+        var weather: String?
+        var temperatureC: Double?
+        var motion: String?
+    }
+
+    private let locationManager = CLLocationManager()
+    private let geocoder = CLGeocoder()
+    private let motionManager = CMMotionActivityManager()
+    private var started = false
+    private(set) var snapshot = Snapshot()
+    private var lastGeocode = Date.distantPast
+    private var lastWeatherFetch = Date.distantPast
+
+    func start() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.start() }
+            return
+        }
+        guard !started else { return }
+        started = true
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        locationManager.pausesLocationUpdatesAutomatically = true
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
+        if CMMotionActivityManager.isActivityAvailable() {
+            motionManager.startActivityUpdates(to: .main) { [weak self] activity in
+                guard let a = activity else { return }
+                if a.walking { self?.snapshot.motion = "walking" }
+                else if a.running { self?.snapshot.motion = "running" }
+                else if a.cycling { self?.snapshot.motion = "cycling" }
+                else if a.automotive { self?.snapshot.motion = "in a vehicle" }
+                else if a.stationary { self?.snapshot.motion = "still" }
+            }
+        }
+        print("🧭 [Context] Engine started")
+    }
+
+    /// One sentence for AI prompts — the context header every brain receives.
+    func contextHeader() -> String {
+        start()
+        var bits: [String] = []
+        let df = DateFormatter()
+        df.dateFormat = "EEEE h:mma"
+        bits.append("It is \(df.string(from: Date())) local time")
+        var place: [String] = []
+        if let s = snapshot.street { place.append(s) }
+        if let s = snapshot.suburb, s != snapshot.city { place.append(s) }
+        if let c = snapshot.city { place.append(c) }
+        if let c = snapshot.country { place.append(c) }
+        if !place.isEmpty { bits.append("the user is at " + place.joined(separator: ", ")) }
+        if let w = snapshot.weather, let t = snapshot.temperatureC {
+            bits.append("weather \(w), \(Int(t.rounded())) degrees C")
+        }
+        if let m = snapshot.motion { bits.append("the user is \(m)") }
+        return bits.joined(separator: "; ") + "."
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        print("🧭 [Context] Location authorization: \(status.rawValue)")
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        snapshot.latitude = loc.coordinate.latitude
+        snapshot.longitude = loc.coordinate.longitude
+        snapshot.timestamp = Date()
+        if Date().timeIntervalSince(lastGeocode) > 120 {
+            lastGeocode = Date()
+            reverseGeocode(loc)
+        }
+        if Date().timeIntervalSince(lastWeatherFetch) > 900 {
+            lastWeatherFetch = Date()
+            fetchWeather(loc)
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("🧭 [Context] Location error: \(error.localizedDescription)")
+    }
+
+    private func reverseGeocode(_ loc: CLLocation) {
+        geocoder.reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
+            guard let p = placemarks?.first else { return }
+            DispatchQueue.main.async {
+                self?.snapshot.street = p.thoroughfare
+                self?.snapshot.suburb = p.subLocality
+                self?.snapshot.city = p.locality
+                self?.snapshot.country = p.country
+                self?.snapshot.countryCode = p.isoCountryCode
+                print("🧭 [Context] Located: \(p.locality ?? "?"), \(p.country ?? "?")")
+            }
+        }
+    }
+
+    private func fetchWeather(_ loc: CLLocation) {
+        guard let url = URL(string: "https://api.open-meteo.com/v1/forecast?latitude=\(loc.coordinate.latitude)&longitude=\(loc.coordinate.longitude)&current=temperature_2m,weather_code") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let current = json["current"] as? [String: Any] else { return }
+            DispatchQueue.main.async {
+                if let t = current["temperature_2m"] as? Double { self?.snapshot.temperatureC = t }
+                if let code = current["weather_code"] as? Int { self?.snapshot.weather = ContextEngine.weatherDescription(code) }
+            }
+        }.resume()
+    }
+
+    private static func weatherDescription(_ code: Int) -> String {
+        switch code {
+        case 0: return "clear sky"
+        case 1, 2: return "partly cloudy"
+        case 3: return "overcast"
+        case 45, 48: return "foggy"
+        case 51...57: return "drizzle"
+        case 61...67: return "rain"
+        case 71...77: return "snow"
+        case 80...82: return "rain showers"
+        case 85, 86: return "snow showers"
+        case 95...99: return "thunderstorm"
+        default: return "unsettled"
         }
     }
 }

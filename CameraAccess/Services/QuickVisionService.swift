@@ -187,7 +187,7 @@ class QuickVisionService {
                 "content": [
                     ["type": "image",
                      "source": ["type": "base64", "media_type": "image/jpeg", "data": imageB64]],
-                    ["type": "text", "text": prompt]
+                    ["type": "text", "text": prompt + "\n\n[Context: " + ContextEngine.shared.contextHeader() + "]"]
                 ]
             ]],
             "tools": [[
