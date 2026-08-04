@@ -488,6 +488,159 @@ enum LiveAIError: LocalizedError {
 // no Xcode project registration risk. Weather via Open-Meteo (free, no
 // key, no WeatherKit entitlement needed).
 
+// MARK: - Backup & Restore (Settings → Backup)
+// One file carries EVERYTHING: every file in Documents (journal crumbs,
+// spots, notes, records, gallery) + the app's UserDefaults (theme, voice,
+// emergency contact, cost history, language). Share it to iCloud Drive;
+// restore it on a new phone. Migration + lost-phone insurance in one.
+final class ChappyBackup {
+    static let shared = ChappyBackup()
+
+    func createBackup() -> URL? {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        var files: [String: String] = [:]
+        if let items = try? fm.subpathsOfDirectory(atPath: docs.path) {
+            for rel in items {
+                let full = docs.appendingPathComponent(rel)
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: full.path, isDirectory: &isDir), !isDir.boolValue,
+                   let data = try? Data(contentsOf: full) {
+                    files[rel] = data.base64EncodedString()
+                }
+            }
+        }
+        var defaults: [String: Any] = [:]
+        if let bundleID = Bundle.main.bundleIdentifier,
+           let domain = UserDefaults.standard.persistentDomain(forName: bundleID) {
+            for (k, v) in domain where JSONSerialization.isValidJSONObject([k: v]) {
+                defaults[k] = v
+            }
+        }
+        let payload: [String: Any] = [
+            "chappy_backup_version": 1,
+            "created": ISO8601DateFormatter().string(from: Date()),
+            "files": files,
+            "defaults": defaults
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return nil }
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd-HHmm"
+        let out = fm.temporaryDirectory.appendingPathComponent("Chappy-Backup-\(df.string(from: Date())).chappybackup")
+        try? data.write(to: out)
+        return out
+    }
+
+    /// Returns a human-readable result to show the user.
+    func restore(from url: URL) -> String {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              json["chappy_backup_version"] != nil else {
+            return "That file is not a Chappy backup."
+        }
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return "Could not reach app storage."
+        }
+        var restoredFiles = 0
+        for (rel, b64) in (json["files"] as? [String: String]) ?? [:] {
+            guard let d = Data(base64Encoded: b64) else { continue }
+            let dest = docs.appendingPathComponent(rel)
+            try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? d.write(to: dest)
+            restoredFiles += 1
+        }
+        var restoredKeys = 0
+        for (k, v) in (json["defaults"] as? [String: Any]) ?? [:] {
+            UserDefaults.standard.set(v, forKey: k)
+            restoredKeys += 1
+        }
+        return "Restored \(restoredFiles) files and \(restoredKeys) settings. Close and reopen Chappy to load everything."
+    }
+}
+
+// MARK: - Cost Meter (Settings → Usage)
+// Rough LOCAL estimate of AI spend — counts what the app actually does
+// (Live AI minutes, TTS characters, Quick Vision + deep research calls)
+// and prices them with ballpark rates. Not a bill — a smoke alarm.
+final class CostMeter {
+    static let shared = CostMeter()
+    private let storeKey = "chappy_cost_days"
+    private let spokenKey = "chappy_cost_warned"
+    private let lock = NSLock()
+
+    // BALLPARK RATES (USD) — deliberately rounded UP a little so the meter
+    // over-warns rather than under-warns. Tune here if bills say otherwise.
+    static let ratePerLiveMinute = 0.08      // Gemini Live audio+video stream
+    static let ratePerTTSThousandChars = 0.02 // Gemini TTS
+    static let ratePerQuickVision = 0.02      // Claude vision call
+    static let ratePerResearch = 0.20         // Claude + web search deep dive
+
+    private static func dayKey(_ d: Date = Date()) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: d)
+    }
+
+    private func load() -> [String: [String: Double]] {
+        (UserDefaults.standard.dictionary(forKey: storeKey) as? [String: [String: Double]]) ?? [:]
+    }
+
+    private func bump(_ field: String, by amount: Double) {
+        lock.lock(); defer { lock.unlock() }
+        var all = load()
+        var day = all[Self.dayKey()] ?? [:]
+        day[field] = (day[field] ?? 0) + amount
+        all[Self.dayKey()] = day
+        // keep only the last 62 days
+        if all.count > 62 {
+            for k in all.keys.sorted().dropLast(62) { all.removeValue(forKey: k) }
+        }
+        UserDefaults.standard.set(all, forKey: storeKey)
+        maybeSpeakWarning()
+    }
+
+    func addLiveSeconds(_ s: Double) { guard s > 0 else { return }; bump("live_s", by: s) }
+    func addTTSChars(_ n: Int) { guard n > 0 else { return }; bump("tts_c", by: Double(n)) }
+    func addQuickVision() { bump("qv", by: 1) }
+    func addResearch() { bump("research", by: 1) }
+
+    static func cost(of day: [String: Double]) -> Double {
+        ((day["live_s"] ?? 0) / 60) * ratePerLiveMinute
+            + ((day["tts_c"] ?? 0) / 1000) * ratePerTTSThousandChars
+            + (day["qv"] ?? 0) * ratePerQuickVision
+            + (day["research"] ?? 0) * ratePerResearch
+    }
+
+    /// (liveMinutes, ttsChars, quickVision, research, estimatedUSD) for today
+    func today() -> (Double, Int, Int, Int, Double) {
+        let d = load()[Self.dayKey()] ?? [:]
+        return ((d["live_s"] ?? 0) / 60, Int(d["tts_c"] ?? 0), Int(d["qv"] ?? 0),
+                Int(d["research"] ?? 0), Self.cost(of: d))
+    }
+
+    /// Estimated USD for the current calendar month
+    func monthCostUSD() -> Double {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM"
+        let prefix = f.string(from: Date())
+        return load().filter { $0.key.hasPrefix(prefix) }.values.map(Self.cost).reduce(0, +)
+    }
+
+    /// Chappy speaks up ONCE per threshold per day: $2, $5, $10
+    private func maybeSpeakWarning() {
+        let todayCost = Self.cost(of: load()[Self.dayKey()] ?? [:])
+        var warned = (UserDefaults.standard.dictionary(forKey: spokenKey) as? [String: [Double]]) ?? [:]
+        var done = warned[Self.dayKey()] ?? []
+        for threshold in [2.0, 5.0, 10.0] where todayCost >= threshold && !done.contains(threshold) {
+            done.append(threshold)
+            warned = [Self.dayKey(): done]
+            UserDefaults.standard.set(warned, forKey: spokenKey)
+            DispatchQueue.main.async {
+                TTSService.shared.speak("Heads up - roughly \(Int(threshold)) dollars of AI usage today.")
+            }
+        }
+    }
+}
+
 // MARK: - Conversation Save Gate (duplicate-Records fix)
 // Both LiveAIManager and OmniRealtimeViewModel can end up saving the SAME
 // session (Siri-started manager + opened screen = two save paths). The gate
