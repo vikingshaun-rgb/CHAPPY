@@ -34,6 +34,13 @@ class GeminiLiveService: NSObject {
     private var playbackEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var audioLifelinesInstalled = false
+
+    // SESSION CONTINUITY (Phase 4 Step 8, part 1): Gemini live sessions have
+    // a max duration — the server warns with a goAway message, then aborts
+    // with 1008 if the client does not act. We store the rotating resumption
+    // handle and auto-reconnect into the SAME session (context intact).
+    private var resumptionHandle: String?
+    private var isRenewingSession = false
     private let playbackAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
     private let recordTargetFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
     private var recordConverter: AVAudioConverter?
@@ -254,6 +261,9 @@ class GeminiLiveService: NSObject {
                 // "read this" trigger depend on these arriving.
                 "input_audio_transcription": [:],
                 "output_audio_transcription": [:],
+                // SESSION CONTINUITY: server sends resumption handles;
+                // on renew we pass the stored handle to resume the session.
+                "session_resumption": (resumptionHandle != nil ? ["handle": resumptionHandle!] : [:]) as [String: Any],
                 // FASTER TURNS: respond ~half a second after you stop talking
                 // instead of waiting out a long silence.
                 "realtime_input_config": [
@@ -585,6 +595,22 @@ class GeminiLiveService: NSObject {
                 return
             }
 
+            // SESSION CONTINUITY: keep the newest resumption handle
+            if let update = json["sessionResumptionUpdate"] as? [String: Any] {
+                if let handle = update["newHandle"] as? String, !handle.isEmpty {
+                    self.resumptionHandle = handle
+                }
+                return
+            }
+
+            // goAway: session clock expiring — reconnect gracefully now,
+            // resuming the same session via the stored handle.
+            if json["goAway"] != nil {
+                print("⏳ [Gemini] goAway received — renewing session")
+                self.renewSession()
+                return
+            }
+
             // Handle server content (audio/text responses)
             if let serverContent = json["serverContent"] as? [String: Any] {
                 self.handleServerContent(serverContent)
@@ -795,9 +821,35 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason given"
         print("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        // Session-duration abort (1008 after a missed goAway): reconnect
+        // silently instead of showing an error.
+        if closeCode.rawValue == 1008 && reasonString.lowercased().contains("goaway") {
+            print("⏳ [Gemini] Session-duration abort — auto-renewing")
+            DispatchQueue.main.async { self.renewSession() }
+            return
+        }
         // 1000/1001 = normal shutdown (our own disconnect) — everything else is a failure worth showing
         if closeCode != .normalClosure && closeCode != .goingAway {
             reportSocketError("Socket closed — code \(closeCode.rawValue): \(reasonString)")
+        }
+    }
+
+    /// SESSION CONTINUITY: tear down just the socket and reconnect with the
+    /// stored resumption handle. Mic and playback keep running — the send
+    /// gate holds frames and audio until the renewed session is configured.
+    private func renewSession() {
+        guard !isRenewingSession else { return }
+        isRenewingSession = true
+        isSessionConfigured = false
+        webSocket?.cancel(with: .goingAway, reason: nil)
+        webSocket = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.isRenewingSession = false
+            print("🔁 [Gemini] Reconnecting (resume handle: \(self.resumptionHandle != nil ? "yes" : "none"))")
+            self.connect()
         }
     }
 
