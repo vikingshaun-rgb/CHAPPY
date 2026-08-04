@@ -35,12 +35,12 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>33</string>
+	<string>35</string>
 	<key>LSApplicationCategoryType</key>
 	<string></string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
-		<string>fb-viewapp</string>
+		<string>comgooglemaps</string>
 	</array>
 	<key>MWDAT</key>
 	<dict>
