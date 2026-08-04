@@ -363,7 +363,8 @@ class LiveAIManager: ObservableObject {
 
             // Steady 1 fps frame drip to Gemini so it can actually SEE
             frameTickCount += 1
-            if frameTickCount >= 5 {
+            // SCOOTER MODE: ~3fps drip keeps the view fresh at a glance
+            if frameTickCount >= 3 {
                 frameTickCount = 0
                 if provider == .google, isConnected {
                     geminiService?.sendImageInput(frame)
