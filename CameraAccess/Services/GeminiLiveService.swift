@@ -41,6 +41,8 @@ class GeminiLiveService: NSObject {
     // handle and auto-reconnect into the SAME session (context intact).
     private var resumptionHandle: String?
     private var isRenewingSession = false
+    private var renewalCount = 0
+    private var speechFrameFired = false
     private let playbackAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
     private let recordTargetFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
     private var recordConverter: AVAudioConverter?
@@ -592,6 +594,21 @@ class GeminiLiveService: NSObject {
                 print("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
+                // POST-RENEWAL RE-BRIEF: resumed sessions can come back with
+                // amnesia. Re-inject identity as silent context and drop a
+                // visible marker in the chat so renewals show themselves.
+                if self.renewalCount > 0 {
+                    self.onTranscriptDone?("🔁 [session renewed #\(self.renewalCount)]")
+                    self.sendJSON([
+                        "client_content": [
+                            "turns": [[
+                                "role": "user",
+                                "parts": [["text": "SYSTEM REMINDER, do not reply to this: you are still Chappy, Shauns glasses assistant. All persona, identity and vision rules remain fully in force. Live camera frames keep streaming from the glasses - always describe what they show when asked. Never call yourself a language model."]]
+                            ]],
+                            "turn_complete": false
+                        ]
+                    ])
+                }
                 return
             }
 
@@ -663,6 +680,8 @@ class GeminiLiveService: NSObject {
             print("✅ [Gemini] AIReply complete")
             finishAudioPlayback()
             onTranscriptDone?("")
+            // Re-arm the instant-eyes trigger for the next question
+            speechFrameFired = false
         }
 
         // Check for interrupted flag
@@ -676,6 +695,12 @@ class GeminiLiveService: NSObject {
         if let inputTranscription = content["inputTranscription"] as? [String: Any],
            let text = inputTranscription["text"] as? String {
             print("👤 [Gemini] User said: \(text)")
+            // INSTANT EYES: fire a fresh frame the moment the user starts
+            // talking, so answers ground in what they see RIGHT NOW.
+            if !speechFrameFired {
+                speechFrameFired = true
+                onSpeechStarted?()
+            }
             onUserTranscript?(text)
 
             // "READ THIS" DETECTION: when the user asks for reading, ship one
@@ -840,6 +865,7 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
     private func renewSession() {
         guard !isRenewingSession else { return }
         isRenewingSession = true
+        renewalCount += 1
         isSessionConfigured = false
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
