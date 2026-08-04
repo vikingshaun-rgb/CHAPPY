@@ -68,6 +68,11 @@ class GeminiLiveService: NSObject {
     private var audioBuffer = Data()
     private var isCollectingAudio = false
     private var audioChunkCount = 0
+    // VOICE WATCHDOG: detects turns where TEXT arrived but AUDIO never did
+    // (server stopped sending voice) and self-heals — engine restart first,
+    // silent session renewal if it happens twice in a row.
+    private var audioChunksThisTurn = 0
+    private var consecutiveSilentTurns = 0
     private let minChunksBeforePlay = 2
     private var hasStartedPlaying = false
     private var isPlaybackEngineRunning = false
@@ -630,7 +635,7 @@ class GeminiLiveService: NSObject {
             let contact = UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? ""
             if !contact.isEmpty,
                let u = URL(string: "https://wa.me/\(contact)?text=EMERGENCY%20-%20I%20need%20help.%20My%20location:%20https://maps.google.com/?q=\(lat),\(lon)") {
-                UIApplication.shared.open(u)
+                await UIApplication.shared.open(u)
                 report += " A WhatsApp emergency message to the trusted contact is open on the phone - press send."
             }
         }
@@ -668,7 +673,11 @@ class GeminiLiveService: NSObject {
 
     private func scheduleNavDetection() {
         let lower = currentUserLine.lowercased()
-        guard Self.navPhrases.contains(where: { lower.contains($0) })
+        let hasIntent = lower.contains("navigate") || lower.contains("navigation")
+            || lower.contains("directions") || lower.contains("direct me")
+            || lower.contains("route")
+        guard hasIntent
+            || Self.navPhrases.contains(where: { lower.contains($0) })
             || Self.modePhrases.contains(where: { lower.contains($0) }) else { return }
         navDetectWork?.cancel()
         let lineSnapshot = currentUserLine
@@ -694,9 +703,29 @@ class GeminiLiveService: NSObject {
             || lowerLine.contains(" car") || lowerLine.contains("scooter")
             || lowerLine.contains("motorbike") || lowerLine.contains("taxi")
         guard let hit = best else {
-            // No destination in this sentence — but is it a travel-mode
-            // follow-up like "navigate me via car"? Re-route the LAST
-            // destination in the new mode.
+            // FALLBACK A: nav intent word + " to X" anywhere in the sentence
+            // ("Navigate me by car to Brisbane Airport") — the destination is
+            // whatever follows the LAST " to ".
+            let navIntent = lowerLine.contains("navigate") || lowerLine.contains("navigation")
+                || lowerLine.contains("directions") || lowerLine.contains("direct me")
+                || lowerLine.contains("route")
+            if navIntent, let toRange = line.range(of: " to ", options: [.caseInsensitive, .backwards]) {
+                var dest2 = String(line[toRange.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: .punctuationCharacters)
+                if dest2.lowercased().hasPrefix("the ") { dest2 = String(dest2.dropFirst(4)) }
+                if dest2.count > 1 {
+                    journalCommandFired = true
+                    print("🧭 [Gemini] Nav bridge fallback → '\(dest2)' driving=\(wantsDrive)")
+                    Task { @MainActor in
+                        let reply = await NavEngine.shared.navigate(to: dest2, driving: wantsDrive)
+                        self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+                    }
+                    return
+                }
+            }
+            // FALLBACK B: travel-mode-only follow-up like "navigate me via
+            // car"? Re-route the LAST destination in the new mode.
             if Self.modePhrases.contains(where: { lowerLine.contains($0) }) {
                 journalCommandFired = true
                 let driving = !(lowerLine.contains("walk") || lowerLine.contains("on foot"))
@@ -749,6 +778,9 @@ class GeminiLiveService: NSObject {
     /// turn_complete false = no spoken reply, it just updates the model's
     /// working knowledge (same mechanism as the post-renewal re-brief).
     private func sendContextUpdate() {
+        // Never interleave a context turn while Chappy is mid-reply — that
+        // risks confusing the audio stream. The next tick catches it.
+        guard !isCollectingAudio else { return }
         sendJSON([
             "client_content": [
                 "turns": [[
@@ -1042,6 +1074,26 @@ class GeminiLiveService: NSObject {
             print("✅ [Gemini] AIReply complete")
             finishAudioPlayback()
             onTranscriptDone?("")
+            // VOICE WATCHDOG: text without a single audio chunk = server-side
+            // voice loss. First strike: rebuild the playback engine. Second
+            // strike in a row: silently renew the session (context survives
+            // via the resumption handle) — voice comes back on its own.
+            if !currentModelLine.isEmpty {
+                if audioChunksThisTurn == 0 {
+                    consecutiveSilentTurns += 1
+                    print("🔇 [Gemini] Turn had TEXT but no AUDIO (\(consecutiveSilentTurns) in a row) — reviving")
+                    stopPlaybackEngine()
+                    setupPlaybackEngine()
+                    if consecutiveSilentTurns >= 2 {
+                        consecutiveSilentTurns = 0
+                        print("🔇 [Gemini] Voice watchdog: renewing session to restore audio")
+                        renewSession()
+                    }
+                } else {
+                    consecutiveSilentTurns = 0
+                }
+            }
+            audioChunksThisTurn = 0
             // Re-arm the instant-eyes + journal triggers for the next question
             speechFrameFired = false
             journalCommandFired = false
@@ -1169,6 +1221,7 @@ class GeminiLiveService: NSObject {
         }
 
         audioChunkCount += 1
+        audioChunksThisTurn += 1
 
         if !hasStartedPlaying {
             audioBuffer.append(audioData)
