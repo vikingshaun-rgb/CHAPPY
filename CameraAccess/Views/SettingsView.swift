@@ -5,6 +5,7 @@
 
 import SwiftUI
 import MWDATCore
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
@@ -33,6 +34,10 @@ struct SettingsView: View {
     @State private var selectedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "high"
     @State private var hasAPIKey = false // changed to a State variable
     @State private var hasGoogleAPIKey = false // Google API Key Status
+    // BACKUP & RESTORE
+    @State private var showRestoreImporter = false
+    @State private var restoreResultMessage = ""
+    @State private var showRestoreResult = false
 
     init(streamViewModel: StreamSessionViewModel, apiKey: String) {
         self.streamViewModel = streamViewModel
@@ -43,6 +48,16 @@ struct SettingsView: View {
     private func refreshAPIKeyStatus() {
         hasAPIKey = providerManager.hasAPIKey
         hasGoogleAPIKey = APIKeyManager.shared.hasGoogleAPIKey()
+    }
+
+    // Present the iOS share sheet for the backup file
+    private func presentShareSheet(url: URL) {
+        guard let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        var top = root
+        while let presented = top.presentedViewController { top = presented }
+        top.present(activity, animated: true)
     }
 
     var body: some View {
@@ -292,6 +307,103 @@ struct SettingsView: View {
                     Text("Voice")
                 }
 
+                // Appearance — Chappy theme picker
+                Section {
+                    NavigationLink {
+                        ThemePickerList()
+                    } label: {
+                        HStack {
+                            Image(systemName: "paintbrush.fill")
+                                .foregroundColor(.pink)
+                            Text("Theme")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Text(UserDefaults.standard.string(forKey: "chappy_theme") ?? "Midnight Jade")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+
+                    NavigationLink {
+                        AvatarPickerList()
+                    } label: {
+                        HStack {
+                            Image(systemName: "sparkles")
+                                .foregroundColor(.mint)
+                            Text("Avatar")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Text(UserDefaults.standard.string(forKey: "chappy_avatar") ?? "Auto (match theme)")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                } header: {
+                    Text("Appearance")
+                }
+
+                // Usage — rough AI cost meter
+                Section {
+                    NavigationLink {
+                        CostMeterView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "dollarsign.circle.fill")
+                                .foregroundColor(.green)
+                            Text("AI Usage")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Text(String(format: "~$%.2f today", CostMeter.shared.today().4))
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                } header: {
+                    Text("Usage")
+                }
+
+                // Backup & Restore — migration + lost-phone insurance
+                Section {
+                    Button {
+                        if let url = ChappyBackup.shared.createBackup() {
+                            presentShareSheet(url: url)
+                        } else {
+                            restoreResultMessage = "Backup failed — could not read app storage."
+                            showRestoreResult = true
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.up.doc.fill")
+                                .foregroundColor(.blue)
+                            Text("Back Up Now")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Text("journal · records · settings")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+
+                    Button {
+                        showRestoreImporter = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.down.doc.fill")
+                                .foregroundColor(.orange)
+                            Text("Restore from Backup")
+                                .foregroundColor(AppColors.textPrimary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textTertiary)
+                        }
+                    }
+                } header: {
+                    Text("Backup")
+                } footer: {
+                    Text("Back Up Now bundles your journal, spots, notes, conversation records and settings into one file — save it to iCloud Drive. On a new phone, install Chappy from TestFlight, then Restore from Backup.")
+                }
+
                 // OpenClaw
                 Section {
                     Button {
@@ -358,6 +470,21 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showQualitySettings) {
                 VideoQualitySettingsView(selectedQuality: $selectedQuality)
+            }
+            .fileImporter(isPresented: $showRestoreImporter,
+                          allowedContentTypes: [.item]) { result in
+                switch result {
+                case .success(let url):
+                    restoreResultMessage = ChappyBackup.shared.restore(from: url)
+                case .failure(let error):
+                    restoreResultMessage = "Could not open that file: \(error.localizedDescription)"
+                }
+                showRestoreResult = true
+            }
+            .alert("Backup", isPresented: $showRestoreResult) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(restoreResultMessage)
             }
             .sheet(isPresented: $showAppLanguageSettings) {
                 AppLanguageSettingsView()
@@ -1302,5 +1429,75 @@ struct ChappyVoiceSettingsView: View {
             }
         }
         .navigationTitle("Chappy's Voice")
+    }
+}
+
+// MARK: - Cost Meter View (Settings → Usage)
+
+struct CostMeterView: View {
+    @State private var today: (Double, Int, Int, Int, Double) = CostMeter.shared.today()
+    @State private var monthCost: Double = CostMeter.shared.monthCostUSD()
+
+    var body: some View {
+        List {
+            Section {
+                HStack {
+                    Text("Estimated today")
+                    Spacer()
+                    Text(String(format: "$%.2f", today.4))
+                        .font(.title3).bold()
+                        .foregroundColor(today.4 >= 5 ? .orange : .green)
+                }
+                HStack {
+                    Text("Estimated this month")
+                    Spacer()
+                    Text(String(format: "$%.2f", monthCost))
+                        .bold()
+                }
+            } header: {
+                Text("Spend (rough estimate)")
+            }
+
+            Section {
+                HStack {
+                    Label("Live AI", systemImage: "waveform.circle.fill")
+                    Spacer()
+                    Text(String(format: "%.0f min", today.0))
+                        .foregroundColor(.secondary)
+                }
+                HStack {
+                    Label("Voice (TTS)", systemImage: "speaker.wave.2.fill")
+                    Spacer()
+                    Text("\(today.1) characters")
+                        .foregroundColor(.secondary)
+                }
+                HStack {
+                    Label("Quick Vision", systemImage: "eye.circle.fill")
+                    Spacer()
+                    Text("\(today.2) looks")
+                        .foregroundColor(.secondary)
+                }
+                HStack {
+                    Label("Deep Research", systemImage: "magnifyingglass.circle.fill")
+                    Spacer()
+                    Text("\(today.3) dives")
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Today's activity")
+            }
+
+            Section {
+                Text("These are ballpark numbers estimated on the phone, rounded up on purpose — a smoke alarm, not a bill. Chappy will also say it out loud when a day passes about $2, $5 and $10. Exact spend lives in your Google Cloud and Anthropic consoles.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("AI Usage")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            today = CostMeter.shared.today()
+            monthCost = CostMeter.shared.monthCostUSD()
+        }
     }
 }

@@ -26,6 +26,11 @@ struct TurboMetaHomeView: View {
     @State private var showLiveStream = false
     @State private var showRTMPStreaming = false
     @State private var showLeanEat = false
+    // CHAPPY THEMES: the Face's wardrobe (picker lives in Settings → Appearance)
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    // LIVING ORB: breathing animation state
+    @State private var orbPulse = false
     @State private var showQuickVision = false
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
@@ -38,8 +43,7 @@ struct TurboMetaHomeView: View {
                 // Re-skin only — every action fires the exact same wiring
                 // as the old grid (no-breakage law).
                 LinearGradient(
-                    colors: [Color(red: 0.05, green: 0.08, blue: 0.11),
-                             Color(red: 0.02, green: 0.03, blue: 0.05)],
+                    colors: [theme.bgTop, theme.bgBottom],
                     startPoint: .top, endPoint: .bottom
                 )
                 .ignoresSafeArea()
@@ -48,24 +52,19 @@ struct TurboMetaHomeView: View {
                     VStack(spacing: 16) {
                         // ORB HEADER — glows when Chappy is live
                         VStack(spacing: 8) {
-                            Circle()
-                                .fill(RadialGradient(
-                                    colors: [Color(red: 0.28, green: 0.9, blue: 0.63),
-                                             Color(red: 0.03, green: 0.36, blue: 0.25)],
-                                    center: .init(x: 0.35, y: 0.3),
-                                    startRadius: 2, endRadius: 34))
-                                .frame(width: 58, height: 58)
-                                .shadow(color: Color(red: 0.28, green: 0.9, blue: 0.63)
-                                    .opacity(liveAIManager.isRunning ? 0.8 : 0.35),
-                                    radius: liveAIManager.isRunning ? 18 : 10)
+                            // THE AVATAR — Chappy's living face. Eight styles,
+                            // theme-matched by default, chosen in Settings →
+                            // Appearance → Avatar. Pure code: GPU-composited,
+                            // home-screen only, zero cost to the AI pipeline.
+                            ChappyAvatarView(theme: theme, live: liveAIManager.isRunning)
                             Text("Chappy")
                                 .font(.system(size: 30, weight: .bold, design: .rounded))
-                                .foregroundColor(.white)
+                                .foregroundColor(theme.textPrimary)
                             Text(liveAIManager.isRunning ? "Listening — just talk"
                                  : (continuousVision.isRunning ? "Watching — say chappy stop to end"
                                     : "Ready when you are"))
                                 .font(.subheadline)
-                                .foregroundColor(.white.opacity(0.55))
+                                .foregroundColor(theme.textSecondary)
                         }
                         .padding(.top, 18)
 
@@ -87,10 +86,10 @@ struct TurboMetaHomeView: View {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text("→ \(navEngine.destinationName)")
                                             .font(.headline)
-                                            .foregroundColor(.white)
+                                            .foregroundColor(theme.textPrimary)
                                         Text(navEngine.nextInstruction)
                                             .font(.subheadline)
-                                            .foregroundColor(.white.opacity(0.85))
+                                            .foregroundColor(theme.textPrimary.opacity(0.85))
                                             .lineLimit(2)
                                     }
                                     Spacer()
@@ -114,7 +113,7 @@ struct TurboMetaHomeView: View {
                                 }
                             }
                             .padding(14)
-                            .background(RoundedRectangle(cornerRadius: 18).fill(Color.black.opacity(0.4)))
+                            .background(RoundedRectangle(cornerRadius: 18).fill(theme.cardFill))
                             .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.green.opacity(0.5), lineWidth: 1))
                             .sheet(isPresented: $showNavMap) {
                                 NavMapSheet(navEngine: navEngine)
@@ -127,7 +126,7 @@ struct TurboMetaHomeView: View {
                                 ModeTile(title: "Talk",
                                          subtitle: "Live AI — eyes, ears and answers",
                                          icon: "waveform.circle.fill",
-                                         accent: Color(red: 0.28, green: 0.9, blue: 0.63),
+                                         accent: theme.accent,
                                          active: liveAIManager.isRunning) {
                                     showLiveAI = true
                                 }
@@ -182,14 +181,14 @@ struct TurboMetaHomeView: View {
                         // TODAY — journal glance
                         HStack {
                             Image(systemName: "book.closed.fill")
-                                .foregroundColor(.white.opacity(0.5))
+                                .foregroundColor(theme.textSecondary)
                             Text("Today: \(TripRecorder.shared.crumbs.count) points · \(TripRecorder.shared.spots.filter { Calendar.current.isDateInToday($0.t) }.count) spots · \(TripRecorder.shared.notes.count) notes")
                                 .font(.footnote)
-                                .foregroundColor(.white.opacity(0.55))
+                                .foregroundColor(theme.textSecondary)
                             Spacer()
                         }
                         .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.05)))
+                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
 
                         // MORE
                         VStack(spacing: 8) {
@@ -680,23 +679,463 @@ struct RouteMapView: UIViewRepresentable {
 }
 
 
+// MARK: - Chappy Themes (the Face's wardrobe)
+
+struct ChappyTheme {
+    let name: String
+    let bgTop: Color
+    let bgBottom: Color
+    let orbBright: Color
+    let orbDeep: Color
+    let accent: Color
+    let textPrimary: Color
+    let textSecondary: Color
+    let cardFill: Color
+    let cardActive: Color
+    let stroke: Color
+
+    static let midnightJade = ChappyTheme(
+        name: "Midnight Jade",
+        bgTop: Color(red: 0.05, green: 0.08, blue: 0.11), bgBottom: Color(red: 0.02, green: 0.03, blue: 0.05),
+        orbBright: Color(red: 0.28, green: 0.9, blue: 0.63), orbDeep: Color(red: 0.03, green: 0.36, blue: 0.25),
+        accent: Color(red: 0.28, green: 0.9, blue: 0.63),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let baliSunset = ChappyTheme(
+        name: "Bali Sunset",
+        bgTop: Color(red: 0.11, green: 0.07, blue: 0.05), bgBottom: Color(red: 0.04, green: 0.02, blue: 0.01),
+        orbBright: Color(red: 1.0, green: 0.5, blue: 0.3), orbDeep: Color(red: 0.45, green: 0.13, blue: 0.03),
+        accent: Color(red: 1.0, green: 0.58, blue: 0.3),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let neonSaigon = ChappyTheme(
+        name: "Neon Saigon",
+        bgTop: Color(red: 0.07, green: 0.02, blue: 0.1), bgBottom: Color(red: 0.02, green: 0.01, blue: 0.05),
+        orbBright: Color(red: 1.0, green: 0.25, blue: 0.62), orbDeep: Color(red: 0.35, green: 0.03, blue: 0.4),
+        accent: Color(red: 1.0, green: 0.3, blue: 0.65),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let reefBlue = ChappyTheme(
+        name: "Reef Blue",
+        bgTop: Color(red: 0.02, green: 0.07, blue: 0.13), bgBottom: Color(red: 0.01, green: 0.02, blue: 0.06),
+        orbBright: Color(red: 0.3, green: 0.85, blue: 1.0), orbDeep: Color(red: 0.02, green: 0.28, blue: 0.48),
+        accent: Color(red: 0.3, green: 0.85, blue: 1.0),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let arcticWhite = ChappyTheme(
+        name: "Arctic White",
+        bgTop: Color(red: 0.97, green: 0.97, blue: 0.98), bgBottom: Color(red: 0.88, green: 0.89, blue: 0.92),
+        orbBright: Color(red: 1.0, green: 0.2, blue: 0.28), orbDeep: Color(red: 0.55, green: 0.0, blue: 0.1),
+        accent: Color(red: 0.92, green: 0.1, blue: 0.22),
+        textPrimary: Color(red: 0.08, green: 0.09, blue: 0.11), textSecondary: Color.black.opacity(0.5),
+        cardFill: Color.black.opacity(0.05), cardActive: Color.black.opacity(0.1), stroke: Color.black.opacity(0.1))
+
+    static let outbackGold = ChappyTheme(
+        name: "Outback Gold",
+        bgTop: Color(red: 0.06, green: 0.05, blue: 0.02), bgBottom: Color(red: 0.01, green: 0.01, blue: 0.0),
+        orbBright: Color(red: 1.0, green: 0.82, blue: 0.38), orbDeep: Color(red: 0.45, green: 0.3, blue: 0.05),
+        accent: Color(red: 0.96, green: 0.78, blue: 0.35),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let bladeRunner = ChappyTheme(
+        name: "Blade Runner",
+        bgTop: Color(red: 0.03, green: 0.05, blue: 0.09), bgBottom: Color(red: 0.01, green: 0.01, blue: 0.03),
+        orbBright: Color(red: 1.0, green: 0.1, blue: 0.16), orbDeep: Color(red: 0.38, green: 0.0, blue: 0.06),
+        accent: Color(red: 1.0, green: 0.15, blue: 0.22),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let heavyMetal = ChappyTheme(
+        name: "Heavy Metal",
+        bgTop: Color(red: 0.08, green: 0.08, blue: 0.09), bgBottom: Color(red: 0.02, green: 0.02, blue: 0.02),
+        orbBright: Color(red: 0.88, green: 0.9, blue: 0.94), orbDeep: Color(red: 0.22, green: 0.24, blue: 0.28),
+        accent: Color(red: 0.78, green: 0.81, blue: 0.86),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.07), cardActive: Color.white.opacity(0.14), stroke: Color.white.opacity(0.1))
+
+    static let cyberVolt = ChappyTheme(
+        name: "Cyber Volt",
+        bgTop: Color(red: 0.04, green: 0.05, blue: 0.02), bgBottom: Color(red: 0.0, green: 0.01, blue: 0.0),
+        orbBright: Color(red: 0.78, green: 1.0, blue: 0.2), orbDeep: Color(red: 0.25, green: 0.4, blue: 0.02),
+        accent: Color(red: 0.78, green: 1.0, blue: 0.2),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let deepAmethyst = ChappyTheme(
+        name: "Deep Amethyst",
+        bgTop: Color(red: 0.07, green: 0.04, blue: 0.12), bgBottom: Color(red: 0.02, green: 0.01, blue: 0.05),
+        orbBright: Color(red: 0.72, green: 0.45, blue: 1.0), orbDeep: Color(red: 0.25, green: 0.08, blue: 0.45),
+        accent: Color(red: 0.72, green: 0.45, blue: 1.0),
+        textPrimary: .white, textSecondary: Color.white.opacity(0.55),
+        cardFill: Color.white.opacity(0.06), cardActive: Color.white.opacity(0.12), stroke: Color.white.opacity(0.08))
+
+    static let all: [ChappyTheme] = [midnightJade, baliSunset, neonSaigon, reefBlue,
+                                     arcticWhite, outbackGold, bladeRunner, heavyMetal,
+                                     cyberVolt, deepAmethyst]
+
+    static func named(_ n: String) -> ChappyTheme {
+        all.first { $0.name == n } ?? midnightJade
+    }
+}
+
+// MARK: - Chappy Avatars (the Face's soul — 8 styles, pure code)
+
+enum ChappyAvatar: String, CaseIterable {
+    case auto = "Auto (match theme)"
+    case classic = "Classic Orb"
+    case wisp = "The Wisp"
+    case holoCore = "Holo-Core"
+    case plasma = "Plasma Heart"
+    case mercury = "Liquid Mercury"
+    case nebula = "Nebula"
+    case sentinel = "Sentinel"
+    case jelly = "The Jelly"
+    case aurora = "Aurora Flame"
+
+    /// Which avatar actually renders: explicit choice wins, else theme-matched.
+    static func resolved(for themeName: String) -> ChappyAvatar {
+        let stored = UserDefaults.standard.string(forKey: "chappy_avatar") ?? ChappyAvatar.auto.rawValue
+        if let chosen = ChappyAvatar(rawValue: stored), chosen != .auto { return chosen }
+        return themeMatch(for: themeName)
+    }
+
+    /// The theme's natural avatar, ignoring any explicit choice.
+    static func themeMatch(for themeName: String) -> ChappyAvatar {
+        switch themeName {
+        case "Midnight Jade":  return .wisp
+        case "Bali Sunset":    return .plasma
+        case "Neon Saigon":    return .aurora
+        case "Reef Blue":      return .jelly
+        case "Arctic White":   return .holoCore
+        case "Outback Gold":   return .mercury
+        case "Blade Runner":   return .holoCore
+        case "Heavy Metal":    return .mercury
+        case "Cyber Volt":     return .sentinel
+        case "Deep Amethyst":  return .nebula
+        default:               return .classic
+        }
+    }
+}
+
+/// Simple regular polygon for the Sentinel avatar.
+struct AvatarPolygon: Shape {
+    let sides: Int
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2
+        for i in 0..<sides {
+            let angle = (Double(i) / Double(sides)) * 2 * .pi - .pi / 2
+            let point = CGPoint(x: center.x + radius * cos(angle),
+                                y: center.y + radius * sin(angle))
+            if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+struct ChappyAvatarView: View {
+    let theme: ChappyTheme
+    let live: Bool
+    /// When set, renders this exact style (used by the picker previews).
+    var forceStyle: ChappyAvatar? = nil
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    @AppStorage("chappy_avatar") private var avatarChoice = ChappyAvatar.auto.rawValue
+    @State private var pulse = false
+    @State private var spin = false
+
+    private var avatar: ChappyAvatar { forceStyle ?? ChappyAvatar.resolved(for: themeName) }
+    /// Live AI running → everything moves ~2x faster (the heartbeat quickens)
+    private var tempo: Double { live ? 0.45 : 1.0 }
+    private let gold = Color(red: 1.0, green: 0.83, blue: 0.45)
+
+    var body: some View {
+        ZStack {
+            // Shared breathing halo behind every style
+            Circle()
+                .fill(RadialGradient(colors: [theme.orbBright.opacity(0.3), .clear],
+                                     center: .center, startRadius: 4, endRadius: 60))
+                .frame(width: 120, height: 120)
+                .scaleEffect(pulse ? 1.16 : 0.88)
+                .opacity(pulse ? 0.9 : 0.4)
+                .animation(.easeInOut(duration: 2.4 * tempo).repeatForever(autoreverses: true), value: pulse)
+            avatarBody
+                .shadow(color: theme.orbBright.opacity(live ? 0.8 : 0.35),
+                        radius: live ? 18 : 9)
+        }
+        .frame(width: 96, height: 96)
+        .onAppear { pulse = true; spin = true }
+    }
+
+    @ViewBuilder private var avatarBody: some View {
+        switch avatar {
+        case .wisp: wispView
+        case .holoCore: holoCoreView
+        case .plasma: plasmaView
+        case .mercury: mercuryView
+        case .nebula: nebulaView
+        case .sentinel: sentinelView
+        case .jelly: jellyView
+        case .aurora: auroraView
+        default: classicView
+        }
+    }
+
+    // Classic Orb — the original breathing sphere
+    private var classicView: some View {
+        Circle()
+            .fill(RadialGradient(colors: [theme.orbBright, theme.orbDeep],
+                                 center: .init(x: 0.35, y: 0.3), startRadius: 2, endRadius: 34))
+            .frame(width: 58, height: 58)
+            .scaleEffect(pulse ? 1.06 : 0.96)
+            .animation(.easeInOut(duration: 2.4 * tempo).repeatForever(autoreverses: true), value: pulse)
+    }
+
+    // The Wisp — silk-smoke ribbons orbiting a golden firefly core
+    private var wispView: some View {
+        ZStack {
+            ZStack {
+                ForEach(0..<3, id: \.self) { i in
+                    Capsule()
+                        .fill(theme.orbBright.opacity(0.45))
+                        .frame(width: 56, height: 13)
+                        .blur(radius: 6)
+                        .rotationEffect(.degrees(Double(i) * 120))
+                }
+            }
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .animation(.linear(duration: 7 * tempo).repeatForever(autoreverses: false), value: spin)
+            Circle().fill(gold).frame(width: 11, height: 11).blur(radius: 1.5)
+                .scaleEffect(pulse ? 1.25 : 0.85)
+                .animation(.easeInOut(duration: 1.6 * tempo).repeatForever(autoreverses: true), value: pulse)
+        }
+    }
+
+    // Holo-Core — Jarvis rings orbiting a warm core
+    private var holoCoreView: some View {
+        ZStack {
+            Circle()
+                .fill(RadialGradient(colors: [gold, theme.orbDeep],
+                                     center: .center, startRadius: 1, endRadius: 18))
+                .frame(width: 26, height: 26)
+            Ellipse().stroke(theme.accent.opacity(0.75), lineWidth: 1.3)
+                .frame(width: 72, height: 26)
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .animation(.linear(duration: 8 * tempo).repeatForever(autoreverses: false), value: spin)
+            Ellipse().stroke(theme.accent.opacity(0.45), lineWidth: 1.1)
+                .frame(width: 64, height: 52)
+                .rotationEffect(.degrees(60))
+                .rotationEffect(.degrees(spin ? -360 : 0))
+                .animation(.linear(duration: 11 * tempo).repeatForever(autoreverses: false), value: spin)
+            Circle().stroke(theme.accent.opacity(0.3), lineWidth: 1)
+                .frame(width: 78, height: 78)
+                .scaleEffect(pulse ? 1.04 : 0.97)
+                .animation(.easeInOut(duration: 2.4 * tempo).repeatForever(autoreverses: true), value: pulse)
+        }
+    }
+
+    // Plasma Heart — golden sun with flaring corona rings
+    private var plasmaView: some View {
+        ZStack {
+            Circle().stroke(theme.orbBright.opacity(pulse ? 0.0 : 0.6), lineWidth: 2)
+                .frame(width: 50, height: 50)
+                .scaleEffect(pulse ? 1.8 : 1.0)
+                .animation(.easeOut(duration: 2.0 * tempo).repeatForever(autoreverses: false), value: pulse)
+            Circle()
+                .fill(RadialGradient(colors: [Color(red: 1.0, green: 0.9, blue: 0.55), gold, theme.orbDeep],
+                                     center: .init(x: 0.4, y: 0.35), startRadius: 2, endRadius: 30))
+                .frame(width: 50, height: 50)
+                .scaleEffect(pulse ? 1.07 : 0.95)
+                .animation(.easeInOut(duration: 1.4 * tempo).repeatForever(autoreverses: true), value: pulse)
+        }
+    }
+
+    // Liquid Mercury — chrome sphere with a sliding highlight
+    private var mercuryView: some View {
+        Circle()
+            .fill(AngularGradient(colors: [Color(white: 0.92), Color(white: 0.45),
+                                           Color(white: 0.8), Color(white: 0.3), Color(white: 0.92)],
+                                  center: .center))
+            .frame(width: 56, height: 56)
+            .overlay(
+                Circle().fill(RadialGradient(colors: [.white, .clear],
+                                             center: .center, startRadius: 1, endRadius: 12))
+                    .frame(width: 20, height: 20)
+                    .offset(x: pulse ? 12 : -12, y: -13)
+                    .animation(.easeInOut(duration: 3.0 * tempo).repeatForever(autoreverses: true), value: pulse)
+            )
+            .overlay(Circle().fill(theme.accent.opacity(0.16)))
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .animation(.linear(duration: 14 * tempo).repeatForever(autoreverses: false), value: spin)
+    }
+
+    // Nebula — swirling cosmic dust around a starlight core
+    private var nebulaView: some View {
+        ZStack {
+            Ellipse().fill(theme.orbBright.opacity(0.35))
+                .frame(width: 72, height: 30).blur(radius: 8)
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .animation(.linear(duration: 10 * tempo).repeatForever(autoreverses: false), value: spin)
+            Ellipse().fill(theme.accent.opacity(0.3))
+                .frame(width: 58, height: 24).blur(radius: 7)
+                .rotationEffect(.degrees(45))
+                .rotationEffect(.degrees(spin ? -360 : 0))
+                .animation(.linear(duration: 7 * tempo).repeatForever(autoreverses: false), value: spin)
+            Circle().fill(.white).frame(width: 12, height: 12).blur(radius: 2)
+                .scaleEffect(pulse ? 1.3 : 0.9)
+                .animation(.easeInOut(duration: 2.0 * tempo).repeatForever(autoreverses: true), value: pulse)
+        }
+    }
+
+    // Sentinel — counter-rotating geometric guardian
+    private var sentinelView: some View {
+        ZStack {
+            AvatarPolygon(sides: 6)
+                .stroke(theme.accent.opacity(0.8), lineWidth: 1.4)
+                .frame(width: 58, height: 58)
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .animation(.linear(duration: 9 * tempo).repeatForever(autoreverses: false), value: spin)
+            AvatarPolygon(sides: 6)
+                .stroke(gold.opacity(0.5), lineWidth: 1)
+                .frame(width: 42, height: 42)
+                .rotationEffect(.degrees(30))
+                .rotationEffect(.degrees(spin ? -360 : 0))
+                .animation(.linear(duration: 6 * tempo).repeatForever(autoreverses: false), value: spin)
+            Circle().fill(theme.orbBright).frame(width: 9, height: 9)
+                .scaleEffect(pulse ? 1.4 : 0.8)
+                .animation(.easeInOut(duration: 1.5 * tempo).repeatForever(autoreverses: true), value: pulse)
+        }
+    }
+
+    // The Jelly — pulsing bell with drifting tendrils
+    private var jellyView: some View {
+        VStack(spacing: 1) {
+            Ellipse()
+                .fill(RadialGradient(colors: [theme.orbBright.opacity(0.85), theme.orbDeep.opacity(0.4)],
+                                     center: .init(x: 0.5, y: 0.25), startRadius: 2, endRadius: 30))
+                .frame(width: 50, height: pulse ? 32 : 40)
+                .animation(.easeInOut(duration: 1.8 * tempo).repeatForever(autoreverses: true), value: pulse)
+            HStack(spacing: 6) {
+                ForEach(0..<4, id: \.self) { i in
+                    Capsule()
+                        .fill(theme.orbBright.opacity(0.5))
+                        .frame(width: 2.5, height: i % 2 == 0 ? 24 : 18)
+                        .rotationEffect(.degrees((pulse ? 7 : -7) * (i % 2 == 0 ? 1 : -1)), anchor: .top)
+                        .animation(.easeInOut(duration: 1.8 * tempo).repeatForever(autoreverses: true), value: pulse)
+                }
+            }
+            .blur(radius: 0.5)
+        }
+    }
+
+    // Aurora Flame — swaying ribbons of light
+    private var auroraView: some View {
+        HStack(spacing: -9) {
+            ForEach(0..<3, id: \.self) { i in
+                Capsule()
+                    .fill(LinearGradient(colors: [theme.orbBright, theme.accent.opacity(0.35), .clear],
+                                         startPoint: .bottom, endPoint: .top))
+                    .frame(width: 13, height: 62 - CGFloat(i) * 10)
+                    .blur(radius: 4.5)
+                    .rotationEffect(.degrees((pulse ? 9 : -9) * (i % 2 == 0 ? 1 : -1)), anchor: .bottom)
+                    .animation(.easeInOut(duration: (2.2 - Double(i) * 0.3) * tempo)
+                        .repeatForever(autoreverses: true), value: pulse)
+            }
+        }
+    }
+}
+
+/// Avatar picker — pushed from Settings → Appearance → Avatar.
+struct AvatarPickerList: View {
+    @AppStorage("chappy_avatar") private var avatarChoice = ChappyAvatar.auto.rawValue
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    var body: some View {
+        List(ChappyAvatar.allCases, id: \.rawValue) { a in
+            Button {
+                avatarChoice = a.rawValue
+            } label: {
+                HStack(spacing: 14) {
+                    // Live animated mini-preview of THIS style in the current theme
+                    ZStack {
+                        Circle().fill(Color.black)
+                        ChappyAvatarView(theme: ChappyTheme.named(themeName), live: false,
+                                         forceStyle: a == .auto ? ChappyAvatar.themeMatch(for: themeName) : a)
+                            .scaleEffect(0.38)
+                    }
+                    .frame(width: 44, height: 44)
+                    .clipShape(Circle())
+                    Text(a.rawValue)
+                        .foregroundColor(.primary)
+                    Spacer()
+                    if avatarChoice == a.rawValue {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .navigationTitle("Chappy Avatar")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// Theme picker — pushed from Settings → Appearance → Theme.
+struct ThemePickerList: View {
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    var body: some View {
+        List(ChappyTheme.all, id: \.name) { t in
+            Button {
+                themeName = t.name
+            } label: {
+                HStack(spacing: 14) {
+                    Circle()
+                        .fill(RadialGradient(colors: [t.orbBright, t.orbDeep],
+                                             center: .init(x: 0.35, y: 0.3),
+                                             startRadius: 2, endRadius: 16))
+                        .frame(width: 32, height: 32)
+                        .shadow(color: t.orbBright.opacity(0.6), radius: 5)
+                    Text(t.name)
+                        .foregroundColor(.primary)
+                    Spacer()
+                    if themeName == t.name {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .navigationTitle("Chappy Theme")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 // MARK: - The Face (Phase 4.9) building blocks
 
 struct StatusChip: View {
     let label: String
     let on: Bool
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
         HStack(spacing: 5) {
             Circle()
-                .fill(on ? Color(red: 0.28, green: 0.9, blue: 0.63) : Color.white.opacity(0.25))
+                .fill(on ? theme.accent : theme.textPrimary.opacity(0.25))
                 .frame(width: 7, height: 7)
             Text(label)
                 .font(.caption2)
-                .foregroundColor(.white.opacity(on ? 0.9 : 0.45))
+                .foregroundColor(theme.textPrimary.opacity(on ? 0.9 : 0.45))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(Capsule().fill(Color.white.opacity(0.06)))
+        .background(Capsule().fill(theme.cardFill))
     }
 }
 
@@ -707,6 +1146,8 @@ struct ModeTile: View {
     let accent: Color
     let active: Bool
     let action: () -> Void
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 8) {
@@ -716,17 +1157,17 @@ struct ModeTile: View {
                 Spacer(minLength: 2)
                 Text(title)
                     .font(.headline)
-                    .foregroundColor(.white)
+                    .foregroundColor(theme.textPrimary)
                 Text(subtitle)
                     .font(.caption)
-                    .foregroundColor(.white.opacity(0.5))
+                    .foregroundColor(theme.textSecondary)
                     .lineLimit(2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(height: 110)
             .padding(14)
-            .background(RoundedRectangle(cornerRadius: 20).fill(Color.white.opacity(active ? 0.12 : 0.06)))
-            .overlay(RoundedRectangle(cornerRadius: 20).stroke(active ? accent.opacity(0.7) : Color.white.opacity(0.08), lineWidth: 1))
+            .background(RoundedRectangle(cornerRadius: 20).fill(active ? theme.cardActive : theme.cardFill))
+            .overlay(RoundedRectangle(cornerRadius: 20).stroke(active ? accent.opacity(0.7) : theme.stroke, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -736,19 +1177,21 @@ struct QuickActionButton: View {
     let icon: String
     let label: String
     let action: () -> Void
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
         Button(action: action) {
             VStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 20))
-                    .foregroundColor(.white.opacity(0.9))
+                    .foregroundColor(theme.textPrimary.opacity(0.9))
                 Text(label)
                     .font(.caption2)
-                    .foregroundColor(.white.opacity(0.6))
+                    .foregroundColor(theme.textPrimary.opacity(0.6))
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
+            .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
         }
         .buttonStyle(.plain)
     }
@@ -759,28 +1202,30 @@ struct MoreRow: View {
     let title: String
     let detail: String
     let action: () -> Void
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
                 Image(systemName: icon)
                     .font(.system(size: 18))
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(theme.textPrimary.opacity(0.7))
                     .frame(width: 26)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.subheadline)
-                        .foregroundColor(.white)
+                        .foregroundColor(theme.textPrimary)
                     Text(detail)
                         .font(.caption2)
-                        .foregroundColor(.white.opacity(0.45))
+                        .foregroundColor(theme.textPrimary.opacity(0.45))
                 }
                 Spacer()
                 Image(systemName: "chevron.right")
                     .font(.caption)
-                    .foregroundColor(.white.opacity(0.3))
+                    .foregroundColor(theme.textPrimary.opacity(0.3))
             }
             .padding(12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.05)))
+            .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
         }
         .buttonStyle(.plain)
     }
