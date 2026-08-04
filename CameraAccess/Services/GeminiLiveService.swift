@@ -48,6 +48,11 @@ class GeminiLiveService: NSObject {
     // STEP 8 FUSION: the live session other modules can speak through
     static weak var activeInstance: GeminiLiveService?
 
+    // CONTEXT DRIP: keeps Chappy's sense of time & place fresh all session
+    private var contextTimer: Timer?
+    // NAV BRIDGE v2: debounced full-sentence navigation detection
+    private var navDetectWork: DispatchWorkItem?
+
     // STEP 8 CONTINUITY PART 2: rolling conversation memory for re-briefs
     private var currentUserLine = ""
     private var currentModelLine = ""
@@ -225,6 +230,10 @@ class GeminiLiveService: NSObject {
     func disconnect() {
         print("🔌 [Gemini] Disconnect the WebSocket")
         if GeminiLiveService.activeInstance === self { GeminiLiveService.activeInstance = nil }
+        contextTimer?.invalidate()
+        contextTimer = nil
+        navDetectWork?.cancel()
+        navDetectWork = nil
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -241,7 +250,7 @@ class GeminiLiveService: NSObject {
 
         // Get the system prompt for the current Live AI mode
         // PHASE 4: live context header — Chappy knows where/when it is
-        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers ONLY in the very LATEST frame - when asked what the user is looking at, describe the newest image and NEVER an earlier one, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked. TOOLS ARE YOUR HANDS: use your function tools freely and unprompted - navigate_to when the user wants to go somewhere, remember_spot to save places, save_observation whenever you notice something notable worth remembering, alert_when_near for stop-watching, deep_research for questions needing thorough current facts (say you are digging into it first), open_app or open_website to act on the phone, and emergency IMMEDIATELY if the user is in danger. Never say you cannot do these things - call the tool."
+        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers ONLY in the very LATEST frame - when asked what the user is looking at, describe the newest image and NEVER an earlier one, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked. TOOLS ARE YOUR HANDS: use your function tools freely and unprompted - navigate_to when the user wants to go somewhere, remember_spot to save places, save_observation whenever you notice something notable worth remembering, alert_when_near for stop-watching, deep_research for questions needing thorough current facts (say you are digging into it first), open_app or open_website to act on the phone, and emergency IMMEDIATELY if the user is in danger. Never say you cannot do these things - call the tool. NAVIGATION TRUTH: you have NO power to 'send directions to the phone', 'load a map' or 'pull up a route' by yourself - the ONLY way navigation ever starts is the navigate_to tool, or a 'Navigation:' app message confirming the route. Never claim directions are ready or loaded unless one of those actually happened; if you did not call the tool, NOTHING happened. TIME AND PLACE TRUTH: messages starting with CONTEXT UPDATE are ground truth for the user's REAL current local time and location - when asked the time, the date, or where you are, answer from the LATEST context update, in local time. NEVER answer in UTC, never say you do not know where the user is, and never guess a city."
 
         // Use the voice chosen in Settings → Voice (was hardcoded to Aoede,
         // which silently ignored the user's picker). "System" (Apple TTS)
@@ -303,8 +312,8 @@ class GeminiLiveService: NSObject {
                     // PHASE 4 STEP 7 — THE HANDS: real function tools.
                     ["function_declarations": [
                         ["name": "navigate_to",
-                         "description": "Start hands-free walking navigation to a destination: a place name, shop, address, or a remembered spot.",
-                         "parameters": ["type": "OBJECT", "properties": ["destination": ["type": "STRING", "description": "Where to go"]], "required": ["destination"]]],
+                         "description": "Start hands-free turn-by-turn navigation to a destination: a place name, shop, address, or a remembered spot. Use mode 'drive' when the user is in a car, on a scooter or motorbike.",
+                         "parameters": ["type": "OBJECT", "properties": ["destination": ["type": "STRING", "description": "Where to go"], "mode": ["type": "STRING", "description": "walk or drive; default walk"]], "required": ["destination"]]],
                         ["name": "get_me_home",
                          "description": "Navigate the user back to their saved home or hotel spot."],
                         ["name": "stop_navigation",
@@ -520,7 +529,9 @@ class GeminiLiveService: NSObject {
         print("🔧 [Gemini] Tool: \(name) args: \(args)")
         switch name {
         case "navigate_to":
-            return await NavEngine.shared.navigate(to: args["destination"] as? String ?? "")
+            let mode = (args["mode"] as? String ?? "walk").lowercased()
+            return await NavEngine.shared.navigate(to: args["destination"] as? String ?? "",
+                                                   driving: mode.contains("driv") || mode.contains("car"))
         case "get_me_home":
             return await NavEngine.shared.getHome()
         case "stop_navigation":
@@ -635,6 +646,120 @@ class GeminiLiveService: NSObject {
     /// PHASE 4: hand the model an app-computed answer to speak (journal
     /// results, saved-spot confirmations). Sent as a completed user turn
     /// so Chappy replies out loud in its own voice.
+    // MARK: - Nav Bridge v2 (full-sentence, debounced)
+
+    /// Every phrasing that means "start navigation". Matched inside the
+    /// accumulated user sentence, so word order and politeness don't matter.
+    private static let navPhrases = [
+        "navigate me to ", "navigate us to ", "navigate to ",
+        "take me to ", "walk me to ", "drive me to ", "direct me to ",
+        "get me directions to ", "directions to ", "get me to ",
+        "guide me to ", "route me to ", "route to ",
+        "closest ", "nearest "
+    ]
+
+    /// Follow-up phrasings that change HOW to travel ("navigate me via car")
+    /// without repeating the destination.
+    private static let modePhrases = [
+        "via car", "by car", "in the car", "drive there", "driving there",
+        "via scooter", "by scooter", "on the scooter", "on my scooter",
+        "via bike", "by motorbike", "walk there", "on foot", "walking there"
+    ]
+
+    private func scheduleNavDetection() {
+        let lower = currentUserLine.lowercased()
+        guard Self.navPhrases.contains(where: { lower.contains($0) })
+            || Self.modePhrases.contains(where: { lower.contains($0) }) else { return }
+        navDetectWork?.cancel()
+        let lineSnapshot = currentUserLine
+        let work = DispatchWorkItem { [weak self] in self?.fireNavDetection(on: lineSnapshot) }
+        navDetectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+    }
+
+    private func fireNavDetection(on line: String) {
+        guard !journalCommandFired else { return }
+        // Find the LAST matching phrase so lead-ins ("hey can you please
+        // navigate me to...") don't poison the destination.
+        var best: Range<String.Index>? = nil
+        for phrase in Self.navPhrases {
+            var searchRange = line.startIndex..<line.endIndex
+            while let r = line.range(of: phrase, options: .caseInsensitive, range: searchRange) {
+                if best == nil || r.upperBound > best!.upperBound { best = r }
+                searchRange = r.upperBound..<line.endIndex
+            }
+        }
+        let lowerLine = line.lowercased()
+        let wantsDrive = lowerLine.contains("drive") || lowerLine.contains("driving")
+            || lowerLine.contains(" car") || lowerLine.contains("scooter")
+            || lowerLine.contains("motorbike") || lowerLine.contains("taxi")
+        guard let hit = best else {
+            // No destination in this sentence — but is it a travel-mode
+            // follow-up like "navigate me via car"? Re-route the LAST
+            // destination in the new mode.
+            if Self.modePhrases.contains(where: { lowerLine.contains($0) }) {
+                journalCommandFired = true
+                let driving = !(lowerLine.contains("walk") || lowerLine.contains("on foot"))
+                Task { @MainActor in
+                    if let last = NavEngine.shared.lastQuery {
+                        let reply = await NavEngine.shared.navigate(to: last, driving: driving)
+                        self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+                    } else {
+                        self.sendAppReply("Navigation: no destination given yet. Ask the user where they want to go.")
+                    }
+                }
+            }
+            return
+        }
+        var dest = String(line[hit.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: .punctuationCharacters)
+        for mp in Self.modePhrases {
+            if let r = dest.range(of: mp, options: .caseInsensitive) {
+                dest = String(dest[..<r.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: .punctuationCharacters)
+            }
+        }
+        for junk in ["thank you", "thanks", "please", "now"] {
+            if dest.lowercased().hasSuffix(junk) {
+                dest = String(dest.dropLast(junk.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: .punctuationCharacters)
+            }
+        }
+        if dest.lowercased().hasPrefix("the ") { dest = String(dest.dropFirst(4)) }
+        guard dest.count > 1 else { return }
+        journalCommandFired = true
+        print("🧭 [Gemini] Nav bridge v2 → '\(dest)'")
+        if dest.lowercased() == "home" {
+            Task { @MainActor in
+                let reply = await NavEngine.shared.getHome()
+                self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+            }
+        } else {
+            Task { @MainActor in
+                let reply = await NavEngine.shared.navigate(to: dest, driving: wantsDrive)
+                self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
+            }
+        }
+    }
+
+    /// CONTEXT DRIP: silently refresh Chappy's real local time + location.
+    /// turn_complete false = no spoken reply, it just updates the model's
+    /// working knowledge (same mechanism as the post-renewal re-brief).
+    private func sendContextUpdate() {
+        sendJSON([
+            "client_content": [
+                "turns": [[
+                    "role": "user",
+                    "parts": [["text": "CONTEXT UPDATE (ground truth, do NOT reply to this): \(ContextEngine.shared.contextHeader())"]]
+                ]],
+                "turn_complete": false
+            ]
+        ])
+    }
+
     private func sendAppReply(_ text: String) {
         sendJSON([
             "client_content": [
@@ -820,6 +945,16 @@ class GeminiLiveService: NSObject {
                 print("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
+                // CONTEXT DRIP: GPS usually locks a few seconds AFTER connect,
+                // so the setup header is often empty. Re-feed real time+place
+                // shortly after connect, then keep it fresh every 45s.
+                self.contextTimer?.invalidate()
+                self.contextTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
+                    self?.sendContextUpdate()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                    self?.sendContextUpdate()
+                }
                 // POST-RENEWAL RE-BRIEF: resumed sessions can come back with
                 // amnesia ("I'm just a language model"). Re-inject identity as
                 // silent context (turn_complete false = no spoken reply) and
@@ -996,21 +1131,12 @@ class GeminiLiveService: NSObject {
                         let reply = await NavEngine.shared.getHome()
                         self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
                     }
-                } else if let navRange = text.range(of: "navigate to ", options: .caseInsensitive)
-                    ?? text.range(of: "take me to ", options: .caseInsensitive)
-                    ?? text.range(of: "walk me to ", options: .caseInsensitive) {
-                    journalCommandFired = true
-                    let dest = String(text[navRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .trimmingCharacters(in: .punctuationCharacters)
-                    if dest.count > 2 {
-                        Task { @MainActor in
-                            let reply = await NavEngine.shared.navigate(to: dest)
-                            self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
-                        }
-                    } else {
-                        journalCommandFired = false
-                    }
+                } else {
+                    // NAV BRIDGE v2: transcripts arrive in fragments, so match
+                    // on the ACCUMULATED sentence with a short debounce - this
+                    // catches "navigate ME to X", "directions to X", "the
+                    // closest IGA" and never cuts the destination in half.
+                    scheduleNavDetection()
                 }
             }
         }
