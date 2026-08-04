@@ -341,7 +341,7 @@ class OmniRealtimeViewModel: ObservableObject {
     /// Send the latest glasses frame to Gemini once per second while connected.
     private func startFrameSendTimer() {
         frameSendTimer?.invalidate()
-        frameSendTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        frameSendTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isConnected else { return }
                 // POCKET MODE: view-driven frame updates STOP when the screen

@@ -27,8 +27,10 @@ struct SettingsView: View {
     @ObservedObject var quickVisionModeManager = QuickVisionModeManager.shared
     @ObservedObject var liveAIModeManager = LiveAIModeManager.shared
     @State private var selectedModel = "qwen3-omni-flash-realtime"
-    @State private var selectedLanguage = "zh-CN" // default English
-    @State private var selectedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "medium"
+    // FIXED: was an orphan @State hardcoded to zh-CN and never saved —
+    // now persisted to UserDefaults and defaults to English
+    @State private var selectedLanguage = UserDefaults.standard.string(forKey: "output_language") ?? "en-US"
+    @State private var selectedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "high"
     @State private var hasAPIKey = false // changed to a State variable
     @State private var hasGoogleAPIKey = false // Google API Key Status
 
@@ -451,7 +453,7 @@ struct SettingsView: View {
         case "ko-KR": return "한국어"
         case "es-ES": return "Español"
         case "fr-FR": return "Français"
-        default: return "Chinese"
+        default: return "English"
         }
     }
 
@@ -925,6 +927,7 @@ struct LanguageSettingsView: View {
                     ForEach(languages, id: \.0) { lang in
                         Button {
                             selectedLanguage = lang.0
+                            UserDefaults.standard.set(lang.0, forKey: "output_language")
                         } label: {
                             HStack {
                                 Text(lang.1)

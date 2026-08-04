@@ -13,7 +13,8 @@ class TTSService: NSObject, ObservableObject {
     @Published var isSpeaking = false
 
     // Gemini TTS models — primary, with fallback name if Google renames tiers
-    private let ttsModels = ["gemini-2.5-flash-tts", "gemini-2.5-flash-preview-tts"]
+    // Verified current 2026-08: 3.1 preview is the live tier; 2.5 preview kept as fallback
+    private let ttsModels = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
 
     /// Gemini prebuilt voice. Change via UserDefaults key "chappy_tts_voice".
     /// Nice options: Kore (warm female), Puck (male), Aoede, Charon, Fenrir, Leda.
@@ -187,7 +188,7 @@ class TTSService: NSObject, ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 30
+        request.timeoutInterval = 8  // fail FAST to the system voice, never stall the session
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
@@ -267,7 +268,10 @@ class TTSService: NSObject, ObservableObject {
         synthesizer.delegate = self
 
         let utterance = AVSpeechUtterance(string: text)
-        let language = await MainActor.run { LanguageManager.shared.currentLanguage == .chinese ? "zh-CN" : "en-AU" }
+        // Voice chosen by the TEXT itself — the old app-language setting was
+        // still "Chinese" from TurboMeta days and made English sound Chinese.
+        let hasCJK = text.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+        let language = hasCJK ? "zh-CN" : "en-AU"
         utterance.voice = AVSpeechSynthesisVoice(language: language)
             ?? AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate

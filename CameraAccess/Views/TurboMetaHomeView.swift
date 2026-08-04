@@ -18,6 +18,8 @@ struct TurboMetaHomeView: View {
     @StateObject private var continuousVision = ContinuousVisionManager.shared
     @StateObject private var navEngine = NavEngine.shared
     @State private var showNavMap = false
+    @State private var showEmergencyContact = false
+    @State private var emergencyContactText = UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? ""
     let apiKey: String
 
     @State private var showLiveAI = false
@@ -204,6 +206,10 @@ struct TurboMetaHomeView: View {
                             MoreRow(icon: "chart.bar.fill", title: "LeanEat", detail: "Food analysis") {
                                 showLeanEat = true
                             }
+                            MoreRow(icon: "cross.circle.fill", title: "Emergency Contact",
+                                    detail: emergencyContactText.isEmpty ? "Set the WhatsApp number for emergencies" : "Saved — tap to change") {
+                                showEmergencyContact = true
+                            }
                         }
                         .padding(.bottom, 30)
                     }
@@ -248,6 +254,24 @@ struct TurboMetaHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: .liveAITriggered)) { _ in
             // Triggered from Shortcuts — auto-open the Live AI screen
             showLiveAI = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .continuousVisionTriggered)) { _ in
+            // "Hey Siri, Continuous Vision"
+            if !continuousVision.isRunning {
+                continuousVision.start(streamViewModel: streamViewModel)
+            }
+        }
+        .alert("Emergency Contact", isPresented: $showEmergencyContact) {
+            TextField("Number with country code, e.g. 61412345678", text: $emergencyContactText)
+                .keyboardType(.phonePad)
+            Button("Save") {
+                UserDefaults.standard.set(
+                    emergencyContactText.trimmingCharacters(in: .whitespaces),
+                    forKey: "chappy_emergency_contact")
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("When you say Chappy emergency, your live location is sent to this WhatsApp number.")
         }
     }
 }
