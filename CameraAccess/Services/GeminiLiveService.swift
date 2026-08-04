@@ -33,6 +33,7 @@ class GeminiLiveService: NSObject {
     // Audio Playback Engine (separate engine for playback)
     private var playbackEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
+    private var audioLifelinesInstalled = false
     private let playbackAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)
     private let recordTargetFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
     private var recordConverter: AVAudioConverter?
@@ -79,6 +80,44 @@ class GeminiLiveService: NSObject {
     private func setupAudioEngine() {
         audioEngine = AVAudioEngine()
         setupPlaybackEngine()
+        installAudioLifelines()
+    }
+
+    // VOICE LIFELINE: iOS silently kills the playback engine on audio
+    // interruptions and Bluetooth route changes (glasses drop/reconnect).
+    // The old code trusted its own isPlaybackEngineRunning flag — which
+    // stays true — so every later reply was scheduled into a dead engine:
+    // the chat kept answering, the voice went mute. These observers plus
+    // the health check in playAudio() bring the voice back automatically.
+    private func installAudioLifelines() {
+        guard !audioLifelinesInstalled else { return }
+        audioLifelinesInstalled = true
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            if let engine = self.playbackEngine, !engine.isRunning {
+                self.revivePlaybackEngine()
+            }
+        }
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            if let engine = self.playbackEngine, !engine.isRunning {
+                self.revivePlaybackEngine()
+            }
+        }
+        print("🛟 [Gemini] Audio lifelines installed (interruption + route change)")
+    }
+
+    private func revivePlaybackEngine() {
+        print("🔄 [Gemini] Playback engine dead (interruption/route change) — reviving")
+        playerNode?.stop()
+        playbackEngine?.stop()
+        isPlaybackEngineRunning = false
+        setupPlaybackEngine()
+        startPlaybackEngine()
+        playerNode?.play()
     }
 
     private func setupPlaybackEngine() {
@@ -178,7 +217,7 @@ class GeminiLiveService: NSObject {
         guard !isSessionConfigured else { return }
 
         // Get the system prompt for the current Live AI mode
-        let instructions = LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: speak naturally and briefly like a trusted friend; lead with the answer; more detail only when asked. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers in the MOST RECENT frame, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked."
+        let instructions = LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers in the MOST RECENT frame, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked."
 
         // Use the voice chosen in Settings → Voice (was hardcoded to Aoede,
         // which silently ignored the user's picker). "System" (Apple TTS)
@@ -208,6 +247,9 @@ class GeminiLiveService: NSObject {
                         ["text": instructions]
                     ]
                 ],
+                // PROACTIVE AUDIO pulled 2026-08-03: v1beta rejects the field
+                // (1007 "Unknown name 'proactivity'"). It's v1alpha-only —
+                // re-add together with a v1alpha endpoint experiment later.
                 // Transcripts of BOTH sides — the app's history and the
                 // "read this" trigger depend on these arriving.
                 "input_audio_transcription": [:],
@@ -217,7 +259,7 @@ class GeminiLiveService: NSObject {
                 "realtime_input_config": [
                     "automatic_activity_detection": [
                         "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
-                        "silence_duration_ms": 500
+                        "silence_duration_ms": 300
                     ]
                 ],
                 // LONG SESSIONS: sliding-window compression stops the session
@@ -676,6 +718,13 @@ class GeminiLiveService: NSObject {
     }
 
     private func playAudio(_ audioData: Data) {
+        // Health check FIRST: if the engine died since the last chunk
+        // (route change / interruption), rebuild it — then grab the
+        // fresh playerNode below so buffers land on the LIVE node.
+        if let engine = playbackEngine, !engine.isRunning, isPlaybackEngineRunning {
+            revivePlaybackEngine()
+        }
+
         guard let playerNode = playerNode,
               let playbackAudioFormat else {
             return
