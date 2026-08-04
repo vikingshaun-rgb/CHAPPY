@@ -112,43 +112,9 @@ struct SettingsView: View {
                         }
                     }
 
-                    // API Provider
-                    Button {
-                        showProviderSettings = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "server.rack")
-                                .foregroundColor(AppColors.accent)
-                            Text("settings.provider".localized)
-                                .foregroundColor(AppColors.textPrimary)
-                            Spacer()
-                            Text(providerManager.currentProvider.displayName)
-                                .font(AppTypography.caption)
-                                .foregroundColor(AppColors.textSecondary)
-                            Image(systemName: "chevron.right")
-                                .font(AppTypography.caption)
-                                .foregroundColor(AppColors.textTertiary)
-                        }
-                    }
-
-                    Button {
-                        showModelSettings = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "cpu")
-                                .foregroundColor(AppColors.accent)
-                            Text("settings.model".localized)
-                                .foregroundColor(AppColors.textPrimary)
-                            Spacer()
-                            Text(providerManager.selectedModel)
-                                .font(AppTypography.caption)
-                                .foregroundColor(AppColors.textSecondary)
-                                .lineLimit(1)
-                            Image(systemName: "chevron.right")
-                                .font(AppTypography.caption)
-                                .foregroundColor(AppColors.textTertiary)
-                        }
-                    }
+                    // SETTINGS CLEANUP: dead Alibaba-era rows (API Provider /
+                    // Vision Model qwen picker) removed — Chappy is Gemini +
+                    // Claude only. The sheets remain in code but unreachable.
 
                     Button {
                         showLanguageSettings = true
