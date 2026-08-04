@@ -301,6 +301,12 @@ class StreamSessionViewModel: ObservableObject {
   private func showError(_ message: String) {
     errorMessage = message
     showError = true
+    // RIDER: glasses trouble reaches the EARS, not just the screen —
+    // battery-critical / overheating / closed hinges get spoken.
+    let lower = message.lowercased()
+    if lower.contains("temperature") || lower.contains("battery") || lower.contains("hinges") {
+        TTSService.shared.speak(message)
+    }
   }
 
   func dismissError() {
