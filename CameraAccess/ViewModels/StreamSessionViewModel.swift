@@ -77,6 +77,10 @@ class StreamSessionViewModel: ObservableObject {
   private var sessionErrorTask: Task<Void, Never>?
   private var sessionStateTask: Task<Void, Never>?
 
+  // Fast-lane frame conversion (off-main; one in flight, freshest wins)
+  nonisolated(unsafe) private static var frameConversionBusy = false
+  private static let frameQueue = DispatchQueue(label: "chappy.frameconvert", qos: .userInteractive)
+
   private let wearables: WearablesInterface
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
@@ -232,17 +236,23 @@ class StreamSessionViewModel: ObservableObject {
         }
       }
 
-      // Subscribe to video frames (skip if previous frame still processing)
+      // Subscribe to video frames.
+      // PERF FIX (iPhone 11): conversion used to run on the MAIN thread —
+      // high-res frames backed up behind the UI and the "current" frame
+      // went seconds stale. Now: dedicated queue, one conversion in flight,
+      // freshest frame always wins, main thread only receives the result.
       videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] videoFrame in
-        Task { @MainActor [weak self] in
-          guard let self, !self.isProcessingFrame else { return }
-          self.isProcessingFrame = true
-          defer { self.isProcessingFrame = false }
-
-          if let image = videoFrame.makeUIImage() {
+        guard !Self.frameConversionBusy else { return }
+        Self.frameConversionBusy = true
+        Self.frameQueue.async { [weak self] in
+          let image = videoFrame.makeUIImage()
+          Self.frameConversionBusy = false
+          guard let image else { return }
+          Task { @MainActor [weak self] in
+            guard let self else { return }
             self.currentVideoFrame = image
             if !self.hasReceivedFirstFrame {
-              logger.info("🎥 First frame received and converted")
+              logger.info("🎥 First frame received and converted (fast path)")
               self.hasReceivedFirstFrame = true
             }
           }
