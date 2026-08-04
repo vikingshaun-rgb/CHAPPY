@@ -8,6 +8,7 @@ import SwiftUI
 import AVFoundation
 import CoreLocation
 import CoreMotion
+import MapKit
 
 // MARK: - Live AI Manager
 
@@ -477,7 +478,6 @@ enum LiveAIError: LocalizedError {
     }
 }
 
-
 // MARK: - Context Engine (Phase 4 Step 1)
 // Chappy's ambient awareness: WHERE the user is (street/city/country),
 // WHEN it is, the weather, and how they're moving. One snapshot, available
@@ -568,6 +568,10 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         snapshot.latitude = loc.coordinate.latitude
         snapshot.longitude = loc.coordinate.longitude
         snapshot.timestamp = Date()
+        // PHASE 4 STEP 3: every fix feeds the journal (it self-throttles)
+        TripRecorder.shared.record(location: loc)
+        // PHASE 4 STEP 5: and the navigator (speaks turns when close)
+        Task { @MainActor in NavEngine.shared.updateLocation(loc) }
         if Date().timeIntervalSince(lastGeocode) > 120 {
             lastGeocode = Date()
             reverseGeocode(loc)
@@ -623,5 +627,479 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         case 95...99: return "thunderstorm"
         default: return "unsettled"
         }
+    }
+}
+
+// MARK: - Trip Recorder (Phase 4 Step 3)
+// The always-on journal: GPS breadcrumbs + named spots, near-zero battery,
+// fully offline (files in Documents). Fed by ContextEngine's location
+// updates; queried by voice through Live AI.
+
+final class TripRecorder {
+    static let shared = TripRecorder()
+
+    struct Crumb: Codable {
+        let t: Date
+        let lat: Double
+        let lon: Double
+        var street: String?
+        var city: String?
+        var motion: String?
+    }
+
+    struct Spot: Codable {
+        let name: String
+        let t: Date
+        let lat: Double
+        let lon: Double
+        var street: String?
+        var city: String?
+        var country: String?
+    }
+
+    private(set) var crumbs: [Crumb] = []
+    private(set) var spots: [Spot] = []
+    private var lastCrumb: Crumb?
+    private let ioQueue = DispatchQueue(label: "chappy.triprecorder", qos: .utility)
+
+    private var docs: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+    private var spotsURL: URL { docs.appendingPathComponent("chappy-spots.json") }
+    private func crumbsURL(for date: Date) -> URL {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        return docs.appendingPathComponent("chappy-crumbs-\(df.string(from: date)).json")
+    }
+    private func notesURL(for date: Date) -> URL {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        return docs.appendingPathComponent("chappy-notes-\(df.string(from: date)).json")
+    }
+    private(set) var notes: [String] = []
+
+    private init() {
+        if let d = try? Data(contentsOf: crumbsURL(for: Date())),
+           let c = try? JSONDecoder().decode([Crumb].self, from: d) {
+            crumbs = c
+            lastCrumb = c.last
+        }
+        if let d = try? Data(contentsOf: spotsURL),
+           let s = try? JSONDecoder().decode([Spot].self, from: d) {
+            spots = s
+        }
+        if let d = try? Data(contentsOf: notesURL(for: Date())),
+           let n = try? JSONDecoder().decode([String].self, from: d) {
+            notes = n
+        }
+        print("👣 [Trip] Loaded \(crumbs.count) crumbs, \(spots.count) spots, \(notes.count) notes")
+    }
+
+    /// Called by ContextEngine on every location fix; keeps only meaningful movement.
+    func record(location: CLLocation) {
+        let snap = ContextEngine.shared.snapshot
+        let new = Crumb(t: Date(),
+                        lat: location.coordinate.latitude,
+                        lon: location.coordinate.longitude,
+                        street: snap.street, city: snap.city, motion: snap.motion)
+        if let last = lastCrumb {
+            let dist = TripRecorder.meters(last.lat, last.lon, new.lat, new.lon)
+            let dt = new.t.timeIntervalSince(last.t)
+            guard dist > 25 || dt > 120 else { return }
+        }
+        lastCrumb = new
+        crumbs.append(new)
+        saveCrumbs()
+    }
+
+    @discardableResult
+    func rememberSpot(named rawName: String) -> Spot {
+        let snap = ContextEngine.shared.snapshot
+        var name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty {
+            let df = DateFormatter()
+            df.dateFormat = "h:mma"
+            name = "spot at \(df.string(from: Date()))"
+            if let s = snap.street { name += " near \(s)" }
+        }
+        let spot = Spot(name: name, t: Date(),
+                        lat: snap.latitude ?? lastCrumb?.lat ?? 0,
+                        lon: snap.longitude ?? lastCrumb?.lon ?? 0,
+                        street: snap.street, city: snap.city, country: snap.country)
+        spots.append(spot)
+        saveSpots()
+        print("📍 [Trip] Remembered spot: \(name)")
+        return spot
+    }
+
+    /// Streets/areas passed through today, in order, plus remembered spots.
+    func todaySummary() -> String {
+        var route: [String] = []
+        for c in crumbs {
+            if let s = c.street ?? c.city, route.last != s, !route.contains(s) {
+                route.append(s)
+            }
+        }
+        var out = ""
+        if route.isEmpty {
+            out = "The journal has no located places yet today."
+        } else {
+            out = "Today the user has passed through: \(route.joined(separator: ", "))."
+        }
+        let todaySpots = spots.filter { Calendar.current.isDateInToday($0.t) }
+        if !todaySpots.isEmpty {
+            out += " Remembered spots today: \(todaySpots.map { $0.name }.joined(separator: ", "))."
+        }
+        if !notes.isEmpty {
+            out += " Observations noted: \(notes.suffix(3).joined(separator: "; "))."
+        }
+        return out
+    }
+
+    /// Spoken situation report for "I'm lost".
+    func lostReport() -> String {
+        guard let here = lastCrumb ?? crumbs.last else {
+            return "There is no location fix yet - ask the user to wait a moment while GPS settles."
+        }
+        var out = "The user is"
+        if let s = here.street { out += " on \(s)" }
+        if let c = here.city { out += ", \(c)" }
+        if here.street == nil && here.city == nil { out += " at an unnamed location" }
+        out += "."
+        if let nearest = spots.min(by: {
+            TripRecorder.meters($0.lat, $0.lon, here.lat, here.lon) < TripRecorder.meters($1.lat, $1.lon, here.lat, here.lon)
+        }) {
+            let d = TripRecorder.meters(nearest.lat, nearest.lon, here.lat, here.lon)
+            let dir = TripRecorder.compass(from: (here.lat, here.lon), to: (nearest.lat, nearest.lon))
+            out += " The nearest remembered spot is '\(nearest.name)', about \(Int(d.rounded())) meters to the \(dir)."
+        }
+        out += " There are \(crumbs.count) breadcrumbs recorded today, so the route back exists."
+        return out
+    }
+
+    /// STEP 8: ambient noticing — Chappy's own observations, journaled.
+    func addObservation(_ text: String) {
+        guard !text.isEmpty else { return }
+        let df = DateFormatter()
+        df.dateFormat = "h:mma"
+        var line = "\(df.string(from: Date())): \(text)"
+        let snap = ContextEngine.shared.snapshot
+        if let s = snap.street { line += " (near \(s))" }
+        notes.append(line)
+        let snapshot = notes
+        let url = notesURL(for: Date())
+        ioQueue.async {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
+        }
+        print("📝 [Trip] Observation: \(text)")
+    }
+
+    /// Spoken guidance for "trace my steps back" — the day's route in reverse.
+    func retraceGuidance() -> String {
+        guard crumbs.count > 1 else {
+            return "There are not enough breadcrumbs yet to retrace - the trail starts recording as the user moves."
+        }
+        var route: [String] = []
+        for c in crumbs.reversed() {
+            if let s = c.street ?? c.city, route.last != s, !route.contains(s) {
+                route.append(s)
+            }
+        }
+        let total = zip(crumbs, crumbs.dropFirst()).reduce(0.0) {
+            $0 + TripRecorder.meters($1.0.lat, $1.0.lon, $1.1.lat, $1.1.lon)
+        }
+        var out = "To retrace the route back"
+        if route.count > 1 {
+            out += ", head back along " + route.prefix(6).joined(separator: ", then ")
+        }
+        out += ". The full trail today is about \(Int((total / 100).rounded()) * 100) meters."
+        out += " Guide the user street by street if they ask."
+        return out
+    }
+
+    private func saveCrumbs() {
+        let snapshot = crumbs
+        let url = crumbsURL(for: Date())
+        ioQueue.async {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
+        }
+    }
+
+    private func saveSpots() {
+        let snapshot = spots
+        let url = spotsURL
+        ioQueue.async {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
+        }
+    }
+
+    static func meters(_ lat1: Double, _ lon1: Double, _ lat2: Double, _ lon2: Double) -> Double {
+        CLLocation(latitude: lat1, longitude: lon1).distance(from: CLLocation(latitude: lat2, longitude: lon2))
+    }
+
+    static func compass(from a: (Double, Double), to b: (Double, Double)) -> String {
+        let dLon = (b.1 - a.1) * .pi / 180
+        let lat1 = a.0 * .pi / 180, lat2 = b.0 * .pi / 180
+        let y = sin(dLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        var deg = atan2(y, x) * 180 / .pi
+        if deg < 0 { deg += 360 }
+        let dirs = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest", "north"]
+        return dirs[Int((deg + 22.5) / 45)]
+    }
+}
+
+// MARK: - Nav Engine (Phase 4 Step 5)
+// Voice-first turn-by-turn: Google Routes PRIMARY (best SE Asia data,
+// chappy-maps key) with MapKit fallback, Google Places destination search,
+// spoken geofenced turns via TTSService, off-route auto-reroute.
+
+@MainActor
+final class NavEngine: NSObject, ObservableObject {
+    static let shared = NavEngine()
+
+    struct NavStep {
+        let instruction: String
+        let coord: CLLocationCoordinate2D
+        let distanceMeters: Double
+    }
+
+    @Published var isNavigating = false
+    @Published var destinationName = ""
+    @Published var nextInstruction = ""
+    @Published var distanceText = ""
+    @Published var routeCoords: [CLLocationCoordinate2D] = []
+    @Published var destinationCoord: CLLocationCoordinate2D?
+
+    private var steps: [NavStep] = []
+    private var stepIndex = 0
+    private var lastReroute = Date.distantPast
+    // STEP 8: "tell me when I'm near X" watch target
+    private var watchTarget: (name: String, coord: CLLocationCoordinate2D)?
+
+    /// STEP 8 FUSION: nav speaks through the live Chappy session when one
+    /// is running (camera-aware turns); falls back to plain TTS otherwise.
+    private func speakNav(_ text: String) {
+        if let live = GeminiLiveService.activeInstance {
+            live.announceNavStep(text)
+        } else {
+            TTSService.shared.speak(text)
+        }
+    }
+
+    /// STEP 8: set a proximity watch — "tell me when I'm near my stop"
+    func alertWhenNear(_ place: String) async -> String {
+        let snap = ContextEngine.shared.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else { return "No GPS fix yet." }
+        if let found = await placesSearch(query: place, lat: lat, lon: lon) {
+            watchTarget = (found.1, found.0)
+            return "Watch set - the user will be alerted when they are near \(found.1)."
+        }
+        return "Could not find \(place) nearby to watch for."
+    }
+
+    /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
+    func navigate(to query: String) async -> String {
+        let snap = ContextEngine.shared.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else {
+            return "No GPS fix yet - ask the user to try again in a few seconds."
+        }
+        var destName = query
+        var dest: CLLocationCoordinate2D?
+        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if let spot = TripRecorder.shared.spots.last(where: { q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q) }) {
+            dest = CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon)
+            destName = spot.name
+        }
+        if dest == nil, let found = await placesSearch(query: query, lat: lat, lon: lon) {
+            dest = found.0
+            destName = found.1
+        }
+        guard let destination = dest else {
+            return "Could not find '\(query)' nearby. Ask the user to try a different name."
+        }
+        var routed = await googleRoute(fromLat: lat, fromLon: lon, to: destination)
+        if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: destination) }
+        guard let route = routed, !route.steps.isEmpty else {
+            return "Could not find a walking route to \(destName)."
+        }
+        steps = route.steps
+        routeCoords = route.coords
+        destinationCoord = destination
+        destinationName = destName
+        stepIndex = 0
+        isNavigating = true
+        updateCard()
+        let mins = max(1, Int(route.durationSec / 60))
+        return "Route to \(destName) found: about \(Int(route.distanceMeters)) meters, roughly \(mins) minutes walking. First step: \(steps[0].instruction)."
+    }
+
+    func getHome() async -> String {
+        if let home = TripRecorder.shared.spots.last(where: { ["home", "hotel", "my hotel", "the hotel"].contains($0.name.lowercased()) }) {
+            return await navigate(to: home.name)
+        }
+        return "No spot named home or hotel is saved yet. Tell the user: stand at your hotel and say remember this spot, call it home."
+    }
+
+    func stop(announce: Bool = false) {
+        isNavigating = false
+        steps = []
+        routeCoords = []
+        nextInstruction = ""
+        distanceText = ""
+        destinationCoord = nil
+        if announce { TTSService.shared.speak("Navigation stopped.") }
+    }
+
+    /// Fed by ContextEngine on every fix: speaks turns, detects off-route.
+    func updateLocation(_ loc: CLLocation) {
+        // STEP 8: proximity watch fires even when not navigating
+        if let w = watchTarget {
+            let dw = loc.distance(from: CLLocation(latitude: w.coord.latitude, longitude: w.coord.longitude))
+            if dw < 150 {
+                watchTarget = nil
+                speakNav("Heads up - you are about \(Int(dw)) meters from \(w.name).")
+            }
+        }
+        guard isNavigating, stepIndex < steps.count else { return }
+        let step = steps[stepIndex]
+        let d = loc.distance(from: CLLocation(latitude: step.coord.latitude, longitude: step.coord.longitude))
+        distanceText = d > 950 ? String(format: "%.1f km", d / 1000) : "\(Int(d)) m"
+        if d < 25 {
+            stepIndex += 1
+            if stepIndex >= steps.count {
+                speakNav("You have arrived at \(destinationName).")
+                stop()
+                return
+            }
+            speakNav(steps[stepIndex].instruction)
+            updateCard()
+        } else if Date().timeIntervalSince(lastReroute) > 30, !routeCoords.isEmpty {
+            let nearest = routeCoords.map { loc.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude)) }.min() ?? 0
+            if nearest > 60 {
+                lastReroute = Date()
+                speakNav("You are off the route. Recalculating.")
+                let name = destinationName
+                Task { _ = await self.navigate(to: name) }
+            }
+        }
+    }
+
+    private func updateCard() {
+        guard stepIndex < steps.count else { return }
+        nextInstruction = steps[stepIndex].instruction
+    }
+
+    private struct Routed {
+        let steps: [NavStep]
+        let coords: [CLLocationCoordinate2D]
+        let distanceMeters: Double
+        let durationSec: Double
+    }
+
+    private func googleRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D) async -> Routed? {
+        let key = APIKeyManager.shared.getMapsAPIKey() ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://routes.googleapis.com/directions/v2:computeRoutes") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "X-Goog-Api-Key")
+        req.setValue("routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction,routes.legs.steps.endLocation,routes.legs.steps.distanceMeters", forHTTPHeaderField: "X-Goog-FieldMask")
+        let body: [String: Any] = [
+            "origin": ["location": ["latLng": ["latitude": fromLat, "longitude": fromLon]]],
+            "destination": ["location": ["latLng": ["latitude": to.latitude, "longitude": to.longitude]]],
+            "travelMode": "WALK"
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return nil }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let routes = json["routes"] as? [[String: Any]], let r = routes.first else {
+            print("🗺️ [Nav] Google route failed (\((resp as? HTTPURLResponse)?.statusCode ?? -1)) — MapKit fallback")
+            return nil
+        }
+        var navSteps: [NavStep] = []
+        for leg in (r["legs"] as? [[String: Any]] ?? []) {
+            for s in (leg["steps"] as? [[String: Any]] ?? []) {
+                let instr = ((s["navigationInstruction"] as? [String: Any])?["instructions"] as? String) ?? "Continue"
+                let end = ((s["endLocation"] as? [String: Any])?["latLng"] as? [String: Any])
+                let c = CLLocationCoordinate2D(latitude: end?["latitude"] as? Double ?? 0,
+                                               longitude: end?["longitude"] as? Double ?? 0)
+                let dm = (s["distanceMeters"] as? Double) ?? Double(s["distanceMeters"] as? Int ?? 0)
+                navSteps.append(NavStep(instruction: instr, coord: c, distanceMeters: dm))
+            }
+        }
+        let dist = (r["distanceMeters"] as? Double) ?? Double(r["distanceMeters"] as? Int ?? 0)
+        var dur = 0.0
+        if let ds = r["duration"] as? String { dur = Double(ds.replacingOccurrences(of: "s", with: "")) ?? 0 }
+        let poly = ((r["polyline"] as? [String: Any])?["encodedPolyline"] as? String).map(NavEngine.decodePolyline) ?? []
+        print("🗺️ [Nav] Google route OK: \(navSteps.count) steps, \(Int(dist))m")
+        return Routed(steps: navSteps, coords: poly, distanceMeters: dist, durationSec: dur)
+    }
+
+    private func mapKitRoute(fromLat: Double, fromLon: Double, to: CLLocationCoordinate2D) async -> Routed? {
+        let req = MKDirections.Request()
+        req.source = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: fromLat, longitude: fromLon)))
+        req.destination = MKMapItem(placemark: MKPlacemark(coordinate: to))
+        req.transportType = .walking
+        guard let resp = try? await MKDirections(request: req).calculate(), let route = resp.routes.first else { return nil }
+        var navSteps: [NavStep] = []
+        for s in route.steps where !s.instructions.isEmpty {
+            let pc = s.polyline.pointCount
+            var cs = [CLLocationCoordinate2D](repeating: CLLocationCoordinate2D(), count: pc)
+            s.polyline.getCoordinates(&cs, range: NSRange(location: 0, length: pc))
+            navSteps.append(NavStep(instruction: s.instructions, coord: cs.last ?? to, distanceMeters: s.distance))
+        }
+        let pc = route.polyline.pointCount
+        var coords = [CLLocationCoordinate2D](repeating: CLLocationCoordinate2D(), count: pc)
+        route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: pc))
+        print("🗺️ [Nav] MapKit route OK: \(navSteps.count) steps")
+        return Routed(steps: navSteps, coords: coords, distanceMeters: route.distance, durationSec: route.expectedTravelTime)
+    }
+
+    private func placesSearch(query: String, lat: Double, lon: Double) async -> (CLLocationCoordinate2D, String)? {
+        let key = APIKeyManager.shared.getMapsAPIKey() ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://places.googleapis.com/v1/places:searchText") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "X-Goog-Api-Key")
+        req.setValue("places.displayName,places.location", forHTTPHeaderField: "X-Goog-FieldMask")
+        let body: [String: Any] = [
+            "textQuery": query,
+            "locationBias": ["circle": ["center": ["latitude": lat, "longitude": lon], "radius": 15000.0]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let places = json["places"] as? [[String: Any]], let p = places.first,
+              let locd = p["location"] as? [String: Any],
+              let la = locd["latitude"] as? Double, let lo = locd["longitude"] as? Double else { return nil }
+        let name = ((p["displayName"] as? [String: Any])?["text"] as? String) ?? query
+        print("🗺️ [Nav] Places found: \(name)")
+        return (CLLocationCoordinate2D(latitude: la, longitude: lo), name)
+    }
+
+    nonisolated static func decodePolyline(_ encoded: String) -> [CLLocationCoordinate2D] {
+        var coords: [CLLocationCoordinate2D] = []
+        var index = encoded.startIndex
+        var lat = 0, lon = 0
+        while index < encoded.endIndex {
+            for pair in 0..<2 {
+                var result = 0, shift = 0, b = 0
+                repeat {
+                    guard index < encoded.endIndex else { return coords }
+                    b = Int(encoded[index].asciiValue ?? 63) - 63
+                    index = encoded.index(after: index)
+                    result |= (b & 0x1F) << shift
+                    shift += 5
+                } while b >= 0x20
+                let delta = (result & 1) != 0 ? ~(result >> 1) : (result >> 1)
+                if pair == 0 { lat += delta } else { lon += delta }
+            }
+            coords.append(CLLocationCoordinate2D(latitude: Double(lat) / 1e5, longitude: Double(lon) / 1e5))
+        }
+        return coords
     }
 }
