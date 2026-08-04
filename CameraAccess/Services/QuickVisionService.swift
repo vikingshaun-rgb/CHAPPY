@@ -161,6 +161,7 @@ class QuickVisionService {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             throw QuickVisionError.invalidResponse
         }
+        CostMeter.shared.addQuickVision()
 
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"

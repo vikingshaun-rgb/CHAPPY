@@ -118,6 +118,7 @@ class TTSService: NSObject, ObservableObject {
             if !googleKey.isEmpty && !wantsSystemVoice {
                 do {
                     try await self.speakWithGemini(text: trimmed, apiKey: googleKey)
+                    CostMeter.shared.addTTSChars(trimmed.count)
                     if !Task.isCancelled { await MainActor.run { self.isSpeaking = false } }
                     return
                 } catch {

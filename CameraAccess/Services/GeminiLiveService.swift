@@ -48,6 +48,9 @@ class GeminiLiveService: NSObject {
     // STEP 8 FUSION: the live session other modules can speak through
     static weak var activeInstance: GeminiLiveService?
 
+    // COST METER: when this live session started (for spend estimates)
+    private var liveSessionStartAt: Date?
+
     // CONTEXT DRIP: keeps Chappy's sense of time & place fresh all session
     private var contextTimer: Timer?
     // NAV BRIDGE v2: debounced full-sentence navigation detection
@@ -239,6 +242,11 @@ class GeminiLiveService: NSObject {
         contextTimer = nil
         navDetectWork?.cancel()
         navDetectWork = nil
+        // COST METER: bank the session time
+        if let started = liveSessionStartAt {
+            CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(started))
+            liveSessionStartAt = nil
+        }
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -593,6 +601,7 @@ class GeminiLiveService: NSObject {
         guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             return "Research brain unavailable - no key configured."
         }
+        CostMeter.shared.addResearch()
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue(key, forHTTPHeaderField: "x-api-key")
@@ -977,6 +986,11 @@ class GeminiLiveService: NSObject {
                 print("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
+                // COST METER: bank elapsed minutes across renewals
+                if let started = self.liveSessionStartAt {
+                    CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(started))
+                }
+                self.liveSessionStartAt = Date()
                 // CONTEXT DRIP: GPS usually locks a few seconds AFTER connect,
                 // so the setup header is often empty. Re-feed real time+place
                 // shortly after connect, then keep it fresh every 45s.
