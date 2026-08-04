@@ -278,6 +278,9 @@ class OmniRealtimeViewModel: ObservableObject {
             print("💬 [LiveAI] No conversation content — skipping save")
             return
         }
+        // DUPLICATE-RECORDS FIX: shared gate with LiveAIManager
+        let fp = "\(conversationHistory.count)|\(conversationHistory.first?.content ?? "")|\(conversationHistory.last?.content ?? "")"
+        guard ConversationSaveGate.shared.shouldSave(fingerprint: fp) else { return }
 
         let aiModel: String
         switch provider {
