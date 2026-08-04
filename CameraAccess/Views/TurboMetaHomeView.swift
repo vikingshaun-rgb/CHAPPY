@@ -267,7 +267,7 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
             return
         }
 
-        TTSService.shared.speak("Continuous vision on. Say stop when you are done.")
+        TTSService.shared.speak("Continuous vision on. Say chappy stop anytime.")
         while TTSService.shared.isSpeaking && isRunning {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -325,6 +325,14 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
 
         let inputNode = listenEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+        // CRASH GUARD: installing a tap with a dead mic format (sampleRate 0,
+        // e.g. audio session not configured for recording yet) crashes the
+        // app with an unhandled exception. Skip voice-stop this session
+        // instead — the button still stops it.
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            print("⚠️ [ContinuousVision] Mic format not ready — voice-stop off this session")
+            return
+        }
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
             request.append(buffer)
@@ -341,9 +349,15 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             if let result {
                 let text = result.bestTranscription.formattedString.lowercased()
-                // Ignore anything heard while Chappy itself is talking
-                if !TTSService.shared.isSpeaking,
-                   text.hasSuffix("stop") || text.contains("stop chappy") || text.contains("chappy stop") {
+                // BARGE-IN: "chappy stop" / "stop chappy" / "shut up" cuts
+                // Chappy off ANY time — even mid-sentence. Bare "stop" only
+                // counts while Chappy is quiet, so its own narration
+                // ("...there's a bus stop...") can never kill the session.
+                let strongStop = text.contains("stop chappy")
+                    || text.contains("chappy stop")
+                    || text.contains("shut up")
+                let bareStop = !TTSService.shared.isSpeaking && text.hasSuffix("stop")
+                if strongStop || bareStop {
                     Task { @MainActor in self?.stop() }
                     return
                 }
