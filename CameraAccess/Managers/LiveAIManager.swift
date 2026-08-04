@@ -419,6 +419,8 @@ class LiveAIManager: ObservableObject {
             print("💬 [LiveAIManager] No conversation content — skipping save")
             return
         }
+        let fp = "\(conversationHistory.count)|\(conversationHistory.first?.content ?? "")|\(conversationHistory.last?.content ?? "")"
+        guard ConversationSaveGate.shared.shouldSave(fingerprint: fp) else { return }
 
         let aiModel: String
         switch provider {
@@ -485,6 +487,29 @@ enum LiveAIError: LocalizedError {
 // to every feature. Embedded here deliberately — no new .swift file means
 // no Xcode project registration risk. Weather via Open-Meteo (free, no
 // key, no WeatherKit entitlement needed).
+
+// MARK: - Conversation Save Gate (duplicate-Records fix)
+// Both LiveAIManager and OmniRealtimeViewModel can end up saving the SAME
+// session (Siri-started manager + opened screen = two save paths). The gate
+// lets the first save through and swallows an identical one within 5 min.
+final class ConversationSaveGate {
+    static let shared = ConversationSaveGate()
+    private var lastFingerprint: String?
+    private var lastSavedAt = Date.distantPast
+    private let lock = NSLock()
+
+    func shouldSave(fingerprint: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        if fingerprint == lastFingerprint && now.timeIntervalSince(lastSavedAt) < 300 {
+            print("💾 [SaveGate] Duplicate conversation save blocked")
+            return false
+        }
+        lastFingerprint = fingerprint
+        lastSavedAt = now
+        return true
+    }
+}
 
 final class ContextEngine: NSObject, CLLocationManagerDelegate {
     static let shared = ContextEngine()
