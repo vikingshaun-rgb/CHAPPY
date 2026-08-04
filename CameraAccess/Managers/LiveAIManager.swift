@@ -908,10 +908,13 @@ final class NavEngine: NSObject, ObservableObject {
     /// Last destination the user asked for — lets "navigate via car" work
     /// as a follow-up without repeating the destination.
     private(set) var lastQuery: String?
+    /// Whether the last route was a driving route (for Google Maps handoff).
+    private(set) var lastDriving = false
 
     /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
     func navigate(to query: String, driving: Bool = false) async -> String {
         lastQuery = query
+        lastDriving = driving
         let snap = ContextEngine.shared.snapshot
         guard let lat = snap.latitude, let lon = snap.longitude else {
             return "No GPS fix yet - ask the user to try again in a few seconds."
