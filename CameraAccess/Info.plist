@@ -35,7 +35,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>39</string>
+	<string>42</string>
 	<key>LSApplicationCategoryType</key>
 	<string></string>
 	<key>LSApplicationQueriesSchemes</key>
@@ -60,8 +60,14 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Chappy need blutoooth usage to connect to Meta</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_bonjour._tcp</string>
+	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Chappy needs camera to capture photos</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Chappy connects to your glasses over WiFi to stream the camera.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>Allowing Always lets Chappy keep your travel journal even when the app is in the background.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
@@ -86,6 +92,9 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>bluetooth-central</string>
+		<string>bluetooth-peripheral</string>
+		<string>external-accessory</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
