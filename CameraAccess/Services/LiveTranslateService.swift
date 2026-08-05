@@ -57,11 +57,16 @@ class LiveTranslateService: NSObject {
     var onAudioDelta: ((Data) -> Void)?
     var onAudioDone: (() -> Void)?
     var onError: ((String) -> Void)?
+    // TRANSCRIPT v2: the speaker's own words, streaming and finalised.
+    var onOriginalDelta: ((String) -> Void)?      // incremental heard text
+    var onTurnComplete: ((String, String) -> Void)?  // (heard, translated)
 
     // State
     private var isRecording = false
     private var isConnected = false
     private var accumulatedText = ""
+    /// TRANSCRIPT v2: incoming speech, accumulated across a turn.
+    private var accumulatedOriginal = ""
 
     // Reconnect bookkeeping: recording may only resume AFTER setupComplete,
     // never straight after connect() — audio sent before setup kills the socket.
@@ -246,7 +251,13 @@ class LiveTranslateService: NSObject {
             "systemInstruction": [
                 "parts": [["text": systemPrompt]]
             ],
-            "outputAudioTranscription": [:]
+            "outputAudioTranscription": [:],
+            // TRANSCRIPT v2: ask the server to transcribe the INCOMING speech
+            // too. Without this the app only ever knew what Chappy said back —
+            // which is why the screen could show a translation but never the
+            // sentence it came from, and why a saved history entry had an empty
+            // originalText. This is what makes a two-sided transcript real.
+            "inputAudioTranscription": [:]
         ]
 
         // NOTE: this Live model supports AUDIO responses ONLY — requesting TEXT
@@ -544,6 +555,14 @@ class LiveTranslateService: NSObject {
             // Server content: audio chunks, transcription, turn completion
             if let serverContent = json["serverContent"] as? [String: Any] {
 
+                // TRANSCRIPT v2: what the SPEAKER actually said, in their own
+                // language — the left-hand side of every bubble pair.
+                if let inputT = serverContent["inputTranscription"] as? [String: Any],
+                   let text = inputT["text"] as? String, !text.isEmpty {
+                    self.accumulatedOriginal += text
+                    self.onOriginalDelta?(text)
+                }
+
                 // Translated-speech transcription (text of what is being spoken)
                 if let transcription = serverContent["outputTranscription"] as? [String: Any],
                    let text = transcription["text"] as? String, !text.isEmpty {
@@ -578,11 +597,16 @@ class LiveTranslateService: NSObject {
                 // Turn complete: finalize text
                 if (serverContent["turnComplete"] as? Bool) == true {
                     let final = self.accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let heard = self.accumulatedOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !final.isEmpty {
                         print("✅ [Translate] Translation complete: \(final.prefix(80))")
+                        // TRANSCRIPT v2: the pair is delivered together so a turn
+                        // can never be filed with a translation but no original.
+                        self.onTurnComplete?(heard, final)
                         self.onTranslationText?(final)
                     }
                     self.accumulatedText = ""
+                    self.accumulatedOriginal = ""
                     self.onAudioDone?()
                 }
                 return
