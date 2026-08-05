@@ -120,6 +120,10 @@ class LiveTranslateService: NSObject {
         playerNode?.reset()
         playbackEngine.stop()
         isPlaybackEngineRunning = false
+        // AUDIT FIX: hasStartedPlaying stayed true across restarts, so
+        // playerNode.play() was never called again — translation went
+        // permanently silent after any language/voice change.
+        hasStartedPlaying = false
         print("⏹️ [Translate] Playback engine stopped")
     }
 
@@ -226,11 +230,14 @@ class LiveTranslateService: NSObject {
         let systemPrompt = """
         You are a professional two-way simultaneous interpreter between \(source) and \(target). \
         Listen to each utterance and detect its language automatically. \
-        If the speech is in \(target), speak the \(source) translation. \
-        Otherwise (including \(source) or any other language), speak the \(target) translation. \
+        If the speech is in \(source), speak the \(target) translation. \
+        For speech in ANY other language, including \(target), speak the \(source) translation \
+        - the wearer speaks \(source), so anything foreign always comes back to them. \
         Speak ONLY the translation - no commentary, no explanations, no questions, \
-        no extra words. Keep the tone and intent of the speaker. If speech is \
-        unclear, translate what you understood. If an image is provided, use it \
+        no extra words. Keep the tone and intent of the speaker. \
+        SILENCE DISCIPLINE: if the audio is silence, background noise, music, a TV, \
+        or speech clearly not directed at this conversation, output NOTHING AT ALL. \
+        Never translate your own previous output. If an image is provided, use it \
         only as context to improve the translation.
         """
 
@@ -268,8 +275,11 @@ class LiveTranslateService: NSObject {
         do {
             print("🎤 [Translate] Start recording, using \(usePhoneMic ? "iPhone" : "Bluetooth") microphone")
 
-            if let engine = audioEngine, engine.isRunning {
-                engine.stop()
+            // AUDIT FIX (CRASH): a failed engine.start() left the tap
+            // installed; the next record attempt double-installed and iOS
+            // raised an uncatchable exception. Always remove first.
+            if let engine = audioEngine {
+                if engine.isRunning { engine.stop() }
                 engine.inputNode.removeTap(onBus: 0)
             }
 
@@ -279,7 +289,7 @@ class LiveTranslateService: NSObject {
                 // iPhone microphone - best for translating the other person
                 try audioSession.setCategory(
                     .playAndRecord,
-                    mode: .default,
+                    mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
                     options: [.defaultToSpeaker]
                 )
                 print("🎙️ [Translate] Using iPhone mic (translate the other person)")
@@ -287,7 +297,7 @@ class LiveTranslateService: NSObject {
                 // Bluetooth mic (glasses) - best for translating yourself
                 try audioSession.setCategory(
                     .playAndRecord,
-                    mode: .default,
+                    mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
                     options: [.allowBluetooth, .defaultToSpeaker]
                 )
                 print("🎙️ [Translate] Using Bluetooth mic (translate yourself)")

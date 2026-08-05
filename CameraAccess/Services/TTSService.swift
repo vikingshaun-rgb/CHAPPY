@@ -61,8 +61,16 @@ class TTSService: NSObject, ObservableObject {
     private func configureAudioSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            // Playback mode keeps glasses/Bluetooth output working for spoken replies
-            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            // AUDIT FIX (CRITICAL): this used to force .playback on EVERY
+            // spoken line. Any engine holding a microphone tap — Standby's
+            // wake-word ear, Live AI's recorder, Continuous Vision's
+            // voice-stop — lost its input the moment Chappy opened his mouth,
+            // silently and permanently ("standby stops hearing me").
+            // .playAndRecord plays exactly as well and never tears down a
+            // recording route.
+            try session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                    options: [.duckOthers, .allowBluetooth,
+                                              .allowBluetoothA2DP, .defaultToSpeaker])
             try session.setActive(true)
         } catch {
             print("⚠️ [TTS] Audio session configuration failed: \(error.localizedDescription) — continuing")

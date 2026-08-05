@@ -89,7 +89,7 @@ class QuickVisionService {
     ///   - customPrompt: Custom prompt (optional; falls back to the current mode's prompt when nil)
     ///   - deepAnalysis: escalate to the big model with extended thinking for a careful look
     /// - Returns: Concise description text suitable for TTS
-    func analyzeImage(_ image: UIImage, customPrompt: String? = nil, deepAnalysis: Bool = false) async throws -> String {
+    func analyzeImage(_ image: UIImage, customPrompt: String? = nil, deepAnalysis: Bool = false, allowWebSearch: Bool = true) async throws -> String {
         // Use the custom prompt, the mode manager's prompt, or the default
         let prompt = customPrompt ?? QuickVisionModeManager.staticPrompt
 
@@ -99,13 +99,28 @@ class QuickVisionService {
         // Messages API instead.
         if provider == .anthropic {
             // Higher quality for Claude — it reads fine print happily
-            guard let imageData = image.jpegData(compressionQuality: 0.85) else {
+            // AUDIT FIX (CRITICAL): no resize meant full-res glasses JPEGs could
+        // exceed Anthropic's 5MB per-image limit (base64 inflates 1.34x) — a
+        // hard 400 on every snap for users migrated to high quality. 1568px is
+        // the largest edge Claude actually uses; anything bigger is pure cost.
+        let maxEdge: CGFloat = 1568
+        let longest = max(image.size.width, image.size.height)
+        let sized: UIImage
+        if longest > maxEdge {
+            let f = maxEdge / longest
+            let newSize = CGSize(width: image.size.width * f, height: image.size.height * f)
+            sized = UIGraphicsImageRenderer(size: newSize).image { _ in
+                image.draw(in: CGRect(origin: .zero, size: newSize))
+            }
+        } else { sized = image }
+        guard let imageData = sized.jpegData(compressionQuality: 0.85) else {
                 throw QuickVisionError.invalidImage
             }
             return try await makeAnthropicRequest(
                 imageB64: imageData.base64EncodedString(),
                 prompt: prompt,
-                deep: deepAnalysis
+                deep: deepAnalysis,
+                allowWebSearch: allowWebSearch
             )
         }
 
@@ -157,12 +172,10 @@ class QuickVisionService {
     the answer (prices, opening hours, reviews, what a place or product is).
     """
 
-    private func makeAnthropicRequest(imageB64: String, prompt: String, deep: Bool) async throws -> String {
+    private func makeAnthropicRequest(imageB64: String, prompt: String, deep: Bool, allowWebSearch: Bool = true) async throws -> String {
         guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             throw QuickVisionError.invalidResponse
         }
-        CostMeter.shared.addQuickVision()
-
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
@@ -193,12 +206,14 @@ class QuickVisionService {
                     ["type": "text", "text": prompt + "\n\n[Context: " + ContextEngine.shared.contextHeader() + "]"]
                 ]
             ]],
-            "tools": [[
-                "type": "web_search_20250305",
-                "name": "web_search",
-                "max_uses": 3
-            ]]
         ]
+        // AUDIT FIX (CRITICAL COST): web search was attached to EVERY call,
+        // including the Continuous Vision narration loop — up to 3 server-side
+        // searches per frame at ~$0.01 each, ~10x the cost of a plain snap.
+        // Now opt-in, and capped at 2.
+        if allowWebSearch {
+            body["tools"] = [["type": "web_search_20250305", "name": "web_search", "max_uses": 2]]
+        }
         if deep {
             body["thinking"] = ["type": "enabled", "budget_tokens": 4096]
         }
@@ -221,6 +236,7 @@ class QuickVisionService {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw QuickVisionError.invalidResponse
         }
+        if httpResponse.statusCode == 200 { CostMeter.shared.addQuickVision() }
         guard httpResponse.statusCode == 200 else {
             let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
             print("❌ [QuickVision] Claude error \(httpResponse.statusCode): \(errorMessage.prefix(300))")

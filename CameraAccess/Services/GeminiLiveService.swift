@@ -22,6 +22,11 @@ class GeminiLiveService: NSObject {
     private var webSocket: URLSessionWebSocketTask?
     private var urlSession: URLSession?
     private var didReportSocketError = false
+    /// AUDIT FIX (LA-H2): bounded auto-recovery state.
+    private var recoveryAttempts = 0
+    /// True between the user starting Live and the user (or a cap) ending it.
+    /// Recovery must never fire after a deliberate disconnect.
+    private var isUserSessionActive = false
 
     // Configuration
     private let apiKey: String
@@ -29,6 +34,8 @@ class GeminiLiveService: NSObject {
 
     // Audio Engine (for recording)
     private var audioEngine: AVAudioEngine?
+    /// AUDIT FIX (LA-H1): observer token for the record-engine watchdog.
+    private var engineWatchdogToken: NSObjectProtocol?
 
     // Audio Playback Engine (separate engine for playback)
     private var playbackEngine: AVAudioEngine?
@@ -51,9 +58,38 @@ class GeminiLiveService: NSObject {
 
     // STEP 8 FUSION: the live session other modules can speak through
     static weak var activeInstance: GeminiLiveService?
+    /// AUDIT FIX: activeInstance stays set across renewals and dead sockets,
+    /// so NavEngine spoke turns into a void instead of falling back to TTS.
+    var isLive: Bool { isSessionConfigured && webSocket != nil }
 
     // COST METER: when this live session started (for spend estimates)
     private var liveSessionStartAt: Date?
+
+    // AUDIT FIX (LA-C2): the most expensive failure mode in the whole app is a
+    // live session nobody closed — frames AND audio, both metered, until the
+    // battery dies. Two brakes: a hard wall-clock cap that survives renewals,
+    // and a silence cutoff for the pocketed-phone case.
+    private var sessionAnchor: Date?
+    private var sessionCapTimer: Timer?
+    private static let maxSessionMinutes: Double = 30
+    private static let maxSilentMinutes: Double = 10
+    private var didWarnSessionCap = false
+
+    /// Anchored to the FIRST connect, so renewals can't keep pushing the cap out.
+    private func armSessionCap() {
+        if sessionAnchor == nil { sessionAnchor = Date() }
+        guard let anchor = sessionAnchor else { return }
+        let elapsed = Date().timeIntervalSince(anchor)
+        let remaining = max(5, Self.maxSessionMinutes * 60 - elapsed)
+        sessionCapTimer?.invalidate()
+        sessionCapTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                TTSService.shared.speak("That's half an hour of live - I'm closing the session to protect your credit. Say Chappy, live, to start again.")
+                self.disconnect()
+            }
+        }
+    }
 
     // CONTEXT DRIP: keeps Chappy's sense of time & place fresh all session
     private var contextTimer: Timer?
@@ -212,6 +248,13 @@ class GeminiLiveService: NSObject {
     // MARK: - WebSocket Connection
 
     func connect() {
+        // AUDIT FIX: connect() used to overwrite the socket without cancelling
+        // the old one — the abandoned socket kept receiving, kept pushing audio
+        // into the same player and kept billing.
+        if webSocket != nil || urlSession != nil {
+            webSocket?.cancel(with: .goingAway, reason: nil); webSocket = nil
+            urlSession?.invalidateAndCancel(); urlSession = nil
+        }
         // Gemini Live WebSocket URL with API key
         let baseURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         let urlString = baseURL
@@ -226,6 +269,7 @@ class GeminiLiveService: NSObject {
         }
 
         didReportSocketError = false
+        isUserSessionActive = true
         GeminiLiveService.activeInstance = self
 
         let configuration = URLSessionConfiguration.default
@@ -244,6 +288,22 @@ class GeminiLiveService: NSObject {
     func disconnect() {
         print("🔌 [Gemini] Disconnect the WebSocket")
         if GeminiLiveService.activeInstance === self { GeminiLiveService.activeInstance = nil }
+        // AUDIT FIX (LA-C2 / LA-H10): drop the brakes and the interlock flag
+        // together — a stale "live" flag would lock Continuous Vision out for
+        // the rest of the app's life.
+        sessionCapTimer?.invalidate()
+        sessionCapTimer = nil
+        sessionAnchor = nil
+        didWarnSessionCap = false
+        isUserSessionActive = false
+        recoveryAttempts = 0
+        Task { @MainActor in
+            LiveAIManager.shared.isRunning = false
+            // AUDIT FIX (LA-H9): every exit from a live session — the X button,
+            // the cap, a fatal drop — re-arms the wake word. Previously only the
+            // manager's own (unused) stop path did.
+            ChappyStandby.shared.resumeAfterHandOff()
+        }
         contextTimer?.invalidate()
         contextTimer = nil
         navDetectWork?.cancel()
@@ -430,6 +490,7 @@ class GeminiLiveService: NSObject {
             try engine.start()
 
             isRecording = true
+            installRecordEngineWatchdog()
             print("✅ [Gemini] Recording started")
 
         } catch {
@@ -438,10 +499,38 @@ class GeminiLiveService: NSObject {
         }
     }
 
+    /// AUDIT FIX (LA-H1): iOS tears the engine's graph down whenever the audio
+    /// route changes — Chappy's own TTS ducking, glasses connecting or dropping,
+    /// AirPods, a phone call, CarPlay. Without this the tap is silently gone:
+    /// the session looks alive, the meter keeps running and Chappy simply never
+    /// hears another word. Rebuild the tap when the graph changes.
+    private func installRecordEngineWatchdog() {
+        guard engineWatchdogToken == nil, let engine = audioEngine else { return }
+        engineWatchdogToken = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.isRecording, self.isSessionConfigured else { return }
+            print("🔧 [Gemini] Audio engine reconfigured — rebuilding the mic tap")
+            self.isRecording = false
+            self.audioEngine?.inputNode.removeTap(onBus: 0)
+            self.audioEngine?.stop()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, self.isSessionConfigured else { return }
+                self.startRecording()
+            }
+        }
+    }
+
     func stopRecording() {
         guard isRecording else { return }
 
         print("🛑 [Gemini] Stop recording")
+        if let token = engineWatchdogToken {
+            NotificationCenter.default.removeObserver(token)
+            engineWatchdogToken = nil
+        }
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         isRecording = false
@@ -653,6 +742,18 @@ class GeminiLiveService: NSObject {
         guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
             return "Research brain unavailable - no key configured."
         }
+        // AUDIT FIX (LA-C4): this is the most expensive single call in Chappy
+        // (Opus plus live web search) and the MODEL decides when to make it —
+        // no human presses a button. Uncapped, on a key baked into the build,
+        // a talkative afternoon is a four-figure surprise. Cap it per day.
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let dayKey = "chappy_research_" + df.string(from: Date())
+        let usedToday = UserDefaults.standard.integer(forKey: dayKey)
+        guard usedToday < 15 else {
+            return "That's fifteen deep-research runs today - my daily limit. I can still answer from what I know, or ask me again tomorrow."
+        }
+        UserDefaults.standard.set(usedToday + 1, forKey: dayKey)
         CostMeter.shared.addResearch()
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -665,7 +766,7 @@ class GeminiLiveService: NSObject {
             "max_tokens": 1500,
             "system": "You are the deep-research brain of Chappy, a voice assistant for a traveller in Asia. Current context: \(ContextEngine.shared.contextHeader()) Answer thoroughly but SPEAKABLE: plain sentences, no markdown, no lists, under 250 words. Use web search for current facts.",
             "messages": [["role": "user", "content": question]],
-            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 5]]
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 3]]
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
@@ -721,7 +822,7 @@ class GeminiLiveService: NSObject {
         "take me to ", "walk me to ", "drive me to ", "direct me to ",
         "get me directions to ", "directions to ", "get me to ",
         "guide me to ", "route me to ", "route to ",
-        "closest ", "nearest "
+        "the closest ", "the nearest "
     ]
 
     /// Follow-up phrasings that change HOW to travel ("navigate me via car")
@@ -736,7 +837,7 @@ class GeminiLiveService: NSObject {
         let lower = currentUserLine.lowercased()
         let hasIntent = lower.contains("navigate") || lower.contains("navigation")
             || lower.contains("directions") || lower.contains("direct me")
-            || lower.contains("route")
+            || lower.contains("route me")
         guard hasIntent
             || Self.navPhrases.contains(where: { lower.contains($0) })
             || Self.modePhrases.contains(where: { lower.contains($0) }) else { return }
@@ -958,7 +1059,19 @@ class GeminiLiveService: NSObject {
         // the INSTANT the user speaks, the live-shot VAD fires a fresh frame
         // and full rate resumes — reactivity is untouched.
         let idle = Date().timeIntervalSince(lastInteractionAt)
-        if idle > 45 {
+        // AUDIT FIX (LA-C2): the pocketed-phone case. Ten minutes with neither
+        // side saying a word means the session was forgotten, not paused —
+        // close it rather than stream frames into an empty room all night.
+        if idle > Self.maxSilentMinutes * 60 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isSessionConfigured else { return }
+                TTSService.shared.speak("Nothing for ten minutes - I'm closing live to save your credit.")
+                self.disconnect()
+            }
+            return
+        }
+        // AUDIT FIX (LA-C2): eco drip starts at 25s of quiet, not 45s.
+        if idle > 25 {
             ecoSkipCounter += 1
             if ecoSkipCounter % 8 != 0 { return }
         } else {
@@ -1054,7 +1167,12 @@ class GeminiLiveService: NSObject {
             case .failure(let error):
                 let nsError = error as NSError
                 print("❌ [Gemini] Failed to receive message: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
-                if nsError.code != 57 && nsError.code != -999 { self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)") }
+                // AUDIT FIX (LA-H2): 57/-999 are our own teardown; anything
+                // else is a live socket dying mid-conversation — recover, don't
+                // just report and go quiet forever.
+                if nsError.code != 57 && nsError.code != -999 {
+                    self?.attemptRecovery("receive error \(nsError.code)")
+                }
             }
         }
     }
@@ -1087,11 +1205,36 @@ class GeminiLiveService: NSObject {
                 self.isSessionConfigured = true
                 self.onConnected?()
                 Task { @MainActor in ChappyHaptics.shared.connected() }
+                // HANDOVER: a question Standby judged too big for one shot
+                // rides across into the live session and gets answered
+                // properly — the user never repeats themselves.
+                if let pending = UserDefaults.standard.string(forKey: "chappy_pending_question"),
+                   !pending.isEmpty {
+                    UserDefaults.standard.removeObject(forKey: "chappy_pending_question")
+                    self.sendJSON([
+                        "client_content": [
+                            "turns": [["role": "user", "parts": [["text": pending]]]],
+                            "turn_complete": true
+                        ]
+                    ])
+                    print("🎯 [Gemini] Carried over standby question: \(pending)")
+                }
                 // COST METER: bank elapsed minutes across renewals
                 if let started = self.liveSessionStartAt {
                     CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(started))
                 }
                 self.liveSessionStartAt = Date()
+                // AUDIT FIX (LA-C2): arm the runaway brakes.
+                self.armSessionCap()
+                // AUDIT FIX (LA-H2): a good handshake clears the recovery budget
+                // so a later, unrelated drop still gets its three tries.
+                self.recoveryAttempts = 0
+                self.didReportSocketError = false
+                // AUDIT FIX (LA-H10): the interlocks (Continuous Vision, the
+                // stop intent, Quick Vision) all read LiveAIManager.isRunning,
+                // which nothing ever set for a UI-started session — so every
+                // one of them was a no-op. THIS is the live session; say so.
+                Task { @MainActor in LiveAIManager.shared.isRunning = true }
                 // CONTEXT DRIP: GPS usually locks a few seconds AFTER connect,
                 // so the setup header is often empty. Re-feed real time+place
                 // shortly after connect, then keep it fresh every 45s.
@@ -1252,8 +1395,7 @@ class GeminiLiveService: NSObject {
             // full-sharpness frame so fine print is actually legible.
             let lower = text.lowercased()
             if lower.contains("read th") || lower.contains("read it")
-                || lower.contains("read me") || lower.contains("what does")
-                || lower.contains("what do these") {
+                || lower.contains("read me")                 || lower.contains("what do these") {
                 print("📖 [Gemini] Read request detected — requesting high-res frame")
                 onReadRequest?()
             }
@@ -1273,7 +1415,7 @@ class GeminiLiveService: NSObject {
                     }
                     let spot = TripRecorder.shared.rememberSpot(named: name)
                     sendAppReply("The app just saved this location as a remembered spot named '\(spot.name)'. Briefly confirm this to the user in one short sentence.")
-                } else if lower.contains("where was i") || lower.contains("where have i been")
+                } else if lower.contains("where was i today") || lower.contains("where have i been")
                     || lower.contains("where did i go") {
                     journalCommandFired = true
                     sendAppReply("Journal answer: \(TripRecorder.shared.todaySummary()) Relay this to the user naturally and briefly.")
@@ -1305,7 +1447,7 @@ class GeminiLiveService: NSObject {
                         self.sendAppReply("Phone battery is at \(phone). Glasses battery isn't exposed to the app - the Meta AI app shows it. Report this briefly.")
                     }
                 } else if lower.contains("cost check") || lower.contains("usage check")
-                    || lower.contains("spent today") || lower.contains("how much have i spent") {
+                    || lower.contains("i spent today on ai") || lower.contains("how much have i spent") {
                     journalCommandFired = true
                     let t = CostMeter.shared.today()
                     let month = CostMeter.shared.monthCostUSD()
@@ -1318,7 +1460,7 @@ class GeminiLiveService: NSObject {
                     journalCommandFired = true
                     NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
                     sendAppReply("The app is taking a photo through the glasses right now and saving it to the phone's photo library. Confirm briefly: photo taken.")
-                } else if lower.contains("coordinates") || lower.contains("co-ordinates")
+                } else if lower.contains("my coordinates") || lower.contains("my co-ordinates")
                     || lower.contains("gps position") || lower.contains("exact position")
                     || lower.contains("exact location") {
                     // GPS TRUTH: the app answers with exact figures, no guessing
@@ -1331,7 +1473,7 @@ class GeminiLiveService: NSObject {
                     } else {
                         sendAppReply("No GPS fix yet. Tell the user to give it a few seconds, ideally outdoors.")
                     }
-                } else if lower.contains("google maps") || lower.contains("open maps")
+                } else if lower.contains("open google maps") || lower.contains("open maps")
                     || lower.contains("open the maps") || lower.contains("real maps") {
                     // GOOGLE MAPS HANDOFF: launch the real Google Maps app
                     // with the current/last destination pre-loaded.
@@ -1517,9 +1659,31 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
             DispatchQueue.main.async { self.renewSession() }
             return
         }
-        // 1000/1001 = normal shutdown (our own disconnect) — everything else is a failure worth showing
+        // 1000/1001 = normal shutdown (our own disconnect). AUDIT FIX (LA-H2):
+        // everything else used to be terminal — one alert and a dead session.
         if closeCode != .normalClosure && closeCode != .goingAway {
-            reportSocketError("Socket closed — code \(closeCode.rawValue): \(reasonString)")
+            attemptRecovery("code \(closeCode.rawValue): \(reasonString)")
+        }
+    }
+
+    /// AUDIT FIX (LA-H2): a socket death that isn't a goAway — a WiFi-to-cell
+    /// handover, a VPN reconnect, a lift, a 5xx from Google — used to kill the
+    /// session permanently: one alert on screen, glasses silent, and the only
+    /// cure was force-quitting the app. Reconnect on the resumption handle
+    /// (context intact), three tries with backoff, and only tell the user if
+    /// all three fail.
+    private func attemptRecovery(_ why: String) {
+        guard isUserSessionActive else { return }
+        guard recoveryAttempts < 3 else {
+            reportSocketError("Live connection lost (\(why)). Start Live again to reconnect.")
+            return
+        }
+        recoveryAttempts += 1
+        let delay = Double(recoveryAttempts) * 1.5
+        print("🔁 [Gemini] Recovery \(recoveryAttempts)/3 in \(delay)s — \(why)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isUserSessionActive, !self.isSessionConfigured else { return }
+            self.renewSession()
         }
     }
 
@@ -1564,7 +1728,13 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
     }
 }
 
-// MARK: - Voice shutter notification
+// MARK: - Chappy internal notifications
 extension Notification.Name {
     static let chappyCapturePhoto = Notification.Name("chappyCapturePhoto")
+    static let chappyOpenTranslate = Notification.Name("chappyOpenTranslate")
+    static let chappyOpenGoogleMaps = Notification.Name("chappyOpenGoogleMaps")
+    /// Background-only Live AI start (no UI). Kept separate from
+    /// .liveAITriggered so one trigger can never start two sessions.
+    static let liveAIBackgroundStart = Notification.Name("liveAIBackgroundStart")
+    static let chappyShowMap = Notification.Name("chappyShowMap")
 }
