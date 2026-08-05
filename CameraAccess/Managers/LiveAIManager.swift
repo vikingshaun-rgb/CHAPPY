@@ -740,6 +740,14 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         return bits.joined(separator: "; ") + "."
     }
 
+    /// NAV PRECISION: street-corner accuracy while navigating, battery-light
+    /// hundred-metre mode the rest of the time.
+    func setPrecision(navigating: Bool) {
+        locationManager.desiredAccuracy = navigating
+            ? kCLLocationAccuracyBestForNavigation
+            : kCLLocationAccuracyHundredMeters
+    }
+
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
         print("🧭 [Context] Location authorization: \(status.rawValue)")
@@ -1122,6 +1130,7 @@ final class NavEngine: NSObject, ObservableObject {
         destinationName = destName
         stepIndex = 0
         isNavigating = true
+        ContextEngine.shared.setPrecision(navigating: true)
         updateCard()
         let mins = max(1, Int(route.durationSec / 60))
         let distText = route.distanceMeters >= 2000
@@ -1139,6 +1148,7 @@ final class NavEngine: NSObject, ObservableObject {
 
     func stop(announce: Bool = false) {
         isNavigating = false
+        ContextEngine.shared.setPrecision(navigating: false)
         steps = []
         routeCoords = []
         nextInstruction = ""
@@ -1161,7 +1171,12 @@ final class NavEngine: NSObject, ObservableObject {
         let step = steps[stepIndex]
         let d = loc.distance(from: CLLocation(latitude: step.coord.latitude, longitude: step.coord.longitude))
         distanceText = d > 950 ? String(format: "%.1f km", d / 1000) : "\(Int(d)) m"
-        if d < 25 {
+        // SPEED-AWARE TURNS: announce ~8 seconds before the corner at your
+        // ACTUAL speed. Walking (~1.4 m/s) → ~25m as before; scooter at
+        // 40 km/h (~11 m/s) → ~90m warning; capped at 200m for highways.
+        let speed = max(loc.speed, 0) // m/s, -1 when unknown → treat as 0
+        let lookahead = min(max(25.0, speed * 8.0), 200.0)
+        if d < lookahead {
             stepIndex += 1
             if stepIndex >= steps.count {
                 speakNav("You have arrived at \(destinationName).")
