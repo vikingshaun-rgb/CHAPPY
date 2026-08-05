@@ -32,6 +32,17 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
     let detectedLanguage: String?
     let sourceCode: String
     let targetCode: String
+    /// BUILD 58: a marker row rather than a spoken turn — "Now translating
+    /// German". Changing language mid-session is nearly always a new
+    /// conversation, but throwing the old one away without asking is rude and
+    /// asking every time is worse. A line across the screen says it plainly and
+    /// costs nothing.
+    let isDivider: Bool
+    /// BUILD 58: the transcriber came back with a language that is neither
+    /// yours nor theirs — so it misheard, and everything downstream of it is
+    /// built on a wrong sentence. Better to say so than to show the user a line
+    /// of Korean and let them conclude the app is broken.
+    let misheard: Bool
 
     init(id: UUID = UUID(),
          at: Date = Date(),
@@ -40,7 +51,9 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
          fromWearer: Bool,
          detectedLanguage: String? = nil,
          sourceCode: String,
-         targetCode: String) {
+         targetCode: String,
+         isDivider: Bool = false,
+         misheard: Bool = false) {
         self.id = id
         self.at = at
         self.original = original
@@ -49,6 +62,8 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
         self.detectedLanguage = detectedLanguage
         self.sourceCode = sourceCode
         self.targetCode = targetCode
+        self.isDivider = isDivider
+        self.misheard = misheard
     }
 }
 
@@ -100,6 +115,8 @@ struct ChappyBubble: View {
     var live: Bool = false
     /// Language of the foreign side, for spotting a price.
     var foreignCode: String = "id"
+    /// Chappy misheard this one — shown dimmed with a plain warning.
+    var misheard: Bool = false
     /// Fill the screen with this line so someone can read it across a counter.
     var onShowBig: ((String) -> Void)? = nil
     /// Keep this line for next time.
@@ -162,10 +179,21 @@ struct ChappyBubble: View {
                 // half of it was in a language you can't read. Every bubble now
                 // leads with the line YOU understand; the foreign line sits
                 // under it, still there, still tappable, still shareable.
+                if misheard {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                        Text("MISHEARD — SAY IT AGAIN")
+                            .font(.system(size: 10, weight: .heavy))
+                            .tracking(0.4)
+                    }
+                    .foregroundColor(.orange)
+                }
+
                 Text(wearerLine)
                     .font(AppTypography.body)
                     .fontWeight(.semibold)
-                    .foregroundColor(theme.textPrimary)
+                    .foregroundColor(misheard ? theme.textSecondary : theme.textPrimary)
                     .multilineTextAlignment(mine ? .trailing : .leading)
 
                 if !foreignLine.isEmpty {
@@ -215,7 +243,7 @@ struct ChappyBubble: View {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .stroke(mine ? theme.accent.opacity(0.45) : theme.stroke, lineWidth: 1)
             )
-            .opacity(live ? 0.72 : 1.0)
+            .opacity(live ? 0.72 : (misheard ? 0.6 : 1.0))
             .frame(maxWidth: 320, alignment: mine ? .trailing : .leading)
             // TAP ANYWHERE ON THE BUBBLE to hear the translation again; press
             // and hold for the original. contentShape makes the padding count,
@@ -627,6 +655,9 @@ struct LiveTranslateView: View {
                     }
 
                     ForEach(viewModel.transcript) { turn in
+                        if turn.isDivider {
+                            dividerRow(turn)
+                        } else {
                         ChappyBubble(wearerLine: turn.fromWearer ? turn.original : turn.translated,
                                      foreignLine: turn.fromWearer ? turn.translated : turn.original,
                                      at: turn.at,
@@ -638,10 +669,12 @@ struct LiveTranslateView: View {
                                      // quoted BY THE VENDOR never showed a chip.
                                      // Those are the prices you actually need.
                                      foreignCode: turn.targetCode,
+                                     misheard: turn.misheard,
                                      onShowBig: { bigText = $0 },
                                      onSave: { viewModel.savePhrase(from: turn) },
                                      onShare: { shareText = $0 })
                             .id(turn.id)
+                        }
                     }
 
                     // The turn currently in flight — dimmed until it lands.
@@ -655,9 +688,11 @@ struct LiveTranslateView: View {
                             .id("live-bubble")
                     }
 
-                    Color.clear.frame(height: 1).id("transcript-bottom")
+                    // BUILD 58: breathing room so the newest bubble never sits
+                    // behind the controls — it was half-hidden before.
+                    Color.clear.frame(height: 10).id("transcript-bottom")
                 }
-                .padding(.vertical, 8)
+                .padding(.top, 8)
             }
             .frame(maxHeight: .infinity)
             // Follow the conversation without the user having to chase it.
@@ -673,40 +708,70 @@ struct LiveTranslateView: View {
         }
     }
 
+    /// A quiet line across the transcript when the language changes. Nothing is
+    /// deleted — the old conversation stays scrollable above it, which matters
+    /// if the price you agreed was three turns back. "Start fresh" is there for
+    /// when you do want a clean slate.
+    private func dividerRow(_ turn: TranslateTurn) -> some View {
+        HStack(spacing: 10) {
+            Rectangle().fill(theme.stroke).frame(height: 1)
+            Text(turn.translated)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(theme.textSecondary)
+                .fixedSize()
+            Button("Start fresh") {
+                confirmClear = true
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(theme.accent)
+            .frame(minHeight: 44)
+            Rectangle().fill(theme.stroke).frame(height: 1)
+        }
+        .padding(.vertical, 2)
+        .id(turn.id)
+    }
+
     // MARK: - Control Bar
 
     /// BUILD 57: three small toggles in a row ABOVE the record button, rather
     /// than crowded either side of it. The old arrangement had no room for a
     /// third control without pushing the record button off-centre, and this is
     /// the row that will keep growing.
-    private func toggleButton(_ label: String,
-                              icon: String,
-                              on: Bool,
-                              dimmed: Bool = false,
-                              action: @escaping () -> Void) -> some View {
+    /// BUILD 58: these were 54-point circles in a row of their own, and with the
+    /// 72-point record button under them the controls were eating a third of the
+    /// screen and hiding the newest bubble behind themselves. One slim capsule
+    /// instead — same three controls, same 44-point tap height, a third of the
+    /// footprint.
+    private func toggleSegment(_ label: String,
+                               icon: String,
+                               on: Bool,
+                               dimmed: Bool = false,
+                               action: @escaping () -> Void) -> some View {
         Button {
             action()
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
-            VStack(spacing: 2) {
+            HStack(spacing: 5) {
                 Image(systemName: icon)
-                    .font(.system(size: 18))
+                    .font(.system(size: 13, weight: .semibold))
                 Text(label)
-                    .font(.system(size: 9.5, weight: .heavy))
-                    .tracking(0.5)
+                    .font(.system(size: 11, weight: .heavy))
+                    .tracking(0.4)
             }
             .foregroundColor(on ? .white : theme.textSecondary)
-            .frame(width: 54, height: 54)
-            .background(Circle().fill(on ? theme.accent : theme.cardFill))
-            .overlay(Circle().stroke(on ? .clear : theme.stroke, lineWidth: 1))
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(on ? theme.accent : Color.clear)
+            )
             .opacity(dimmed ? 0.4 : 1.0)
-            .contentShape(Circle())
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
     private var controlBar: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 9) {
             if viewModel.isRecording {
                 HStack(spacing: 8) {
                     Circle()
@@ -718,32 +783,34 @@ struct LiveTranslateView: View {
                 }
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 3) {
                 // SPEAK — whether Chappy talks at all. Off is a silent,
                 // reading-only interpreter: the right mode in a quiet
                 // restaurant, a hotel lobby at midnight, or a temple.
-                toggleButton("SPEAK",
-                             icon: viewModel.audioOutputEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                             on: viewModel.audioOutputEnabled) {
+                toggleSegment("SPEAK",
+                              icon: viewModel.audioOutputEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                              on: viewModel.audioOutputEnabled) {
                     viewModel.audioOutputEnabled.toggle()
                 }
 
                 // LOUD — push it out of the iPhone speaker for a table.
                 // Meaningless when SPEAK is off, so it says so by dimming.
-                toggleButton("LOUD",
-                             icon: "speaker.wave.3.fill",
-                             on: viewModel.loudSpeaker,
-                             dimmed: !viewModel.audioOutputEnabled) {
+                toggleSegment("LOUD",
+                              icon: "speaker.wave.3.fill",
+                              on: viewModel.loudSpeaker,
+                              dimmed: !viewModel.audioOutputEnabled) {
                     viewModel.loudSpeaker.toggle()
                 }
 
                 // SAY — pronunciation line under non-Latin script.
-                toggleButton("SAY",
-                             icon: "character.phonetic",
-                             on: showPronunciation) {
+                toggleSegment("SAY",
+                              icon: "character.phonetic",
+                              on: showPronunciation) {
                     showPronunciation.toggle()
                 }
             }
+            .padding(3)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(theme.cardFill))
 
             Button {
                 viewModel.toggleRecording()
@@ -751,10 +818,10 @@ struct LiveTranslateView: View {
                 ZStack {
                     Circle()
                         .fill(viewModel.isRecording ? Color.red : theme.accent)
-                        .frame(width: 72, height: 72)
+                        .frame(width: 62, height: 62)
 
                     Image(systemName: viewModel.isRecording ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 28))
+                        .font(.system(size: 24))
                         .foregroundColor(.white)
                 }
             }
@@ -786,7 +853,7 @@ struct LiveTranslateView: View {
                 }
             }
         }
-        .padding(.bottom, 10)
+        .padding(.bottom, 2)
     }
 
     // MARK: - Video Background
