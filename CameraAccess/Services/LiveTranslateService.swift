@@ -174,6 +174,49 @@ class LiveTranslateService: NSObject {
 
     // MARK: - Language helpers
 
+    /// BUILD 57: Chinese isn't one script. Simplified is used in the mainland
+    /// and Singapore, Traditional in Taiwan, Hong Kong and Macau — and showing
+    /// the wrong one to someone reading your screen looks careless at best and
+    /// unreadable at worst. Decide it from where you're actually standing.
+    private var scriptInstruction: String {
+        let country = (ContextEngine.shared.snapshot.countryCode ?? "").uppercased()
+        switch targetLanguage.rawValue {
+        case "zh":
+            let traditional = ["TW", "HK", "MO"].contains(country)
+            return traditional
+                ? "SCRIPT: write Chinese in TRADITIONAL characters. "
+                : "SCRIPT: write Chinese in SIMPLIFIED characters. "
+        case "yue":
+            return "SCRIPT: write Cantonese in TRADITIONAL characters. "
+        case "ja":
+            return "SCRIPT: write Japanese normally - kanji with kana, not romaji. "
+        case "ko":
+            return "SCRIPT: write Korean in hangul, not romanised. "
+
+        // BUILD 57: Portuguese and Spanish are not one language each. Brazilian
+        // and European Portuguese differ in vocabulary, pronouns and rhythm
+        // enough that a Lisbon translation sounds stilted and faintly comic in
+        // São Paulo. Latin American Spanish likewise: "vosotros" and a Castilian
+        // lisp mark you as very much not from around here.
+        case "pt":
+            let brazil = ["BR"].contains(country)
+            let european = ["PT", "AO", "MZ", "CV", "TL"].contains(country)
+            if brazil { return "VARIETY: use BRAZILIAN Portuguese - Brazilian vocabulary, você rather than tu, and natural Brazilian phrasing. " }
+            if european { return "VARIETY: use EUROPEAN Portuguese as spoken in Portugal. " }
+            return "VARIETY: use BRAZILIAN Portuguese unless the speaker's own words are clearly European Portuguese. "
+
+        case "es":
+            let spain = country == "ES"
+            let riverPlate = ["AR", "UY", "PY"].contains(country)
+            if spain { return "VARIETY: use European Spanish as spoken in Spain. " }
+            if riverPlate { return "VARIETY: use River Plate Spanish - voseo (vos/tenés/querés) and local phrasing, as spoken in Argentina and Uruguay. " }
+            return "VARIETY: use LATIN AMERICAN Spanish - ustedes rather than vosotros, no Castilian lisp, neutral Latin American vocabulary. "
+
+        default:
+            return ""
+        }
+    }
+
     private func languageName(_ code: String) -> String {
         let map: [String: String] = [
             "en": "English", "zh": "Chinese (Mandarin)", "ja": "Japanese",
@@ -295,14 +338,19 @@ class LiveTranslateService: NSObject {
         PRICES: whenever a sum of money is spoken, render the number in the text \
         as DIGITS with thousands separators (say 250,000 - not two hundred and \
         fifty thousand), and keep the currency word. \
+        \(scriptInstruction)\
         CONTROL PHRASES: when the wearer says the name "Chappy" together with a \
         repeat instruction - "Chappy repeat that", "Chappy say that again", \
         "Chappy one more time" - that is an instruction to the app and NOT speech \
         to translate: output NOTHING AT ALL and stay silent, the app handles it. \
         A bare single word from the other speaker asking for a repeat - "ulangi", \
         "sekali lagi", "maaf", "apa" - is likewise handled by the app: stay silent. \
-        Likewise "Chappy be polite", "Chappy formal" and "Chappy casual" are app \
-        commands - stay silent, the app handles them. \
+        Likewise ANY short sentence that begins with or contains the name "Chappy" \
+        and an app instruction is a command, not speech: "Chappy be polite", \
+        "Chappy casual", "Chappy quiet", "Chappy silent", "Chappy mute", \
+        "Chappy speak", "Chappy loud", "Chappy loudspeaker", "Chappy speaker off", \
+        "Chappy private", "Chappy pronunciation". Stay completely silent on all \
+        of them - the app handles them. \
         CRITICAL: any OTHER sentence containing repeat wording IS ordinary speech \
         and must be translated normally. "Can you repeat that?", "sorry, could you \
         say that again?" and "one more time please" are things the wearer is saying \
