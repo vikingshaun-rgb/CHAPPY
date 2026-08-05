@@ -64,10 +64,16 @@ class LiveTranslateViewModel: ObservableObject {
         }
     }
 
+    /// BUILD 57: DEAD CONTROL. These voices — Cherry, Jada, Dylan, Sunny, Peter,
+    /// Kiki, Eric — are Alibaba/Qwen voices left over from the original app.
+    /// Translate runs on Gemini now and speaks with the single voice chosen in
+    /// Settings → Voice, like every other part of Chappy. Picking one here has
+    /// never changed anything. Worse, it used to tear down and rebuild the live
+    /// session to apply a value the service ignores — a two-second dropout for
+    /// nothing. It still saves your choice, but it no longer costs you a session.
     @Published var selectedVoice: TranslateVoice {
         didSet {
             UserDefaults.standard.set(selectedVoice.rawValue, forKey: "translate_voice")
-            updateServiceSettings()
         }
     }
 
@@ -121,6 +127,7 @@ class LiveTranslateViewModel: ObservableObject {
     private var imageTimer: Timer?
     /// BUILD 56: idle sleep — see startIdleCountdown().
     private var idleTimer: Timer?
+    private var backgroundToken: NSObjectProtocol?
     private var resumeRecordingOnConnect = false
     private static let idleSleepSeconds: TimeInterval = 180
     /// BUILD 55: deferred settings push — see updateServiceSettings().
@@ -183,6 +190,7 @@ class LiveTranslateViewModel: ObservableObject {
         self.loudSpeaker = UserDefaults.standard.object(forKey: "translate_loud_speaker") as? Bool ?? false
         self.politeMode = UserDefaults.standard.object(forKey: "translate_polite") as? Bool ?? true
         self.phrases = SavedPhrase.load()
+        installLifecycleObserver()
     }
 
     // MARK: - Connection
@@ -439,8 +447,37 @@ class LiveTranslateViewModel: ObservableObject {
 
         translateService?.onError = { [weak self] error in
             DispatchQueue.main.async {
+                // BUILD 57: an alert raised while the app is in the background
+                // is waiting for you the moment you come back, describing a
+                // problem that no longer exists. Log it, don't ambush them.
+                guard UIApplication.shared.applicationState == .active else {
+                    print("🔇 [TranslateVM] Suppressed background error: \(error)")
+                    return
+                }
                 self?.errorMessage = error
                 self?.showError = true
+            }
+        }
+    }
+
+    // MARK: - App lifecycle (BUILD 57)
+
+    /// Minimising the app suspended the network stack under the socket, which
+    /// surfaced as a socket error, which then tried to recover three times and
+    /// finally threw an alert in your face — describing a failure you caused by
+    /// pressing the home button. Translate has no reason to run in the
+    /// background, so it stands down cleanly instead and waits for you.
+    private func installLifecycleObserver() {
+        guard backgroundToken == nil else { return }
+        backgroundToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isConnected || self.isRecording else { return }
+                print("📱 [TranslateVM] Backgrounded — standing the session down")
+                if self.isRecording { self.stopRecording() }
+                self.sleepSession()
             }
         }
     }
@@ -615,14 +652,81 @@ class LiveTranslateViewModel: ObservableObject {
         "bisa ulangi", "maaf", "apa"
     ]
 
-    /// "Chappy, be polite" / "Chappy, casual". Returns nil when it isn't one.
-    private static func registerCommand(_ text: String) -> Bool? {
+    /// BUILD 57: hands-free control of every toggle on the screen. Returns true
+    /// when the utterance was a command and has been handled — the caller then
+    /// files no bubble and the interpreter, which has been told to stay silent
+    /// on these, has already said nothing.
+    ///
+    /// Order matters here: "speaker off" contains "speak", and "loudspeaker"
+    /// contains both "loud" and "speak", so the narrower cases are tested first.
+    @discardableResult
+    private func handleSettingCommand(_ text: String) -> Bool {
         let t = text.lowercased().filter { $0.isLetter || $0.isWhitespace }
             .trimmingCharacters(in: .whitespaces)
-        guard t.contains("chappy") || t.contains("chappie"), t.count <= 40 else { return nil }
-        if t.contains("polite") || t.contains("formal") || t.contains("respectful") { return true }
-        if t.contains("casual") || t.contains("relax") || t.contains("informal") { return false }
-        return nil
+        guard t.contains("chappy") || t.contains("chappie"), t.count <= 46 else { return false }
+
+        // Register
+        if t.contains("polite") || t.contains("formal") || t.contains("respectful") {
+            politeMode = true
+            TTSService.shared.speak("Polite from here.")
+            return true
+        }
+        if t.contains("casual") || t.contains("relax") || t.contains("informal") {
+            politeMode = false
+            TTSService.shared.speak("Casual from here.")
+            return true
+        }
+
+        // Silence — checked before anything containing "speak". Note the
+        // unmute guard: "unmute" contains "mute", so without it the command to
+        // turn speech back ON would have turned it off.
+        if !t.contains("unmute"),
+           t.contains("quiet") || t.contains("silent") || t.contains("mute")
+            || t.contains("stop talking") || t.contains("shush")
+            || t.contains("dont speak") || t.contains("no voice")
+            || t.contains("text only") || t.contains("read only") {
+            audioOutputEnabled = false
+            // The last thing it says before going quiet, deliberately.
+            TTSService.shared.speak("Silent. I'll write it, not say it.")
+            return true
+        }
+
+        // Back to the glasses / private.
+        if t.contains("speaker off") || t.contains("glasses only")
+            || t.contains("private") || t.contains("headphone")
+            || t.contains("in my ear") {
+            loudSpeaker = false
+            TTSService.shared.speak("Back to your glasses.")
+            return true
+        }
+
+        // Loudspeaker on — implies speech is on at all.
+        if t.contains("loud") || t.contains("speaker on") || t.contains("speak up") {
+            audioOutputEnabled = true
+            loudSpeaker = true
+            TTSService.shared.speak("Loudspeaker on.")
+            return true
+        }
+
+        // Speech back on.
+        if t.contains("speak") || t.contains("talk") || t.contains("unmute")
+            || t.contains("out loud") || t.contains("voice on") {
+            audioOutputEnabled = true
+            TTSService.shared.speak("Speaking again.")
+            return true
+        }
+
+        // Pronunciation line.
+        if t.contains("pronunciation") || t.contains("pronounce")
+            || t.contains("phonetic") || t.contains("pinyin") || t.contains("romaji") {
+            let key = "translate_show_pronunciation"
+            let now = !(UserDefaults.standard.object(forKey: key) as? Bool ?? true)
+            UserDefaults.standard.set(now, forKey: key)
+            TTSService.shared.speak(now ? "Pronunciation on." : "Pronunciation off.")
+            return true
+        }
+
+        return false
     }
 
     /// Is this an instruction to the app, or something to translate?
@@ -665,16 +769,27 @@ class LiveTranslateViewModel: ObservableObject {
         // slightly different rules, which is how a rule could be right in one
         // place and wrong in the other.
         var fromWearer = !usePhoneMic
-        var detected: String? = nil
-        if clean.count >= 8 {
-            let recogniser = NLLanguageRecognizer()
-            recogniser.processString(clean)
-            if let lang = recogniser.dominantLanguage?.rawValue {
-                detected = lang
-                // The wearer speaks the SOURCE language; anything else is them.
+        var detected: String? = Self.identify(clean)
+
+        // BUILD 57: identify from the TRANSLATION first, not the original.
+        // The translation is written cleanly by the model; the original is a
+        // transcription of noisy audio and gets it wrong on short words —
+        // "bagus" was too short to call and landed on your side of the screen.
+        // And the logic is exact: an interpreter always answers in the OTHER
+        // language, so if the reply is in their language, you spoke.
+        let cleanTranslated = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let outLang = Self.identify(cleanTranslated) {
+            if Self.sameLanguage(outLang, targetLanguage.rawValue) {
+                fromWearer = true
+            } else if Self.sameLanguage(outLang, sourceLanguage.rawValue) {
+                fromWearer = false
+            } else if let lang = detected {
                 fromWearer = Self.sameLanguage(lang, sourceLanguage.rawValue)
             }
+        } else if let lang = detected {
+            fromWearer = Self.sameLanguage(lang, sourceLanguage.rawValue)
         }
+        if detected == nil { detected = Self.identify(cleanTranslated) }
 
         // VERBAL REPEAT: catch it before it becomes a bubble. The interpreter
         // has been told to stay silent on these, so nothing was spoken over it.
@@ -683,14 +798,13 @@ class LiveTranslateViewModel: ObservableObject {
             return
         }
 
-        // BUILD 55: register by voice. Same rule as repeat — your name makes it
-        // a command, so "could you be polite to him" still gets translated.
-        if let wantsPolite = Self.registerCommand(clean) {
-            politeMode = wantsPolite
-            // Worded so it stays true whether it applies now or at the next gap.
-            TTSService.shared.speak(wantsPolite ? "Polite from here." : "Casual from here.")
-            return
-        }
+        // BUILD 57: every toggle on the screen also has a spoken form, so you
+        // never have to dig the phone out mid-conversation. Same rule as repeat
+        // — your name is what makes it a command, so "could you be polite to
+        // him" or "speak up, I can't hear you" still get translated normally.
+        // Only YOUR voice can drive the app. Whatever the person opposite says,
+        // however it transcribes, it gets translated and never acted on.
+        if fromWearer, handleSettingCommand(clean) { return }
 
         // ECHO GUARD (BUILD 53): the signature of a feedback loop is Chappy
         // hearing back the exact words it just spoke. Even with the microphone
@@ -779,8 +893,12 @@ class LiveTranslateViewModel: ObservableObject {
     /// the giveaway. Runs once per session start and only when it's clearly
     /// backwards, so a deliberate choice is never overridden.
     private func autoOrientToPhoneLanguage() {
-        // Your choice always wins over my guess.
-        guard !hasOwnDefault else { return }
+        // BUILD 57: this used to stand down entirely once you'd pinned a
+        // default — so pinning the pair while it was still the wrong way round
+        // locked it backwards permanently, with the correction switched off.
+        // The condition below is strict: it only fires when YOUR side is a
+        // language your phone isn't in AND their side is. A deliberate choice
+        // like English → Indonesian can never trip it.
         guard let raw = Locale.preferredLanguages.first else { return }
         let phone = String(raw.prefix(2)).lowercased()
         let src = String(sourceLanguage.rawValue.prefix(2)).lowercased()
@@ -791,6 +909,12 @@ class LiveTranslateViewModel: ObservableObject {
         sourceLanguage = targetLanguage
         targetLanguage = temp
         suppressSettingsPush = false
+        // If a backwards pair had been pinned, repair the pin too — otherwise
+        // it would come back wrong the very next time you opened Translate.
+        if hasOwnDefault {
+            UserDefaults.standard.set(sourceLanguage.rawValue, forKey: "translate_default_source")
+            UserDefaults.standard.set(targetLanguage.rawValue, forKey: "translate_default_target")
+        }
         print("🌐 [TranslateVM] Languages were backwards — now \(sourceLanguage.rawValue) → \(targetLanguage.rawValue)")
     }
 
@@ -814,12 +938,28 @@ class LiveTranslateViewModel: ObservableObject {
         let d = String(detected.prefix(2)).lowercased()
         let o = String(ours.prefix(2)).lowercased()
         if d == o { return true }
+        // BUILD 57: Apple reports Indonesian as Malay ("ms") more often than
+        // not — they're close enough that its classifier can't reliably split
+        // them, and every one of those was landing on the wrong side.
         let aliases: [String: Set<String>] = [
+            "id": ["ms"],           // Indonesian ↔ Malay
+            "ms": ["id"],
             "fi": ["tl"],           // fil ↔ tl
             "yu": ["zh"],           // yue ↔ zh
             "zh": ["yu"]
         ]
         return aliases[o]?.contains(d) ?? false
+    }
+
+    /// BUILD 57: the threshold used to be eight characters, which threw away
+    /// exactly the words that matter in a market — "bagus", "berapa", "boleh".
+    /// Four is enough for the classifier to have an opinion worth using.
+    private static func identify(_ text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count >= 4 else { return nil }
+        let recogniser = NLLanguageRecognizer()
+        recogniser.processString(t)
+        return recogniser.dominantLanguage?.rawValue
     }
 
     // MARK: - Auto-retarget (BUILD 54)
@@ -949,13 +1089,48 @@ final class CurrencyRates {
         set { UserDefaults.standard.set(newValue, forKey: "chappy_fx_at") }
     }
 
-    /// Language → the currency you'll actually be handed.
+    /// BUILD 57: currency by COUNTRY first. Keying it off language was fine in
+    /// Asia, where one language mostly means one currency, and completely wrong
+    /// across South America — Spanish was mapped to euros, so a price in Lima,
+    /// Buenos Aires or Bogotá would have been converted as though the vendor
+    /// wanted euros. Where you're standing decides what's in the till.
+    static let currencyForCountry: [String: String] = [
+        // South America
+        "BR": "BRL", "AR": "ARS", "CL": "CLP", "CO": "COP", "PE": "PEN",
+        "UY": "UYU", "PY": "PYG", "BO": "BOB", "EC": "USD", "VE": "VES",
+        "GY": "GYD", "SR": "SRD",
+        // Central America, Mexico, Caribbean
+        "MX": "MXN", "CR": "CRC", "PA": "PAB", "GT": "GTQ", "HN": "HNL",
+        "NI": "NIO", "SV": "USD", "DO": "DOP", "CU": "CUP", "PR": "USD",
+        // Southeast Asia
+        "ID": "IDR", "TH": "THB", "VN": "VND", "PH": "PHP", "KH": "KHR",
+        "LA": "LAK", "MY": "MYR", "SG": "SGD", "BN": "BND", "TL": "USD",
+        // Rest
+        "CN": "CNY", "TW": "TWD", "HK": "HKD", "MO": "MOP", "JP": "JPY",
+        "KR": "KRW", "IN": "INR", "NP": "NPR", "TR": "TRY", "RU": "RUB",
+        "AE": "AED", "SA": "SAR", "QA": "QAR", "EG": "EGP", "MA": "MAD",
+        "AU": "AUD", "NZ": "NZD", "GB": "GBP", "US": "USD", "CA": "CAD",
+        "PT": "EUR", "ES": "EUR", "FR": "EUR", "DE": "EUR", "IT": "EUR",
+        "GR": "EUR", "AO": "AOA", "MZ": "MZN", "CV": "CVE"
+    ]
+
+    /// Fallback when there's no GPS fix yet — language is a decent guess.
     static let currencyForLanguage: [String: String] = [
         "id": "IDR", "th": "THB", "vi": "VND", "fil": "PHP", "km": "KHR",
         "lo": "LAK", "zh": "CNY", "yue": "HKD", "ja": "JPY", "ko": "KRW",
         "hi": "INR", "tr": "TRY", "ar": "AED", "el": "EUR", "fr": "EUR",
-        "es": "EUR", "it": "EUR", "de": "EUR", "pt": "EUR", "ru": "RUB"
+        "it": "EUR", "de": "EUR", "ru": "RUB",
+        // Best guess only — the country map above overrides these whenever
+        // there's a GPS fix, which there almost always is.
+        "es": "USD", "pt": "BRL"
     ]
+
+    /// The currency actually in the till: country if we know it, language if not.
+    static func currency(forLanguage lang: String) -> String? {
+        let country = (ContextEngine.shared.snapshot.countryCode ?? "").uppercased()
+        if !country.isEmpty, let byCountry = currencyForCountry[country] { return byCountry }
+        return currencyForLanguage[lang]
+    }
 
     /// Once a day is plenty — rates move fractions of a percent and a stale
     /// number still tells you whether you're being charged double.
