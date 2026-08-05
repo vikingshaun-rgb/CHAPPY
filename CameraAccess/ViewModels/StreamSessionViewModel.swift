@@ -222,15 +222,14 @@ class StreamSessionViewModel: ObservableObject {
       logger.info("🚀 Device session started")
 
       // 2. Add the Stream capability
-      // SDK 0.8.0 MIGRATION: capabilities are now added via addCamera and the
-      // stream is taken from the camera object. The old addStream path
-      // compiles but returns a dead stream on 0.8 firmware — the exact
-      // "connected but no camera" symptom.
-      guard let camera = try session.addCamera(config: makeStreamConfiguration()) else {
+      // NOTE (2026-08-05): docs describe an addCamera API but SDK 0.8.0's
+      // real surface keeps addStream — proven working in build 42 once the
+      // NSLocalNetworkUsageDescription permission was added (that was the
+      // actual camera fix, not the API).
+      guard let stream = try session.addStream(config: makeStreamConfiguration()) else {
         showError("Couldn't start the camera stream. Please try again.")
         return
       }
-      let stream = camera.stream
       self.stream = stream
 
       // Subscribe to stream state changes
@@ -276,9 +275,9 @@ class StreamSessionViewModel: ObservableObject {
         }
       }
 
-      // 3. Start the stream capability (0.8.0: synchronous now)
+      // 3. Start the stream capability
       logger.info("🚀 Starting stream…")
-      stream.start()
+      await stream.start()
       logger.info("🚀 startSession END - stream started")
 
     } catch {
@@ -299,7 +298,7 @@ class StreamSessionViewModel: ObservableObject {
 
   private func teardownSession() async {
     if let stream {
-      stream.stop() // 0.8.0: synchronous
+      await stream.stop()
     }
     deviceSession?.stop()
     streamStateListenerToken = nil
