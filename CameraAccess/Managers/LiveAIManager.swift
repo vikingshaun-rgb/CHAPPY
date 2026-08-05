@@ -54,7 +54,16 @@ class LiveAIManager: ObservableObject {
     /// Set the StreamSessionViewModel reference
     func setStreamViewModel(_ viewModel: StreamSessionViewModel) {
         self.streamViewModel = viewModel
+        // VOICE SHUTTER: "take a photo" in Live AI fires the glasses camera
+        if !photoObserverInstalled {
+            photoObserverInstalled = true
+            NotificationCenter.default.addObserver(forName: .chappyCapturePhoto,
+                                                   object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.streamViewModel?.capturePhoto() }
+            }
+        }
     }
+    private var photoObserverInstalled = false
 
     @objc private func handleLiveAITrigger(_ notification: Notification) {
         Task { @MainActor in
@@ -488,6 +497,43 @@ enum LiveAIError: LocalizedError {
 // no Xcode project registration risk. Weather via Open-Meteo (free, no
 // key, no WeatherKit entitlement needed).
 
+// MARK: - Chappy Haptics (the silent second voice)
+// Ears carry words; the pocket carries signals. A small learned vocabulary:
+// LEFT = two light taps · RIGHT = one heavy thud · ARRIVAL = success rise ·
+// OFF-ROUTE = warning · SHUTTER = rigid tick · CONNECT = soft tap ·
+// VOICE REVIVED = slow heavy double · COST NUDGE = gentle double ·
+// PROXIMITY = quickening taps. Foreground-reliable; notification-carried
+// versions arrive with Phase 5.5.
+@MainActor
+final class ChappyHaptics {
+    static let shared = ChappyHaptics()
+    private let light = UIImpactFeedbackGenerator(style: .light)
+    private let heavy = UIImpactFeedbackGenerator(style: .heavy)
+    private let rigid = UIImpactFeedbackGenerator(style: .rigid)
+    private let notify = UINotificationFeedbackGenerator()
+
+    /// Play a tap sequence: (delaySeconds, style) pairs.
+    private func taps(_ pattern: [(Double, UIImpactFeedbackGenerator)]) {
+        Task { @MainActor in
+            for (delay, gen) in pattern {
+                if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                gen.impactOccurred()
+            }
+        }
+    }
+
+    func leftTurn()     { taps([(0, light), (0.18, light)]) }
+    func rightTurn()    { taps([(0, heavy)]) }
+    func straightStep() { taps([(0, light)]) }
+    func arrival()      { notify.notificationOccurred(.success); taps([(0.25, light), (0.4, light)]) }
+    func offRoute()     { notify.notificationOccurred(.warning) }
+    func shutter()      { taps([(0, rigid)]) }
+    func connected()    { taps([(0, light)]) }
+    func voiceRevived() { taps([(0, heavy), (0.5, heavy)]) }
+    func costNudge()    { taps([(0, light), (0.3, light)]) }
+    func proximity()    { taps([(0, light), (0.2, light), (0.35, heavy)]) }
+}
+
 // MARK: - Backup & Restore (Settings → Backup)
 // One file carries EVERYTHING: every file in Documents (journal crumbs,
 // spots, notes, records, gallery) + the app's UserDefaults (theme, voice,
@@ -635,6 +681,7 @@ final class CostMeter {
             warned = [Self.dayKey(): done]
             UserDefaults.standard.set(warned, forKey: spokenKey)
             DispatchQueue.main.async {
+                Task { @MainActor in ChappyHaptics.shared.costNudge() }
                 TTSService.shared.speak("Heads up - roughly \(Int(threshold)) dollars of AI usage today.")
             }
         }
@@ -1164,6 +1211,7 @@ final class NavEngine: NSObject, ObservableObject {
             let dw = loc.distance(from: CLLocation(latitude: w.coord.latitude, longitude: w.coord.longitude))
             if dw < 150 {
                 watchTarget = nil
+                ChappyHaptics.shared.proximity()
                 speakNav("Heads up - you are about \(Int(dw)) meters from \(w.name).")
             }
         }
@@ -1179,16 +1227,23 @@ final class NavEngine: NSObject, ObservableObject {
         if d < lookahead {
             stepIndex += 1
             if stepIndex >= steps.count {
+                ChappyHaptics.shared.arrival()
                 speakNav("You have arrived at \(destinationName).")
                 stop()
                 return
             }
+            // HAPTIC TURN LANGUAGE: feel the turn as well as hear it
+            let instr = steps[stepIndex].instruction.lowercased()
+            if instr.contains("left") { ChappyHaptics.shared.leftTurn() }
+            else if instr.contains("right") { ChappyHaptics.shared.rightTurn() }
+            else { ChappyHaptics.shared.straightStep() }
             speakNav(steps[stepIndex].instruction)
             updateCard()
         } else if Date().timeIntervalSince(lastReroute) > 30, !routeCoords.isEmpty {
             let nearest = routeCoords.map { loc.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude)) }.min() ?? 0
             if nearest > 60 {
                 lastReroute = Date()
+                ChappyHaptics.shared.offRoute()
                 speakNav("You are off the route. Recalculating.")
                 let name = destinationName
                 Task { _ = await self.navigate(to: name) }
