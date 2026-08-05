@@ -364,6 +364,17 @@ class LiveTranslateViewModel: ObservableObject {
     /// the mic hint when the sentence is too short to call.
     private func appendTurn(heard: String, translated: String) {
         let clean = heard.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ECHO GUARD (BUILD 53): the signature of a feedback loop is Chappy
+        // hearing back the exact words it just spoke. Even with the microphone
+        // gated, a loud room can leak one through — refuse to file it.
+        if let last = transcript.last,
+           Self.looseMatch(clean, last.translated) || Self.looseMatch(clean, last.original) {
+            print("🔁 [TranslateVM] Dropped an echo of the previous turn")
+            return
+        }
+        // Nothing useful was heard — don't invent a bubble for it.
+        guard clean.count >= 2 else { return }
         var fromWearer = !usePhoneMic
         var detected: String? = nil
         if clean.count >= 8 {
@@ -393,6 +404,18 @@ class LiveTranslateViewModel: ObservableObject {
         if transcript.count > 400 {
             transcript.removeFirst(transcript.count - 400)
         }
+    }
+
+    /// Same words, ignoring case, punctuation and spacing — good enough to spot
+    /// an echo without rejecting a person who genuinely repeats themselves in a
+    /// different sentence.
+    private static func looseMatch(_ a: String, _ b: String) -> Bool {
+        func strip(_ s: String) -> String {
+            s.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        let x = strip(a), y = strip(b)
+        guard !x.isEmpty, !y.isEmpty else { return false }
+        return x == y
     }
 
     /// Apple's language identifier and our TranslateLanguage codes don't always
