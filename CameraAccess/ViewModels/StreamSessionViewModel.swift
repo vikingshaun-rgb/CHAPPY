@@ -289,6 +289,10 @@ class StreamSessionViewModel: ObservableObject {
           if let uiImage = UIImage(data: photoData.data) {
             self.capturedPhoto = uiImage
             self.showPhotoPreview = true
+            // VOICE SHUTTER: every glasses photo also lands in iOS Photos —
+            // time+GPS-stamped by the system, ready for Phase 5 photo ingest.
+            UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+            ChappyHaptics.shared.shutter()
           }
         }
       }
