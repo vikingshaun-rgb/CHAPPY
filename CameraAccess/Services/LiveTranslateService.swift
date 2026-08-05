@@ -45,6 +45,9 @@ class LiveTranslateService: NSObject {
     private var targetLanguage: TranslateLanguage = .en
     private var voice: TranslateVoice = .cherry
     private var audioOutputEnabled = true
+    /// BUILD 55: respectful register for officials and landlords, casual for
+    /// the street. Set before connect, and on every settings push.
+    var politeMode = true
 
     // Audio resampling
     private var audioConverter: AVAudioConverter?
@@ -69,7 +72,41 @@ class LiveTranslateService: NSObject {
     private var accumulatedOriginal = ""
     /// ECHO GATE: the microphone stays shut until this moment has passed.
     private var micGateUntil = Date.distantPast
-    private static let echoTailSeconds: TimeInterval = 0.6
+    /// BUILD 54: one tail length can't suit both cases. On the phone's own
+    /// loudspeaker the mic is centimetres from the source and the room rings,
+    /// so it needs the longer hold. Through the glasses the sound is at your
+    /// ear and barely reaches the mic, so a long tail only eats your first
+    /// word — which is exactly what clipped "how far to the boat" down to
+    /// "far to the boat". Set it from the hardware actually in use.
+    /// BUILD 54: start SHORT and earn the extra time only if the room proves it
+    /// needs it. The audio length itself is known exactly; this covers the three
+    /// things that can't be calculated — the room still ringing, Bluetooth lag,
+    /// and the model's voice detection grabbing a dying syllable. Guessing high
+    /// costs you the first word of every sentence, so guess low and adapt.
+    private var echoTailSeconds: TimeInterval = 0.4
+    private static let tailOnSpeaker: TimeInterval = 0.4
+    private static let tailOnHeadset: TimeInterval = 0.25
+    private static let tailCeiling: TimeInterval = 0.9
+
+    /// Called when an echo actually gets through. Evidence beats my guess: back
+    /// the gate off a notch, up to a sane ceiling, and stay there for the rest
+    /// of the session. Two or three leaks and it settles wherever this room
+    /// needs it to be, without you touching a thing.
+    func lengthenEchoTail() {
+        guard echoTailSeconds < Self.tailCeiling else { return }
+        echoTailSeconds = min(echoTailSeconds + 0.15, Self.tailCeiling)
+        print("🔇 [Translate] Echo got through — tail now \(echoTailSeconds)s")
+    }
+    /// Output forced to the iPhone's loudspeaker so a table can hear it.
+    private var loudSpeaker = false
+    private var bluetoothInputAvailable = false
+    /// BUILD 56: session continuity, ported from Live AI.
+    private var resumptionHandle: String?
+    private var isRenewingSession = false
+    private var recoveryAttempts = 0
+    /// True from the user opening Translate until they close it. Recovery must
+    /// never fire after a deliberate disconnect.
+    private var isUserSessionActive = false
 
     // Reconnect bookkeeping: recording may only resume AFTER setupComplete,
     // never straight after connect() — audio sent before setup kills the socket.
@@ -173,6 +210,7 @@ class LiveTranslateService: NSObject {
         }
 
         didReportSocketError = false
+        isUserSessionActive = true
 
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
@@ -192,6 +230,10 @@ class LiveTranslateService: NSObject {
     func disconnect() {
         print("🔌 [Translate] Disconnecting WebSocket")
         isConnected = false
+        // BUILD 56: a deliberate close must never trigger the recovery logic.
+        isUserSessionActive = false
+        recoveryAttempts = 0
+        resumptionHandle = nil
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
@@ -246,7 +288,26 @@ class LiveTranslateService: NSObject {
         SILENCE DISCIPLINE: if the audio is silence, background noise, music, a TV, \
         or speech clearly not directed at this conversation, output NOTHING AT ALL. \
         Never translate your own previous output. If an image is provided, use it \
-        only as context to improve the translation.
+        only as context to improve the translation. \
+        \(politeMode
+          ? "REGISTER: use the polite, respectful form of the language throughout - the level you would use with an official, a landlord, a police officer or an elder. Include the ordinary courtesy words a native speaker would use. "
+          : "REGISTER: use the everyday casual form a friend or a market vendor would use - natural and relaxed, not stiff or formal. ")\
+        PRICES: whenever a sum of money is spoken, render the number in the text \
+        as DIGITS with thousands separators (say 250,000 - not two hundred and \
+        fifty thousand), and keep the currency word. \
+        CONTROL PHRASES: when the wearer says the name "Chappy" together with a \
+        repeat instruction - "Chappy repeat that", "Chappy say that again", \
+        "Chappy one more time" - that is an instruction to the app and NOT speech \
+        to translate: output NOTHING AT ALL and stay silent, the app handles it. \
+        A bare single word from the other speaker asking for a repeat - "ulangi", \
+        "sekali lagi", "maaf", "apa" - is likewise handled by the app: stay silent. \
+        Likewise "Chappy be polite", "Chappy formal" and "Chappy casual" are app \
+        commands - stay silent, the app handles them. \
+        CRITICAL: any OTHER sentence containing repeat wording IS ordinary speech \
+        and must be translated normally. "Can you repeat that?", "sorry, could you \
+        say that again?" and "one more time please" are things the wearer is saying \
+        TO the person in front of them - translate those, never treat them as \
+        commands. Only the name "Chappy" makes it an instruction.
         """
 
         var setup: [String: Any] = [
@@ -255,6 +316,12 @@ class LiveTranslateService: NSObject {
                 "parts": [["text": systemPrompt]]
             ],
             "outputAudioTranscription": [:],
+            // BUILD 56: SESSION CONTINUITY. Gemini Live sessions have a maximum
+            // duration. The server warns with goAway and then aborts with 1008 —
+            // which is exactly the "Socket closed — code 1008" that ended an
+            // hour-long conversation. Ask for resumption handles so we can
+            // reconnect into the SAME session instead of dying.
+            "sessionResumption": (resumptionHandle != nil ? ["handle": resumptionHandle!] : [:]) as [String: Any],
             // TRANSCRIPT v2: ask the server to transcribe the INCOMING speech
             // too. Without this the app only ever knew what Chappy said back —
             // which is why the screen could show a translation but never the
@@ -282,6 +349,28 @@ class LiveTranslateService: NSObject {
 
     // MARK: - Audio Recording
 
+    /// BUILD 54: force sound out of the iPhone's own loudspeaker regardless of
+    /// which microphone is in use. The glasses speaker is designed to be heard
+    /// by you alone — across a table, in a warung, with two people listening,
+    /// it simply isn't loud enough. This keeps the glasses mic (or the phone's)
+    /// and moves only the OUTPUT to something everyone can hear.
+    func setLoudSpeaker(_ on: Bool) {
+        loudSpeaker = on
+        applyOutputRoute()
+        // Louder into the room means more of it comes back down the mic.
+        echoTailSeconds = (bluetoothInputAvailable && !on) ? Self.tailOnHeadset : Self.tailOnSpeaker
+        print("🔈 [Translate] Loudspeaker \(on ? "ON" : "off") — echo tail \(echoTailSeconds)s")
+    }
+
+    private func applyOutputRoute() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.overrideOutputAudioPort(loudSpeaker ? .speaker : .none)
+        } catch {
+            print("⚠️ [Translate] Could not switch output: \(error.localizedDescription)")
+        }
+    }
+
     func startRecording(usePhoneMic: Bool = false) {
         guard !isRecording else { return }
         lastUsePhoneMic = usePhoneMic
@@ -307,17 +396,26 @@ class LiveTranslateService: NSObject {
             let bluetoothAvailable = (audioSession.availableInputs ?? []).contains {
                 $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
             }
+            bluetoothInputAvailable = bluetoothAvailable
             let usePhoneMic = usePhoneMic || !bluetoothAvailable
             if !bluetoothAvailable {
                 print("🎙️ [Translate] No Bluetooth mic present — configuring for the iPhone")
             }
+
+            // Short hold through the glasses, long hold on any loudspeaker.
+            // BUILD 54 FIX: this used to key off the INPUT device only, so
+            // turning the loudspeaker on while wearing the glasses would have
+            // kept the 0.35s tail and walked us straight back into the echo
+            // loop. It's the output that makes the noise, so ask about that.
+            echoTailSeconds = (bluetoothAvailable && !loudSpeaker) ? Self.tailOnHeadset : Self.tailOnSpeaker
+            print("🔇 [Translate] Echo tail: \(echoTailSeconds)s")
 
             if usePhoneMic {
                 // iPhone microphone - best for translating the other person
                 try audioSession.setCategory(
                     .playAndRecord,
                     mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
-                    options: [.defaultToSpeaker]
+                    options: [.defaultToSpeaker, .allowBluetoothA2DP]
                 )
                 print("🎙️ [Translate] Using iPhone mic (translate the other person)")
             } else {
@@ -325,11 +423,12 @@ class LiveTranslateService: NSObject {
                 try audioSession.setCategory(
                     .playAndRecord,
                     mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
-                    options: [.allowBluetooth, .defaultToSpeaker]
+                    options: [.allowBluetooth, .defaultToSpeaker, .allowBluetoothA2DP]
                 )
                 print("🎙️ [Translate] Using Bluetooth mic (translate yourself)")
             }
             try audioSession.setActive(true)
+            applyOutputRoute()
 
             if let inputRoute = audioSession.currentRoute.inputs.first {
                 print("🎙️ [Translate] Current input device: \(inputRoute.portName) (\(inputRoute.portType.rawValue))")
@@ -376,7 +475,11 @@ class LiveTranslateService: NSObject {
 
         // ECHO GATE (BUILD 53): drop everything the mic hears while Chappy is
         // still speaking, plus a short tail. This is what breaks the loop.
-        if Date() < micGateUntil.addingTimeInterval(Self.echoTailSeconds) { return }
+        // BUILD 54: tapping the speaker on a bubble to repeat a line plays out
+        // of the SAME speaker — without this it would restart the exact loop we
+        // just killed, one tap at a time.
+        if TTSService.shared.isSpeaking { micGateUntil = Date() }
+        if Date() < micGateUntil.addingTimeInterval(echoTailSeconds) { return }
 
         let inputSampleRate = buffer.format.sampleRate
 
@@ -534,7 +637,12 @@ class LiveTranslateService: NSObject {
             case .failure(let error):
                 let nsError = error as NSError
                 print("❌ [Translate] Receive failed: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
-                if nsError.code != 57 && nsError.code != -999 { self?.reportSocketError("Receive error [\(nsError.code)]: \(error.localizedDescription)") }
+                // BUILD 56: 57 and -999 are our own teardown. Anything else is
+                // a live socket dying mid-conversation — try to recover before
+                // troubling the user with an alert.
+                if nsError.code != 57 && nsError.code != -999 {
+                    self?.attemptRecovery("receive error \(nsError.code)")
+                }
             }
         }
     }
@@ -566,6 +674,10 @@ class LiveTranslateService: NSObject {
                 self.accumulatedText = ""
                 self.onConnected?()
                 // Safe point to resume recording after a settings reconnect
+                // BUILD 56: a good handshake clears the recovery budget, so a
+                // later unrelated drop still gets its own three tries.
+                self.recoveryAttempts = 0
+                self.didReportSocketError = false
                 if self.shouldResumeRecordingAfterSetup {
                     self.shouldResumeRecordingAfterSetup = false
                     self.startRecording(usePhoneMic: self.lastUsePhoneMic)
@@ -634,9 +746,20 @@ class LiveTranslateService: NSObject {
             }
 
             // Errors / server-initiated disconnect
-            if let goAway = json["goAway"] as? [String: Any] {
-                print("⚠️ [Translate] Server goAway: \(goAway)")
-                self.onError?("Connection ending (server)")
+            // BUILD 56: the handle rotates; keep the newest one.
+            if let update = json["sessionResumptionUpdate"] as? [String: Any],
+               let handle = update["newHandle"] as? String, !handle.isEmpty {
+                self.resumptionHandle = handle
+                return
+            }
+
+            // BUILD 56: goAway is a WARNING, not a failure — the session clock
+            // is running out. Reconnect on the handle now, quietly, while the
+            // conversation is still going. This used to throw an alert in your
+            // face and stop dead.
+            if json["goAway"] != nil {
+                print("⏳ [Translate] goAway — renewing the session")
+                self.renewSession()
                 return
             }
             if let error = json["error"] as? [String: Any] {
@@ -736,8 +859,54 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.isConnected = false
         }
+        // BUILD 56: 1008 after a missed goAway is the session clock expiring,
+        // not a fault. It's what killed your hour-long conversation with an
+        // alert that read like a crash. Reconnect silently instead.
+        if closeCode.rawValue == 1008 {
+            print("⏳ [Translate] Session-duration abort — auto-renewing")
+            DispatchQueue.main.async { [weak self] in self?.renewSession() }
+            return
+        }
         if closeCode != .goingAway && closeCode != .normalClosure {
-            reportSocketError("Socket closed — code \(closeCode.rawValue): \(reasonText)")
+            attemptRecovery("code \(closeCode.rawValue): \(reasonText)")
+        }
+    }
+
+    /// BUILD 56: tear down the socket only, keep the microphone and playback
+    /// running, and reconnect with the stored handle. The conversation carries
+    /// on — at worst you lose a fraction of a second mid-gap.
+    private func renewSession() {
+        guard !isRenewingSession else { return }
+        isRenewingSession = true
+        // Recording must resume only AFTER setup completes, or the audio we send
+        // in the meantime kills the new socket too.
+        shouldResumeRecordingAfterSetup = isRecording
+        webSocket?.cancel(with: .goingAway, reason: nil)
+        webSocket = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.isRenewingSession = false
+            print("🔁 [Translate] Reconnecting (handle: \(self.resumptionHandle != nil ? "yes" : "none"))")
+            self.connect()
+        }
+    }
+
+    /// A drop that ISN'T the session clock — a tunnel, a WiFi handover, a 5xx.
+    /// Three tries on a backoff before we admit defeat to the user.
+    private func attemptRecovery(_ why: String) {
+        guard isUserSessionActive else { return }
+        guard recoveryAttempts < 3 else {
+            reportSocketError("Connection lost (\(why)). Close and reopen Translate to reconnect.")
+            return
+        }
+        recoveryAttempts += 1
+        let delay = Double(recoveryAttempts) * 1.5
+        print("🔁 [Translate] Recovery \(recoveryAttempts)/3 in \(delay)s — \(why)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isUserSessionActive else { return }
+            self.renewSession()
         }
     }
 

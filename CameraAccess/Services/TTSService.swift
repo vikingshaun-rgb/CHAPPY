@@ -6,6 +6,7 @@
 
 import Foundation
 import AVFoundation
+import NaturalLanguage
 
 class TTSService: NSObject, ObservableObject {
     static let shared = TTSService()
@@ -279,8 +280,17 @@ class TTSService: NSObject, ObservableObject {
         let utterance = AVSpeechUtterance(string: text)
         // Voice chosen by the TEXT itself — the old app-language setting was
         // still "Chinese" from TurboMeta days and made English sound Chinese.
-        let hasCJK = text.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
-        let language = hasCJK ? "zh-CN" : "en-AU"
+        // BUILD 54: the CJK-or-English test was too blunt. When the Gemini voice
+        // is unavailable (no signal, which is exactly when you're standing in a
+        // market), replaying an Indonesian line read it aloud in an Australian
+        // accent. Identify the language on-device and use a matching voice.
+        var language = "en-AU"
+        let recogniser = NLLanguageRecognizer()
+        recogniser.processString(text)
+        if let code = recogniser.dominantLanguage?.rawValue,
+           AVSpeechSynthesisVoice.speechVoices().contains(where: { $0.language.hasPrefix(code) }) {
+            language = (code == "en") ? "en-AU" : code
+        }
         utterance.voice = AVSpeechSynthesisVoice(language: language)
             ?? AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
