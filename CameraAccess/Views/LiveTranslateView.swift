@@ -1,42 +1,142 @@
 /*
  * Live Translate View
  * Live translation main screen
+ *
+ * TRANSCRIPT v2 — the screen used to show ONE translation at a time plus a
+ * single greyed-out line of history, which meant a ten-minute conversation
+ * left you with nothing to look back at. It is now a running two-sided
+ * transcript in iPhone-message bubbles: what they said above, what it means
+ * below, timestamped, themed, scrolling, and structured so Phase 5's memory
+ * store can file every turn verbatim with its language, time and place.
+ *
+ * ChappyBubble and TranslateTurn are declared here but are plain internal
+ * types — Live AI and Quick Vision can use the exact same bubbles without a
+ * new file having to be added to the Xcode project.
  */
 
 import SwiftUI
+
+// MARK: - Transcript Model
+
+/// One completed exchange: what was heard, and what it meant.
+struct TranslateTurn: Identifiable, Codable, Equatable {
+    let id: UUID
+    let at: Date
+    let original: String
+    let translated: String
+    /// True when the wearer spoke. Decided by on-device language identification,
+    /// falling back to which microphone was live.
+    let fromWearer: Bool
+    /// What language the speech was actually identified as (nil if too short).
+    let detectedLanguage: String?
+    let sourceCode: String
+    let targetCode: String
+
+    init(id: UUID = UUID(),
+         at: Date = Date(),
+         original: String,
+         translated: String,
+         fromWearer: Bool,
+         detectedLanguage: String? = nil,
+         sourceCode: String,
+         targetCode: String) {
+        self.id = id
+        self.at = at
+        self.original = original
+        self.translated = translated
+        self.fromWearer = fromWearer
+        self.detectedLanguage = detectedLanguage
+        self.sourceCode = sourceCode
+        self.targetCode = targetCode
+    }
+}
+
+// MARK: - Shared Bubble
+
+/// One message bubble, themed. `mine` puts it on the right in the accent
+/// colour; otherwise it sits left in the card fill — the arrangement every
+/// phone owner already knows how to read without being taught.
+struct ChappyBubble: View {
+    let primary: String
+    let secondary: String?
+    let at: Date?
+    let mine: Bool
+    let theme: ChappyTheme
+    var live: Bool = false
+
+    var body: some View {
+        HStack {
+            if mine { Spacer(minLength: 44) }
+
+            VStack(alignment: mine ? .trailing : .leading, spacing: 5) {
+                // What was actually said, in the speaker's own language.
+                if let secondary, !secondary.isEmpty {
+                    Text(secondary)
+                        .font(AppTypography.caption)
+                        .foregroundColor(theme.textSecondary)
+                        .multilineTextAlignment(mine ? .trailing : .leading)
+                }
+
+                // What it means — the line you actually read.
+                Text(primary)
+                    .font(AppTypography.body)
+                    .foregroundColor(theme.textPrimary)
+                    .multilineTextAlignment(mine ? .trailing : .leading)
+                    .textSelection(.enabled)
+
+                if let at {
+                    Text(at.formatted(date: .omitted, time: .shortened))
+                        .font(AppTypography.caption)
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(mine ? theme.accent.opacity(0.22) : theme.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(mine ? theme.accent.opacity(0.45) : theme.stroke, lineWidth: 1)
+            )
+            .opacity(live ? 0.72 : 1.0)
+            .frame(maxWidth: 320, alignment: mine ? .trailing : .leading)
+
+            if !mine { Spacer(minLength: 44) }
+        }
+    }
+}
+
+// MARK: - Main View
 
 struct LiveTranslateView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel = LiveTranslateViewModel()
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @State private var showSettings = false
+    @State private var showLabelSheet = false
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
 
     var body: some View {
         ZStack {
-            // Background
-            Color.black.ignoresSafeArea()
+            // Background — themed, so Translate stops being the one black
+            // screen in an app where everything else follows your colours.
+            LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
 
             // Video preview (if image input is enabled)
             if viewModel.imageEnhanceEnabled {
                 videoBackground
             }
 
-            // Main content
             VStack(spacing: 0) {
-                // Header
                 headerView
-
-                Spacer()
-
-                // Language selection bar
+                sessionHeader
                 languageBar
-
-                // Translation result area
-                translationArea
-
-                Spacer()
-
-                // Control bar
+                transcriptArea
                 controlBar
             }
             .padding()
@@ -72,37 +172,33 @@ struct LiveTranslateView: View {
 
     private var headerView: some View {
         HStack {
-            // Title
             HStack(spacing: 8) {
                 Image(systemName: "globe")
                     .font(.title2)
                 Text("livetranslate.title".localized)
                     .font(AppTypography.title2)
             }
-            .foregroundColor(.white)
+            .foregroundColor(theme.textPrimary)
 
             Spacer()
 
-            // Connection status
             connectionIndicator
 
-            // Settings button
             Button {
                 showSettings = true
             } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.title3)
-                    .foregroundColor(.white.opacity(0.8))
+                    .foregroundColor(theme.textPrimary.opacity(0.8))
             }
             .padding(.horizontal, 8)
 
-            // Close button
             Button {
                 dismiss()
             } label: {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title2)
-                    .foregroundColor(.white.opacity(0.8))
+                    .foregroundColor(theme.textPrimary.opacity(0.8))
             }
         }
         .padding(.vertical, 8)
@@ -115,35 +211,89 @@ struct LiveTranslateView: View {
                 .frame(width: 8, height: 8)
             Text(viewModel.isConnected ? "livetranslate.connected".localized : "livetranslate.connecting".localized)
                 .font(AppTypography.caption)
-                .foregroundColor(.white.opacity(0.6))
+                .foregroundColor(theme.textSecondary)
         }
+    }
+
+    // MARK: - Session Header
+
+    /// When, where, and with whom — the three things you need six weeks later
+    /// to know which conversation you are looking at.
+    private var sessionHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "clock")
+                .font(.caption)
+                .foregroundColor(theme.textSecondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sessionTitleLine)
+                    .font(AppTypography.caption)
+                    .foregroundColor(theme.textSecondary)
+                    .lineLimit(1)
+                if let place = viewModel.sessionPlace {
+                    Text(place)
+                        .font(AppTypography.caption)
+                        .foregroundColor(theme.textSecondary.opacity(0.75))
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer()
+
+            Button {
+                showLabelSheet = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: viewModel.sessionLabel.isEmpty ? "tag" : "tag.fill")
+                    Text(viewModel.sessionLabel.isEmpty ? "Name it" : viewModel.sessionLabel)
+                        .lineLimit(1)
+                }
+                .font(AppTypography.caption)
+                .foregroundColor(theme.accent)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+        .padding(.bottom, 4)
+        .alert("Name this conversation", isPresented: $showLabelSheet) {
+            TextField("e.g. the landlord", text: $viewModel.sessionLabel)
+            Button("Save") {}
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Makes it findable later.")
+        }
+    }
+
+    private var sessionTitleLine: String {
+        let started = viewModel.sessionStartedAt ?? Date()
+        let day = started.formatted(date: .abbreviated, time: .omitted)
+        let time = started.formatted(date: .omitted, time: .shortened)
+        let pair = "\(viewModel.sourceLanguage.flag) \(viewModel.sourceLanguage.displayName) ↔ \(viewModel.targetLanguage.flag) \(viewModel.targetLanguage.displayName)"
+        return "\(day) · \(time) · \(pair)"
     }
 
     // MARK: - Language Bar
 
     private var languageBar: some View {
         HStack(spacing: 16) {
-            // Source language
             languageButton(
                 language: viewModel.sourceLanguage,
                 label: "livetranslate.source".localized
             ) {
-                // Source language selection (via settings)
                 showSettings = true
             }
 
-            // Swap button
             Button {
                 viewModel.swapLanguages()
             } label: {
                 Image(systemName: "arrow.left.arrow.right")
                     .font(.title3)
-                    .foregroundColor(.white)
+                    .foregroundColor(theme.textPrimary)
                     .padding(12)
-                    .background(Circle().fill(Color.white.opacity(0.2)))
+                    .background(Circle().fill(theme.cardActive))
             }
 
-            // Target language
             languageButton(
                 language: viewModel.targetLanguage,
                 label: "livetranslate.target".localized
@@ -151,7 +301,7 @@ struct LiveTranslateView: View {
                 showSettings = true
             }
         }
-        .padding(.vertical, 16)
+        .padding(.vertical, 12)
     }
 
     private func languageButton(language: TranslateLanguage, label: String, action: @escaping () -> Void) -> some View {
@@ -159,94 +309,81 @@ struct LiveTranslateView: View {
             VStack(spacing: 4) {
                 Text(label)
                     .font(AppTypography.caption)
-                    .foregroundColor(.white.opacity(0.6))
+                    .foregroundColor(theme.textSecondary)
                 HStack(spacing: 6) {
                     Text(language.flag)
                         .font(.title2)
                     Text(language.displayName)
                         .font(AppTypography.body)
-                        .foregroundColor(.white)
+                        .foregroundColor(theme.textPrimary)
                 }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.white.opacity(0.1))
+                    .fill(theme.cardFill)
             )
         }
     }
 
-    // MARK: - Translation Area
+    // MARK: - Transcript
 
-    private var translationArea: some View {
-        VStack(spacing: 16) {
-            // Translation result card
-            VStack(alignment: .leading, spacing: 12) {
-                // Streaming translation
-                if !viewModel.streamingTranslation.isEmpty {
-                    Text(viewModel.streamingTranslation)
-                        .font(AppTypography.body)
-                        .foregroundColor(.white.opacity(0.7))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+    private var transcriptArea: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    if viewModel.transcript.isEmpty
+                        && viewModel.streamingOriginal.isEmpty
+                        && viewModel.streamingTranslation.isEmpty {
+                        Text("livetranslate.placeholder".localized)
+                            .font(AppTypography.body)
+                            .foregroundColor(theme.textSecondary.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                            .padding(.vertical, 60)
+                    }
+
+                    ForEach(viewModel.transcript) { turn in
+                        ChappyBubble(primary: turn.translated,
+                                     secondary: turn.original,
+                                     at: turn.at,
+                                     mine: turn.fromWearer,
+                                     theme: theme)
+                            .id(turn.id)
+                    }
+
+                    // The turn currently in flight — dimmed until it lands.
+                    if !viewModel.streamingOriginal.isEmpty || !viewModel.streamingTranslation.isEmpty {
+                        ChappyBubble(primary: viewModel.streamingTranslation.isEmpty ? "…" : viewModel.streamingTranslation,
+                                     secondary: viewModel.streamingOriginal,
+                                     at: nil,
+                                     mine: false,
+                                     theme: theme,
+                                     live: true)
+                            .id("live-bubble")
+                    }
+
+                    Color.clear.frame(height: 1).id("transcript-bottom")
                 }
-
-                // Final translation result
-                if !viewModel.currentTranslation.isEmpty {
-                    Text(viewModel.currentTranslation)
-                        .font(AppTypography.title2)
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                // Placeholder text
-                if viewModel.currentTranslation.isEmpty && viewModel.streamingTranslation.isEmpty {
-                    Text("livetranslate.placeholder".localized)
-                        .font(AppTypography.body)
-                        .foregroundColor(.white.opacity(0.4))
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 40)
+                .padding(.vertical, 8)
+            }
+            .frame(maxHeight: .infinity)
+            // Follow the conversation without the user having to chase it.
+            .onChange(of: viewModel.transcript.count) { _, _ in
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
             }
-            .padding(20)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.white.opacity(0.1))
-            )
-
-            // History (most recent)
-            if let lastRecord = viewModel.translationHistory.first {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("\(lastRecord.sourceLanguage.flag) → \(lastRecord.targetLanguage.flag)")
-                            .font(AppTypography.caption)
-                        Spacer()
-                        Text(lastRecord.timestamp.formatted(date: .omitted, time: .shortened))
-                            .font(AppTypography.caption)
-                    }
-                    .foregroundColor(.white.opacity(0.5))
-
-                    Text(lastRecord.translatedText)
-                        .font(AppTypography.caption)
-                        .foregroundColor(.white.opacity(0.7))
-                        .lineLimit(2)
-                }
-                .padding(12)
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color.white.opacity(0.05))
-                )
+            .onChange(of: viewModel.streamingTranslation) { _, _ in
+                proxy.scrollTo("transcript-bottom", anchor: .bottom)
             }
         }
-        .padding(.horizontal)
     }
 
     // MARK: - Control Bar
 
     private var controlBar: some View {
-        VStack(spacing: 16) {
-            // Recording status hint
+        VStack(spacing: 14) {
             if viewModel.isRecording {
                 HStack(spacing: 8) {
                     Circle()
@@ -254,17 +391,16 @@ struct LiveTranslateView: View {
                         .frame(width: 8, height: 8)
                     Text("livetranslate.recording".localized)
                         .font(AppTypography.caption)
-                        .foregroundColor(.white.opacity(0.8))
+                        .foregroundColor(theme.textSecondary)
                 }
             }
 
-            // Record button
             Button {
                 viewModel.toggleRecording()
             } label: {
                 ZStack {
                     Circle()
-                        .fill(viewModel.isRecording ? Color.red : Color.blue)
+                        .fill(viewModel.isRecording ? Color.red : theme.accent)
                         .frame(width: 72, height: 72)
 
                     Image(systemName: viewModel.isRecording ? "stop.fill" : "mic.fill")
@@ -275,18 +411,17 @@ struct LiveTranslateView: View {
             .disabled(!viewModel.isConnected)
             .opacity(viewModel.isConnected ? 1.0 : 0.5)
 
-            // Clear button
-            if !viewModel.currentTranslation.isEmpty || !viewModel.streamingTranslation.isEmpty {
+            if !viewModel.transcript.isEmpty {
                 Button {
                     viewModel.clearTranslation()
                 } label: {
                     Text("livetranslate.clear".localized)
                         .font(AppTypography.caption)
-                        .foregroundColor(.white.opacity(0.6))
+                        .foregroundColor(theme.textSecondary)
                 }
             }
         }
-        .padding(.bottom, 20)
+        .padding(.bottom, 12)
     }
 
     // MARK: - Video Background
