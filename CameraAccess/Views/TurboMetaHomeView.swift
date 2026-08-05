@@ -870,7 +870,16 @@ struct ChappyAvatarView: View {
                         radius: live ? 18 : 9)
         }
         .frame(width: 96, height: 96)
-        .onAppear { pulse = true; spin = true }
+        // FRESH IDENTITY per style+theme: switching avatar or theme rebuilds
+        // this view from scratch, restarting every repeatForever animation.
+        // Without this, a newly chosen avatar renders FROZEN.
+        .id("avatar-\(avatar.rawValue)-\(theme.name)")
+        .onAppear {
+            pulse = false; spin = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                pulse = true; spin = true
+            }
+        }
     }
 
     @ViewBuilder private var avatarBody: some View {
