@@ -7,6 +7,7 @@ import Foundation
 import SwiftUI
 import UIKit
 import NaturalLanguage
+import AVFoundation
 
 @MainActor
 class LiveTranslateViewModel: ObservableObject {
@@ -498,11 +499,35 @@ class LiveTranslateViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isConnected || self.isRecording else { return }
+
+                // BUILD 59 FIX: iOS fires this when the screen LOCKS, not just
+                // when you leave the app. Build 57 stood the session down either
+                // way — which meant putting the phone in your pocket mid-
+                // conversation, with the glasses on, killed the interpreter.
+                // That's the whole point of wearing glasses.
+                //
+                // So: if you're actively interpreting through a headset, this is
+                // a pocket, not an exit. The audio background mode keeps it alive
+                // and it carries on in your ear. Otherwise you've genuinely left,
+                // and holding a paid session open would be waste.
+                if self.isRecording, Self.headsetConnected {
+                    print("📱 [TranslateVM] Backgrounded on the glasses — carrying on")
+                    return
+                }
+
                 print("📱 [TranslateVM] Backgrounded — standing the session down")
                 if self.isRecording { self.stopRecording() }
                 self.sleepSession()
             }
         }
+    }
+
+    /// Are the glasses (or any headset) actually connected right now?
+    private static var headsetConnected: Bool {
+        let route = AVAudioSession.sharedInstance().currentRoute
+        let types: Set<AVAudioSession.Port> = [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE, .headphones, .headsetMic]
+        return route.outputs.contains { types.contains($0.portType) }
+            || route.inputs.contains { types.contains($0.portType) }
     }
 
     // MARK: - Idle sleep (BUILD 56)
