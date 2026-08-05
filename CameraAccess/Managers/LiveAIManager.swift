@@ -1136,7 +1136,7 @@ final class NavEngine: NSObject, ObservableObject {
         let distText = route.distanceMeters >= 2000
             ? String(format: "%.1f kilometers", route.distanceMeters / 1000)
             : "\(Int(route.distanceMeters)) meters"
-        return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction)."
+        return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction). Also tell the user: say 'open Google Maps' anytime for the full map with turn-by-turn on screen."
     }
 
     func getHome() async -> String {
