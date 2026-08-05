@@ -45,6 +45,9 @@ class GeminiLiveService: NSObject {
     private var speechFrameFired = false
     private var endFrameFired = false
     private var journalCommandFired = false
+    // ECO DRIP: cost saver — full frame rate only around conversation
+    private var lastInteractionAt = Date()
+    private var ecoSkipCounter = 0
 
     // STEP 8 FUSION: the live session other modules can speak through
     static weak var activeInstance: GeminiLiveService?
@@ -56,6 +59,8 @@ class GeminiLiveService: NSObject {
     private var contextTimer: Timer?
     // NAV BRIDGE v2: debounced full-sentence navigation detection
     private var navDetectWork: DispatchWorkItem?
+    // LOG THIS: debounced full-sentence note capture
+    private var noteDetectWork: DispatchWorkItem?
 
     // STEP 8 CONTINUITY PART 2: rolling conversation memory for re-briefs
     private var currentUserLine = ""
@@ -243,6 +248,8 @@ class GeminiLiveService: NSObject {
         contextTimer = nil
         navDetectWork?.cancel()
         navDetectWork = nil
+        noteDetectWork?.cancel()
+        noteDetectWork = nil
         // COST METER: bank the session time
         if let started = liveSessionStartAt {
             CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(started))
@@ -264,7 +271,7 @@ class GeminiLiveService: NSObject {
 
         // Get the system prompt for the current Live AI mode
         // PHASE 4: live context header — Chappy knows where/when it is
-        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers ONLY in the very LATEST frame - when asked what the user is looking at, describe the newest image and NEVER an earlier one. The scene often changes WHILE the user is speaking: if frames disagree, the NEWEST frame is the truth and older frames are history - counting fingers, reading signs, describing scenes must always use the final frame received, and when the scene changes significantly or something notable appears (a sign, a hazard, a place worth mentioning), briefly say so without waiting to be asked. TOOLS ARE YOUR HANDS: use your function tools freely and unprompted - navigate_to when the user wants to go somewhere, remember_spot to save places, save_observation whenever you notice something notable worth remembering, alert_when_near for stop-watching, deep_research for questions needing thorough current facts (say you are digging into it first), open_app or open_website to act on the phone, and emergency IMMEDIATELY if the user is in danger. Never say you cannot do these things - call the tool. NAVIGATION TRUTH: you have NO power to 'send directions to the phone', 'load a map' or 'pull up a route' by yourself - the ONLY way navigation ever starts is the navigate_to tool, or a 'Navigation:' app message confirming the route. Never claim directions are ready or loaded unless one of those actually happened; if you did not call the tool, NOTHING happened. TIME AND PLACE TRUTH: messages starting with CONTEXT UPDATE are ground truth for the user's REAL current local time and location - when asked the time, the date, or where you are, answer from the LATEST context update, in local time. NEVER answer in UTC, never say you do not know where the user is, and never guess a city."
+        let instructions = "LIVE CONTEXT: " + ContextEngine.shared.contextHeader() + "\n\n" + LiveAIModeManager.staticSystemPrompt + "\n\nIDENTITY: Your name is Chappy. You are the personal assistant of Shaun, an Australian traveller. When asked who or what you are, answer as Chappy - warmly and briefly. NEVER mention Gemini, Google, AI models, or being a language model; you are simply Chappy. PERSONA: loyal, sharp and capable like a great butler-engineer - concise, practical, a touch of dry wit when the moment suits, never rambling. Use your tools without being asked: search the web when current facts are needed, compute when numbers are involved (currency, bills, distances), and volunteer the useful next step ('want directions?', 'shall I remember this spot?').\n\nCHAPPY LIVE RULES: You are Chappy, a sharp real-time assistant looking through smart glasses worn by the user. Vision: describe only what is actually visible in the images you receive, in specific concrete detail - exact words, numbers, prices, colors, brands. If no clear image has arrived, say you cannot see clearly right now; never guess or invent. Reading: when asked to read, or when signs, menus, labels or screens are visible, read the text aloud verbatim. Food and health: when asked about food, drinks or products, read ingredients and labels, flag allergens and give practical health info. Translation: when visible text is in a foreign language, translate it and say the original name too. Places: when the user asks about a shop, restaurant, landmark or location, act like a knowledgeable local guide - what it is, what it is good for, whether it looks worth visiting. Style: SPEED IS EVERYTHING - default to ONE short punchy sentence, spoken immediately; expand only when explicitly asked for detail. Speak naturally like a trusted friend; lead with the answer, no preamble, no restating the question. Always answer in the language the user speaks to you. Watching: you receive a continuous stream of frames - always ground your answers ONLY in the very LATEST frame - when asked what the user is looking at, describe the newest image and NEVER an earlier one. The scene often changes WHILE the user is speaking: if frames disagree, the NEWEST frame is the truth and older frames are history - counting fingers, reading signs, describing scenes must always use the final frame received. SPEAK-WHEN-SPOKEN-TO DISCIPLINE: do NOT narrate scene changes by default - the camera moves constantly and unprompted commentary clogs the voice channel. Volunteer speech ONLY for genuine safety hazards or truly exceptional sights, at most one short sentence every couple of minutes. NEVER stack multiple replies: one question gets exactly one answer, and if the user starts speaking, abandon whatever you were saying instantly and listen. TOOLS ARE YOUR HANDS: use your function tools freely and unprompted - navigate_to when the user wants to go somewhere, remember_spot to save places, save_observation whenever you notice something notable worth remembering, alert_when_near for stop-watching, deep_research for questions needing thorough current facts (say you are digging into it first), open_app or open_website to act on the phone, and emergency IMMEDIATELY if the user is in danger. Never say you cannot do these things - call the tool. NAVIGATION TRUTH: you have NO power to 'send directions to the phone', 'load a map' or 'pull up a route' by yourself - the ONLY way navigation ever starts is the navigate_to tool, or a 'Navigation:' app message confirming the route. Never claim directions are ready or loaded unless one of those actually happened; if you did not call the tool, NOTHING happened. TIME AND PLACE TRUTH: messages starting with CONTEXT UPDATE are ground truth for the user's REAL current local time and location - when asked the time, the date, or where you are, answer from the LATEST context update, in local time. NEVER answer in UTC, never say you do not know where the user is, and never guess a city."
 
         // Use the voice chosen in Settings → Voice (was hardcoded to Aoede,
         // which silently ignored the user's picker). "System" (Apple TTS)
@@ -460,6 +467,7 @@ class GeminiLiveService: NSObject {
                 let level = sum / Float(max(count, 1))
                 let now = Date()
                 if level > 0.015 {
+                    lastInteractionAt = now // ECO DRIP: voice = full rate
                     if now.timeIntervalSince(lastLoudAt) > 0.8 && !speechFrameFired {
                         speechFrameFired = true
                         endFrameFired = false
@@ -767,6 +775,10 @@ class GeminiLiveService: NSObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .trimmingCharacters(in: .punctuationCharacters)
                 if dest2.lowercased().hasPrefix("the ") { dest2 = String(dest2.dropFirst(4)) }
+                // Cleaner Places queries: "closest sushi place" → "sushi place"
+                for prefix in ["closest ", "nearest "] where dest2.lowercased().hasPrefix(prefix) {
+                    dest2 = String(dest2.dropFirst(prefix.count))
+                }
                 if dest2.count > 1 {
                     journalCommandFired = true
                     print("🧭 [Gemini] Nav bridge fallback → '\(dest2)' driving=\(wantsDrive)")
@@ -824,6 +836,38 @@ class GeminiLiveService: NSObject {
                 let reply = await NavEngine.shared.navigate(to: dest, driving: wantsDrive)
                 self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
             }
+        }
+    }
+
+    // MARK: - Log This (voice notes into the journal)
+
+    private func scheduleNoteDetection() {
+        let lower = currentUserLine.lowercased()
+        guard lower.contains("log this") || lower.contains("note this")
+            || lower.contains("write this down") || lower.contains("make a note") else { return }
+        noteDetectWork?.cancel()
+        let snapshot = currentUserLine
+        let work = DispatchWorkItem { [weak self] in self?.fireNoteDetection(on: snapshot) }
+        noteDetectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    private func fireNoteDetection(on line: String) {
+        guard !journalCommandFired else { return }
+        journalCommandFired = true
+        var note = ""
+        for p in ["write this down", "make a note", "log this", "note this"] {
+            if let r = line.range(of: p, options: .caseInsensitive) {
+                note = String(line[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,:;.-!?"))
+                break
+            }
+        }
+        if note.count > 2 {
+            TripRecorder.shared.addObservation(note)
+            sendAppReply("The app logged this note in the journal, stamped with time and location: '\(note)'. Confirm to the user briefly: noted.")
+        } else {
+            sendAppReply("The user wants to log a note but the content was empty. Ask them to say it as one sentence, for example: log this, the hotel gate code is 4 4 2 1.")
         }
     }
 
@@ -908,6 +952,18 @@ class GeminiLiveService: NSObject {
     func sendImageInput(_ image: UIImage) {
         guard isSessionConfigured else { return }
         guard !isFrameSendInFlight else { return }
+
+        // ECO DRIP: streaming frames while nobody's talking is pure cost.
+        // After 45s of silence, drop to ~1 frame every 2.5s (an 8x saving);
+        // the INSTANT the user speaks, the live-shot VAD fires a fresh frame
+        // and full rate resumes — reactivity is untouched.
+        let idle = Date().timeIntervalSince(lastInteractionAt)
+        if idle > 45 {
+            ecoSkipCounter += 1
+            if ecoSkipCounter % 8 != 0 { return }
+        } else {
+            ecoSkipCounter = 0
+        }
 
         // EAGLE MODE: small fast frames win for reactivity — a 512px frame
         // uploads 3-4x faster than 768px, so vision stays CURRENT even on a
@@ -1030,6 +1086,7 @@ class GeminiLiveService: NSObject {
                 print("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
+                Task { @MainActor in ChappyHaptics.shared.connected() }
                 // COST METER: bank elapsed minutes across renewals
                 if let started = self.liveSessionStartAt {
                     CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(started))
@@ -1130,6 +1187,7 @@ class GeminiLiveService: NSObject {
         // Check if turn is complete
         if let turnComplete = content["turnComplete"] as? Bool, turnComplete {
             print("✅ [Gemini] AIReply complete")
+            lastInteractionAt = Date() // ECO DRIP: conversation = full rate
             finishAudioPlayback()
             onTranscriptDone?("")
             // VOICE WATCHDOG: text without a single audio chunk = server-side
@@ -1140,6 +1198,7 @@ class GeminiLiveService: NSObject {
                 if audioChunksThisTurn == 0 {
                     consecutiveSilentTurns += 1
                     print("🔇 [Gemini] Turn had TEXT but no AUDIO (\(consecutiveSilentTurns) in a row) — reviving")
+                    Task { @MainActor in ChappyHaptics.shared.voiceRevived() }
                     stopPlaybackEngine()
                     setupPlaybackEngine()
                     if consecutiveSilentTurns >= 2 {
@@ -1236,6 +1295,29 @@ class GeminiLiveService: NSObject {
                     journalCommandFired = true
                     Task { @MainActor in NavEngine.shared.stop() }
                     sendAppReply("Navigation has been stopped. Briefly confirm to the user.")
+                } else if lower.contains("battery check") || lower.contains("battery status")
+                    || lower.contains("battery level") || lower.contains("how's the battery") {
+                    journalCommandFired = true
+                    Task { @MainActor in
+                        UIDevice.current.isBatteryMonitoringEnabled = true
+                        let lvl = UIDevice.current.batteryLevel
+                        let phone = lvl >= 0 ? "\(Int(lvl * 100)) percent" : "unknown"
+                        self.sendAppReply("Phone battery is at \(phone). Glasses battery isn't exposed to the app - the Meta AI app shows it. Report this briefly.")
+                    }
+                } else if lower.contains("cost check") || lower.contains("usage check")
+                    || lower.contains("spent today") || lower.contains("how much have i spent") {
+                    journalCommandFired = true
+                    let t = CostMeter.shared.today()
+                    let month = CostMeter.shared.monthCostUSD()
+                    sendAppReply(String(format: "AI usage estimate: about $%.2f today with %.0f live minutes and %d research dives; roughly $%.2f this month. These are rough over-estimates. Report briefly.", t.4, t.0, t.3, month))
+                } else if lower.contains("take a photo") || lower.contains("take a picture")
+                    || lower.contains("take a snapshot") || lower.contains("snap a photo")
+                    || lower.contains("capture that") || lower.contains("capture this") {
+                    // VOICE SHUTTER: fire the glasses' photo capture; the
+                    // stream pipeline saves it to the phone's Photos.
+                    journalCommandFired = true
+                    NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
+                    sendAppReply("The app is taking a photo through the glasses right now and saving it to the phone's photo library. Confirm briefly: photo taken.")
                 } else if lower.contains("coordinates") || lower.contains("co-ordinates")
                     || lower.contains("gps position") || lower.contains("exact position")
                     || lower.contains("exact location") {
@@ -1287,6 +1369,8 @@ class GeminiLiveService: NSObject {
                     // catches "navigate ME to X", "directions to X", "the
                     // closest IGA" and never cuts the destination in half.
                     scheduleNavDetection()
+                    // LOG THIS: same debounce trick — capture the whole note
+                    scheduleNoteDetection()
                 }
             }
         }
@@ -1478,4 +1562,9 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
         print("❌ [Gemini] \(message)")
         reportSocketError(message)
     }
+}
+
+// MARK: - Voice shutter notification
+extension Notification.Name {
+    static let chappyCapturePhoto = Notification.Name("chappyCapturePhoto")
 }
