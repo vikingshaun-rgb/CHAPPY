@@ -33,9 +33,15 @@ enum StreamingStatus {
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
   @Published var hasReceivedFirstFrame: Bool = false
-  // CAMERA WATCHDOG: last time a frame actually arrived; stalls get kicked
-  private var lastFrameAt = Date()
+  // CAMERA WATCHDOG: last time a frame ARRIVED from the glasses (set at
+  // arrival, NOT after conversion — else a slow phone looks like a dead
+  // stream and the watchdog kick-cycles, making everything worse).
+  nonisolated(unsafe) private var lastFrameAt = Date()
   private var frameWatchdogTask: Task<Void, Never>?
+  private var stallKicks = 0
+  // PREVIEW THROTTLE: iPhone 11 can't convert 24fps of high-res — cap
+  // preview conversions at ~12fps; the freshest frame still always wins.
+  nonisolated(unsafe) private static var lastConvertAt = Date.distantPast
   @Published var streamingStatus: StreamingStatus = .stopped {
     // POCKET-MODE KEEPALIVE: while the glasses are streaming, hold the
     // screen awake — iOS stalls the frame pipeline when the display
@@ -139,10 +145,14 @@ class StreamSessionViewModel: ObservableObject {
       resolution = .medium
     }
     logger.info("🟢 Using video quality: \(savedQuality) -> \(String(describing: resolution))")
+    // FRAME RATE 24→15 (2026-08-05): the 0.8 WiFi transport really delivers
+    // what we ask for — 24fps of high-res raw drowned the iPhone 11's CPU
+    // (heat, jank, watchdog false alarms). 15fps is smooth to the eye, halves
+    // the load, and Gemini only samples ~3fps anyway.
     return StreamConfiguration(
       videoCodec: .raw,
       resolution: resolution,
-      frameRate: 24)
+      frameRate: 15)
   }
 
   // MARK: - Permissions + Start
@@ -249,8 +259,13 @@ class StreamSessionViewModel: ObservableObject {
       // went seconds stale. Now: dedicated queue, one conversion in flight,
       // freshest frame always wins, main thread only receives the result.
       videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] videoFrame in
-        guard !Self.frameConversionBusy else { return }
+        // Arrival marker FIRST — the watchdog watches delivery, not conversion
+        self?.lastFrameAt = Date()
+        let now = Date()
+        guard !Self.frameConversionBusy,
+              now.timeIntervalSince(Self.lastConvertAt) > 0.08 else { return }
         Self.frameConversionBusy = true
+        Self.lastConvertAt = now
         Self.frameQueue.async { [weak self] in
           let image = videoFrame.makeUIImage()
           Self.frameConversionBusy = false
@@ -258,7 +273,6 @@ class StreamSessionViewModel: ObservableObject {
           Task { @MainActor [weak self] in
             guard let self else { return }
             self.currentVideoFrame = image
-            self.lastFrameAt = Date()
             if !self.hasReceivedFirstFrame {
               logger.info("🎥 First frame received and converted (fast path)")
               self.hasReceivedFirstFrame = true
@@ -290,16 +304,29 @@ class StreamSessionViewModel: ObservableObject {
       // transport without touching the session or the conversation.
       lastFrameAt = Date()
       frameWatchdogTask?.cancel()
+      stallKicks = 0
       frameWatchdogTask = Task { @MainActor [weak self] in
         while !Task.isCancelled {
           try? await Task.sleep(nanoseconds: 3_000_000_000)
           guard let self, let stream = self.stream else { continue }
           if self.hasReceivedFirstFrame,
              Date().timeIntervalSince(self.lastFrameAt) > 6 {
-            logger.warning("🩺 Camera stalled >6s — kicking the stream")
+            self.stallKicks += 1
+            if self.stallKicks >= 3 {
+              // Two kicks didn't revive it — the transport is wedged.
+              // Nuclear: full camera session restart (conversation unaffected).
+              logger.warning("🩺 Stream kicks failed — FULL session restart")
+              self.stallKicks = 0
+              await self.stopSession()
+              await self.startSession()
+              return // startSession spawns a fresh watchdog
+            }
+            logger.warning("🩺 Camera stalled >6s — kicking the stream (\(self.stallKicks))")
             self.lastFrameAt = Date() // debounce: one kick per stall window
             await stream.stop()
             await stream.start()
+          } else if Date().timeIntervalSince(self.lastFrameAt) < 3 {
+            self.stallKicks = 0 // frames flowing again — reset escalation
           }
         }
       }
