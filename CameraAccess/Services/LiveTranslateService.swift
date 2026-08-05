@@ -76,6 +76,11 @@ class LiveTranslateService: NSObject {
     /// While this is above zero, Chappy is audibly speaking — whatever the clock
     /// says — and the microphone must stay shut.
     private var pendingPlaybackBuffers = 0
+    /// When that counter last moved. If it stops moving while still above zero,
+    /// a completion callback was dropped and the microphone would stay shut for
+    /// the rest of the session — silent, permanent, and indistinguishable from
+    /// the app being broken. Never ship a gate without a way out.
+    private var lastPlaybackChangeAt = Date.distantPast
     /// BUILD 54: one tail length can't suit both cases. On the phone's own
     /// loudspeaker the mic is centimetres from the source and the room rings,
     /// so it needs the longer hold. Through the glasses the sound is at your
@@ -149,6 +154,21 @@ class LiveTranslateService: NSObject {
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
         playbackEngine.prepare()
 
+        // A route change (headphones, glasses, the LOUD toggle) tears the graph
+        // down. Rebuild at once rather than discovering it mid-sentence.
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: playbackEngine, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            print("🔧 [Translate] Playback graph changed — re-arming")
+            self.isPlaybackEngineRunning = false
+            self.hasStartedPlaying = false
+            self.pendingPlaybackBuffers = 0
+            self.lastPlaybackChangeAt = Date()
+            self.ensurePlaybackReady()
+        }
+
         print("✅ [Translate] Playback engine initialized: Float32 @ 24kHz")
     }
 
@@ -170,6 +190,7 @@ class LiveTranslateService: NSObject {
         playbackEngine.stop()
         isPlaybackEngineRunning = false
         pendingPlaybackBuffers = 0
+        lastPlaybackChangeAt = Date()
         // AUDIT FIX: hasStartedPlaying stayed true across restarts, so
         // playerNode.play() was never called again — translation went
         // permanently silent after any language/voice change.
@@ -415,6 +436,9 @@ class LiveTranslateService: NSObject {
     func setLoudSpeaker(_ on: Bool) {
         loudSpeaker = on
         applyOutputRoute()
+        // Changing the output port IS a route change — re-arm before the next
+        // chunk arrives, or the first sentence after the toggle is lost.
+        ensurePlaybackReady()
         // Louder into the room means more of it comes back down the mic.
         echoTailSeconds = (bluetoothInputAvailable && !on) ? Self.tailOnHeadset : Self.tailOnSpeaker
         print("🔈 [Translate] Loudspeaker \(on ? "ON" : "off") — echo tail \(echoTailSeconds)s")
@@ -422,8 +446,22 @@ class LiveTranslateService: NSObject {
 
     private func applyOutputRoute() {
         let session = AVAudioSession.sharedInstance()
+        // BUILD 58 FIX (CRITICAL): passing .none does not mean "default" — it
+        // CANCELS defaultToSpeaker and sends audio to the little earpiece at the
+        // top of the phone, which is inaudible unless you hold it to your head.
+        // That is why nothing was coming out of the speaker with LOUD off.
+        //
+        // LOUD off is meant to mean "play through the glasses". If there are no
+        // glasses to play through, the loudspeaker is the only sensible answer —
+        // the earpiece is never right for a translator.
+        let headsetConnected = session.currentRoute.outputs.contains {
+            $0.portType == .bluetoothA2DP || $0.portType == .bluetoothHFP
+                || $0.portType == .bluetoothLE || $0.portType == .headphones
+        }
+        let wantSpeaker = loudSpeaker || !headsetConnected
         do {
-            try session.overrideOutputAudioPort(loudSpeaker ? .speaker : .none)
+            try session.overrideOutputAudioPort(wantSpeaker ? .speaker : .none)
+            print("🔈 [Translate] Output → \(wantSpeaker ? "loudspeaker" : "headset")")
         } catch {
             print("⚠️ [Translate] Could not switch output: \(error.localizedDescription)")
         }
@@ -533,8 +571,16 @@ class LiveTranslateService: NSObject {
 
         // BUILD 58: the authoritative check — is sound still coming out?
         if pendingPlaybackBuffers > 0 {
-            micGateUntil = Date()
-            return
+            // WATCHDOG: three seconds with the counter stuck means a callback
+            // never arrived. Let go rather than stay deaf.
+            if Date().timeIntervalSince(lastPlaybackChangeAt) > 3.0 {
+                print("⚠️ [Translate] Playback callback lost — releasing the mic gate")
+                pendingPlaybackBuffers = 0
+                lastPlaybackChangeAt = Date()
+            } else {
+                micGateUntil = Date()
+                return
+            }
         }
 
         // ECHO GATE (BUILD 53): drop everything the mic hears while Chappy is
@@ -853,15 +899,50 @@ class LiveTranslateService: NSObject {
         let seconds = frames / (playbackFormat?.sampleRate ?? 24000)
         micGateUntil = max(micGateUntil, Date()).addingTimeInterval(seconds)
 
-        startPlaybackEngine()
-        guard isPlaybackEngineRunning else { return }
+        guard ensurePlaybackReady() else { return }
+        playAudio(audioData)
+    }
 
-        if !hasStartedPlaying {
-            playerNode?.play()
-            hasStartedPlaying = true
+    /// BUILD 58 (ROOT CAUSE): the old code asked a Bool we maintain ourselves
+    /// whether the playback engine was running. iOS stops that engine on its own
+    /// whenever the audio route changes — which is EXACTLY what toggling LOUD
+    /// does, because switching the output port is a route change. Our flag stayed
+    /// true, so:
+    ///
+    ///   • startPlaybackEngine() early-returned and never restarted it
+    ///   • hasStartedPlaying stayed true so play() was never called again
+    ///   • buffers were scheduled into a dead node — silence
+    ///   • their completion callbacks never fired — so the new mic gate never
+    ///     released and the microphone stayed shut for the rest of the session
+    ///
+    /// One dead engine, and the app both goes silent AND stops listening. Ask the
+    /// engine what it's doing instead of remembering what we told it to do.
+    @discardableResult
+    private func ensurePlaybackReady() -> Bool {
+        guard let engine = playbackEngine, let node = playerNode else { return false }
+
+        if !engine.isRunning {
+            // It died under us. Everything we believed about it is stale.
+            isPlaybackEngineRunning = false
+            hasStartedPlaying = false
+            pendingPlaybackBuffers = 0
+            lastPlaybackChangeAt = Date()
+            do {
+                engine.prepare()
+                try engine.start()
+                isPlaybackEngineRunning = true
+                print("♻️ [Translate] Playback engine had stopped — restarted")
+            } catch {
+                print("❌ [Translate] Playback engine won't restart: \(error.localizedDescription)")
+                return false
+            }
         }
 
-        playAudio(audioData)
+        if !node.isPlaying {
+            node.play()
+            hasStartedPlaying = true
+        }
+        return true
     }
 
     private func playAudio(_ audioData: Data) {
@@ -880,9 +961,11 @@ class LiveTranslateService: NSObject {
         // Now we count buffers and let the audio engine tell us when the last one
         // has ACTUALLY been played. No arithmetic, no assumption.
         pendingPlaybackBuffers += 1
+        lastPlaybackChangeAt = Date()
         playerNode?.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
             self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
+            self.lastPlaybackChangeAt = Date()
             if self.pendingPlaybackBuffers == 0 {
                 // The tail starts from the moment sound actually stopped.
                 self.micGateUntil = Date()
