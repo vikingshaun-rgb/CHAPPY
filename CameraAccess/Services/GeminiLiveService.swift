@@ -1191,6 +1191,19 @@ class GeminiLiveService: NSObject {
                     journalCommandFired = true
                     Task { @MainActor in NavEngine.shared.stop() }
                     sendAppReply("Navigation has been stopped. Briefly confirm to the user.")
+                } else if lower.contains("coordinates") || lower.contains("co-ordinates")
+                    || lower.contains("gps position") || lower.contains("exact position")
+                    || lower.contains("exact location") {
+                    // GPS TRUTH: the app answers with exact figures, no guessing
+                    journalCommandFired = true
+                    let s = ContextEngine.shared.snapshot
+                    if let la = s.latitude, let lo = s.longitude {
+                        var place = [s.street, s.suburb, s.city].compactMap { $0 }.joined(separator: ", ")
+                        if place.isEmpty { place = "street name still resolving" }
+                        sendAppReply(String(format: "Exact GPS position from the phone: latitude %.5f, longitude %.5f - %@. Read the coordinates clearly and slowly to the user.", la, lo, place))
+                    } else {
+                        sendAppReply("No GPS fix yet. Tell the user to give it a few seconds, ideally outdoors.")
+                    }
                 } else if lower.contains("google maps") || lower.contains("open maps")
                     || lower.contains("open the maps") || lower.contains("real maps") {
                     // GOOGLE MAPS HANDOFF: launch the real Google Maps app
