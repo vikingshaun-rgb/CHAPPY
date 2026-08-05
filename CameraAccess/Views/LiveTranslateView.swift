@@ -340,7 +340,7 @@ struct LiveTranslateView: View {
             get: { shareText.map { BigLine(text: $0) } },
             set: { shareText = $0?.text }
         )) { line in
-            ShareSheet(items: [line.text])
+            ChappyShareSheet(items: [line.text])
         }
         .alert("livetranslate.error.title".localized, isPresented: $viewModel.showError) {
             Button("common.ok".localized, role: .cancel) {}
@@ -1049,7 +1049,7 @@ struct PhraseListView: View {
             get: { shareText.map { BigLine(text: $0) } },
             set: { shareText = $0?.text }
         )) { line in
-            ShareSheet(items: [line.text])
+            ChappyShareSheet(items: [line.text])
         }
     }
 
@@ -1107,7 +1107,12 @@ struct PhraseListView: View {
 /// Hand a line to anything on the phone — WhatsApp, Messenger, Messages, Mail,
 /// Notes, Telegram. The translated text is real Unicode, so Chinese characters,
 /// Thai and Khmer arrive intact rather than as boxes.
-struct ShareSheet: UIViewControllerRepresentable {
+///
+/// BUILD 57 FIX: named ChappyShareSheet, not ShareSheet — PhotoPreviewView
+/// already declares a ShareSheet(photo:) for sharing images, and two types with
+/// the same name in one module is a compile error that also breaks THEIR call
+/// sites. The build error blamed their file for a collision I caused.
+struct ChappyShareSheet: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
         UIActivityViewController(activityItems: items, applicationActivities: nil)
