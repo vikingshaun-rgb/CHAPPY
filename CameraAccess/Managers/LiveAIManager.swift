@@ -9,6 +9,7 @@ import AVFoundation
 import CoreLocation
 import CoreMotion
 import MapKit
+import Speech
 
 // MARK: - Live AI Manager
 
@@ -42,11 +43,17 @@ class LiveAIManager: ObservableObject {
     private let tts = TTSService.shared
 
     private init() {
-        // Listen for Intent triggers
+        // AUDIT FIX (CRITICAL — double session): this manager USED to start
+        // its own background Live AI session on .liveAITriggered, while the
+        // home view ALSO presented LiveAIView which starts its own. One
+        // command = two websockets, two microphones, two voices talking over
+        // each other, and double billing. The screen now owns the session
+        // exclusively; this manager only runs sessions started directly
+        // (Siri background path calls startLiveAISession itself).
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleLiveAITrigger(_:)),
-            name: .liveAITriggered,
+            name: .liveAIBackgroundStart,
             object: nil
         )
     }
@@ -59,7 +66,8 @@ class LiveAIManager: ObservableObject {
             photoObserverInstalled = true
             NotificationCenter.default.addObserver(forName: .chappyCapturePhoto,
                                                    object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.streamViewModel?.capturePhoto() }
+                // AUDIT FIX (QV-C5): this is the ONLY path that saves to Photos.
+                Task { @MainActor in self?.streamViewModel?.capturePhoto(saveToRoll: true) }
             }
         }
     }
@@ -78,6 +86,14 @@ class LiveAIManager: ObservableObject {
         guard !isRunning else {
             print("⚠️ [LiveAIManager] Already running")
             return
+        }
+        // MIC HANDOFF: Standby's local ear must let go before the deep layer
+        // takes the microphone — two recognizers cannot share one input node.
+        if ChappyStandby.shared.isListening {
+            // AUDIT FIX (LA-H9): handOff() so stopSession()'s
+            // resumeAfterHandOff() actually re-arms the wake word.
+            ChappyStandby.shared.handOff()
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
         guard let streamViewModel = streamViewModel else {
@@ -389,6 +405,9 @@ class LiveAIManager: ObservableObject {
         guard isRunning else { return }
 
         print("🛑 [LiveAIManager] Stopping session...")
+        // AUDIT FIX: the wake-word ear comes back on its own after the deep
+        // layer closes — no digging the phone out to re-arm it.
+        defer { ChappyStandby.shared.resumeAfterHandOff() }
 
         // Stop the timer
         frameUpdateTimer?.invalidate()
@@ -407,6 +426,10 @@ class LiveAIManager: ObservableObject {
         case .google:
             geminiService?.disconnect()
         }
+        // AUDIT FIX (LA-H10): the live session the user actually starts lives
+        // in LiveAIView, not in this manager — so "Hey Siri, stop live" closed
+        // nothing at all. Reach the real socket through the shared instance.
+        GeminiLiveService.activeInstance?.disconnect()
 
         // Stop the video stream
         await streamViewModel?.stopSession()
@@ -496,6 +519,966 @@ enum LiveAIError: LocalizedError {
 // to every feature. Embedded here deliberately — no new .swift file means
 // no Xcode project registration risk. Weather via Open-Meteo (free, no
 // key, no WeatherKit entitlement needed).
+
+// MARK: - CHAPPY STANDBY (Phase 4.97) — the wake word and the router
+//
+// The front door to everything. While the app is open (pocket fine, screen
+// dark fine), a local on-device ear listens for the name "Chappy" — costing
+// NOTHING while it waits, sending nothing anywhere. When the name lands, the
+// rest of the sentence is routed by cost, cheapest first:
+//
+//   TIER 0  free phone actions      (photo, log, remember, map, status, modes)
+//   TIER 1  one cheap call          (general questions, one-look, deal check)
+//   TIER 2  live sessions           (talk, navigate, translate, watch)
+//   TIER 3  the computer            (OpenClaw jobs, queued when PC is asleep)
+//
+// Laws: barge-in always · three-strike escape (never loop "didn't catch
+// that" — offer Live AI instead) · one either/or when unsure · confirm money.
+@MainActor
+final class ChappyStandby: NSObject, ObservableObject {
+    static let shared = ChappyStandby()
+
+    @Published private(set) var isListening = false
+    @Published private(set) var lastHeard = ""
+
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let engine = AVAudioEngine()
+    private var restartTimer: Timer?
+
+    // Wake-word state
+    private var awake = false
+    private var command = ""
+    private var lastWordAt = Date()
+    private var routeWork: DispatchWorkItem?
+    private var strikes = 0
+    private var busy = false
+    private var coachCount = 0
+    private var routeTask: Task<Void, Never>?
+    private var starting = false
+    private var wasListeningBeforeHandoff = false
+    private var pendingAmbiguous: String?
+    /// AUDIT FIX (SB-H1): interruption/route resilience state.
+    private var resilienceInstalled = false
+    private var interruptedWhileListening = false
+
+    private static let wakeWords = ["chappy", "chappie", "chapy", "chappy's"]
+
+    // MARK: Language intelligence (country-aware translation)
+
+    /// AUDIT FIX (HIGH): every code here MUST exist in TranslateLanguage or
+    /// the module silently degrades to English↔English while Chappy cheerfully
+    /// announces "Translating English and Tagalog". Verified against the enum:
+    /// en zh ja ko fr de ru es pt it yue id vi th ar hi el tr fil km lo.
+    private static let supportedCodes: Set<String> = [
+        "en", "zh", "ja", "ko", "fr", "de", "ru", "es", "pt", "it", "yue",
+        "id", "vi", "th", "ar", "hi", "el", "tr", "fil", "km", "lo"
+    ]
+    /// Where you ARE decides the language — no menus, no picking.
+    private static let countryLanguage: [String: String] = [
+        "ID": "id", "TH": "th", "VN": "vi", "PH": "fil", "KH": "km", "LA": "lo",
+        "SG": "zh", "CN": "zh", "TW": "zh", "HK": "yue", "JP": "ja",
+        "KR": "ko", "IN": "hi", "TR": "tr", "FR": "fr", "ES": "es", "IT": "it",
+        "DE": "de", "PT": "pt", "BR": "pt", "RU": "ru", "GR": "el",
+        "AE": "ar", "EG": "ar", "MA": "ar", "SA": "ar", "JO": "ar"
+    ]
+    /// Spoken names → codes. Ordered lookup (dictionaries have no order, and
+    /// random iteration made Chappy say "Bahasa" or "Indonesian" at random).
+    private static let spokenLanguages: [(String, String)] = [
+        ("indonesian", "id"), ("bahasa", "id"), ("thai", "th"), ("vietnamese", "vi"),
+        ("filipino", "fil"), ("tagalog", "fil"), ("khmer", "km"), ("cambodian", "km"),
+        ("lao", "lo"), ("mandarin", "zh"), ("chinese", "zh"), ("cantonese", "yue"),
+        ("japanese", "ja"), ("korean", "ko"), ("hindi", "hi"), ("turkish", "tr"),
+        ("french", "fr"), ("spanish", "es"), ("italian", "it"), ("german", "de"),
+        ("portuguese", "pt"), ("russian", "ru"), ("greek", "el"), ("arabic", "ar")
+    ]
+
+    static func languageCode(forCountry code: String?) -> String? {
+        guard let code, let mapped = countryLanguage[code.uppercased()],
+              supportedCodes.contains(mapped) else { return nil }
+        return mapped
+    }
+    static func languageCode(spokenIn text: String) -> String? {
+        guard let hit = spokenLanguages.first(where: { text.contains($0.0) }) else { return nil }
+        return supportedCodes.contains(hit.1) ? hit.1 : nil
+    }
+    static func languageName(_ code: String) -> String {
+        spokenLanguages.first(where: { $0.1 == code })?.0.capitalized ?? code.uppercased()
+    }
+
+    // MARK: Lifecycle
+
+    func toggle() { isListening ? stop() : start() }
+
+    func start() {
+        // AUDIT FIX: isListening is only set at the END of beginSession, so a
+        // double tap (or tap + Siri) used to build two recognizers, two
+        // engines and two greetings.
+        guard !isListening, !starting else { return }
+        starting = true
+        // Never fight Live AI for the microphone — Live AI IS the deep layer.
+        guard !LiveAIManager.shared.isRunning else {
+            // AUDIT FIX (SB-C1): this returned without clearing `starting`, so
+            // one tap while Live AI was running left the flag stuck true and
+            // Standby could NEVER be started again for the life of the app.
+            starting = false
+            TTSService.shared.speak("Live AI is already listening - no need for standby.")
+            return
+        }
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            Task { @MainActor in
+                guard status == .authorized else {
+                    self?.starting = false
+                    TTSService.shared.speak("I need speech permission for standby. Enable it in settings.")
+                    return
+                }
+                // AUDIT FIX: mic permission was never requested — a denied mic
+                // failed silently with the toggle just flipping back.
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    Task { @MainActor in
+                        guard granted else {
+                            self?.starting = false
+                            TTSService.shared.speak("I need microphone access for standby.")
+                            return
+                        }
+                        self?.beginSession()
+                    }
+                }
+            }
+        }
+    }
+
+    func stop() {
+        restartTimer?.invalidate(); restartTimer = nil
+        routeWork?.cancel(); routeWork = nil
+        routeTask?.cancel(); routeTask = nil
+        task?.cancel(); task = nil
+        request?.endAudio(); request = nil
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
+        awake = false; command = ""; strikes = 0
+        busy = false; starting = false // AUDIT FIX: a stuck busy flag made the ear permanently deaf
+        isListening = false
+        print("👂 [Standby] Ear closed")
+    }
+
+    /// AUDIT FIX (HIGH): every hand-off to a session used to close the ear
+    /// forever — after one translate or one chat, the wake word was dead
+    /// until the user dug the phone out and tapped the button. Now the ear
+    /// remembers it was on and comes back by itself.
+    func handOff() {
+        wasListeningBeforeHandoff = isListening
+        stop()
+    }
+    func resumeAfterHandOff() {
+        guard wasListeningBeforeHandoff, !isListening else { return }
+        wasListeningBeforeHandoff = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, !LiveAIManager.shared.isRunning else { return }
+            self.start()
+        }
+    }
+
+    private func beginSession() {
+        // AUDIT FIX (SB-C1): both early exits below used to leave `starting`
+        // true — a single low-battery tap deadlocked the wake word permanently.
+        guard let recognizer, recognizer.isAvailable else {
+            starting = false
+            TTSService.shared.speak("Standby isn't available on this phone right now.")
+            return
+        }
+        // Battery guard — a local ear sips, but not below 20%.
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let lvl = UIDevice.current.batteryLevel
+        if lvl >= 0 && lvl < 0.20 {
+            starting = false
+            TTSService.shared.speak("Battery is under twenty percent - standby stays off to save it.")
+            return
+        }
+
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                 options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
+        try? session.setActive(true)
+
+        guard startRecognition() else { starting = false; return }
+        isListening = true
+        starting = false
+        installAudioResilience()
+        ChappyHaptics.shared.connected()
+        TTSService.shared.speak("Standby on. Just say Chappy.")
+        // Recognition tasks die after about a minute — quietly renew them.
+        restartTimer?.invalidate()
+        restartTimer = Timer.scheduledTimer(withTimeInterval: 50, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.renew() }
+        }
+        print("👂 [Standby] Ear open — waiting for the name")
+    }
+
+    private func renew() {
+        guard isListening, !awake, !busy else { return } // never interrupt a command
+        // AUDIT FIX (SB-H1): health check first. If iOS tore the engine down
+        // while we weren't looking (a call, an alarm, media services resetting),
+        // renewing the recognizer alone gives you a live ear with no audio going
+        // into it — deaf, but the chip still says "Standby on".
+        if !engine.isRunning {
+            print("👂 [Standby] Engine died — rebuilding the whole ear")
+            rebuildEar()
+            return
+        }
+        task?.cancel(); task = nil
+        request?.endAudio(); request = nil
+        _ = startRecognition()
+    }
+
+    /// AUDIT FIX (SB-H1): full teardown and restart, keeping isListening true so
+    /// the UI never flickers and the user never has to touch the phone.
+    private func rebuildEar() {
+        task?.cancel(); task = nil
+        request?.endAudio(); request = nil
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                 options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
+        try? session.setActive(true)
+        if !startRecognition() {
+            // Genuinely can't come back — say so rather than pretending.
+            isListening = false
+            TTSService.shared.speak("Standby dropped out - tap the ear to bring me back.")
+        }
+    }
+
+    /// AUDIT FIX (SB-H1): Standby had NO interruption handling at all — Live AI
+    /// next door has it, this didn't. One incoming call, one alarm, one Siri
+    /// press and the wake word went silently deaf: the home screen still showed
+    /// "Standby on", the ear was simply gone until the app was restarted. This
+    /// is the difference between a wake word you can trust in your pocket all
+    /// day and one you have to keep checking.
+    private func installAudioResilience() {
+        guard !resilienceInstalled else { return }
+        resilienceInstalled = true
+        let nc = NotificationCenter.default
+
+        nc.addObserver(forName: AVAudioSession.interruptionNotification,
+                       object: nil, queue: .main) { [weak self] note in
+            guard let self else { return }
+            let raw = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) ?? 0
+            guard let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            Task { @MainActor in
+                switch type {
+                case .began:
+                    // A call or an alarm has the mic. Let go cleanly.
+                    if self.isListening {
+                        self.interruptedWhileListening = true
+                        self.task?.cancel(); self.task = nil
+                        self.request?.endAudio(); self.request = nil
+                        if self.engine.isRunning { self.engine.stop() }
+                        print("👂 [Standby] Interrupted — holding")
+                    }
+                case .ended:
+                    guard self.interruptedWhileListening else { return }
+                    self.interruptedWhileListening = false
+                    // iOS needs a beat after the interruption clears.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                        guard let self, self.isListening,
+                              !LiveAIManager.shared.isRunning else { return }
+                        self.rebuildEar()
+                    }
+                @unknown default: break
+                }
+            }
+        }
+
+        // Media services resetting nukes every engine in the process.
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                       object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isListening else { return }
+                print("👂 [Standby] Media services reset — rebuilding")
+                self.rebuildEar()
+            }
+        }
+
+        // Route changes (glasses connecting, AirPods, a cable) rebuild the graph.
+        nc.addObserver(forName: .AVAudioEngineConfigurationChange,
+                       object: engine, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isListening, !self.awake, !self.busy else { return }
+                print("👂 [Standby] Audio graph changed — rebuilding")
+                self.rebuildEar()
+            }
+        }
+    }
+
+    @discardableResult
+    private func startRecognition() -> Bool {
+        guard let recognizer else { return false }
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        // ON-DEVICE = free, private, works with no signal.
+        if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
+        request = req
+
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            print("⚠️ [Standby] Mic format not ready")
+            return false
+        }
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
+            req.append(buffer)
+        }
+        if !engine.isRunning {
+            engine.prepare()
+            do { try engine.start() } catch {
+                print("⚠️ [Standby] Mic failed: \(error.localizedDescription)")
+                return false
+            }
+        }
+        // AUDIT FIX (HIGH): cancelling a task delivers a final error to the
+        // OLD task's handler, which used to nil out the NEW task and start a
+        // third — an unbounded ping-pong of orphaned recognizers all calling
+        // heard(), i.e. duplicate commands. Each callback now proves it is
+        // still the current task before doing anything.
+        var thisTask: SFSpeechRecognitionTask?
+        thisTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            if let result {
+                let text = result.bestTranscription.formattedString.lowercased()
+                Task { @MainActor in
+                    guard let self, self.task === thisTask else { return }
+                    self.heard(text)
+                }
+            }
+            if error != nil || (result?.isFinal ?? false) {
+                Task { @MainActor in
+                    guard let self, self.task === thisTask else { return }
+                    self.task = nil
+                    // AUDIT FIX: restarting the EAR while a command routes is
+                    // harmless (re-entry is blocked in finish()); the old
+                    // !busy guard left the ear dead for up to 50 seconds.
+                    guard self.isListening else { return }
+                    _ = self.startRecognition()
+                }
+            }
+        }
+        task = thisTask
+        return true
+    }
+
+    // MARK: Hearing
+
+    private func heard(_ text: String) {
+        lastHeard = text
+
+        // BARGE-IN LAW — with the self-interruption guard.
+        // Naive "any speech stops the voice" is a trap: the mic hears CHAPPY
+        // through the speaker and cuts him off mid-sentence, every sentence.
+        // So while he is speaking, only DELIBERATE kill-words count; the
+        // moment he's quiet, everything is heard normally.
+        if TTSService.shared.isSpeaking {
+            let killWords = ["chappy stop", "stop chappy", "shut up", "shush",
+                             "be quiet", "quiet", "enough", "stop talking", "that's enough"]
+            if killWords.contains(where: { text.hasSuffix($0) || text.contains($0) }) {
+                TTSService.shared.stop()
+                ChappyHaptics.shared.straightStep()
+                awake = false; command = ""
+                routeWork?.cancel()
+                print("🤫 [Standby] Killed mid-sentence by voice")
+            }
+            return // never route while he's mid-answer
+        }
+
+        if !awake {
+            guard let range = Self.wakeWords.compactMap({ text.range(of: $0, options: .backwards) })
+                .max(by: { $0.upperBound < $1.upperBound })
+            else { return }
+            awake = true
+            command = String(text[range.upperBound...])
+            ChappyHaptics.shared.connected()
+            print("👂⚡ [Standby] Woken")
+        } else {
+            // Keep only what follows the LAST wake word in the running text
+            if let range = Self.wakeWords.compactMap({ text.range(of: $0, options: .backwards) })
+                .max(by: { $0.upperBound < $1.upperBound }) {
+                command = String(text[range.upperBound...])
+            } else {
+                command = text
+            }
+        }
+        lastWordAt = Date()
+        // Debounce: 1.1s of quiet means the sentence is finished.
+        routeWork?.cancel()
+        let snapshot = command
+        let work = DispatchWorkItem { [weak self] in self?.finish(snapshot) }
+        routeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: work)
+    }
+
+    private func finish(_ raw: String) {
+        // AUDIT FIX (HIGH — re-entry): a second command arriving while one is
+        // still routing used to run BOTH concurrently — two paid calls, two
+        // voices, and a `busy` flag that stopped meaning anything.
+        guard !busy else {
+            print("👂 [Standby] Busy — dropped: \(raw)")
+            return
+        }
+        let cmd = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        awake = false
+        command = ""
+        guard !cmd.isEmpty else {
+            TTSService.shared.speak("Yes?")
+            resetRecognition()
+            return
+        }
+        print("👂➡️ [Standby] Command: \(cmd)")
+        busy = true
+        routeTask?.cancel()
+        routeTask = Task { @MainActor in
+            await route(cmd)
+            self.busy = false
+            // AUDIT FIX (HIGH — phantom repeats): the recognizer keeps ONE
+            // growing transcript for its whole task. Without wiping it, the
+            // words "chappy take a photo" stay in the buffer and re-fire the
+            // command on the next unrelated sentence. Fresh ear after every
+            // command.
+            self.resetRecognition()
+        }
+    }
+
+    /// Discard the accumulated transcript and listen fresh.
+    private func resetRecognition() {
+        guard isListening else { return }
+        task?.cancel(); task = nil
+        request?.endAudio(); request = nil
+        _ = startRecognition()
+    }
+
+    // MARK: The router
+
+    private func route(_ c: String) async {
+        // ---------- SAFETY FIRST — emergency outranks everything ----------
+        // AUDIT FIX (P0): "Chappy, emergency" used to fall through to a 25s
+        // network call. Standby is often the ONLY thing listening (screen
+        // dark, phone pocketed) — that is exactly when this must be instant.
+        if c.contains("emergency") || c.contains("help me help me") || c.contains("i need help now") {
+            runEmergencyFromStandby(); return
+        }
+
+        // ---------- STOPS — anchored, never greedy ----------
+        // AUDIT FIX (P0): "stop navigation" was swallowed by hasPrefix("stop")
+        // so navigation could never be stopped by voice; and contains("enough")
+        // silenced innocent sentences like "is 500,000 rupiah enough for dinner".
+        if c.contains("stop navigation") || c.contains("stop navigating")
+            || c.contains("cancel navigation") || c.contains("stop the route") {
+            NavEngine.shared.stop(); speak("Navigation stopped."); return
+        }
+        if c == "stop" || c == "cancel" || c.hasPrefix("stop talking")
+            || c.contains("never mind") || c.contains("cancel that")
+            || c.contains("shut up") || c.contains("be quiet")
+            || c.hasSuffix("that's enough") || c == "enough" || c.contains("back to standby") {
+            TTSService.shared.stop(); ChappyHaptics.shared.straightStep(); return
+        }
+
+        // ---------- TIER 3 — the computer (unambiguous openers, checked early
+        // so job wording like "send the photos" can't be hijacked) ----------
+        if let job = after(c, ["get the computer to", "ask my computer to", "ask my computer",
+                               "have the pc", "have the computer", "computer job",
+                               "get the pc to", "tell the computer to", "when the computer's on",
+                               "when the computer is on"]) {
+            queueComputerJob(job); return
+        }
+
+        // ---------- TIER 0 — free, instant, on the phone ----------
+        // AUDIT FIX (P0): bare "photo"/"picture"/"snap" used to eat
+        // "log this, snap peas are 20,000" and "take me to the photo shop".
+        // Imperative shapes only.
+        if after(c, ["take a photo", "take a picture", "take a shot", "get a shot",
+                     "snap a photo", "snap that", "snap this", "capture this",
+                     "capture that", "photo quick"]) != nil
+            || c == "photo" || c == "take photo" {
+            NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
+            // AUDIT FIX: don't claim success when the camera isn't running.
+            if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
+                speak("Photo taken.")
+            } else {
+                speak("Camera isn't running - open Talk or Look first, then I can shoot.")
+            }
+            return
+        }
+        if let note = after(c, ["log this", "note this", "write this down", "make a note", "jot this down"]) {
+            if note.count > 2 {
+                TripRecorder.shared.addObservation(note)
+                ChappyHaptics.shared.straightStep()
+                speak("Logged.")
+            } else {
+                speak("What should I log?")
+            }
+            return
+        }
+        if c.contains("remember this spot") || c.contains("remember here")
+            || c.contains("save this place") || c.contains("pin this")
+            || c.contains("mark this spot") || c.contains("this is home") {
+            var name = after(c, ["call it "]) ?? ""
+            if c.contains("this is home") { name = "home" }
+            let spot = TripRecorder.shared.rememberSpot(named: name)
+            ChappyHaptics.shared.straightStep()
+            speak(spot.lat == 0 ? "Saved, but GPS hasn't locked yet." : "Saved \(spot.name).")
+            return
+        }
+        if c.contains("where was i") || c.contains("where have i been") || c.contains("what did i do today") {
+            speak(TripRecorder.shared.todaySummary()); return
+        }
+        if c.contains("trace my steps") || c.contains("retrace") || c.contains("way i came") {
+            speak(TripRecorder.shared.retraceGuidance()); return
+        }
+        if c.contains("i'm lost") || c.contains("im lost") || c.contains("i am lost") {
+            speak(TripRecorder.shared.lostReport()); return
+        }
+        if c.contains("where am i") || c.contains("what street") {
+            speak(ContextEngine.shared.contextHeader()); return
+        }
+        if c.contains("coordinates") || c.contains("gps position") || c.contains("exact location") {
+            let s = ContextEngine.shared.snapshot
+            if let la = s.latitude, let lo = s.longitude {
+                speak(String(format: "Latitude %.5f, longitude %.5f.", la, lo))
+            } else { speak("No GPS fix yet.") }
+            return
+        }
+        // AUDIT FIX (P0): bare "battery" hijacked "navigate me to the battery
+        // store" and "get the computer to find a battery for the drone".
+        if c.contains("battery check") || c.contains("battery level")
+            || c.contains("battery status") || c.contains("how's the battery")
+            || c.contains("hows the battery") || c == "battery" {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            let l = UIDevice.current.batteryLevel
+            speak(l >= 0 ? "Phone battery \(Int(l * 100)) percent." : "Battery level unknown."); return
+        }
+        if c.contains("cost check") || c.contains("spent today") || c.contains("usage today")
+            || c.contains("usage check") || c.contains("how much have i spent")
+            || c.contains("what have i spent") {
+            let t = CostMeter.shared.today()
+            speak(String(format: "About %.2f dollars today, %.2f this month.", t.4, CostMeter.shared.monthCostUSD()))
+            return
+        }
+        // THE COACH — "what can I say?" answers for the moment you're IN,
+        // never a 60-item menu (voice can't be scanned).
+        // SIM FIX: "help me talk to her" (19 chars) hit the coach while
+        // "help me talk to them" (20) hit translate — one character decided.
+        if c.contains("what can i say") || c.contains("what can you do")
+            || c.contains("commands")
+            || (c.contains("help me") && c.count < 20
+                && !c.contains("talk to") && !c.contains("figure") && !c.contains("work out")) {
+            speak(coachLine()); return
+        }
+        if c.contains("quiet mode") { UserDefaults.standard.set("quiet", forKey: "chappy_mode"); speak("Quiet mode."); return }
+        if c.contains("tour mode") { UserDefaults.standard.set("tour", forKey: "chappy_mode"); speak("Tour mode."); return }
+        if c.contains("budget mode") { UserDefaults.standard.set("budget", forKey: "chappy_mode"); speak("Budget mode on."); return }
+        if c.contains("normal mode") { UserDefaults.standard.set("normal", forKey: "chappy_mode"); speak("Back to normal."); return }
+        // AUDIT FIX (coverage gap): the map was promised in the grammar and
+        // had no handler at all. Must sit ABOVE "where am i".
+        if c.contains("show the map") || c.contains("show my trail") || c.contains("show map")
+            || c.contains("open the map") || c.contains("where am i on the map") {
+            NotificationCenter.default.post(name: .chappyShowMap, object: nil)
+            speak("Map's up."); return
+        }
+        // AUDIT FIX (coverage gap): alert_when_near existed as a Live AI tool
+        // but Standby couldn't reach it.
+        if let place = after(c, ["alert me when we're near a", "alert me when we're near",
+                                 "alert me when i'm near a", "alert me when im near a",
+                                 "alert me when we pass a", "tell me when you see a",
+                                 "tell me when we're near a"]) {
+            speak("Watching for \(place).")
+            let reply = await NavEngine.shared.alertWhenNear(place)
+            speak(reply); return
+        }
+
+        // ---------- TIER 3 — the computer (checked early: explicit opener) ----------
+        if let job = after(c, ["get the computer to", "ask my computer to", "ask my computer",
+                               "have the pc", "have the computer", "computer job",
+                               "get the pc to", "tell the computer to"]) {
+            queueComputerJob(job); return
+        }
+
+        // ---------- TIER 2 — live sessions ----------
+        if c.contains("let's talk") || c.contains("lets talk") || c.contains("start live")
+            || c.contains("eyes on") || c.contains("come with me") || c.contains("watch with me") {
+            speak("Opening Live AI.")
+            handOff() // AUDIT FIX: ear remembers to come back
+            NotificationCenter.default.post(name: .liveAITriggered, object: nil)
+            return
+        }
+        // TRANSLATE — country-aware, auto-detecting, auto-starting.
+        // "translate" alone picks the local language from where you ARE
+        // (Indonesia → Indonesian); "translate to Thai" pins it explicitly.
+        // English is always your home side; the engine detects which side is
+        // speaking, so one command covers both directions.
+        // AUDIT FIX: "translate this" is a Tier 1 ONE-LOOK (read the sign and
+        // translate it) — it used to launch the whole metered session.
+        if c.contains("translate this") || c.contains("translate that")
+            || c.contains("translate the sign") || c.contains("translate the menu") {
+            speak("Reading it.")
+            QuickVisionManager.shared.triggerQuickVision(customPrompt:
+                "Read the text in this image and translate it into English. Say the original briefly, then the translation. Two short spoken sentences.")
+            return
+        }
+        if c.hasPrefix("translate") || c.contains("interpreter")
+            || c.contains("help me talk to") || c.contains("talk to them")
+            || (c.contains("translate") && (c.contains("mode") || c.contains("for me"))) {
+            let picked = Self.languageCode(spokenIn: c)
+                ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode)
+            guard let code = picked else {
+                // Honest failure beats a translator that silently does nothing
+                speak("I don't have this country's language yet. Say translate to Indonesian, Thai, Vietnamese, Chinese, Japanese or Filipino.")
+                return
+            }
+            UserDefaults.standard.set("en", forKey: "translate_source_language")
+            UserDefaults.standard.set(code, forKey: "translate_target_language")
+            UserDefaults.standard.set(true, forKey: "translate_autostart")
+            speak("Translating English and \(Self.languageName(code)). Go ahead.")
+            handOff()
+            NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
+            return
+        }
+        if c.contains("keep watching") || c.contains("continuous vision") || c.contains("narrate") {
+            speak("Watching.")
+            handOff()
+            NotificationCenter.default.post(name: .continuousVisionTriggered, object: nil)
+            return
+        }
+        if c.contains("stop navigation") || c.contains("cancel navigation") {
+            NavEngine.shared.stop(); speak("Navigation stopped."); return
+        }
+        if c.contains("get me home") || c.contains("take me home") {
+            speak("Finding your way home.")
+            let reply = await NavEngine.shared.getHome()
+            speak(reply); return
+        }
+        if let dest = navDestination(in: c) {
+            // AUDIT FIX: bare " car" forced driving on "walk me to the car
+            // rental place"; anchored mode phrases only.
+            let driving = c.contains("drive me") || c.contains("driving to") || c.contains("by car")
+                || c.contains("via car") || c.contains("in the car") || c.contains("by scooter")
+                || c.contains("on the scooter") || c.contains("by motorbike") || c.contains("by taxi")
+            // AUDIT FIX: "take me to home" bypassed the saved-home handler
+            if ["home", "hotel", "the hotel", "my hotel", "our hotel", "the room"]
+                .contains(dest.lowercased()) {
+                speak("Heading home.")
+                let reply = await NavEngine.shared.getHome()
+                speak(reply); return
+            }
+            speak("Finding \(dest).")
+            let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
+            speak(reply); return
+        }
+        // AUDIT FIX (coverage gap): mode follow-ups re-route the last
+        // destination — they worked in-session but not in Standby.
+        if let last = NavEngine.shared.lastQuery,
+           ["via car", "by car", "in the car", "by scooter", "on the scooter",
+            "on foot", "walking instead", "by motorbike"].contains(where: { c.contains($0) }),
+           c.split(separator: " ").count <= 5 {
+            let driving = !(c.contains("foot") || c.contains("walking"))
+            speak("Re-routing.")
+            let reply = await NavEngine.shared.navigate(to: last, driving: driving)
+            speak(reply); return
+        }
+        if c.contains("open google maps") || c.contains("open maps") {
+            NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+            speak("Opening Google Maps."); return
+        }
+
+        // ---------- TIER 1 — one cheap call ----------
+        // THE DEAL CHECK — one look + a price verdict + a haggling number
+        if c.contains("good deal") || c.contains("good price") || c.contains("ripped off")
+            || c.contains("should this cost") || c.contains("is that fair")
+            || c.contains("worth it") || c.contains("too expensive") {
+            speak("Checking.")
+            QuickVisionManager.shared.triggerQuickVision(customPrompt:
+                "Identify the item and any marked price in this photo. Then judge the price: is it fair for this region, or high? Answer in two short spoken sentences: what it is and the going rate, then a verdict with a number to counter-offer if it's high. Context: \(ContextEngine.shared.contextHeader())")
+            return
+        }
+        // AUDIT FIX: "read the menu" and "what does this sign say" — both in
+        // the spec — used to fall through to a BLIND paid call that would
+        // invent an answer. Matches the in-session bridge's breadth now.
+        if c.contains("read th") || c.contains("read it") || c.contains("read me")
+            || c.contains("what does this say") || c.contains("what does that say")
+            || (c.contains("what does") && c.contains("say")) {
+            speak("Reading.")
+            QuickVisionManager.shared.triggerQuickVision(customPrompt:
+                "Read ALL visible text in this image aloud, verbatim and in order. If it is in another language, read it then translate it. No commentary.")
+            return
+        }
+        if c.contains("can i eat") || c.contains("can she eat") || c.contains("can we eat")
+            || c.contains("what's in this") || c.contains("is this safe to eat")
+            || c.contains("allergen") || c.contains("vegetarian") {
+            speak("Checking the label.")
+            QuickVisionManager.shared.triggerQuickVision(customPrompt:
+                "Read the ingredients or menu item in this image. Flag ALLERGENS clearly first (nuts, shellfish, dairy, gluten, egg, soy), then say briefly what it is. Two short spoken sentences.")
+            return
+        }
+        if c.contains("what's this") || c.contains("what is this") || c.contains("what am i looking at")
+            || c.contains("what's that") || c.contains("what is that") || c.contains("look at this") {
+            speak("Looking.")
+            QuickVisionManager.shared.triggerQuickVision()
+            return
+        }
+        // AUTO-ESCALATION: if this is really a conversation, don't fake it
+        // with a one-shot — hand it to Live AI and carry the question over.
+        if needsDeepSession(c) {
+            speak("That needs a proper chat - opening Live AI.")
+            UserDefaults.standard.set(c, forKey: "chappy_pending_question")
+            handOff()
+            NotificationCenter.default.post(name: .liveAITriggered, object: nil)
+            return
+        }
+
+        // THE UNSURE RULE (spec'd, previously unbuilt): a bare noun is
+        // ambiguous — "Chappy, sushi" could be find-me-one or tell-me-about.
+        // Ask ONE either/or instead of guessing or burning a paid call.
+        let words = c.split(separator: " ")
+        if words.count <= 3, !c.contains("?"),
+           !c.hasPrefix("what"), !c.hasPrefix("how"), !c.hasPrefix("who"),
+           !c.hasPrefix("when"), !c.hasPrefix("where"), !c.hasPrefix("why"),
+           !c.hasPrefix("is "), !c.hasPrefix("are "), !c.hasPrefix("can ") {
+            pendingAmbiguous = c
+            speak("\(c.capitalized) - find you one nearby, or tell you about it?")
+            return
+        }
+        // Answer to the either/or question
+        if let pending = pendingAmbiguous {
+            pendingAmbiguous = nil
+            if c.contains("near") || c.contains("find") || c.contains("go") || c.contains("take me") {
+                speak("Finding \(pending).")
+                let reply = await NavEngine.shared.navigate(to: pending, driving: false)
+                speak(reply); return
+            }
+            await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
+            return
+        }
+
+        // Everything else question-shaped → the cheap brain
+        await quickAsk(c)
+    }
+
+    // MARK: Tier 1 brain — one call, spoken, then back to sleep
+
+    private func quickAsk(_ question: String) async {
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            escalate("I can't reach my brain - no key configured."); return
+        }
+        CostMeter.shared.addQuickVision() // one-shot call, same rough cost bracket
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 25
+        let body: [String: Any] = [
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 300,
+            "system": "You are Chappy, Shaun's glasses assistant, answering ONE quick spoken question. Context: \(ContextEngine.shared.contextHeader()) Answer in ONE or TWO short spoken sentences - no markdown, no lists, no preamble, lead with the answer. If the question needs live web facts you don't have, say so in one sentence and offer to dig deeper.",
+            "messages": [["role": "user", "content": question]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else {
+            escalate("That one didn't come back."); return
+        }
+        let text = content.compactMap { ($0["type"] as? String) == "text" ? ($0["text"] as? String) : nil }
+            .joined(separator: " ")
+        if text.isEmpty { escalate("I got nothing back on that."); return }
+        strikes = 0
+        speak(text)
+    }
+
+    // MARK: Tier 3 — computer jobs (queued when the PC is asleep)
+
+    private func queueComputerJob(_ job: String) {
+        guard job.count > 3 else { speak("What should the computer do?"); return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(stamp)] \(job)\n"
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        if let url = docs?.appendingPathComponent("chappy-openclaw-outbox.txt") {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(line.data(using: .utf8) ?? Data())
+                try? handle.close()
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+        TripRecorder.shared.addObservation("Computer job: \(job)")
+        speak("Job saved for the computer: \(job). It runs when the computer's awake.")
+    }
+
+    // MARK: Helpers
+
+    /// Text following any of these openers (nil if none present)
+    private func after(_ text: String, _ openers: [String]) -> String? {
+        for o in openers {
+            if let r = text.range(of: o) {
+                return String(text[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            }
+        }
+        return nil
+    }
+
+    /// Destination from any natural navigation phrasing.
+    /// AUDIT FIXES: (a) full opener list matching the in-session bridge —
+    /// "guide me to", "direct me to", "navigate us to", "take us to" all
+    /// worked in Live AI but silently failed here; (b) junk words are only
+    /// stripped from the END, because the old "strip anywhere" logic turned
+    /// "take me to Walking Street" into an empty destination and "the driving
+    /// range" into a Places search for "the"; (c) leading "the/a" and
+    /// "closest/nearest" are removed so Places gets a clean query, matching
+    /// what the in-session bridge sends.
+    private func navDestination(in c: String) -> String? {
+        // Question words mean it's a question ABOUT a place, not a request to
+        // go there: "how far is the nearest hospital" must not start a route.
+        let questionOpeners = ["how far", "how long", "how much", "what time", "is there", "are there"]
+        if questionOpeners.contains(where: { c.hasPrefix($0) }) { return nil }
+
+        // SIM FIX: "take us back to the hotel" matched no opener at all.
+        let openers = ["navigate me to ", "navigate us to ", "navigate to ",
+                       "take me back to ", "take us back to ", "get us back to ",
+                       "take me to ", "take us to ", "walk me to ", "walk us to ",
+                       "drive me to ", "drive us to ", "direct me to ", "guide me to ",
+                       "get me directions to ", "directions to ", "get me to ",
+                       "route me to ", "route to ", "how do i get to ", "how do we get to ",
+                       "closest ", "nearest "]
+        // Take the LAST opener match so lead-ins can't poison the destination
+        var best: Range<String.Index>?
+        for o in openers {
+            if let r = c.range(of: o, options: .backwards) {
+                if best == nil || r.upperBound > best!.upperBound { best = r }
+            }
+        }
+        guard let hit = best else { return nil }
+        var d = String(c[hit.upperBound...])
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        // Trailing mode/politeness words only
+        for junk in [" by car", " via car", " by scooter", " on foot", " on the scooter",
+                     " walking", " driving", " please", " thanks", " thank you", " now"] {
+            while d.lowercased().hasSuffix(junk) {
+                d = String(d.dropLast(junk.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            }
+        }
+        // Clean the query the way the in-session bridge does
+        for prefix in ["the ", "a ", "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
+            d = String(d.dropFirst(prefix.count))
+        }
+        d = d.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        return d.count > 1 ? d : nil
+    }
+
+    /// AUDIT FIX (P0 safety): emergency handled locally, instantly, with no
+    /// network round-trip — country emergency number spoken, WhatsApp SOS
+    /// with a live map pin opened for the trusted contact.
+    private func runEmergencyFromStandby() {
+        let snap = ContextEngine.shared.snapshot
+        var address = [snap.street, snap.city, snap.country].compactMap { $0 }.joined(separator: ", ")
+        if address.isEmpty { address = "location not fixed yet" }
+        let numbers: [String: String] = ["ID": "112", "TH": "191", "VN": "113", "PH": "911",
+                                         "KH": "117", "LA": "1191", "MY": "999", "SG": "995", "AU": "000"]
+        let emergencyNumber = numbers[snap.countryCode ?? ""] ?? "112"
+        var line = "Emergency. You are at \(address). Local emergency number is \(emergencyNumber). Calling that number is \(emergencyNumber)."
+        let contact = (UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? "")
+            .filter(\.isNumber) // AUDIT FIX: "+61 412..." never resolved on wa.me
+        if !contact.isEmpty, let lat = snap.latitude, let lon = snap.longitude,
+           let u = URL(string: "https://wa.me/\(contact)?text=EMERGENCY%20-%20I%20need%20help.%20My%20location:%20https://maps.google.com/?q=\(lat),\(lon)") {
+            UIApplication.shared.open(u)
+            line += " A WhatsApp message with your location is open - press send."
+        }
+        ChappyHaptics.shared.offRoute()
+        TTSService.shared.speak(line)
+    }
+
+    /// AUDIT FIX (HIGH — visible in every demo): NavEngine and TripRecorder
+    /// return strings written to be fed to an AI model, so Standby was
+    /// literally saying "...First step: turn left. Also tell the user: say
+    /// 'open Google Maps' anytime..." and "Ask the user to try again".
+    /// Everything from a coaching phrase onward is stripped, and remaining
+    /// third-person instructions are made human.
+    private static let promptTails = [
+        "also tell the user", "tell the user", "ask the user", "report this",
+        "relay this", "confirm this", "say this", "guide the user",
+        "read all of this to the user", "briefly confirm"
+    ]
+    static func humanise(_ text: String) -> String {
+        var out = text
+        let lower = out.lowercased()
+        for tail in promptTails {
+            if let r = lower.range(of: tail) {
+                out = String(out[..<r.lowerBound])
+                break
+            }
+        }
+        out = out
+            .replacingOccurrences(of: "the user's", with: "your")
+            .replacingOccurrences(of: "The user's", with: "Your")
+            .replacingOccurrences(of: "the user", with: "you")
+            .replacingOccurrences(of: "The user", with: "You")
+        return out.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;-"))
+    }
+
+    private func speak(_ text: String) {
+        ChappyHaptics.shared.straightStep()
+        TTSService.shared.speak(Self.humanise(text))
+    }
+
+    /// CONTEXTUAL COACH: four things worth saying RIGHT NOW, rotating so you
+    /// meet the whole vocabulary over a week instead of memorising a manual.
+    private func coachLine() -> String {
+        var options: [String] = []
+        if NavEngine.shared.isNavigating {
+            options = ["open Google Maps", "stop navigation", "how far to go",
+                       "remember this spot"]
+        } else if ContextEngine.shared.snapshot.motion == "in a vehicle" {
+            options = ["what's that place", "navigate me to the closest petrol station",
+                       "log this", "take a photo"]
+        } else {
+            options = ["is this a good deal", "read this", "can she eat this",
+                       "remember this spot call it home", "navigate me to the closest ATM",
+                       "log this", "take a photo", "get the computer to research something",
+                       "let's talk for a proper conversation", "translate"]
+        }
+        let picks = options.shuffled().prefix(4).joined(separator: ", or ")
+        coachCount += 1
+        let tail = coachCount <= 2 ? " Say Chappy first, then the words." : ""
+        return "Try: \(picks).\(tail)"
+    }
+
+    /// COMPLEXITY DETECTOR: some requests are conversations, not commands —
+    /// hand those to the deep layer instead of half-answering them.
+    private func needsDeepSession(_ c: String) -> Bool {
+        let conversational = ["help me figure", "help me work out", "what should i do",
+                              "walk me through", "let's plan", "lets plan", "plan my",
+                              "talk me through", "explain in detail", "go through",
+                              "compare all", "and then", "after that", "keep watching"]
+        if conversational.contains(where: { c.contains($0) }) { return true }
+        // Long multi-clause sentences are conversations wearing a command's hat
+        return c.split(separator: " ").count > 22
+    }
+
+    /// THREE-STRIKE ESCAPE: never loop "didn't catch that" — offer the deep
+    /// layer instead. This is the on-ramp to full Live AI.
+    private func escalate(_ reason: String) {
+        strikes += 1
+        if strikes >= 2 {
+            strikes = 0
+            TTSService.shared.speak("\(reason) Want me to open Live AI so we can talk it through? Say: Chappy let's talk.")
+        } else {
+            TTSService.shared.speak("\(reason) Try me again?")
+        }
+    }
+}
 
 // MARK: - Chappy Haptics (the silent second voice)
 // Ears carry words; the pocket carries signals. A small learned vocabulary:
@@ -793,6 +1776,16 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         locationManager.desiredAccuracy = navigating
             ? kCLLocationAccuracyBestForNavigation
             : kCLLocationAccuracyHundredMeters
+        // AUDIT FIX: with auto-pause on, iOS stops updates when it thinks you
+        // are stationary and does NOT reliably resume — turns went unspoken
+        // and the journal stopped. The whole product is phone-in-pocket.
+        locationManager.pausesLocationUpdatesAutomatically = !navigating
+        locationManager.activityType = navigating ? .otherNavigation : .other
+        if navigating, locationManager.authorizationStatus == .authorizedAlways {
+            locationManager.allowsBackgroundLocationUpdates = true
+        } else if !navigating {
+            locationManager.allowsBackgroundLocationUpdates = false
+        }
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -937,6 +1930,15 @@ final class TripRecorder {
 
     /// Called by ContextEngine on every location fix; keeps only meaningful movement.
     func record(location: CLLocation) {
+        // AUDIT FIX: crumbs were loaded once at launch and appended forever,
+        // so after midnight yesterday's whole route was re-saved into today's
+        // file and "where was I today" replayed yesterday. Roll at midnight.
+        if let last = lastCrumb, !Calendar.current.isDateInToday(last.t) {
+            crumbs.removeAll { !Calendar.current.isDateInToday($0.t) }
+            notes.removeAll { !Calendar.current.isDateInToday($0.t) }
+            lastCrumb = nil
+            print("🌅 [Trip] New day — journal rolled over")
+        }
         let snap = ContextEngine.shared.snapshot
         let new = Crumb(t: Date(),
                         lat: location.coordinate.latitude,
