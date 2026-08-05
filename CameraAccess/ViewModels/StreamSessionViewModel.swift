@@ -33,6 +33,9 @@ enum StreamingStatus {
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
   @Published var hasReceivedFirstFrame: Bool = false
+  // CAMERA WATCHDOG: last time a frame actually arrived; stalls get kicked
+  private var lastFrameAt = Date()
+  private var frameWatchdogTask: Task<Void, Never>?
   @Published var streamingStatus: StreamingStatus = .stopped {
     // POCKET-MODE KEEPALIVE: while the glasses are streaming, hold the
     // screen awake — iOS stalls the frame pipeline when the display
@@ -255,6 +258,7 @@ class StreamSessionViewModel: ObservableObject {
           Task { @MainActor [weak self] in
             guard let self else { return }
             self.currentVideoFrame = image
+            self.lastFrameAt = Date()
             if !self.hasReceivedFirstFrame {
               logger.info("🎥 First frame received and converted (fast path)")
               self.hasReceivedFirstFrame = true
@@ -280,6 +284,26 @@ class StreamSessionViewModel: ObservableObject {
       await stream.start()
       logger.info("🚀 startSession END - stream started")
 
+      // CAMERA WATCHDOG: the WiFi transport can stall silently (frozen
+      // preview, voice fine). If no frame lands for 6+ seconds while we
+      // believe we're streaming, kick the stream — stop/start heals the
+      // transport without touching the session or the conversation.
+      lastFrameAt = Date()
+      frameWatchdogTask?.cancel()
+      frameWatchdogTask = Task { @MainActor [weak self] in
+        while !Task.isCancelled {
+          try? await Task.sleep(nanoseconds: 3_000_000_000)
+          guard let self, let stream = self.stream else { continue }
+          if self.hasReceivedFirstFrame,
+             Date().timeIntervalSince(self.lastFrameAt) > 6 {
+            logger.warning("🩺 Camera stalled >6s — kicking the stream")
+            self.lastFrameAt = Date() // debounce: one kick per stall window
+            await stream.stop()
+            await stream.start()
+          }
+        }
+      }
+
     } catch {
       logger.error("❌ startSession failed: \(error.localizedDescription)")
       showError(Self.describe(error))
@@ -297,6 +321,8 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func teardownSession() async {
+    frameWatchdogTask?.cancel()
+    frameWatchdogTask = nil
     if let stream {
       await stream.stop()
     }
