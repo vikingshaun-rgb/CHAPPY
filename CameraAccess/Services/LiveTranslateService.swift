@@ -72,6 +72,10 @@ class LiveTranslateService: NSObject {
     private var accumulatedOriginal = ""
     /// ECHO GATE: the microphone stays shut until this moment has passed.
     private var micGateUntil = Date.distantPast
+    /// Audio buffers handed to the player that have not finished playing yet.
+    /// While this is above zero, Chappy is audibly speaking — whatever the clock
+    /// says — and the microphone must stay shut.
+    private var pendingPlaybackBuffers = 0
     /// BUILD 54: one tail length can't suit both cases. On the phone's own
     /// loudspeaker the mic is centimetres from the source and the room rings,
     /// so it needs the longer hold. Through the glasses the sound is at your
@@ -165,6 +169,7 @@ class LiveTranslateService: NSObject {
         playerNode?.reset()
         playbackEngine.stop()
         isPlaybackEngineRunning = false
+        pendingPlaybackBuffers = 0
         // AUDIT FIX: hasStartedPlaying stayed true across restarts, so
         // playerNode.play() was never called again — translation went
         // permanently silent after any language/voice change.
@@ -322,6 +327,11 @@ class LiveTranslateService: NSObject {
         // conversation works with no buttons and no language switching.
         let systemPrompt = """
         You are a professional two-way simultaneous interpreter between \(source) and \(target). \
+        TRANSCRIPTION DISCIPLINE: this conversation contains ONLY \(source) and \(target). \
+        When you transcribe the incoming speech, transcribe it as one of those two \
+        languages - never as a third language that merely sounds similar. If a phrase \
+        is unclear, render your best guess in \(source) or \(target) rather than \
+        reaching for another language entirely. \
         Listen to each utterance and detect its language automatically. \
         If the speech is in \(source), speak the \(target) translation. \
         For speech in ANY other language, including \(target), speak the \(source) translation \
@@ -520,6 +530,12 @@ class LiveTranslateService: NSObject {
 
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
         guard buffer.floatChannelData != nil else { return }
+
+        // BUILD 58: the authoritative check — is sound still coming out?
+        if pendingPlaybackBuffers > 0 {
+            micGateUntil = Date()
+            return
+        }
 
         // ECHO GATE (BUILD 53): drop everything the mic hears while Chappy is
         // still speaking, plus a short tail. This is what breaks the loop.
@@ -773,6 +789,7 @@ class LiveTranslateService: NSObject {
                     self.playerNode?.stop()
                     self.playerNode?.reset()
                     self.hasStartedPlaying = false
+                    self.pendingPlaybackBuffers = 0
                 }
 
                 // Turn complete: finalize text
@@ -852,7 +869,25 @@ class LiveTranslateService: NSObject {
               let buffer = createPCMBuffer(from: audioData, format: playbackFormat) else {
             return
         }
-        playerNode?.scheduleBuffer(buffer, completionHandler: nil)
+        // BUILD 58 (CRITICAL): the echo gate used to be a stopwatch — it added up
+        // the DURATION of the audio we handed to the player and assumed playback
+        // finished then. It doesn't. The player buffers, so the sound is still
+        // coming out of the speaker after the stopwatch has run out, the mic
+        // reopens early, and Chappy hears the tail of its own Indonesian. That's
+        // how "bagaimana kabarmu hari ini?" arrived as though a stranger had said
+        // it, and how your own sentence came back glued onto Chappy's.
+        //
+        // Now we count buffers and let the audio engine tell us when the last one
+        // has ACTUALLY been played. No arithmetic, no assumption.
+        pendingPlaybackBuffers += 1
+        playerNode?.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            guard let self else { return }
+            self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
+            if self.pendingPlaybackBuffers == 0 {
+                // The tail starts from the moment sound actually stopped.
+                self.micGateUntil = Date()
+            }
+        }
     }
 
     private func createPCMBuffer(from data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
