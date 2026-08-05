@@ -1935,7 +1935,12 @@ final class TripRecorder {
         // file and "where was I today" replayed yesterday. Roll at midnight.
         if let last = lastCrumb, !Calendar.current.isDateInToday(last.t) {
             crumbs.removeAll { !Calendar.current.isDateInToday($0.t) }
-            notes.removeAll { !Calendar.current.isDateInToday($0.t) }
+            // BUILD 52 FIX: notes are plain strings with no timestamp on them,
+            // so they can't be filtered by date — they're already written to a
+            // per-day file the moment they're logged, which means yesterday's
+            // notes are safely on disk under yesterday's date. Clearing the
+            // in-memory list is the whole job, and loses nothing.
+            notes.removeAll()
             lastCrumb = nil
             print("🌅 [Trip] New day — journal rolled over")
         }
