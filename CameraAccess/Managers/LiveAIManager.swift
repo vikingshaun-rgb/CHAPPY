@@ -578,10 +578,21 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// Where you ARE decides the language — no menus, no picking.
     private static let countryLanguage: [String: String] = [
         "ID": "id", "TH": "th", "VN": "vi", "PH": "fil", "KH": "km", "LA": "lo",
-        "SG": "zh", "CN": "zh", "TW": "zh", "HK": "yue", "JP": "ja",
-        "KR": "ko", "IN": "hi", "TR": "tr", "FR": "fr", "ES": "es", "IT": "it",
-        "DE": "de", "PT": "pt", "BR": "pt", "RU": "ru", "GR": "el",
-        "AE": "ar", "EG": "ar", "MA": "ar", "SA": "ar", "JO": "ar"
+        "MY": "id", "BN": "id",
+        "SG": "zh", "CN": "zh", "TW": "zh", "HK": "yue", "MO": "yue", "JP": "ja",
+        "KR": "ko", "IN": "hi", "NP": "hi", "TR": "tr", "FR": "fr", "IT": "it",
+        "DE": "de", "AT": "de", "CH": "de", "RU": "ru", "GR": "el", "CY": "el",
+        "AE": "ar", "EG": "ar", "MA": "ar", "SA": "ar", "JO": "ar",
+        "QA": "ar", "KW": "ar", "OM": "ar", "BH": "ar", "TN": "ar", "LB": "ar",
+        // BUILD 57 — PORTUGUESE-SPEAKING
+        "PT": "pt", "BR": "pt", "AO": "pt", "MZ": "pt", "CV": "pt", "TL": "pt",
+        // BUILD 57 — SPANISH-SPEAKING: all of South and Central America, plus
+        // Mexico, the Caribbean and Spain. "Chappy, translate" now picks the
+        // right language anywhere from Tijuana to Ushuaia.
+        "ES": "es", "MX": "es", "AR": "es", "CL": "es", "CO": "es", "PE": "es",
+        "UY": "es", "PY": "es", "BO": "es", "EC": "es", "VE": "es",
+        "CR": "es", "PA": "es", "GT": "es", "HN": "es", "NI": "es", "SV": "es",
+        "DO": "es", "CU": "es", "PR": "es", "GQ": "es"
     ]
     /// Spoken names → codes. Ordered lookup (dictionaries have no order, and
     /// random iteration made Chappy say "Bahasa" or "Indonesian" at random).
@@ -591,7 +602,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         ("lao", "lo"), ("mandarin", "zh"), ("chinese", "zh"), ("cantonese", "yue"),
         ("japanese", "ja"), ("korean", "ko"), ("hindi", "hi"), ("turkish", "tr"),
         ("french", "fr"), ("spanish", "es"), ("italian", "it"), ("german", "de"),
-        ("portuguese", "pt"), ("russian", "ru"), ("greek", "el"), ("arabic", "ar")
+        ("portuguese", "pt"), ("russian", "ru"), ("greek", "el"), ("arabic", "ar"),
+        // BUILD 57: how people actually ask for these two.
+        ("brazilian", "pt"), ("brazil", "pt"), ("portugese", "pt"),
+        ("castilian", "es"), ("mexican", "es"), ("argentinian", "es"),
+        ("argentinean", "es"), ("colombian", "es"), ("peruvian", "es"),
+        ("chilean", "es"), ("latin american", "es"), ("espanol", "es")
     ]
 
     static func languageCode(forCountry code: String?) -> String? {
@@ -1386,7 +1402,18 @@ final class ChappyStandby: NSObject, ObservableObject {
         var address = [snap.street, snap.city, snap.country].compactMap { $0 }.joined(separator: ", ")
         if address.isEmpty { address = "location not fixed yet" }
         let numbers: [String: String] = ["ID": "112", "TH": "191", "VN": "113", "PH": "911",
-                                         "KH": "117", "LA": "1191", "MY": "999", "SG": "995", "AU": "000"]
+                                         "KH": "117", "LA": "1191", "MY": "999", "SG": "995", "AU": "000",
+                                         // BUILD 57 — the Americas. 112 is a
+                                         // sensible European default but it is
+                                         // NOT the number in Brazil or Peru,
+                                         // and this is the one list where a
+                                         // wrong answer really matters.
+                                         "BR": "190", "AR": "911", "CL": "133", "CO": "123",
+                                         "PE": "105", "UY": "911", "PY": "911", "BO": "110",
+                                         "EC": "911", "VE": "171", "MX": "911", "CR": "911",
+                                         "PA": "911", "GT": "110", "US": "911", "CA": "911",
+                                         "NZ": "111", "GB": "999", "IN": "112", "JP": "110",
+                                         "KR": "112", "CN": "110", "TW": "110", "HK": "999"]
         let emergencyNumber = numbers[snap.countryCode ?? ""] ?? "112"
         var line = "Emergency. You are at \(address). Local emergency number is \(emergencyNumber). Calling that number is \(emergencyNumber)."
         let contact = (UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? "")
