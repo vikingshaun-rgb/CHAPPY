@@ -34,6 +34,8 @@ struct TurboMetaHomeView: View {
     // Journal refresh trigger (Remember button feedback) + always-on map
     @State private var journalTick = 0
     @State private var showMapSheet = false
+    // CHAPPY STANDBY — the wake-word ear
+    @StateObject private var standby = ChappyStandby.shared
     @State private var showQuickVision = false
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
@@ -76,7 +78,7 @@ struct TurboMetaHomeView: View {
                             StatusChip(label: "Glasses", on: streamViewModel.hasActiveDevice)
                             StatusChip(label: "Camera", on: streamViewModel.streamingStatus == .streaming)
                             StatusChip(label: "Live AI", on: liveAIManager.isRunning)
-                            StatusChip(label: "Vision", on: continuousVision.isRunning)
+                            StatusChip(label: "Standby", on: standby.isListening)
                         }
 
                         // NAVIGATION CARD — appears only while navigating
@@ -131,6 +133,11 @@ struct TurboMetaHomeView: View {
                                          icon: "waveform.circle.fill",
                                          accent: theme.accent,
                                          active: liveAIManager.isRunning) {
+                                    // AUDIT FIX (LA-H9): stop() forgets Standby was
+                                    // ever listening, so closing Live AI left the
+                                    // wake word dead until the user dug the phone
+                                    // out. handOff() remembers and comes back.
+                                    if standby.isListening { standby.handOff() }
                                     showLiveAI = true
                                 }
                                 ModeTile(title: "Look",
@@ -147,6 +154,9 @@ struct TurboMetaHomeView: View {
                                          icon: "globe",
                                          accent: .teal,
                                          active: false) {
+                                    // AUDIT FIX: mic handoff — two engines on
+                                    // one input node crashed the translator
+                                    if standby.isListening { standby.handOff() }
                                     showLiveTranslate = true
                                 }
                                 ModeTile(title: "Navigate",
@@ -178,8 +188,17 @@ struct TurboMetaHomeView: View {
                                 if continuousVision.isRunning {
                                     continuousVision.stop()
                                 } else {
+                                    // AUDIT FIX: mic handoff (the Talk tile did
+                                    // this, the Watch tile didn't — two
+                                    // recognizers fought over one microphone)
+                                    if standby.isListening { standby.handOff() }
                                     continuousVision.start(streamViewModel: streamViewModel)
                                 }
+                            }
+                            // CHAPPY STANDBY — the wake-word ear (free while waiting)
+                            QuickActionButton(icon: standby.isListening ? "ear.fill" : "ear",
+                                              label: standby.isListening ? "Ear On" : "Standby") {
+                                standby.toggle()
                             }
                             QuickActionButton(icon: "map.fill", label: "Map") {
                                 ContextEngine.shared.start()
@@ -274,6 +293,28 @@ struct TurboMetaHomeView: View {
             // Triggered from Shortcuts — auto-open the Live AI screen
             showLiveAI = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyOpenTranslate)) { _ in
+            showLiveTranslate = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyShowMap)) { _ in
+            showMapSheet = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyOpenGoogleMaps)) { _ in
+            let nav = NavEngine.shared
+            var url: URL?
+            if let d = nav.destinationCoord {
+                let mode = nav.lastDriving ? "driving" : "walking"
+                let appURL = URL(string: "comgooglemaps://?daddr=\(d.latitude),\(d.longitude)&directionsmode=\(mode)")
+                url = (appURL.map { UIApplication.shared.canOpenURL($0) } == true)
+                    ? appURL
+                    : URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(d.latitude),\(d.longitude)&travelmode=\(mode)")
+            } else {
+                let appURL = URL(string: "comgooglemaps://")
+                url = (appURL.map { UIApplication.shared.canOpenURL($0) } == true)
+                    ? appURL : URL(string: "https://maps.google.com/")
+            }
+            if let u = url { UIApplication.shared.open(u) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .continuousVisionTriggered)) { _ in
             // "Hey Siri, Continuous Vision"
             if !continuousVision.isRunning {
@@ -317,20 +358,58 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
 
     // MARK: Start / Stop
 
+    // AUDIT: session guards — a narration loop with no brakes is a money fire
+    private var startedStream = false
+    private var startedAt = Date()
+    private var renewTimer: Timer?
+    private var failures = 0
+    private static let maxSessionMinutes: Double = 25
+
     func start(streamViewModel: StreamSessionViewModel) {
         guard !isRunning else { return }
+        // AUDIT FIX (HIGH): Watch + Talk together = two Chappys narrating over
+        // each other, both metered, each stealing the other's audio session.
+        guard !LiveAIManager.shared.isRunning else {
+            TTSService.shared.speak("Live AI is already running - stop that first.")
+            return
+        }
         self.streamViewModel = streamViewModel
 
         guard streamViewModel.hasActiveDevice else {
             TTSService.shared.speak("Glasses not connected - pair them in the Meta AI app first.")
             return
         }
+        // AUDIT FIX: battery guard (Standby had one, this didn't)
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let lvl = UIDevice.current.batteryLevel
+        if lvl >= 0 && lvl < 0.20 {
+            TTSService.shared.speak("Battery's under twenty percent - watching would drain it fast.")
+            return
+        }
+        // AUDIT FIX: the wake-word ear must let go of the mic, and be restored
+        if ChappyStandby.shared.isListening { ChappyStandby.shared.handOff() }
 
         isRunning = true
+        startedAt = Date()
+        failures = 0
         statusText = "Starting..."
 
-        // Ask for speech permission (for the voice "stop") — loop runs either way
         SFSpeechRecognizer.requestAuthorization { _ in }
+        // AUDIT FIX: mic permission was never requested — voice-stop failed
+        // silently on a fresh install while the intro promised it worked.
+        AVAudioSession.sharedInstance().requestRecordPermission { _ in }
+
+        // AUDIT FIX (HIGH): recognition tasks die after ~60s and renewal was
+        // only attempted between loop iterations — so "chappy stop" was deaf
+        // for most of every describe-and-speak cycle.
+        renewTimer?.invalidate()
+        renewTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isRunning, !TTSService.shared.isSpeaking else { return }
+                self.stopVoiceStopListener()
+                self.startVoiceStopListener()
+            }
+        }
 
         loopTask = Task { [weak self] in
             await self?.runLoop()
@@ -342,11 +421,21 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
         isRunning = false
         loopTask?.cancel()
         loopTask = nil
+        renewTimer?.invalidate(); renewTimer = nil
         stopVoiceStopListener()
         TTSService.shared.stop()
+        // AUDIT FIX (CRITICAL): stop() never released the camera. The glasses
+        // kept streaming and isIdleTimerDisabled stayed true, so the phone
+        // screen never slept — both batteries burned after the user said stop.
+        if startedStream, let vm = streamViewModel {
+            startedStream = false
+            Task { @MainActor in await vm.stopSession() }
+        }
         if announce {
             TTSService.shared.speak("Continuous vision off.")
         }
+        // AUDIT FIX: the ear comes back after a voice-started Watch session
+        ChappyStandby.shared.resumeAfterHandOff()
         statusText = ""
         print("🛑 [ContinuousVision] Stopped")
     }
@@ -354,10 +443,13 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
     // MARK: Main loop
 
     private func runLoop() async {
-        guard let streamViewModel else { return }
+        // AUDIT FIX: bailing here left isRunning stuck true with no loop —
+        // a permanently "Watching" UI that does nothing.
+        guard let streamViewModel else { stop(announce: false); return }
 
         // Make sure the glasses stream is running
         if streamViewModel.streamingStatus != .streaming {
+            startedStream = true // remember WE started it, so we release it
             await streamViewModel.handleStartStreaming()
             let deadline = Date().addingTimeInterval(6)
             while streamViewModel.streamingStatus != .streaming && Date() < deadline {
@@ -365,8 +457,10 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
             }
         }
         guard streamViewModel.streamingStatus == .streaming else {
-            TTSService.shared.speak("Could not start the camera stream - check the glasses.")
+            // AUDIT FIX: stop() cancels TTS, so speaking BEFORE stopping meant
+            // the user heard nothing at all — the button just flipped back.
             stop(announce: false)
+            TTSService.shared.speak("Could not start the camera stream - check the glasses.")
             return
         }
 
@@ -378,32 +472,90 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
         // Start listening for "stop" AFTER the intro (so it doesn't hear itself)
         startVoiceStopListener()
 
+        var blindTicks = 0
         while isRunning && !Task.isCancelled {
-            // Keep the voice-stop listener alive (recognition tasks time out)
+            // AUDIT FIX (CRITICAL): hard session cap. There was no duration
+            // limit, no battery stop and no spend ceiling — a forgotten
+            // session narrated the inside of a bag for hours, billing all day.
+            if Date().timeIntervalSince(startedAt) > Self.maxSessionMinutes * 60 {
+                TTSService.shared.speak("That's twenty five minutes of watching - I'll stop here to save battery and cost. Say watch again to carry on.")
+                stop(announce: false)
+                return
+            }
             ensureVoiceStopListener()
 
             guard let frame = streamViewModel.currentVideoFrame else {
+                // AUDIT FIX (HIGH): a Quick Vision snap, glasses out of range,
+                // or a stream restart nils the frame — the loop used to spin
+                // here FOREVER while the UI still claimed to be watching.
+                blindTicks += 1
+                if blindTicks == 20 { // ~10s blind: try to revive the stream
+                    statusText = "Reconnecting..."
+                    if streamViewModel.streamingStatus != .streaming {
+                        await streamViewModel.handleStartStreaming()
+                        startedStream = true
+                    }
+                }
+                if blindTicks > 60 { // ~30s blind: say so, don't lie
+                    TTSService.shared.speak("I've lost the camera - continuous vision off.")
+                    stop(announce: false)
+                    return
+                }
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 continue
             }
+            blindTicks = 0
 
             statusText = "Looking..."
             do {
-                let answer = try await QuickVisionService().analyzeImage(frame)
-                guard isRunning else { break }
+                // AUDIT FIX (CRITICAL COST): the default Quick Vision prompt
+                // carries web search (up to 3 searches PER FRAME, ~$0.01 each)
+                // and whatever mode the user last picked — an encyclopedia
+                // entry every ten seconds. Narration gets its own short,
+                // search-free prompt.
+                let answer = try await QuickVisionService().analyzeImage(
+                    frame,
+                    customPrompt: "You are narrating for someone wearing these glasses. In ONE short spoken sentence, say only what is notable or has CHANGED in this view. If nothing has meaningfully changed, reply with exactly: SKIP. No preamble, no lists, never mention images or photos.",
+                    allowWebSearch: false) // AUDIT FIX: search per narration frame was ~10x the cost
+                guard isRunning, !Task.isCancelled else { break }
+                failures = 0
 
+                let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.uppercased().hasPrefix("SKIP") || trimmed.isEmpty {
+                    // Nothing new to say — stay quiet and cost nothing extra
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    continue
+                }
+                // (cost is booked inside the service on a real 200 — no double count)
                 statusText = "Speaking..."
-                TTSService.shared.speak(answer)
-                while TTSService.shared.isSpeaking && isRunning {
+                TTSService.shared.speak(trimmed)
+                while TTSService.shared.isSpeaking && isRunning && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 300_000_000)
                 }
+                // AUDIT FIX (HIGH): the recognizer keeps ONE growing transcript,
+                // so Chappy narrating "...there's a bus stop" left the word
+                // "stop" in the buffer and killed the session a moment later.
+                // Fresh ear after every utterance.
+                stopVoiceStopListener()
+                startVoiceStopListener()
 
-                // Small breather before the next look
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             } catch {
-                print("⚠️ [ContinuousVision] Snap failed: \(error.localizedDescription)")
+                // AUDIT FIX (HIGH): this used to retry forever, silently — a
+                // bad key meant 30 failed calls a minute and total silence
+                // while the UI said "Watching".
+                failures += 1
+                print("⚠️ [ContinuousVision] Snap failed (\(failures)): \(error.localizedDescription)")
                 statusText = "Retrying..."
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if failures == 2 {
+                    TTSService.shared.speak("I'm having trouble seeing - trying again.")
+                }
+                if failures >= 5 {
+                    TTSService.shared.speak("Vision keeps failing - stopping. Check the connection and your key.")
+                    stop(announce: false)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Double(failures) * 2_000_000_000))
             }
         }
         statusText = ""
