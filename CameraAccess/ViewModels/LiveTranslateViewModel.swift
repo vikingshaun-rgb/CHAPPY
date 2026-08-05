@@ -6,6 +6,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import NaturalLanguage
 
 @MainActor
 class LiveTranslateViewModel: ObservableObject {
@@ -20,9 +21,20 @@ class LiveTranslateViewModel: ObservableObject {
 
     // MARK: - Translation State
     @Published var currentTranslation = ""       // current translation result
-    @Published var currentOriginal = ""          // current original text (not yet supported, reserved) 
-    @Published var streamingTranslation = ""     // streaming translation chunkchunk
+    @Published var currentOriginal = ""          // what the speaker actually said
+    @Published var streamingTranslation = ""     // streaming translation chunk
+    @Published var streamingOriginal = ""        // streaming heard-speech chunk
     @Published var translationHistory: [TranslateRecord] = []
+
+    // MARK: - Transcript (TRANSCRIPT v2)
+    /// The running two-sided conversation, newest last. This is what the screen
+    /// draws as bubbles and what Phase 5's memory store will file verbatim.
+    @Published var transcript: [TranslateTurn] = []
+    /// Session header: when it started and where you were when it did.
+    @Published private(set) var sessionStartedAt: Date?
+    @Published private(set) var sessionPlace: String?
+    /// Optional human name for the session ("with the landlord").
+    @Published var sessionLabel: String = ""
 
     // MARK: - Error State
     @Published var errorMessage: String?
@@ -139,6 +151,9 @@ class LiveTranslateViewModel: ObservableObject {
             return
         }
         sessionStartAt = Date()
+        // TRANSCRIPT v2: stamp the session header once, at the top.
+        sessionStartedAt = Date()
+        sessionPlace = Self.placeString()
 
         translateService = LiveTranslateService(apiKey: apiKey)
         setupCallbacks()
@@ -271,6 +286,22 @@ class LiveTranslateViewModel: ObservableObject {
             }
         }
 
+        // TRANSCRIPT v2: the speaker's own words, arriving live.
+        translateService?.onOriginalDelta = { [weak self] delta in
+            DispatchQueue.main.async {
+                self?.streamingOriginal += delta
+            }
+        }
+
+        // TRANSCRIPT v2: a finished turn — file it as one bubble pair.
+        translateService?.onTurnComplete = { [weak self] heard, translated in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.appendTurn(heard: heard, translated: translated)
+                self.streamingOriginal = ""
+            }
+        }
+
         translateService?.onTranslationText = { [weak self] text in
             DispatchQueue.main.async {
                 self?.currentTranslation = text
@@ -325,12 +356,79 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.sendImageFrame(frame)
     }
 
+    // MARK: - Transcript building (TRANSCRIPT v2)
+
+    /// Who spoke? The mic setting is a hint, not proof — with the glasses mic
+    /// live, BOTH of you are in range. So identify the language of what was
+    /// actually said, on-device and free, and let that decide. Falls back to
+    /// the mic hint when the sentence is too short to call.
+    private func appendTurn(heard: String, translated: String) {
+        let clean = heard.trimmingCharacters(in: .whitespacesAndNewlines)
+        var fromWearer = !usePhoneMic
+        var detected: String? = nil
+        if clean.count >= 8 {
+            let recogniser = NLLanguageRecognizer()
+            recogniser.processString(clean)
+            if let lang = recogniser.dominantLanguage?.rawValue {
+                detected = lang
+                // The wearer speaks the SOURCE language; anything else is them.
+                fromWearer = Self.sameLanguage(lang, sourceLanguage.rawValue)
+            }
+        }
+
+        let turn = TranslateTurn(
+            at: Date(),
+            original: clean,
+            translated: translated.trimmingCharacters(in: .whitespacesAndNewlines),
+            fromWearer: fromWearer,
+            detectedLanguage: detected,
+            sourceCode: sourceLanguage.rawValue,
+            targetCode: targetLanguage.rawValue
+        )
+        transcript.append(turn)
+        currentOriginal = turn.original
+
+        // Keep the in-memory transcript bounded — a two-hour market haggle
+        // shouldn't slowly eat an iPhone 11's RAM.
+        if transcript.count > 400 {
+            transcript.removeFirst(transcript.count - 400)
+        }
+    }
+
+    /// Apple's language identifier and our TranslateLanguage codes don't always
+    /// spell the same language the same way — Filipino is "tl" to Apple and
+    /// "fil" here, Cantonese comes back as Chinese. Compare them honestly
+    /// rather than letting a spelling mismatch tag you as the other speaker.
+    private static func sameLanguage(_ detected: String, _ ours: String) -> Bool {
+        let d = String(detected.prefix(2)).lowercased()
+        let o = String(ours.prefix(2)).lowercased()
+        if d == o { return true }
+        let aliases: [String: Set<String>] = [
+            "fi": ["tl"],           // fil ↔ tl
+            "yu": ["zh"],           // yue ↔ zh
+            "zh": ["yu"]
+        ]
+        return aliases[o]?.contains(d) ?? false
+    }
+
+    /// Where the session started, in plain words, for the header.
+    private static func placeString() -> String? {
+        let snap = ContextEngine.shared.snapshot
+        var parts: [String] = []
+        if let s = snap.street { parts.append(s) }
+        if let c = snap.city { parts.append(c) }
+        if parts.isEmpty, let co = snap.country { parts.append(co) }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
     // MARK: - Clear
 
     func clearTranslation() {
         currentTranslation = ""
         streamingTranslation = ""
+        streamingOriginal = ""
         currentOriginal = ""
+        transcript.removeAll()
     }
 
     func clearHistory() {
