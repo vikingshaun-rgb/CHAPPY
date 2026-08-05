@@ -59,7 +59,13 @@ class LiveTranslateViewModel: ObservableObject {
 
     @Published var targetLanguage: TranslateLanguage {
         didSet {
+            guard targetLanguage != oldValue else { return }
             UserDefaults.standard.set(targetLanguage.rawValue, forKey: "translate_target_language")
+            // BUILD 58: mark the change in the transcript rather than silently
+            // continuing. Two languages interleaved with no visible break reads
+            // as the app malfunctioning — which is exactly how it looked when
+            // Indonesian turns sat above German ones.
+            markLanguageChange()
             updateServiceSettings()
         }
     }
@@ -460,6 +466,23 @@ class LiveTranslateViewModel: ObservableObject {
         }
     }
 
+    /// Drop a marker row where the language changed. Nothing is deleted: the
+    /// old conversation stays scrollable, because the price you agreed three
+    /// turns ago doesn't stop mattering because you've switched languages.
+    /// "Start fresh" on the divider clears it when you actually want that.
+    private func markLanguageChange() {
+        guard !transcript.isEmpty else { return }
+        if transcript.last?.isDivider == true { transcript.removeLast() }
+        transcript.append(TranslateTurn(
+            original: "",
+            translated: "Now translating \(targetLanguage.displayName)",
+            fromWearer: false,
+            sourceCode: sourceLanguage.rawValue,
+            targetCode: targetLanguage.rawValue,
+            isDivider: true
+        ))
+    }
+
     // MARK: - App lifecycle (BUILD 57)
 
     /// Minimising the app suspended the network stack under the socket, which
@@ -752,7 +775,10 @@ class LiveTranslateViewModel: ObservableObject {
     /// want their words back in English; if they ask, they want yours back in
     /// their language. Falls back to the most recent line either way.
     private func handleRepeatCommand(askedByWearer: Bool) {
-        let wanted = transcript.last(where: { $0.fromWearer != askedByWearer }) ?? transcript.last
+        // Skip divider rows — "say that again" should never replay
+        // "Now translating German" at somebody.
+        let spoken = transcript.filter { !$0.isDivider }
+        let wanted = spoken.last(where: { $0.fromWearer != askedByWearer }) ?? spoken.last
         guard let turn = wanted, !turn.translated.isEmpty else {
             TTSService.shared.speak("Nothing to repeat yet.")
             return
@@ -821,6 +847,19 @@ class LiveTranslateViewModel: ObservableObject {
         // Nothing useful was heard — don't invent a bubble for it.
         guard clean.count >= 2 else { return }
 
+        // BUILD 58: you speak English and they speak the target language. If the
+        // transcriber comes back with a THIRD language on YOUR turn, it misheard
+        // — and the translation is then a faithful rendering of a sentence you
+        // never said. That's how "그렇지. 딱이지?" appeared on a German session.
+        // Flag it rather than presenting nonsense as though it were real.
+        var misheard = false
+        if fromWearer, let d = detected,
+           !Self.sameLanguage(d, sourceLanguage.rawValue),
+           !Self.sameLanguage(d, targetLanguage.rawValue) {
+            misheard = true
+            print("⚠️ [TranslateVM] Misheard as \(d): \(clean.prefix(40))")
+        }
+
         let turn = TranslateTurn(
             at: Date(),
             original: clean,
@@ -828,7 +867,8 @@ class LiveTranslateViewModel: ObservableObject {
             fromWearer: fromWearer,
             detectedLanguage: detected,
             sourceCode: sourceLanguage.rawValue,
-            targetCode: targetLanguage.rawValue
+            targetCode: targetLanguage.rawValue,
+            misheard: misheard
         )
         transcript.append(turn)
         currentOriginal = turn.original
