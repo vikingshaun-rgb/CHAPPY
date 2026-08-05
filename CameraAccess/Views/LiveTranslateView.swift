@@ -90,8 +90,10 @@ extension String {
 /// colour; otherwise it sits left in the card fill — the arrangement every
 /// phone owner already knows how to read without being taught.
 struct ChappyBubble: View {
-    let primary: String
-    let secondary: String?
+    /// The line in YOUR language — what you said, or what they meant.
+    let wearerLine: String
+    /// The line in THEIR language — what was spoken aloud, or what they said.
+    let foreignLine: String
     let at: Date?
     let mine: Bool
     let theme: ChappyTheme
@@ -109,7 +111,7 @@ struct ChappyBubble: View {
 
     /// Formatted amount plus the dollar equivalent, when this line is money.
     private var priceChip: (String, String?)? {
-        let source = [secondary, primary].compactMap { $0 }.joined(separator: " ")
+        let source = wearerLine + " " + foreignLine
         guard let hit = PriceSpotter.find(in: source, languageCode: foreignCode) else { return nil }
         let money = "\(PriceSpotter.formatted(hit.amount)) \(hit.code)"
         return (money, CurrencyRates.shared.inAUD(hit.amount, currency: hit.code))
@@ -153,38 +155,32 @@ struct ChappyBubble: View {
                     }
                 }
 
-                // WHAT WAS SAID, in the speaker's own language — full size now,
-                // not a grey whisper. When it's your turn this is your English,
-                // so you can check Chappy heard you correctly.
-                if let secondary, !secondary.isEmpty {
-                    Text(secondary)
+                // BUILD 57: ENGLISH ALWAYS LEADS. It used to show the ORIGINAL
+                // small and the TRANSLATION big, on both sides — which meant
+                // your own bubbles led with Indonesian in bold and hid your
+                // English in a whisper. Scanning back through a conversation,
+                // half of it was in a language you can't read. Every bubble now
+                // leads with the line YOU understand; the foreign line sits
+                // under it, still there, still tappable, still shareable.
+                Text(wearerLine)
+                    .font(AppTypography.body)
+                    .fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                    .multilineTextAlignment(mine ? .trailing : .leading)
+
+                if !foreignLine.isEmpty {
+                    Text(foreignLine)
                         .font(AppTypography.body)
                         .foregroundColor(theme.textSecondary)
                         .multilineTextAlignment(mine ? .trailing : .leading)
-                    if showPronunciation, let roman = secondary.romanised {
+
+                    if showPronunciation, let roman = foreignLine.romanised {
                         Text(roman)
                             .font(.system(size: 13, weight: .regular, design: .rounded))
                             .italic()
                             .foregroundColor(theme.textSecondary.opacity(0.8))
                             .multilineTextAlignment(mine ? .trailing : .leading)
                     }
-                }
-
-                // WHAT WAS SPOKEN ALOUD — the translation, emphasised.
-                Text(primary)
-                    .font(AppTypography.body)
-                    .fontWeight(.semibold)
-                    .foregroundColor(theme.textPrimary)
-                    .multilineTextAlignment(mine ? .trailing : .leading)
-
-                // SOUND IT OUT: pinyin, romaji, readable Thai. On your own
-                // bubble this is the line you try to say yourself.
-                if showPronunciation, let roman = primary.romanised {
-                    Text(roman)
-                        .font(.system(size: 13, weight: .regular, design: .rounded))
-                        .italic()
-                        .foregroundColor(theme.textPrimary.opacity(0.72))
-                        .multilineTextAlignment(mine ? .trailing : .leading)
                 }
 
                 // THE PRICE, big and in dollars. Haggling is mostly numbers and
@@ -226,9 +222,12 @@ struct ChappyBubble: View {
             // so the target is the whole card, not just the glyphs.
             .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .onTapGesture {
-                guard !live, !primary.isEmpty, primary != "…" else { return }
+                // Tap plays whatever the OTHER party needs to hear: on your
+                // bubble that's the foreign line, on theirs it's the English.
+                let line = mine ? foreignLine : wearerLine
+                guard !live, !line.isEmpty, line != "…" else { return }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                TTSService.shared.speak(primary)
+                TTSService.shared.speak(line)
             }
             // AUDIT FIX (UI-C1): everything else on one press-and-hold. Standard
             // iOS, full-width rows, impossible to mis-tap — and it gives Copy
@@ -236,17 +235,16 @@ struct ChappyBubble: View {
             .contextMenu {
                 if !live {
                     Button {
-                        TTSService.shared.speak(primary)
+                        TTSService.shared.speak(mine ? foreignLine : wearerLine)
                     } label: { Label("Say it again", systemImage: "speaker.wave.2.fill") }
 
-                    if let secondary, !secondary.isEmpty {
-                        Button {
-                            TTSService.shared.speak(secondary)
-                        } label: { Label("Say the original", systemImage: "quote.bubble") }
-                    }
+                    Button {
+                        TTSService.shared.speak(mine ? wearerLine : foreignLine)
+                    } label: { Label("Say the other language", systemImage: "quote.bubble") }
 
                     Button {
-                        onShowBig?(primary)
+                        // Always show them THEIR language — that's the point.
+                        onShowBig?(foreignLine.isEmpty ? wearerLine : foreignLine)
                     } label: { Label("Show them (big text)", systemImage: "arrow.up.left.and.arrow.down.right") }
 
                     Button {
@@ -254,19 +252,19 @@ struct ChappyBubble: View {
                     } label: { Label("Save as a phrase", systemImage: "bookmark") }
 
                     Button {
-                        UIPasteboard.general.string = [secondary, primary]
-                            .compactMap { $0 }.joined(separator: "\n")
+                        UIPasteboard.general.string = [wearerLine, foreignLine]
+                            .filter { !$0.isEmpty }.joined(separator: "\n")
                     } label: { Label("Copy", systemImage: "doc.on.doc") }
 
                     // SEND IT (BUILD 56): dictate in English, send in their
                     // language. The text is real Unicode, so characters arrive
                     // intact rather than as little boxes.
                     Button {
-                        QuickShare.whatsApp(primary)
+                        QuickShare.whatsApp(foreignLine.isEmpty ? wearerLine : foreignLine)
                     } label: { Label("Send on WhatsApp", systemImage: "paperplane.fill") }
 
                     Button {
-                        onShare?(primary)
+                        onShare?(foreignLine.isEmpty ? wearerLine : foreignLine)
                     } label: { Label("Share…", systemImage: "square.and.arrow.up") }
                 }
             }
@@ -629,8 +627,8 @@ struct LiveTranslateView: View {
                     }
 
                     ForEach(viewModel.transcript) { turn in
-                        ChappyBubble(primary: turn.translated,
-                                     secondary: turn.original,
+                        ChappyBubble(wearerLine: turn.fromWearer ? turn.original : turn.translated,
+                                     foreignLine: turn.fromWearer ? turn.translated : turn.original,
                                      at: turn.at,
                                      mine: turn.fromWearer,
                                      theme: theme,
@@ -648,8 +646,8 @@ struct LiveTranslateView: View {
 
                     // The turn currently in flight — dimmed until it lands.
                     if !viewModel.streamingOriginal.isEmpty || !viewModel.streamingTranslation.isEmpty {
-                        ChappyBubble(primary: viewModel.streamingTranslation.isEmpty ? "…" : viewModel.streamingTranslation,
-                                     secondary: viewModel.streamingOriginal,
+                        ChappyBubble(wearerLine: viewModel.streamingTranslation.isEmpty ? "…" : viewModel.streamingTranslation,
+                                     foreignLine: viewModel.streamingOriginal,
                                      at: nil,
                                      mine: false,
                                      theme: theme,
@@ -677,8 +675,38 @@ struct LiveTranslateView: View {
 
     // MARK: - Control Bar
 
+    /// BUILD 57: three small toggles in a row ABOVE the record button, rather
+    /// than crowded either side of it. The old arrangement had no room for a
+    /// third control without pushing the record button off-centre, and this is
+    /// the row that will keep growing.
+    private func toggleButton(_ label: String,
+                              icon: String,
+                              on: Bool,
+                              dimmed: Bool = false,
+                              action: @escaping () -> Void) -> some View {
+        Button {
+            action()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.system(size: 18))
+                Text(label)
+                    .font(.system(size: 9.5, weight: .heavy))
+                    .tracking(0.5)
+            }
+            .foregroundColor(on ? .white : theme.textSecondary)
+            .frame(width: 54, height: 54)
+            .background(Circle().fill(on ? theme.accent : theme.cardFill))
+            .overlay(Circle().stroke(on ? .clear : theme.stroke, lineWidth: 1))
+            .opacity(dimmed ? 0.4 : 1.0)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+
     private var controlBar: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             if viewModel.isRecording {
                 HStack(spacing: 8) {
                     Circle()
@@ -690,72 +718,49 @@ struct LiveTranslateView: View {
                 }
             }
 
-            HStack(spacing: 22) {
-                // SPK — output out loud for the table, mic stays where it is.
-                Button {
+            HStack(spacing: 16) {
+                // SPEAK — whether Chappy talks at all. Off is a silent,
+                // reading-only interpreter: the right mode in a quiet
+                // restaurant, a hotel lobby at midnight, or a temple.
+                toggleButton("SPEAK",
+                             icon: viewModel.audioOutputEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                             on: viewModel.audioOutputEnabled) {
+                    viewModel.audioOutputEnabled.toggle()
+                }
+
+                // LOUD — push it out of the iPhone speaker for a table.
+                // Meaningless when SPEAK is off, so it says so by dimming.
+                toggleButton("LOUD",
+                             icon: "speaker.wave.3.fill",
+                             on: viewModel.loudSpeaker,
+                             dimmed: !viewModel.audioOutputEnabled) {
                     viewModel.loudSpeaker.toggle()
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: viewModel.loudSpeaker
-                              ? "speaker.wave.3.fill" : "speaker.slash.fill")
-                            .font(.system(size: 20))
-                        Text("SPK")
-                            .font(.system(size: 10, weight: .heavy))
-                            .tracking(0.6)
-                    }
-                    .foregroundColor(viewModel.loudSpeaker ? .white : theme.textSecondary)
-                    .frame(width: 58, height: 58)
-                    .background(
-                        Circle().fill(viewModel.loudSpeaker ? theme.accent : theme.cardFill)
-                    )
-                    .overlay(
-                        Circle().stroke(viewModel.loudSpeaker ? .clear : theme.stroke, lineWidth: 1)
-                    )
                 }
-                .buttonStyle(.plain)
 
-                Button {
-                    viewModel.toggleRecording()
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(viewModel.isRecording ? Color.red : theme.accent)
-                            .frame(width: 72, height: 72)
-
-                        Image(systemName: viewModel.isRecording ? "stop.fill" : "mic.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.white)
-                    }
-                }
-                // Asleep is a valid state to tap from — it wakes and starts.
-                .disabled(!viewModel.isConnected && !viewModel.isAsleep)
-                .opacity((viewModel.isConnected || viewModel.isAsleep) ? 1.0 : 0.5)
-
-                // Pronunciation line on/off. Sits where the spacer was, so the
-                // record button stays centred.
-                Button {
+                // SAY — pronunciation line under non-Latin script.
+                toggleButton("SAY",
+                             icon: "character.phonetic",
+                             on: showPronunciation) {
                     showPronunciation.toggle()
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: "character.phonetic")
-                            .font(.system(size: 20))
-                        Text("SAY")
-                            .font(.system(size: 10, weight: .heavy))
-                            .tracking(0.6)
-                    }
-                    .foregroundColor(showPronunciation ? .white : theme.textSecondary)
-                    .frame(width: 58, height: 58)
-                    .background(
-                        Circle().fill(showPronunciation ? theme.accent : theme.cardFill)
-                    )
-                    .overlay(
-                        Circle().stroke(showPronunciation ? .clear : theme.stroke, lineWidth: 1)
-                    )
                 }
-                .buttonStyle(.plain)
             }
+
+            Button {
+                viewModel.toggleRecording()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(viewModel.isRecording ? Color.red : theme.accent)
+                        .frame(width: 72, height: 72)
+
+                    Image(systemName: viewModel.isRecording ? "stop.fill" : "mic.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.white)
+                }
+            }
+            // Asleep is a valid state to tap from — it wakes and starts.
+            .disabled(!viewModel.isConnected && !viewModel.isAsleep)
+            .opacity((viewModel.isConnected || viewModel.isAsleep) ? 1.0 : 0.5)
 
             // AUDIT FIX (UI-C2): Clear sat directly under the record button and
             // wiped the whole conversation instantly, with no undo. One fumbled
@@ -781,7 +786,7 @@ struct LiveTranslateView: View {
                 }
             }
         }
-        .padding(.bottom, 12)
+        .padding(.bottom, 10)
     }
 
     // MARK: - Video Background
@@ -873,7 +878,7 @@ enum PriceSpotter {
         if lower.contains("ribu") || lower.contains("nghìn") { best *= 1_000 }
         if lower.contains("juta") || lower.contains("triệu") { best *= 1_000_000 }
 
-        guard let code = CurrencyRates.currencyForLanguage[languageCode] else { return nil }
+        guard let code = CurrencyRates.currency(forLanguage: languageCode) else { return nil }
 
         // AUDIT FIX (TR-C3): a bare number is a time, a quantity, a room number,
         // a date or a phone number far more often than it's money. A wrong price
