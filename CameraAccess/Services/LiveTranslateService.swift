@@ -67,6 +67,9 @@ class LiveTranslateService: NSObject {
     private var accumulatedText = ""
     /// TRANSCRIPT v2: incoming speech, accumulated across a turn.
     private var accumulatedOriginal = ""
+    /// ECHO GATE: the microphone stays shut until this moment has passed.
+    private var micGateUntil = Date.distantPast
+    private static let echoTailSeconds: TimeInterval = 0.6
 
     // Reconnect bookkeeping: recording may only resume AFTER setupComplete,
     // never straight after connect() — audio sent before setup kills the socket.
@@ -296,6 +299,19 @@ class LiveTranslateService: NSObject {
 
             let audioSession = AVAudioSession.sharedInstance()
 
+            // BUILD 53: "use the glasses mic" is a preference, not a fact. With
+            // the glasses off or flat, this asked for a Bluetooth route that
+            // isn't there and iOS quietly handed back the handset mic anyway —
+            // configured for a headset that doesn't exist. Check what's actually
+            // connected and set the session up for the hardware in the room.
+            let bluetoothAvailable = (audioSession.availableInputs ?? []).contains {
+                $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
+            }
+            let usePhoneMic = usePhoneMic || !bluetoothAvailable
+            if !bluetoothAvailable {
+                print("🎙️ [Translate] No Bluetooth mic present — configuring for the iPhone")
+            }
+
             if usePhoneMic {
                 // iPhone microphone - best for translating the other person
                 try audioSession.setCategory(
@@ -352,10 +368,15 @@ class LiveTranslateService: NSObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         isRecording = false
+        micGateUntil = .distantPast
     }
 
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
         guard buffer.floatChannelData != nil else { return }
+
+        // ECHO GATE (BUILD 53): drop everything the mic hears while Chappy is
+        // still speaking, plus a short tail. This is what breaks the loop.
+        if Date() < micGateUntil.addingTimeInterval(Self.echoTailSeconds) { return }
 
         let inputSampleRate = buffer.format.sampleRate
 
@@ -632,6 +653,17 @@ class LiveTranslateService: NSObject {
     private func handleAudioChunk(_ audioData: Data) {
         onAudioDelta?(audioData)
         guard audioOutputEnabled else { return }
+
+        // ECHO GATE (BUILD 53): hardware echo cancellation is not enough here.
+        // The speaker plays the translation, the microphone hears it, the model
+        // translates its own voice back, and the loop never stops:
+        // "Okay" → "Baik, tenang saja" → "calm down" → "Tenang saja" → forever.
+        // Real interpreters are half-duplex, and so is this now: while Chappy is
+        // speaking, the microphone sends nothing. We hold the gate for exactly
+        // as long as the audio we've queued, plus a short tail for the room.
+        let frames = Double(audioData.count / 2)
+        let seconds = frames / (playbackFormat?.sampleRate ?? 24000)
+        micGateUntil = max(micGateUntil, Date()).addingTimeInterval(seconds)
 
         startPlaybackEngine()
         guard isPlaybackEngineRunning else { return }
