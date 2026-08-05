@@ -31,6 +31,9 @@ struct TurboMetaHomeView: View {
     private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     // LIVING ORB: breathing animation state
     @State private var orbPulse = false
+    // Journal refresh trigger (Remember button feedback) + always-on map
+    @State private var journalTick = 0
+    @State private var showMapSheet = false
     @State private var showQuickVision = false
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
@@ -162,8 +165,13 @@ struct TurboMetaHomeView: View {
                                 showQuickVision = true
                             }
                             QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
+                                ContextEngine.shared.start()
                                 let spot = TripRecorder.shared.rememberSpot(named: "")
-                                TTSService.shared.speak("Saved \(spot.name).")
+                                journalTick += 1
+                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                TTSService.shared.speak(spot.lat == 0 && spot.lon == 0
+                                    ? "Saved, but GPS has not locked yet - give it a few seconds outside and try again."
+                                    : "Saved \(spot.name).")
                             }
                             QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
                                               label: continuousVision.isRunning ? "Stop" : "Watch") {
@@ -174,7 +182,15 @@ struct TurboMetaHomeView: View {
                                 }
                             }
                             QuickActionButton(icon: "map.fill", label: "Map") {
-                                if navEngine.isNavigating { showNavMap = true }
+                                ContextEngine.shared.start()
+                                showMapSheet = true
+                            }
+                            .sheet(isPresented: $showMapSheet) {
+                                if navEngine.isNavigating {
+                                    NavMapSheet(navEngine: navEngine)
+                                } else {
+                                    TodayMapSheet()
+                                }
                             }
                         }
 
@@ -189,6 +205,7 @@ struct TurboMetaHomeView: View {
                         }
                         .padding(12)
                         .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                        .id(journalTick) // refresh counts when Remember fires
 
                         // MORE
                         VStack(spacing: 8) {
@@ -239,6 +256,9 @@ struct TurboMetaHomeView: View {
             }
         }
         .onAppear {
+            // GPS from app-open (not just Live AI) — journal, Remember and
+            // the Map button all need a fix before any session starts
+            ContextEngine.shared.start()
             // Ensure QuickVisionManager has the streamViewModel reference
             quickVisionManager.setStreamViewModel(streamViewModel)
             // Ensure LiveAIManager has the streamViewModel reference
@@ -621,6 +641,29 @@ struct ScaleButtonStyle: ButtonStyle {
 // On-demand map: appears ONLY when asked — voice-first always.
 // Route drawn on MapKit (display), routing data from Google (NavEngine).
 
+/// Today's trail — the Map button's view when not navigating: your live
+/// location plus every journal breadcrumb from today.
+struct TodayMapSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationView {
+            RouteMapView(
+                coords: TripRecorder.shared.crumbs.map {
+                    CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                },
+                destination: nil)
+                .ignoresSafeArea(edges: .bottom)
+                .navigationTitle("Today's Trail")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+        }
+    }
+}
+
 struct NavMapSheet: View {
     @ObservedObject var navEngine: NavEngine
     @Environment(\.dismiss) private var dismiss
@@ -652,6 +695,10 @@ struct RouteMapView: UIViewRepresentable {
             let line = MKPolyline(coordinates: coords, count: coords.count)
             map.addOverlay(line)
             map.setVisibleMapRect(line.boundingMapRect.insetBy(dx: -600, dy: -600), animated: false)
+        } else {
+            // No trail yet — follow the user's live blue dot instead of
+            // showing a blank world map
+            map.userTrackingMode = .follow
         }
         if let d = destination {
             let pin = MKPointAnnotation()
