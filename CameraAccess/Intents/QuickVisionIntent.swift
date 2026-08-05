@@ -22,7 +22,10 @@ import SwiftUI
 struct QuickVisionIntent: AppIntent {
     static var title: LocalizedStringResource = "Quick Vision"
     static var description = IntentDescription("Take a photo with Ray-Ban Meta glasses and identify the image content")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @Parameter(title: "Custom Prompt")
     var customPrompt: String?
@@ -41,7 +44,10 @@ struct QuickVisionIntent: AppIntent {
 struct QuickVisionHealthIntent: AppIntent {
     static var title: LocalizedStringResource = "Health Vision"
     static var description = IntentDescription("Analyze how healthy a food/drink is")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -57,7 +63,10 @@ struct QuickVisionHealthIntent: AppIntent {
 struct QuickVisionBlindIntent: AppIntent {
     static var title: LocalizedStringResource = "Describe Surroundings"
     static var description = IntentDescription("Describe the surroundings in detail for visually impaired users")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -73,7 +82,10 @@ struct QuickVisionBlindIntent: AppIntent {
 struct QuickVisionReadingIntent: AppIntent {
     static var title: LocalizedStringResource = "Read Text Aloud"
     static var description = IntentDescription("Recognize and read aloud the text in the image")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -89,7 +101,10 @@ struct QuickVisionReadingIntent: AppIntent {
 struct QuickVisionTranslateIntent: AppIntent {
     static var title: LocalizedStringResource = "Translate Text"
     static var description = IntentDescription("Recognize and translate foreign-language text in the image")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -105,7 +120,10 @@ struct QuickVisionTranslateIntent: AppIntent {
 struct QuickVisionEncyclopediaIntent: AppIntent {
     static var title: LocalizedStringResource = "Encyclopedia Vision"
     static var description = IntentDescription("Identify objects and provide encyclopedia knowledge")
-    static var openAppWhenRun: Bool = false
+    // AUDIT FIX (QV-H1): cold-start Siri ran this with the app never launched,
+    // so streamViewModel was nil and every hands-free snap answered "Vision
+    // feature is not initialized". Bring the app up first.
+    static var openAppWhenRun: Bool = true
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -120,12 +138,17 @@ struct QuickVisionEncyclopediaIntent: AppIntent {
 @available(iOS 16.0, *)
 @MainActor
 private func formatResult(_ manager: QuickVisionManager) -> some IntentResult & ProvidesDialog {
-    if let result = manager.lastResult {
-        return .result(dialog: "Recognition complete: \(result)")
+    // AUDIT FIX (QV-H2): Chappy has ALREADY spoken the answer through TTS by
+    // the time we get here. Returning the full text as the Siri dialog made
+    // Siri read the entire answer a second time, straight over the top of
+    // Chappy's voice — two overlapping readings of a menu in the user's ear.
+    // Keep the dialog to a short acknowledgement.
+    if manager.lastResult != nil {
+        return .result(dialog: "Done.")
     } else if let error = manager.errorMessage {
-        return .result(dialog: "Recognition failed: \(error)")
+        return .result(dialog: "\(error)")
     } else {
-        return .result(dialog: "Recognition complete")
+        return .result(dialog: "Nothing came back.")
     }
 }
 
@@ -266,6 +289,9 @@ class QuickVisionManager: ObservableObject {
 
     // Expose streamViewModel so Intents can check initialization state
     private(set) var streamViewModel: StreamSessionViewModel?
+    /// AUDIT FIX (QV-C1): true only when THIS snap opened the glasses stream,
+    /// so Quick Vision never closes a stream another module owns.
+    private var startedStreamForThisSnap = false
     private let tts = TTSService.shared
 
     private init() {
@@ -306,7 +332,28 @@ class QuickVisionManager: ObservableObject {
             return
         }
 
+        // AUDIT FIX (QV-C1): a snap taken while Live AI or Continuous Vision is
+        // running used to hijack the shared stream and then STOP it on the way
+        // out — the live session went blind mid-sentence and never recovered.
+        // Quick Vision is the cheap layer; it yields to the deep one.
+        if LiveAIManager.shared.isRunning {
+            tts.speak("Live is already looking - just ask it.")
+            return
+        }
+        if ContinuousVisionManager.shared.isRunning {
+            tts.speak("I'm already watching - just ask.")
+            return
+        }
+
         isProcessing = true
+        // AUDIT FIX (QV-C2): isProcessing was cleared only on the happy path and
+        // in the catch blocks. Any hang or early return left it true forever and
+        // Quick Vision was dead for the rest of the app's life — the single most
+        // likely "Quick Vision stopped working" report. defer can't be skipped.
+        defer {
+            isProcessing = false
+            startedStreamForThisSnap = false
+        }
         errorMessage = nil
         lastResult = nil
         lastImage = nil
@@ -316,7 +363,6 @@ class QuickVisionManager: ObservableObject {
         guard let apiKey = APIKeyManager.shared.getAPIKey(), !apiKey.isEmpty else {
             errorMessage = "Please configure an API Key in Settings first"
             tts.speak("Please configure an API Key in Settings first")
-            isProcessing = false
             return
         }
 
@@ -336,7 +382,16 @@ class QuickVisionManager: ObservableObject {
             // 1. Start the video stream (if not already started)
             if streamViewModel.streamingStatus != .streaming {
                 print("📹 [QuickVision] Starting stream...")
-                await streamViewModel.handleStartStreaming()
+                // AUDIT FIX (QV-C1): remember we were the one who opened the
+                // stream, so step 6 only closes what we opened.
+                startedStreamForThisSnap = true
+                // AUDIT FIX (QV-C2): this used to be `await`ed. handleStartStreaming
+                // awaits the SDK's stream.start(), which over the WiFi transport
+                // can simply never return (glasses asleep, transport half-open) —
+                // and an unbounded await parks this task forever with isProcessing
+                // stuck true. Kick it off, then let the poll below decide whether
+                // it worked; a timeout is now a clean "couldn't start", not a hang.
+                Task { await streamViewModel.handleStartStreaming() }
 
                 // Wait for the stream to enter the streaming state (up to 5 seconds)
                 var streamWait = 0
@@ -387,9 +442,13 @@ class QuickVisionManager: ObservableObject {
             // 5. Pre-configure the TTS audio session
             tts.prepareAudioSession()
 
-            // 6. Stop the video stream immediately
-            print("🛑 [QuickVision] Stopping stream after capture")
-            await streamViewModel.stopSession()
+            // 6. Stop the video stream immediately — but only if WE started it.
+            // AUDIT FIX (QV-C1): unconditional, this tore down a stream another
+            // module was using.
+            if startedStreamForThisSnap {
+                print("🛑 [QuickVision] Stopping stream after capture")
+                await streamViewModel.stopSession()
+            }
 
             // 7. Call the vision API
             let service = QuickVisionService(apiKey: apiKey)
@@ -410,15 +469,32 @@ class QuickVisionManager: ObservableObject {
             errorMessage = error.localizedDescription
             print("❌ [QuickVision] QuickVisionError: \(error)")
             tts.speak(error.localizedDescription, apiKey: apiKey)
-            await streamViewModel.stopSession()
+            if startedStreamForThisSnap { await streamViewModel.stopSession() }
         } catch {
             errorMessage = error.localizedDescription
             print("❌ [QuickVision] Error: \(error)")
-            tts.speak("Recognition failed, \(error.localizedDescription)", apiKey: apiKey)
-            await streamViewModel.stopSession()
+            // AUDIT FIX (QV-H3): raw API/URLSession errors were read aloud —
+            // the glasses would recite a JSON body or "NSURLErrorDomain -1009"
+            // into the user's ear. Say something a human can act on.
+            tts.speak(Self.speakableFailure(error), apiKey: apiKey)
+            if startedStreamForThisSnap { await streamViewModel.stopSession() }
         }
+    }
 
-        isProcessing = false
+    /// AUDIT FIX (QV-H3): turn a thrown error into one plain spoken sentence.
+    private static func speakableFailure(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet, NSURLErrorDataNotAllowed:
+                return "No internet right now - I can't see for you until we're back online."
+            case NSURLErrorTimedOut:
+                return "That took too long to come back. Try again."
+            default:
+                return "The connection dropped before I could answer. Try again."
+            }
+        }
+        return "That didn't work - try asking me again."
     }
 
     /// Perform quick vision (using the currently configured mode)
