@@ -289,9 +289,14 @@ class StreamSessionViewModel: ObservableObject {
           if let uiImage = UIImage(data: photoData.data) {
             self.capturedPhoto = uiImage
             self.showPhotoPreview = true
-            // VOICE SHUTTER: every glasses photo also lands in iOS Photos —
+            // VOICE SHUTTER: an intentional photo lands in iOS Photos —
             // time+GPS-stamped by the system, ready for Phase 5 photo ingest.
-            UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+            // AUDIT FIX (QV-C5): gated — Quick Vision's working snaps no longer
+            // spam the camera roll.
+            if self.saveNextPhotoToRoll {
+              self.saveNextPhotoToRoll = false
+              UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+            }
             ChappyHaptics.shared.shutter()
           }
         }
@@ -396,7 +401,14 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
-  func capturePhoto() {
+  /// AUDIT FIX (QV-C5): only an explicit voice shutter ("Chappy, take a photo")
+  /// writes to the camera roll. Quick Vision snaps used the same path, so every
+  /// "what am I looking at" also dumped a JPEG into Photos — hundreds a day on a
+  /// travel day, and it buried the user's real photos.
+  private var saveNextPhotoToRoll = false
+
+  func capturePhoto(saveToRoll: Bool = false) {
+    saveNextPhotoToRoll = saveToRoll
     stream?.capturePhoto(format: .jpeg)
   }
 

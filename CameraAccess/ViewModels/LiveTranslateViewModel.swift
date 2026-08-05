@@ -13,6 +13,10 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Connection State
     @Published var isConnected = false
     @Published var isRecording = false
+    // AUDIT FIX support: autostart is consumed once, cost is metered
+    private var pendingAutostart = false
+    private var suppressSettingsPush = false
+    private var sessionStartAt: Date?
 
     // MARK: - Translation State
     @Published var currentTranslation = ""       // current translation result
@@ -113,12 +117,28 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Connection
 
     func connect() {
+        // AUDIT FIX (HIGH): translate_autostart was only cleared inside
+        // onConnected, so ANY failure (no key, no network, cover collision,
+        // early dismiss) left it true — and days later a manual visit to
+        // Translate would start recording by itself. Read and clear here,
+        // before anything can fail.
+        pendingAutostart = UserDefaults.standard.bool(forKey: "translate_autostart")
+        UserDefaults.standard.set(false, forKey: "translate_autostart")
+
+        // AUDIT FIX (HIGH): a fresh install defaults to en↔en — an interpreter
+        // that repeats you back to yourself. Never let source == target.
+        if sourceLanguage == targetLanguage {
+            targetLanguage = (sourceLanguage == .en) ? .id : .en
+            print("🌐 [TranslateVM] source == target — corrected to \(targetLanguage.rawValue)")
+        }
+
         let apiKey = APIProviderManager.staticLiveAIAPIKey
         guard !apiKey.isEmpty else {
             errorMessage = "livetranslate.error.noApiKey".localized
             showError = true
             return
         }
+        sessionStartAt = Date()
 
         translateService = LiveTranslateService(apiKey: apiKey)
         setupCallbacks()
@@ -135,10 +155,22 @@ class LiveTranslateViewModel: ObservableObject {
 
     func disconnect() {
         stopImageTimer()
+        // AUDIT FIX (CRITICAL): translate minutes were completely invisible to
+        // the cost meter — an hour of interpreting reported as $0.00 and never
+        // tripped the spend warnings.
+        if let start = sessionStartAt {
+            CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(start))
+            sessionStartAt = nil
+        }
         translateService?.disconnect()
         translateService = nil
         isConnected = false
         isRecording = false
+        UserDefaults.standard.set(false, forKey: "translate_autostart")
+        pendingAutostart = false
+        // AUDIT FIX: the wake-word ear comes back after a voice-started
+        // translate session (it used to stay dead until the phone came out).
+        ChappyStandby.shared.resumeAfterHandOff()
     }
 
     // MARK: - Recording
@@ -193,9 +225,16 @@ class LiveTranslateViewModel: ObservableObject {
             return
         }
 
+        // AUDIT FIX (HIGH): each assignment's didSet pushed settings, so one
+        // swap tore down and rebuilt the session TWICE — the second cycle saw
+        // wasRecording == false and the mic never came back while the UI still
+        // showed red. Suppress the push, then send once.
+        suppressSettingsPush = true
         let temp = sourceLanguage
         sourceLanguage = targetLanguage
         targetLanguage = temp
+        suppressSettingsPush = false
+        updateServiceSettings()
 
         // Clear the current translation
         currentTranslation = ""
@@ -215,6 +254,14 @@ class LiveTranslateViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.isConnected = true
                 print("✅ [TranslateVM] Connected")
+                // VOICE-STARTED TRANSLATE: when Chappy opened this by voice
+                // ("Chappy, translate"), start listening the moment the line
+                // is live — no buttons, mid-conversation ready.
+                if self?.pendingAutostart == true {
+                    self?.pendingAutostart = false
+                    self?.startRecording()
+                    print("🎙️ [TranslateVM] Auto-started by voice command")
+                }
             }
         }
 
@@ -246,6 +293,9 @@ class LiveTranslateViewModel: ObservableObject {
     }
 
     private func updateServiceSettings() {
+        // AUDIT FIX: guarded so one swap can't fire two teardown/reconnect
+        // cycles (which left the mic dead with the UI showing red).
+        guard !suppressSettingsPush else { return }
         translateService?.updateSettings(
             sourceLanguage: sourceLanguage,
             targetLanguage: targetLanguage,
