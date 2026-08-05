@@ -595,12 +595,42 @@ class GeminiLiveService: NSObject {
 
     @MainActor
     private func openApp(_ app: String) -> String {
+        let key = app.lowercased()
+        // MAPS LAW: "maps" means GOOGLE Maps (with the current destination
+        // loaded when navigating). Apple Maps only when explicitly asked.
+        if key.contains("map") && !key.contains("apple") {
+            let nav = NavEngine.shared
+            var url: URL?
+            if let d = nav.destinationCoord {
+                let mode = nav.lastDriving ? "driving" : "walking"
+                let appURL = URL(string: "comgooglemaps://?daddr=\(d.latitude),\(d.longitude)&directionsmode=\(mode)")
+                if let u = appURL, UIApplication.shared.canOpenURL(u) {
+                    url = u
+                } else {
+                    url = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(d.latitude),\(d.longitude)&travelmode=\(mode)")
+                }
+            } else {
+                let appURL = URL(string: "comgooglemaps://")
+                if let u = appURL, UIApplication.shared.canOpenURL(u) {
+                    url = u
+                } else {
+                    url = URL(string: "https://maps.google.com/")
+                }
+            }
+            if let u = url {
+                UIApplication.shared.open(u)
+                return nav.destinationCoord != nil
+                    ? "Google Maps is opening with the destination and turn-by-turn loaded."
+                    : "Google Maps is opening on the phone."
+            }
+        }
+        if key.contains("apple") {
+            if let u = URL(string: "maps://") { UIApplication.shared.open(u); return "Opening Apple Maps." }
+        }
         let map: [String: String] = [
             "grab": "grab://", "gojek": "gojek://", "whatsapp": "whatsapp://",
-            "google maps": "comgooglemaps://", "maps": "maps://",
             "youtube": "youtube://", "instagram": "instagram://", "telegram": "tg://"
         ]
-        let key = app.lowercased()
         guard let scheme = map.first(where: { key.contains($0.key) })?.value, let u = URL(string: scheme) else {
             return "No link known for \(app)."
         }
