@@ -544,7 +544,14 @@ final class ChappyStandby: NSObject, ObservableObject {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    private let engine = AVAudioEngine()
+    /// AUDIT P0 (SB-RESET): this was a `let`, so it could never be replaced.
+    /// Apple's contract for a media-services reset is that every AVAudioEngine
+    /// and node in the process is invalid and must be DISPOSED OF and recreated
+    /// — restarting the same instance either throws from start() or gives you an
+    /// engine that runs with no audio reaching the tap. The old code restarted
+    /// this one, so a single reset meant the ear never came back for the rest of
+    /// the day while the chip cheerfully read "Standby on".
+    private var engine = AVAudioEngine()
     private var restartTimer: Timer?
 
     // Wake-word state
@@ -559,9 +566,45 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var starting = false
     private var wasListeningBeforeHandoff = false
     private var pendingAmbiguous: String?
+    /// AUDIT P1 (SB-STICKY): the either/or question expires. Without this it
+    /// latched forever and hijacked the next unrelated command.
+    private var ambiguousAskedAt = Date.distantPast
     /// AUDIT FIX (SB-H1): interruption/route resilience state.
     private var resilienceInstalled = false
     private var interruptedWhileListening = false
+
+    // MARK: Audit P0 state — reconfiguration loop, liveness, hand-off expiry
+
+    /// AUDIT P0 (SB-LOOP): rebuildEar() reconfigures the audio session, which
+    /// makes iOS post AVAudioEngineConfigurationChange to every engine in the
+    /// process — including the one we just rebuilt. With no filter and no
+    /// throttle that is a feedback loop. Translate was given exactly these two
+    /// guards in build 64 after "a reconfiguration loop that took the app down
+    /// after exactly one sentence"; Standby never got them.
+    private var lastEarRebuild = Date.distantPast
+    private var suppressConfigChangeUntil = Date.distantPast
+
+    /// AUDIT P0 (SB-LIVENESS): `isListening` meant "we once armed", not "audio
+    /// is flowing". Every non-deliberate death — interruption, stale tap, killed
+    /// task — left it true, and autoArmIfWanted's `guard !isListening` then made
+    /// the recovery hook a guaranteed no-op after exactly the events it exists
+    /// for. Stamped by the input tap; a stale stamp means the ear is deaf no
+    /// matter what the flag says.
+    private var lastBufferAt = Date.distantPast
+
+    /// AUDIT P0 (SB-LATCH): wasListeningBeforeHandoff was cleared in exactly one
+    /// place — the first line of resumeAfterHandOff(). Any module that failed to
+    /// call it turned the flag into a permanent latch that blocked auto-arm
+    /// forever. Now it expires.
+    private var handOffAt = Date.distantPast
+
+    /// AUDIT P0 (SB-SELFTALK): while Chappy is speaking, the recogniser is still
+    /// transcribing him through the speaker (.spokenAudio has no echo
+    /// cancellation). Results delivered from before this stamp are discarded
+    /// rather than scanned for the wake word.
+    private var suppressTranscriptBefore = Date.distantPast
+    private var wasSpeaking = false
+    private var speechWatch: Timer?
 
     private static let wakeWords = ["chappy", "chappie", "chapy", "chappy's"]
 
@@ -625,7 +668,109 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     // MARK: Lifecycle
 
-    func toggle() { isListening ? stop() : start() }
+    func toggle() {
+        // A tap is always a DELIBERATE act — it speaks, and it overrides any
+        // pending silent auto-arm state left behind by an earlier attempt.
+        silentArm = false
+        if isListening {
+            // A deliberate tap off means OFF — it must survive backgrounding,
+            // or auto-arm would fight the user every time they pocket the phone.
+            userTurnedOff = true
+            stop()
+        } else {
+            userTurnedOff = false
+            start()
+        }
+    }
+
+    /// POCKET LAW: the Action Button opens Chappy and that must be the whole
+    /// interaction — ear armed, wake word live, phone never leaves the pocket.
+    /// Standby used to start closed on every cold launch, so the one gesture
+    /// that exists to avoid touching the screen ended at a screen you had to
+    /// touch. On by default; a deliberate tap-off is respected until relaunch.
+    ///
+    /// Read live from UserDefaults rather than @AppStorage: this is a plain
+    /// class, not a View, so the property wrapper would never see a change the
+    /// Settings screen made. Absent key means ON — a fresh install should be
+    /// hands-free out of the box.
+    private var autoArmEnabled: Bool {
+        let d = UserDefaults.standard
+        guard d.object(forKey: "chappy_standby_autoarm") != nil else { return true }
+        return d.bool(forKey: "chappy_standby_autoarm")
+    }
+    /// Set when the user taps Standby OFF themselves. Auto-arm respects it for
+    /// the life of the app run, then a fresh launch starts armed again.
+    private var userTurnedOff = false
+
+    /// Called on app launch and on every return to the foreground. Safe to call
+    /// as often as you like — every failure mode exits quietly.
+    func autoArmIfWanted(reason: String) {
+        guard autoArmEnabled else { return }
+        guard !userTurnedOff else { return }
+        guard !starting else { return }
+        // AUDIT P0 (SB-LIVENESS): `isListening` alone is not proof of life. If
+        // it claims to be listening but the tap has gone quiet, the honest move
+        // is to rebuild rather than to skip — the old `guard !isListening` was
+        // precisely what made this hook useless after the failures it exists for.
+        if isListening {
+            guard Date().timeIntervalSince(lastBufferAt) > 10 else { return }
+            print("👂 [Standby] Chip says armed but the ear is deaf (\(reason)) — rebuilding")
+            rebuildEar()
+            return
+        }
+        // Never steal the mic from a session that is already using it.
+        guard !LiveAIManager.shared.isRunning else { return }
+        guard !ContinuousVisionManager.shared.isRunning else { return }
+        // Translate is guarded at the CALL SITE (the home view only auto-arms
+        // when no module is covering the screen) rather than by reaching into
+        // LiveTranslateService — that file is on a rolled-back baseline and
+        // must not be touched by this change.
+        // A hand-off owns the ear's return — don't race resumeAfterHandOff().
+        //
+        // AUDIT P0 (SB-LATCH): this used to be an unconditional guard, and the
+        // flag was cleared in exactly ONE place — the first line of
+        // resumeAfterHandOff(). So any module that took the mic and failed to
+        // hand it back turned this into a permanent latch, and auto-arm — the
+        // supposed safety net — was blocked forever by the very failure it was
+        // written to catch. Twenty seconds is far longer than any real hand-off
+        // takes; past that, the module isn't coming back and we take the ear.
+        if wasListeningBeforeHandoff {
+            guard Date().timeIntervalSince(handOffAt) > 20 else { return }
+            print("👂 [Standby] Hand-off never returned after 20s — reclaiming the ear")
+            wasListeningBeforeHandoff = false
+        }
+        // Permissions must already be granted. Auto-arm must NEVER be the thing
+        // that throws a permission dialog in the user's face at launch, and it
+        // must never announce a failure he didn't ask for.
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+            print("👂 [Standby] Auto-arm skipped (\(reason)) — speech not authorised yet")
+            return
+        }
+        guard AVAudioSession.sharedInstance().recordPermission == .granted else {
+            print("👂 [Standby] Auto-arm skipped (\(reason)) — mic not authorised yet")
+            return
+        }
+        print("👂 [Standby] Auto-arming (\(reason))")
+        silentArm = true
+        start()
+    }
+
+    /// Suppresses the spoken greeting for an arm the user didn't ask for out
+    /// loud. A haptic tick still confirms it, which is what you want when the
+    /// phone is in your pocket and you're wearing the glasses.
+    private var silentArm = false
+
+    /// A failed arm the USER asked for is spoken. A failed auto-arm is silent —
+    /// he never asked, so an unprompted "I need microphone access" from a
+    /// pocketed phone is noise, not help.
+    private func announceArmFailure(_ line: String) {
+        if silentArm {
+            silentArm = false
+            print("👂 [Standby] Auto-arm declined: \(line)")
+            return
+        }
+        TTSService.shared.speak(line)
+    }
 
     func start() {
         // AUDIT FIX: isListening is only set at the END of beginSession, so a
@@ -639,14 +784,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             // one tap while Live AI was running left the flag stuck true and
             // Standby could NEVER be started again for the life of the app.
             starting = false
-            TTSService.shared.speak("Live AI is already listening - no need for standby.")
+            announceArmFailure("Live AI is already listening - no need for standby.")
             return
         }
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             Task { @MainActor in
                 guard status == .authorized else {
                     self?.starting = false
-                    TTSService.shared.speak("I need speech permission for standby. Enable it in settings.")
+                    self?.announceArmFailure("I need speech permission for standby. Enable it in settings.")
                     return
                 }
                 // AUDIT FIX: mic permission was never requested — a denied mic
@@ -655,7 +800,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                     Task { @MainActor in
                         guard granted else {
                             self?.starting = false
-                            TTSService.shared.speak("I need microphone access for standby.")
+                            self?.announceArmFailure("I need microphone access for standby.")
                             return
                         }
                         self?.beginSession()
@@ -667,6 +812,7 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     func stop() {
         restartTimer?.invalidate(); restartTimer = nil
+        speechWatch?.invalidate(); speechWatch = nil // AUDIT P0 (SB-SELFTALK)
         routeWork?.cancel(); routeWork = nil
         routeTask?.cancel(); routeTask = nil
         task?.cancel(); task = nil
@@ -685,6 +831,7 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// remembers it was on and comes back by itself.
     func handOff() {
         wasListeningBeforeHandoff = isListening
+        handOffAt = Date()
         stop()
     }
     func resumeAfterHandOff() {
@@ -701,7 +848,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // true — a single low-battery tap deadlocked the wake word permanently.
         guard let recognizer, recognizer.isAvailable else {
             starting = false
-            TTSService.shared.speak("Standby isn't available on this phone right now.")
+            announceArmFailure("Standby isn't available on this phone right now.")
             return
         }
         // Battery guard — a local ear sips, but not below 20%.
@@ -709,7 +856,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         let lvl = UIDevice.current.batteryLevel
         if lvl >= 0 && lvl < 0.20 {
             starting = false
-            TTSService.shared.speak("Battery is under twenty percent - standby stays off to save it.")
+            announceArmFailure("Battery is under twenty percent - standby stays off to save it.")
             return
         }
 
@@ -723,23 +870,38 @@ final class ChappyStandby: NSObject, ObservableObject {
         starting = false
         installAudioResilience()
         ChappyHaptics.shared.connected()
-        TTSService.shared.speak("Standby on. Just say Chappy.")
-        // Recognition tasks die after about a minute — quietly renew them.
-        restartTimer?.invalidate()
-        restartTimer = Timer.scheduledTimer(withTimeInterval: 50, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.renew() }
+        // Auto-arm confirms by haptic only — a phone that announces itself out
+        // loud every time you open the app is a phone you stop carrying.
+        if silentArm {
+            silentArm = false
+            print("👂 [Standby] Armed silently")
+        } else {
+            TTSService.shared.speak("Standby on. I'm listening for my name.")
         }
+        // Recognition tasks die after about a minute — quietly renew them.
+        restartRenewTimer()
+        startSpeechWatch()
         print("👂 [Standby] Ear open — waiting for the name")
     }
 
     private func renew() {
         guard isListening, !awake, !busy else { return } // never interrupt a command
+        guard !interruptedWhileListening else { return } // a call owns the mic
         // AUDIT FIX (SB-H1): health check first. If iOS tore the engine down
         // while we weren't looking (a call, an alarm, media services resetting),
         // renewing the recognizer alone gives you a live ear with no audio going
         // into it — deaf, but the chip still says "Standby on".
         if !engine.isRunning {
             print("👂 [Standby] Engine died — rebuilding the whole ear")
+            rebuildEar()
+            return
+        }
+        // AUDIT P0 (SB-LIVENESS): the engine can be "running" with a stale tap
+        // that hasn't delivered a buffer in minutes. That is the state the chip
+        // was lying about. Buffers arrive continuously when the mic is live, so
+        // 10 seconds of silence from the tap means dead, not quiet.
+        if Date().timeIntervalSince(lastBufferAt) > 10 {
+            print("👂 [Standby] No audio for \(Int(Date().timeIntervalSince(lastBufferAt)))s — ear is deaf, rebuilding")
             rebuildEar()
             return
         }
@@ -750,20 +912,67 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     /// AUDIT FIX (SB-H1): full teardown and restart, keeping isListening true so
     /// the UI never flickers and the user never has to touch the phone.
-    private func rebuildEar() {
+    ///
+    /// AUDIT P0 (SB-LOOP + SB-RESET + SB-RETRY): throttled, self-change
+    /// suppressed, engine optionally replaced, and retried with backoff instead
+    /// of disarming on the first stumble. One transient mic-format failure
+    /// during a Bluetooth route change — which happens constantly with glasses
+    /// and a pocketed phone — used to kill the ear for the rest of the session.
+    /// - Parameters:
+    ///   - freshEngine: replace the AVAudioEngine outright. Required after a
+    ///     media-services reset, where the old instance is invalid by contract.
+    ///   - attempt: retry counter; 0 is the first try.
+    private func rebuildEar(freshEngine: Bool = false, attempt: Int = 0) {
+        // Throttle: one rebuild per 2 seconds, no matter how many notifications
+        // arrive. Retries are exempt — they are deliberately spaced already.
+        if attempt == 0, Date().timeIntervalSince(lastEarRebuild) < 2.0 {
+            print("👂 [Standby] Rebuild throttled")
+            return
+        }
+        lastEarRebuild = Date()
+
         task?.cancel(); task = nil
         request?.endAudio(); request = nil
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .spokenAudio,
-                                 options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
-        try? session.setActive(true)
-        if !startRecognition() {
-            // Genuinely can't come back — say so rather than pretending.
-            isListening = false
-            TTSService.shared.speak("Standby dropped out - tap the ear to bring me back.")
+
+        if freshEngine {
+            // Every node on the old engine is invalid after a reset. Replace it,
+            // and re-register the config-change observer on the NEW instance —
+            // the old registration was scoped to an object that no longer exists.
+            engine = AVAudioEngine()
+            reinstallConfigChangeObserver()
+            print("👂 [Standby] Engine replaced")
         }
+
+        // Suppress the config-change notification our own setCategory/setActive
+        // is about to cause, or we rebuild in response to our own rebuild.
+        suppressConfigChangeUntil = Date().addingTimeInterval(1.5)
+        let session = AVAudioSession.sharedInstance()
+        // Re-applying an identical configuration is itself a route event and
+        // buys nothing — only touch the session if it actually differs.
+        if session.category != .playAndRecord || session.mode != .spokenAudio {
+            try? session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                     options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
+        }
+        try? session.setActive(true)
+
+        if startRecognition() { return }
+
+        // Backoff: 0.6s, 1.5s, 3s. Three misses over ~5 seconds is a real
+        // failure; one miss is just iOS still settling a route.
+        let delays = [0.6, 1.5, 3.0]
+        if attempt < delays.count {
+            print("👂 [Standby] Rebuild attempt \(attempt + 1) failed — retrying in \(delays[attempt])s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delays[attempt]) { [weak self] in
+                guard let self, self.isListening else { return }
+                self.rebuildEar(freshEngine: false, attempt: attempt + 1)
+            }
+            return
+        }
+        // Genuinely can't come back — say so rather than pretending.
+        isListening = false
+        TTSService.shared.speak("Standby dropped out - tap the ear to bring me back.")
     }
 
     /// AUDIT FIX (SB-H1): Standby had NO interruption handling at all — Live AI
@@ -791,16 +1000,28 @@ final class ChappyStandby: NSObject, ObservableObject {
                         self.task?.cancel(); self.task = nil
                         self.request?.endAudio(); self.request = nil
                         if self.engine.isRunning { self.engine.stop() }
+                        // AUDIT P0 (SB-CALLKILL): this timer used to keep
+                        // running through the whole call. Within 50 seconds it
+                        // fired renew(), saw a stopped engine, and called
+                        // rebuildEar() WHILE the call still owned the session —
+                        // setActive failed, the mic format read 0 Hz, and the
+                        // ear disarmed itself. Then `.ended` guarded on
+                        // isListening, which was now false, and never recovered.
+                        // A phone call permanently killed the wake word.
+                        self.restartTimer?.invalidate(); self.restartTimer = nil
                         print("👂 [Standby] Interrupted — holding")
                     }
                 case .ended:
+                    // Drive recovery off the interruption flag, NOT isListening —
+                    // a failed rebuild during the call could have cleared it.
                     guard self.interruptedWhileListening else { return }
                     self.interruptedWhileListening = false
                     // iOS needs a beat after the interruption clears.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                        guard let self, self.isListening,
-                              !LiveAIManager.shared.isRunning else { return }
+                        guard let self, !LiveAIManager.shared.isRunning else { return }
+                        self.isListening = true // we are coming back; assert it
                         self.rebuildEar()
+                        self.restartRenewTimer()
                     }
                 @unknown default: break
                 }
@@ -812,19 +1033,77 @@ final class ChappyStandby: NSObject, ObservableObject {
                        object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isListening else { return }
-                print("👂 [Standby] Media services reset — rebuilding")
-                self.rebuildEar()
+                print("👂 [Standby] Media services reset — rebuilding from scratch")
+                // AUDIT P0 (SB-RESET): the old engine is invalid by Apple's
+                // contract. Restarting it was never going to work.
+                self.rebuildEar(freshEngine: true)
             }
         }
 
-        // Route changes (glasses connecting, AirPods, a cable) rebuild the graph.
-        nc.addObserver(forName: .AVAudioEngineConfigurationChange,
-                       object: engine, queue: .main) { [weak self] _ in
+        reinstallConfigChangeObserver()
+    }
+
+    /// AUDIT P0 (SB-LOOP): scoped to the CURRENT engine instance, so it has to be
+    /// re-registered whenever the engine is replaced. Also filters out the
+    /// changes we caused ourselves — without that, every rebuild triggers the
+    /// next one, and every TTS playback engine start re-enters here too.
+    private func reinstallConfigChangeObserver() {
+        NotificationCenter.default.removeObserver(self, name: .AVAudioEngineConfigurationChange, object: nil)
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine, queue: .main
+        ) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isListening, !self.awake, !self.busy else { return }
+                guard Date() >= self.suppressConfigChangeUntil else {
+                    print("👂 [Standby] Ignoring our own graph change")
+                    return
+                }
                 print("👂 [Standby] Audio graph changed — rebuilding")
                 self.rebuildEar()
             }
+        }
+    }
+
+    /// AUDIT P0 (SB-SELFTALK): the single worst bug in the layer. The mic tap
+    /// stays live while Chappy speaks, and `.spokenAudio` has no echo
+    /// cancellation (unlike the `.voiceChat` mode Translate deliberately uses),
+    /// so the recogniser reliably transcribes what comes out of the speaker.
+    /// heard() only SUPPRESSED ROUTING while isSpeaking was true — it never
+    /// flushed the transcript. SFSpeechRecognizer keeps one cumulative
+    /// transcript per task, so the moment the gate lifted, the next result
+    /// arrived carrying Chappy's own sentence and the wake-word scan found
+    /// "chappy" inside it. His own escape line — "Say: Chappy let's talk" —
+    /// therefore opened a metered Live AI session entirely by itself.
+    ///
+    /// The fix is to flush the ear when the VOICE stops, not when the command
+    /// routes, and to discard anything delivered from before that moment.
+    private func startSpeechWatch() {
+        speechWatch?.invalidate()
+        wasSpeaking = TTSService.shared.isSpeaking
+        speechWatch = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isListening else { return }
+                let now = TTSService.shared.isSpeaking
+                defer { self.wasSpeaking = now }
+                guard self.wasSpeaking, !now else { return }
+                // Voice just stopped. Give the speaker's decay a moment, then
+                // throw away everything the recogniser heard during the answer.
+                self.suppressTranscriptBefore = Date().addingTimeInterval(0.3)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.isListening, !self.awake, !self.busy else { return }
+                    print("🧹 [Standby] Flushing the ear after Chappy's own voice")
+                    self.resetRecognition()
+                }
+            }
+        }
+    }
+
+    /// The 50s renewal, in one place so the interruption handler can restart it.
+    private func restartRenewTimer() {
+        restartTimer?.invalidate()
+        restartTimer = Timer.scheduledTimer(withTimeInterval: 50, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.renew() }
         }
     }
 
@@ -844,9 +1123,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             return false
         }
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
             req.append(buffer)
+            // AUDIT P0 (SB-LIVENESS): the only honest proof that audio is
+            // actually reaching us. engine.isRunning stays true through most of
+            // the ways this ear dies; buffers stopping is what "deaf" looks like.
+            self?.lastBufferAt = Date()
         }
+        lastBufferAt = Date()
         if !engine.isRunning {
             engine.prepare()
             do { try engine.start() } catch {
@@ -887,6 +1171,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     // MARK: Hearing
 
     private func heard(_ text: String) {
+        // AUDIT P0 (SB-SELFTALK): anything delivered while Chappy was talking,
+        // or in the decay window straight after, is his own voice coming back
+        // through the speaker. Discard it without scanning for the wake word.
+        guard Date() >= suppressTranscriptBefore else { return }
         lastHeard = text
 
         // BARGE-IN LAW — with the self-interruption guard.
@@ -894,7 +1182,20 @@ final class ChappyStandby: NSObject, ObservableObject {
         // through the speaker and cuts him off mid-sentence, every sentence.
         // So while he is speaking, only DELIBERATE kill-words count; the
         // moment he's quiet, everything is heard normally.
-        if TTSService.shared.isSpeaking {
+        // SB-DEADLOCK FIX (belt and braces): this gate trusted a single Bool
+        // owned by another object. When that Bool stuck true, the ear went
+        // permanently deaf while the chip still read "Standby on" — armed,
+        // listening, and routing nothing. TTSService now can't stick, but the
+        // wake word is the last thing in the app that should ever depend on
+        // somebody else's flag being honest. If it claims to have been speaking
+        // for longer than any real utterance lasts, disbelieve it and hear.
+        var reallySpeaking = TTSService.shared.isSpeaking
+        if reallySpeaking, let since = TTSService.shared.speakingSince,
+           Date().timeIntervalSince(since) > 60 {
+            print("⚠️ [Standby] TTS has claimed to be speaking for over a minute — ignoring the gate")
+            reallySpeaking = false
+        }
+        if reallySpeaking {
             let killWords = ["chappy stop", "stop chappy", "shut up", "shush",
                              "be quiet", "quiet", "enough", "stop talking", "that's enough"]
             if killWords.contains(where: { text.hasSuffix($0) || text.contains($0) }) {
@@ -938,12 +1239,31 @@ final class ChappyStandby: NSObject, ObservableObject {
         // still routing used to run BOTH concurrently — two paid calls, two
         // voices, and a `busy` flag that stopped meaning anything.
         guard !busy else {
+            // AUDIT P1 (SB-BUSY): this dropped the command with no speech and no
+            // haptic. Wearing glasses with the phone pocketed, "heard and
+            // dropped" and "never heard at all" are indistinguishable — so he
+            // repeats himself into a void. Say something.
             print("👂 [Standby] Busy — dropped: \(raw)")
+            ChappyHaptics.shared.straightStep()
+            TTSService.shared.speak("Still working on the last one.")
+            // AUDIT P1 (SB-AWAKE): `awake` was left TRUE here. The next sentence
+            // was then routed with no wake word at all — an overheard
+            // conversation could fire a command — and renew() is guarded on
+            // `!awake`, so the ear also stopped renewing and went deaf inside a
+            // minute. Both from one dropped command.
+            awake = false
+            command = ""
+            routeWork?.cancel(); routeWork = nil
             return
         }
         let cmd = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
         awake = false
         command = ""
+        // AUDIT P1 (SB-DOUBLE): the debounce work item that scheduled this call
+        // was never cancelled once it fired, and a later partial result could
+        // schedule a second one carrying the same text — two photos, or two
+        // paid calls, from one spoken sentence.
+        routeWork?.cancel(); routeWork = nil
         guard !cmd.isEmpty else {
             TTSService.shared.speak("Yes?")
             resetRecognition()
@@ -979,7 +1299,17 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT FIX (P0): "Chappy, emergency" used to fall through to a 25s
         // network call. Standby is often the ONLY thing listening (screen
         // dark, phone pocketed) — that is exactly when this must be instant.
-        if c.contains("emergency") || c.contains("help me help me") || c.contains("i need help now") {
+        // AUDIT P1 (RG-SOS): bare contains("emergency") fired a REAL SOS —
+        // WhatsApp to the trusted contact with a live map pin — on "is there an
+        // emergency room near here" and "what's the emergency number in
+        // Indonesia". Imperative shapes only; questions about emergencies are
+        // not emergencies.
+        let sosShapes = ["emergency", "sos", "call for help", "help me help me",
+                         "i need help now", "i need an ambulance", "call an ambulance"]
+        let sosAsksAboutIt = c.hasPrefix("what") || c.hasPrefix("where") || c.hasPrefix("is there")
+            || c.hasPrefix("are there") || c.hasPrefix("how do") || c.contains("emergency room")
+            || c.contains("emergency number") || c.contains("emergency exit")
+        if !sosAsksAboutIt, sosShapes.contains(where: { c == $0 || c.hasPrefix($0 + " ") || c.hasSuffix(" " + $0) }) {
             runEmergencyFromStandby(); return
         }
 
@@ -1053,6 +1383,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("i'm lost") || c.contains("im lost") || c.contains("i am lost") {
             speak(TripRecorder.shared.lostReport()); return
         }
+        // AUDIT P1 (RG-MAP): "where am I on the map" was swallowed here by the
+        // broader "where am i" test and the map never opened. The map branch
+        // lives further down, so catch the map wording first.
+        if c.contains("on the map") || c.contains("show the map") || c.contains("show my trail")
+            || c.contains("show map") || c.contains("open the map") {
+            NotificationCenter.default.post(name: .chappyShowMap, object: nil)
+            speak("Map's up."); return
+        }
         if c.contains("where am i") || c.contains("what street") {
             speak(ContextEngine.shared.contextHeader()); return
         }
@@ -1085,8 +1423,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         // "help me talk to them" (20) hit translate — one character decided.
         if c.contains("what can i say") || c.contains("what can you do")
             || c.contains("commands")
-            || (c.contains("help me") && c.count < 20
-                && !c.contains("talk to") && !c.contains("figure") && !c.contains("work out")) {
+            // AUDIT P1 (RG-COACH): a length test decided this — "help me talk to
+            // her" (19) hit the coach, "help me talk to them" (20) didn't. Any
+            // "help me <verb>" is a real request, not a plea for the menu.
+            || (c == "help me" || c == "help") {
             speak(coachLine()); return
         }
         if c.contains("quiet mode") { UserDefaults.standard.set("quiet", forKey: "chappy_mode"); speak("Quiet mode."); return }
@@ -1153,6 +1493,13 @@ final class ChappyStandby: NSObject, ObservableObject {
             UserDefaults.standard.set("en", forKey: "translate_source_language")
             UserDefaults.standard.set(code, forKey: "translate_target_language")
             UserDefaults.standard.set(true, forKey: "translate_autostart")
+            // AUDIT P0 (MH-3): this stamp was READ by LiveTranslateViewModel and
+            // written NOWHERE. A missing key reads back as 0.0, the viewmodel's
+            // `stamp > 0` freshness check was therefore always false, and
+            // pendingAutostart could never become true. So "Chappy, translate"
+            // said "Go ahead" and then never started listening — the FS-17
+            // expiry guard silently disabled the whole feature it was guarding.
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
             speak("Translating English and \(Self.languageName(code)). Go ahead.")
             handOff()
             NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
@@ -1167,7 +1514,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("stop navigation") || c.contains("cancel navigation") {
             NavEngine.shared.stop(); speak("Navigation stopped."); return
         }
-        if c.contains("get me home") || c.contains("take me home") {
+        // AUDIT P1 (RG-HOME): only two phrasings were handled, so "take us
+        // home" at 2am fell all the way through to the either/or prompt.
+        if ["get me home", "take me home", "take us home", "get us home",
+            "walk me home", "walk us home", "head home", "go home", "get home",
+            "way home", "back to the hotel", "take us back to the hotel",
+            "navigate home"].contains(where: { c.contains($0) }) {
             speak("Finding your way home.")
             let reply = await NavEngine.shared.getHome()
             speak(reply); return
@@ -1175,7 +1527,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         if let dest = navDestination(in: c) {
             // AUDIT FIX: bare " car" forced driving on "walk me to the car
             // rental place"; anchored mode phrases only.
-            let driving = c.contains("drive me") || c.contains("driving to") || c.contains("by car")
+            // AUDIT P1 (RG-DRIVE): "drive us to the airport" (with his wife)
+            // matched no driving phrase and silently produced a 140-minute
+            // WALKING route to the airport.
+            let driving = c.contains("drive me") || c.contains("drive us")
+                || c.contains("driving to") || c.contains("by car")
+                || c.contains("by taxi") || c.contains("by grab")
                 || c.contains("via car") || c.contains("in the car") || c.contains("by scooter")
                 || c.contains("on the scooter") || c.contains("by motorbike") || c.contains("by taxi")
             // AUDIT FIX: "take me to home" bypassed the saved-home handler
@@ -1218,7 +1575,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT FIX: "read the menu" and "what does this sign say" — both in
         // the spec — used to fall through to a BLIND paid call that would
         // invent an answer. Matches the in-session bridge's breadth now.
-        if c.contains("read th") || c.contains("read it") || c.contains("read me")
+        if (c.hasPrefix("read th") || c.hasPrefix("read it") || c.contains("read this sign") || c.contains("read that sign") || c.contains("read the menu")) || c.contains("read it") || c.contains("read me")
             || c.contains("what does this say") || c.contains("what does that say")
             || (c.contains("what does") && c.contains("say")) {
             speak("Reading.")
@@ -1253,24 +1610,42 @@ final class ChappyStandby: NSObject, ObservableObject {
         // THE UNSURE RULE (spec'd, previously unbuilt): a bare noun is
         // ambiguous — "Chappy, sushi" could be find-me-one or tell-me-about.
         // Ask ONE either/or instead of guessing or burning a paid call.
+        // AUDIT P1 (SB-LOOP2): the ANSWER branch used to sit BELOW the ask, so a
+        // short reply — "find one", "tell me" — was itself ≤3 words and simply
+        // re-triggered the question. "Chappy, petrol station" → "find you one
+        // nearby, or tell you about it?" → "Chappy, find one" → "Find One -
+        // find you one nearby, or tell you about it?" forever. The either/or
+        // could not be answered by voice at all, which for a wearer with the
+        // phone in his pocket meant it could not be answered.
+        //
+        // AUDIT P1 (SB-STICKY): pendingAmbiguous also never expired. Ignore the
+        // question and walk on, and ten minutes later an unrelated command was
+        // answered as if it were the reply.
+        if let pending = pendingAmbiguous {
+            if Date().timeIntervalSince(ambiguousAskedAt) > 45 {
+                pendingAmbiguous = nil // stale — treat this as a fresh command
+            } else {
+                pendingAmbiguous = nil
+                let wantsNav = ["near", "find", "go", "take me", "one", "closest",
+                                "nearest", "there", "yes"].contains { c.contains($0) }
+                if wantsNav {
+                    speak("Finding \(pending).")
+                    let reply = await NavEngine.shared.navigate(to: pending, driving: false)
+                    speak(reply); return
+                }
+                await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
+                return
+            }
+        }
+
         let words = c.split(separator: " ")
         if words.count <= 3, !c.contains("?"),
            !c.hasPrefix("what"), !c.hasPrefix("how"), !c.hasPrefix("who"),
            !c.hasPrefix("when"), !c.hasPrefix("where"), !c.hasPrefix("why"),
            !c.hasPrefix("is "), !c.hasPrefix("are "), !c.hasPrefix("can ") {
             pendingAmbiguous = c
+            ambiguousAskedAt = Date()
             speak("\(c.capitalized) - find you one nearby, or tell you about it?")
-            return
-        }
-        // Answer to the either/or question
-        if let pending = pendingAmbiguous {
-            pendingAmbiguous = nil
-            if c.contains("near") || c.contains("find") || c.contains("go") || c.contains("take me") {
-                speak("Finding \(pending).")
-                let reply = await NavEngine.shared.navigate(to: pending, driving: false)
-                speak(reply); return
-            }
-            await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
             return
         }
 
@@ -1361,13 +1736,20 @@ final class ChappyStandby: NSObject, ObservableObject {
         if questionOpeners.contains(where: { c.hasPrefix($0) }) { return nil }
 
         // SIM FIX: "take us back to the hotel" matched no opener at all.
-        let openers = ["navigate me to ", "navigate us to ", "navigate to ",
+        // AUDIT P1 (RG-INFO): "closest"/"nearest" matched ANYWHERE, so "tell me
+        // about the nearest temple" and "what's the closest ATM like" started a
+        // live turn-by-turn route instead of answering. They only count as a
+        // navigation opener when the sentence isn't asking ABOUT the place.
+        let informational = ["tell me about", "what's", "whats", "what is", "how good",
+                             "any good", "is the", "are the", "which"]
+        let asksAbout = informational.contains { c.contains($0) }
+        var openers = ["navigate me to ", "navigate us to ", "navigate to ",
                        "take me back to ", "take us back to ", "get us back to ",
                        "take me to ", "take us to ", "walk me to ", "walk us to ",
                        "drive me to ", "drive us to ", "direct me to ", "guide me to ",
                        "get me directions to ", "directions to ", "get me to ",
-                       "route me to ", "route to ", "how do i get to ", "how do we get to ",
-                       "closest ", "nearest "]
+                       "route me to ", "route to ", "how do i get to ", "how do we get to "]
+        if !asksAbout { openers += ["closest ", "nearest "] }
         // Take the LAST opener match so lead-ins can't poison the destination
         var best: Range<String.Index>?
         for o in openers {
@@ -1378,14 +1760,20 @@ final class ChappyStandby: NSObject, ObservableObject {
         guard let hit = best else { return nil }
         var d = String(c[hit.upperBound...])
             .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
-        // Trailing mode/politeness words only
-        for junk in [" by car", " via car", " by scooter", " on foot", " on the scooter",
+        // AUDIT P1 (RG-MODE): mode phrases were stripped only from the END and
+        // the list was missing the ones he actually uses in Asia. "take me to
+        // Kuta Beach by taxi" searched Places for "kuta beach by taxi" and found
+        // nothing. Strip them wherever they appear — they are never part of a
+        // place name.
+        for junk in [" by car", " via car", " by scooter", " on the scooter", " by motorbike",
+                     " by taxi", " by grab", " by bike", " in the car", " on foot",
                      " walking", " driving", " please", " thanks", " thank you", " now"] {
-            while d.lowercased().hasSuffix(junk) {
-                d = String(d.dropLast(junk.count))
+            while let r = d.lowercased().range(of: junk) {
+                d = d.replacingCharacters(in: r, with: " ")
                     .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
             }
         }
+        d = d.replacingOccurrences(of: "  ", with: " ")
         // Clean the query the way the in-session bridge does
         for prefix in ["the ", "a ", "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
             d = String(d.dropFirst(prefix.count))
@@ -1478,7 +1866,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
         let picks = options.shuffled().prefix(4).joined(separator: ", or ")
         coachCount += 1
-        let tail = coachCount <= 2 ? " Say Chappy first, then the words." : ""
+        let tail = coachCount <= 2 ? " Use my name first, then the words." : ""
         return "Try: \(picks).\(tail)"
     }
 
@@ -1500,7 +1888,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         strikes += 1
         if strikes >= 2 {
             strikes = 0
-            TTSService.shared.speak("\(reason) Want me to open Live AI so we can talk it through? Say: Chappy let's talk.")
+            // AUDIT P0 (SB-SELFTALK): this line literally spoke the wake word plus a
+            // command, and the mic heard it. Never put the wake word inside
+            // something Chappy says out loud.
+            TTSService.shared.speak("\(reason) Want me to open Live AI so we can talk it through? Just say the word.")
         } else {
             TTSService.shared.speak("\(reason) Try me again?")
         }
