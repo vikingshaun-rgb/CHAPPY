@@ -93,7 +93,10 @@ class TTSService: NSObject, ObservableObject {
     // MARK: - Speaking-flag lifecycle (deadlock-proof)
 
     /// Claim the speaking flag and return the generation token that owns it.
-    @MainActor
+    /// NOT @MainActor: speak()/speakOffline call this synchronously from
+    /// nonisolated context and need the token back immediately — annotating it
+    /// was a compile error (build 69, caught at archive). State mutation here
+    /// matches the file's existing pattern: callers are main-thread in practice.
     private func beginSpeaking(estimatedCharacters: Int) -> Int {
         speechGeneration &+= 1
         let gen = speechGeneration
@@ -122,7 +125,8 @@ class TTSService: NSObject, ObservableObject {
     }
 
     /// Release the flag, but only if a newer utterance hasn't already claimed it.
-    @MainActor
+    /// Callers hop to the main thread via Task { @MainActor in ... } — the
+    /// method itself stays nonisolated so those Tasks compile.
     private func endSpeaking(_ gen: Int) {
         guard speechGeneration == gen else { return }
         isSpeaking = false
