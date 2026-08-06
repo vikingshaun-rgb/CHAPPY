@@ -156,17 +156,21 @@ class LiveTranslateService: NSObject {
 
         // A route change (headphones, glasses, the LOUD toggle) tears the graph
         // down. Rebuild at once rather than discovering it mid-sentence.
+        // BUILD 59 SAFETY: only mark the state stale here. Starting an engine
+        // from inside a configuration-change callback means touching a graph
+        // that CoreAudio is still rebuilding, and CoreAudio answers that with an
+        // exception rather than an error — an instant crash, not a caught
+        // failure. The next audio chunk rebuilds it safely instead.
         NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: playbackEngine, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            print("🔧 [Translate] Playback graph changed — re-arming")
+            print("🔧 [Translate] Playback graph changed — will re-arm on next audio")
             self.isPlaybackEngineRunning = false
             self.hasStartedPlaying = false
             self.pendingPlaybackBuffers = 0
             self.lastPlaybackChangeAt = Date()
-            self.ensurePlaybackReady()
         }
 
         print("✅ [Translate] Playback engine initialized: Float32 @ 24kHz")
@@ -436,9 +440,13 @@ class LiveTranslateService: NSObject {
     func setLoudSpeaker(_ on: Bool) {
         loudSpeaker = on
         applyOutputRoute()
-        // Changing the output port IS a route change — re-arm before the next
-        // chunk arrives, or the first sentence after the toggle is lost.
-        ensurePlaybackReady()
+        // BUILD 59 SAFETY: mark stale, don't restart here. setLoudSpeaker can be
+        // called before the audio session is configured at all, and starting an
+        // engine against an unconfigured session is a crash, not an error.
+        isPlaybackEngineRunning = false
+        hasStartedPlaying = false
+        pendingPlaybackBuffers = 0
+        lastPlaybackChangeAt = Date()
         // Louder into the room means more of it comes back down the mic.
         echoTailSeconds = (bluetoothInputAvailable && !on) ? Self.tailOnHeadset : Self.tailOnSpeaker
         print("🔈 [Translate] Loudspeaker \(on ? "ON" : "off") — echo tail \(echoTailSeconds)s")
@@ -938,6 +946,8 @@ class LiveTranslateService: NSObject {
             }
         }
 
+        // Only ever talk to a node that is attached to a RUNNING engine.
+        guard engine.isRunning, node.engine != nil else { return false }
         if !node.isPlaying {
             node.play()
             hasStartedPlaying = true
@@ -960,9 +970,16 @@ class LiveTranslateService: NSObject {
         //
         // Now we count buffers and let the audio engine tell us when the last one
         // has ACTUALLY been played. No arithmetic, no assumption.
+        guard let node = playerNode, node.engine != nil,
+              playbackEngine?.isRunning == true, node.isPlaying else {
+            // BUILD 59 SAFETY: scheduling into a stopped or detached node throws
+            // an ObjC exception straight through Swift. Drop the chunk instead.
+            print("⚠️ [Translate] Playback not ready — dropping an audio chunk")
+            return
+        }
         pendingPlaybackBuffers += 1
         lastPlaybackChangeAt = Date()
-        playerNode?.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+        node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
             self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
             self.lastPlaybackChangeAt = Date()
