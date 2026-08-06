@@ -18,6 +18,9 @@ class LiveTranslateViewModel: ObservableObject {
     /// BUILD 56: line released to save resources. Everything on screen still
     /// works — tapping the mic brings it straight back.
     @Published var isAsleep = false
+    /// SB-4: the line is gone and we are not coming back on our own. Distinct
+    /// from asleep, which is a deliberate, cheap, instantly-recoverable state.
+    @Published var lostConnection = false
     // AUDIT FIX support: autostart is consumed once, cost is metered
     private var pendingAutostart = false
     private var suppressSettingsPush = false
@@ -53,6 +56,13 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Settings (persisted)
     @Published var sourceLanguage: TranslateLanguage {
         didSet {
+            guard sourceLanguage != oldValue else { return }
+            // FS-6: source == target is an interpreter that repeats every
+            // speaker back to themselves. Enforce it on every change, not once
+            // at connect — the two lists in Settings are adjacent and identical.
+            if sourceLanguage == targetLanguage {
+                targetLanguage = (sourceLanguage == .en) ? .id : .en
+            }
             UserDefaults.standard.set(sourceLanguage.rawValue, forKey: "translate_source_language")
             updateServiceSettings()
         }
@@ -61,6 +71,9 @@ class LiveTranslateViewModel: ObservableObject {
     @Published var targetLanguage: TranslateLanguage {
         didSet {
             guard targetLanguage != oldValue else { return }
+            if targetLanguage == sourceLanguage {
+                sourceLanguage = (targetLanguage == .en) ? .id : .en
+            }
             UserDefaults.standard.set(targetLanguage.rawValue, forKey: "translate_target_language")
             // BUILD 58: mark the change in the transcript rather than silently
             // continuing. Two languages interleaved with no visible break reads
@@ -86,6 +99,10 @@ class LiveTranslateViewModel: ObservableObject {
 
     @Published var audioOutputEnabled: Bool {
         didSet {
+            // FS-12: without this, "Chappy, speak" when speech was already on
+            // tore the socket down and rebuilt it — deaf through the handshake,
+            // mid-conversation, for a value the server never even sees.
+            guard audioOutputEnabled != oldValue else { return }
             UserDefaults.standard.set(audioOutputEnabled, forKey: "translate_audio_enabled")
             updateServiceSettings()
         }
@@ -93,7 +110,15 @@ class LiveTranslateViewModel: ObservableObject {
 
     @Published var imageEnhanceEnabled: Bool {
         didSet {
+            guard imageEnhanceEnabled != oldValue else { return }
             UserDefaults.standard.set(imageEnhanceEnabled, forKey: "translate_image_enhance")
+            // FS-5: the timer was only ever started from startRecording(), so
+            // flipping this mid-conversation spun the glasses camera up, kept
+            // the screen awake and converted frames — and sent none of them.
+            // Full cost, zero benefit.
+            if isRecording {
+                imageEnhanceEnabled ? startImageTimer() : stopImageTimer()
+            }
         }
     }
 
@@ -110,6 +135,7 @@ class LiveTranslateViewModel: ObservableObject {
     /// of a landlord, an immigration officer or a policeman.
     @Published var politeMode: Bool {
         didSet {
+            guard politeMode != oldValue else { return }
             UserDefaults.standard.set(politeMode, forKey: "translate_polite")
             updateServiceSettings()
         }
@@ -141,6 +167,11 @@ class LiveTranslateViewModel: ObservableObject {
     private var pendingSettingsPush = false
     private var settingsPushTimer: Timer?
     private var lastStreamActivityAt = Date.distantPast
+    /// SB-3: per-minute cost banking and the recording cap.
+    private var costTimer: Timer?
+    /// FS-4: when the newest camera frame actually arrived.
+    private var lastFrameAt = Date.distantPast
+    private var recordedMinutes: Double = 0
 
     // MARK: - Init
 
@@ -208,8 +239,16 @@ class LiveTranslateViewModel: ObservableObject {
         // early dismiss) left it true — and days later a manual visit to
         // Translate would start recording by itself. Read and clear here,
         // before anything can fail.
+        // FS-17: this was a bare Bool written before the screen was known to
+        // open. If another cover was already up SwiftUI dropped the
+        // presentation, the flag survived app restarts, and days later opening
+        // Translate by button started the microphone and the meter with no tap.
+        // It expires now.
+        let stamp = UserDefaults.standard.double(forKey: "translate_autostart_at")
         pendingAutostart = UserDefaults.standard.bool(forKey: "translate_autostart")
+            && stamp > 0 && Date().timeIntervalSince1970 - stamp < 60
         UserDefaults.standard.set(false, forKey: "translate_autostart")
+        UserDefaults.standard.removeObject(forKey: "translate_autostart_at")
 
         // BUILD 54: Source and Target were the wrong way round — Source is
         // meant to be the language YOU speak, and it was set to Indonesian on a
@@ -219,10 +258,16 @@ class LiveTranslateViewModel: ObservableObject {
         // should have to know that. If the target matches the phone's own
         // language and the source doesn't, they're back to front — turn them
         // around before the session starts.
-        // Your saved pair first; the automatic correction only runs if you
-        // haven't set one.
-        applyOwnDefault()
-        autoOrientToPhoneLanguage()
+        // FS-7: waking from idle sleep re-ran all of this, silently undoing an
+        // auto-retarget or a manual swap made during the conversation that is
+        // STILL ON SCREEN, and restamping the header so it claimed the
+        // conversation began after the pause it was displaying. Orientation and
+        // the header belong to the start of a session, not to a resume.
+        let resuming = !transcript.isEmpty
+        if !resuming {
+            applyOwnDefault()
+            autoOrientToPhoneLanguage()
+        }
 
         // AUDIT FIX (HIGH): a fresh install defaults to en↔en — an interpreter
         // that repeats you back to yourself. Never let source == target.
@@ -246,9 +291,12 @@ class LiveTranslateViewModel: ObservableObject {
             ChappyStandby.shared.handOff()
         }
 
-        // TRANSCRIPT v2: stamp the session header once, at the top.
-        sessionStartedAt = Date()
-        sessionPlace = Self.placeString()
+        // TRANSCRIPT v2: stamp the session header once, at the top — and only
+        // for a genuinely new session (FS-7).
+        if !resuming {
+            sessionStartedAt = Date()
+            sessionPlace = Self.placeString()
+        }
 
         translateService = LiveTranslateService(apiKey: apiKey)
         translateService?.politeMode = politeMode
@@ -267,6 +315,8 @@ class LiveTranslateViewModel: ObservableObject {
 
     func disconnect() {
         stopImageTimer()
+        stopCostCheckpoint()
+        recordedMinutes = 0
         idleTimer?.invalidate()
         idleTimer = nil
         isAsleep = false
@@ -305,19 +355,30 @@ class LiveTranslateViewModel: ObservableObject {
     func startRecording() {
         // BUILD 56: asleep? Wake up first, then start listening the moment the
         // line is live. You just tap the mic; you never see the difference.
-        if isAsleep {
+        if isAsleep || lostConnection {
             resumeRecordingOnConnect = true
+            lostConnection = false
             connect()
             return
         }
         idleTimer?.invalidate(); idleTimer = nil
+        startCostCheckpoint()
         // BUILD 56 FIX: the meter used to start the clock when the SCREEN
         // opened. An hour with Translate sitting open and nobody talking was
         // billed as an hour of live interpreting. Gemini charges for audio, not
         // for an idle socket — so the clock starts when the microphone does.
         sessionStartAt = Date()
         translateService?.setLoudSpeaker(loudSpeaker)
-        translateService?.startRecording(usePhoneMic: usePhoneMic)
+        // FS-14: this used to set isRecording unconditionally — a red button, a
+        // running cost clock and a suppressed idle countdown for a microphone
+        // that never opened.
+        guard translateService?.startRecording(usePhoneMic: usePhoneMic) == true else {
+            print("❌ [TranslateVM] Microphone did not open")
+            sessionStartAt = nil
+            stopCostCheckpoint()
+            startIdleCountdown()
+            return
+        }
         isRecording = true
 
         // If image input enabled, start the periodic image timer
@@ -329,6 +390,7 @@ class LiveTranslateViewModel: ObservableObject {
     func stopRecording() {
         translateService?.stopRecording()
         isRecording = false
+        stopCostCheckpoint()
         // Bank only the minutes the microphone was actually open.
         if let start = sessionStartAt {
             CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(start))
@@ -385,8 +447,15 @@ class LiveTranslateViewModel: ObservableObject {
 
     // MARK: - Video Frame
 
-    func updateVideoFrame(_ frame: UIImage) {
+    /// FS-4: takes an optional now. StreamSessionViewModel nils its frame when
+    /// the stream stops, but the forwarder only passed non-nil through and this
+    /// took a non-optional — so there was no way to clear it. Glasses go flat
+    /// mid-session and the 0.5s timer kept uploading the same dead JPEG, about
+    /// 7,200 identical billed images an hour, while telling the interpreter
+    /// about a scene you stopped looking at an hour ago.
+    func updateVideoFrame(_ frame: UIImage?) {
         currentVideoFrame = frame
+        lastFrameAt = frame == nil ? .distantPast : Date()
     }
 
     // MARK: - Private Methods
@@ -400,6 +469,7 @@ class LiveTranslateViewModel: ObservableObject {
                 // ("Chappy, translate"), start listening the moment the line
                 // is live — no buttons, mid-conversation ready.
                 self?.isAsleep = false
+                self?.lostConnection = false
                 if self?.pendingAutostart == true {
                     self?.pendingAutostart = false
                     self?.startRecording()
@@ -433,9 +503,14 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.onTurnComplete = { [weak self] heard, translated in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.appendTurn(heard: heard, translated: translated)
+                // SB-5: cleared on every completed turn now, including the
+                // silent ones. They used to leave their text frozen in the live
+                // bubble, concatenating all session — which in turn wedged
+                // isIdleMoment false forever and stranded every queued setting.
                 self.streamingOriginal = ""
+                self.streamingTranslation = ""
                 self.lastStreamActivityAt = Date()
+                self.appendTurn(heard: heard, translated: translated)
             }
         }
 
@@ -449,6 +524,21 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.onAudioDone = { [weak self] in
             DispatchQueue.main.async {
                 print("🔊 [TranslateVM] audio playback done")
+            }
+        }
+
+        // SB-4: the line is genuinely gone and we are not coming back on our
+        // own. Without this the pill kept saying "Listening" into a dead socket
+        // while every buffer was silently discarded — and still billed.
+        translateService?.onDisconnected = { [weak self] message in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.isRecording { self.stopRecording() }
+                self.isConnected = false
+                self.isAsleep = true
+                self.lostConnection = true
+                self.errorMessage = message
+                self.showError = UIApplication.shared.applicationState == .active
             }
         }
 
@@ -530,6 +620,45 @@ class LiveTranslateViewModel: ObservableObject {
             || route.inputs.contains { types.contains($0.portType) }
     }
 
+    // MARK: - Session cap and cost checkpoint (SB-3)
+
+    /// SB-3: cost was banked ONLY when you pressed Stop or closed the screen. A
+    /// crash, a jetsam kill on a hot phone, or a force-quit lost the entire
+    /// span — Google billed you and your own meter recorded nothing. Worse, the
+    /// spend warnings only fire when the meter moves, so they could never fire
+    /// during the session doing the spending. Bank every minute instead.
+    ///
+    /// And cap it. The background handler deliberately keeps a headset session
+    /// alive when you pocket the phone — correct behaviour, but with no ceiling
+    /// an interrupted market conversation could stream for eight hours at about
+    /// five cents a minute with nothing on screen.
+    private static let maxRecordingMinutes: Double = 45
+
+    private func startCostCheckpoint() {
+        costTimer?.invalidate()
+        costTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isRecording, let start = self.sessionStartAt else { return }
+                // Bank the minute that just passed and restart the clock, so a
+                // crash can never cost more than 60 seconds of unrecorded spend.
+                CostMeter.shared.addLiveSeconds(Date().timeIntervalSince(start))
+                self.sessionStartAt = Date()
+                self.recordedMinutes += 1
+
+                if self.recordedMinutes >= Self.maxRecordingMinutes {
+                    print("⏹️ [TranslateVM] Session cap reached — stopping")
+                    self.say("That's forty-five minutes of interpreting - I'm stopping to protect your credit. Tap the mic to carry on.")
+                    self.stopRecording()
+                }
+            }
+        }
+    }
+
+    private func stopCostCheckpoint() {
+        costTimer?.invalidate()
+        costTimer = nil
+    }
+
     // MARK: - Idle sleep (BUILD 56)
 
     /// BUILD 56: the socket used to open the instant the screen appeared and
@@ -552,6 +681,9 @@ class LiveTranslateViewModel: ObservableObject {
     /// and your phrases are all local — none of them need a connection.
     private func sleepSession() {
         print("😴 [TranslateVM] Idle — releasing the session")
+        // WATCH-LIST: idle sleep saved the API bill but left the glasses camera
+        // at 15fps and the screen awake, on a phone already hot in Indonesia.
+        stopImageTimer()
         translateService?.disconnect()
         translateService = nil
         isConnected = false
@@ -559,6 +691,31 @@ class LiveTranslateViewModel: ObservableObject {
         idleTimer?.invalidate()
         idleTimer = nil
     }
+
+    // MARK: - Speech (FS-3)
+
+    /// FS-3: audioOutputEnabled was consulted in exactly ONE place — the live
+    /// audio stream. Every other spoken line went straight to TTSService, so
+    /// "SPEAK off" still announced "They're speaking Javanese. Switching." out
+    /// loud in a temple, still spoke every bubble tap, every saved phrase and
+    /// every big-text "Say it". The control's own label promises a silent,
+    /// reading-only interpreter. Everything Translate says now goes through
+    /// here, and confirmations of your own commands are the only exemption —
+    /// you need to hear that a command landed.
+    func say(_ text: String, languageCode: String? = nil, isConfirmation: Bool = false) {
+        guard audioOutputEnabled || isConfirmation else {
+            print("🔇 [TranslateVM] Silent mode — not speaking: \(text.prefix(40))")
+            return
+        }
+        if let code = languageCode {
+            TTSService.shared.speakOffline(text, languageCode: code)
+        } else {
+            TTSService.shared.speak(text)
+        }
+    }
+
+    /// A tap while speaking should stop, not restart (FS-11).
+    func stopSpeaking() { TTSService.shared.stop() }
 
     // MARK: - Saved phrases
 
@@ -587,7 +744,12 @@ class LiveTranslateViewModel: ObservableObject {
     /// Speak a saved phrase out loud in their language. Works with no session
     /// running and no signal — the words are already on the phone.
     func speakPhrase(_ phrase: SavedPhrase) {
-        TTSService.shared.speak(phrase.foreign)
+        // FS-11: SavedPhrase has stored languageCode since the day it was
+        // written and nothing ever read it. Using it means the system voice can
+        // speak straight away with no network round trip — which is what the UI
+        // has been promising.
+        if TTSService.shared.isSpeaking { stopSpeaking(); return }
+        say(phrase.foreign, languageCode: phrase.languageCode)
     }
 
     private func updateServiceSettings() {
@@ -613,6 +775,10 @@ class LiveTranslateViewModel: ObservableObject {
     /// speaking, and it's been quiet for long enough to be a real gap rather
     /// than a breath between words.
     private var isIdleMoment: Bool {
+        // SB-5: staleness escape. If nothing has streamed for two seconds the
+        // moment is idle whatever is left sitting in the buffers, so a stuck
+        // one can never strand a queued setting for the rest of the session.
+        if Date().timeIntervalSince(lastStreamActivityAt) > 2.0 { return true }
         guard streamingOriginal.isEmpty, streamingTranslation.isEmpty else { return false }
         guard !TTSService.shared.isSpeaking else { return false }
         return Date().timeIntervalSince(lastStreamActivityAt) >= 0.8
@@ -668,6 +834,9 @@ class LiveTranslateViewModel: ObservableObject {
 
     private func sendCurrentFrame() {
         guard imageEnhanceEnabled, let frame = currentVideoFrame else { return }
+        // Freshness check covers the silent-stall case that nil-forwarding
+        // alone does not: the frame is still there, it is just old.
+        guard Date().timeIntervalSince(lastFrameAt) < 1.5 else { return }
         translateService?.sendImageFrame(frame)
     }
 
@@ -679,121 +848,154 @@ class LiveTranslateViewModel: ObservableObject {
     /// the mic hint when the sentence is too short to call.
     // MARK: - Verbal repeat (BUILD 54)
 
-    /// English repeat wording. On its own this is NOT enough to be a command —
-    /// "can you repeat that?" is a perfectly normal thing to say to the person
-    /// opposite, and swallowing it would leave them staring at you in silence.
-    /// Your name is what makes it an instruction.
-    private static let repeatWordsEN: [String] = [
+    /// SB-6: commands are matched on WORD BOUNDARIES against whole phrases, and
+    /// the utterance must START with your name. The old matcher was a bare
+    /// `contains` over the whole sentence, which meant "Chappy, is it going to
+    /// be cloudy?" turned the loudspeaker on, "Chappy, does he speak English?"
+    /// undid your mute, and "Chappy, don't talk to him" turned the voice ON — a
+    /// direct inversion of what you asked for.
+    private static func commandTail(_ text: String) -> [String]? {
+        let cleaned = text.lowercased()
+            .filter { $0.isLetter || $0.isWhitespace || $0.isNumber }
+            .trimmingCharacters(in: .whitespaces)
+        var tokens = cleaned.split(separator: " ").map(String.init)
+        guard let first = tokens.first else { return nil }
+        guard first == "chappy" || first == "chappie" || first == "chappys" else { return nil }
+        tokens.removeFirst()
+        // Drop pure politeness so "Chappy, could you please be quiet" still lands.
+        tokens.removeAll { ["please", "can", "you", "could", "would", "just", "now"].contains($0) }
+        guard !tokens.isEmpty, tokens.count <= 6 else { return nil }
+        return tokens
+    }
+
+    /// Words that can sit around a command without changing it into a sentence.
+    private static let connectors: Set<String> = [
+        "be", "the", "it", "a", "to", "my", "him", "her", "them", "up", "again", "mode",
+        // Direction words: they qualify a command rather than turning it into a
+        // sentence ("pronunciation off", "speaker on", "no talking").
+        "on", "off", "no", "show", "hide", "stop"
+    ]
+
+    /// Does the tail MEAN this phrase — i.e. contain it on word boundaries, with
+    /// nothing left over but connectors?
+    ///
+    /// SB-6 (second pass): matching the phrase anywhere in the tail still let
+    /// "Chappy, does he speak English?", "Chappy, tell him this is private
+    /// property" and "Chappy, ask him again" fire as commands. Those are things
+    /// you say ABOUT someone, not TO the app. A command is an imperative with
+    /// nothing else in it; anything carrying a verb like "tell", "ask" or "does"
+    /// is a sentence and belongs to the person in front of you.
+    private static func has(_ tokens: [String], _ phrase: String) -> Bool {
+        let want = phrase.split(separator: " ").map(String.init)
+        guard !want.isEmpty, tokens.count >= want.count else { return false }
+        for i in 0...(tokens.count - want.count) where Array(tokens[i..<(i + want.count)]) == want {
+            var leftover = tokens
+            leftover.removeSubrange(i..<(i + want.count))
+            if leftover.allSatisfy({ connectors.contains($0) }) { return true }
+        }
+        return false
+    }
+
+    /// English repeat wording — whole phrases in the tail after your name.
+    private static let repeatPhrasesEN: [String] = [
         "say that again", "say it again", "repeat that", "repeat it",
         "repeat", "one more time", "again", "play that again", "come again"
     ]
 
-    /// The other person doesn't know Chappy exists, so they can't address it by
-    /// name. For them, a bare repeat word IS the command — and replaying the
-    /// last line is exactly what they're asking for anyway. Exact match only,
-    /// so "sekali lagi" mid-sentence while ordering doesn't trigger it.
-    /// AUDIT FIX (TR-H1): "sorry" was in this list. You say sorry constantly —
-    /// bumping someone, squeezing past, declining a tout — and every one of
-    /// them would have been eaten as a command instead of translated. Gone.
+    /// SB-6: "maaf" is GONE. It is the most common Indonesian courtesy word —
+    /// sorry, excuse me — and a complete utterance on its own. A vendor saying
+    /// just "Maaf." triggered a replay and was never filed as a bubble; and
+    /// because attribution comes from the output language, YOUR OWN "maaf" came
+    /// back as English "Sorry", was attributed to them, and fired the replay
+    /// too. That is precisely the bug removing English "sorry" was meant to fix.
     private static let repeatWordsLocal: [String] = [
-        "ulangi", "tolong ulangi", "ulangi lagi", "sekali lagi",
-        "bisa ulangi", "maaf", "apa"
+        "ulangi", "tolong ulangi", "ulangi lagi", "sekali lagi", "bisa ulangi",
+        "apa",
+        "อีกครั้ง", "พูดอีกที", "nhac lai", "nhắc lại"
     ]
 
-    /// BUILD 57: hands-free control of every toggle on the screen. Returns true
-    /// when the utterance was a command and has been handled — the caller then
-    /// files no bubble and the interpreter, which has been told to stay silent
-    /// on these, has already said nothing.
-    ///
-    /// Order matters here: "speaker off" contains "speak", and "loudspeaker"
-    /// contains both "loud" and "speak", so the narrower cases are tested first.
+    /// Is this an instruction to the app, or something to translate?
+    private static func isRepeatCommand(_ text: String, spokenByWearer: Bool) -> Bool {
+        if let tail = commandTail(text) {
+            return repeatPhrasesEN.contains { has(tail, $0) }
+        }
+        // The local shortcuts belong to the LOCAL — they can't say your name.
+        guard !spokenByWearer else { return false }
+        let t = text.lowercased()
+            .filter { !$0.isPunctuation }
+            .trimmingCharacters(in: .whitespaces)
+        return repeatWordsLocal.contains(t)
+    }
+
     @discardableResult
     private func handleSettingCommand(_ text: String) -> Bool {
-        let t = text.lowercased().filter { $0.isLetter || $0.isWhitespace }
-            .trimmingCharacters(in: .whitespaces)
-        guard t.contains("chappy") || t.contains("chappie"), t.count <= 46 else { return false }
+        guard let tail = Self.commandTail(text) else { return false }
+        func has(_ p: String) -> Bool { Self.has(tail, p) }
 
-        // Register
-        if t.contains("polite") || t.contains("formal") || t.contains("respectful") {
+        if has("polite") || has("formal") || has("respectful") {
             politeMode = true
-            TTSService.shared.speak("Polite from here.")
+            say("Polite from here.", isConfirmation: true)
             return true
         }
-        if t.contains("casual") || t.contains("relax") || t.contains("informal") {
+        if has("casual") || has("relaxed") || has("informal") {
             politeMode = false
-            TTSService.shared.speak("Casual from here.")
+            say("Casual from here.", isConfirmation: true)
             return true
         }
 
-        // Silence — checked before anything containing "speak". Note the
-        // unmute guard: "unmute" contains "mute", so without it the command to
-        // turn speech back ON would have turned it off.
-        if !t.contains("unmute"),
-           t.contains("quiet") || t.contains("silent") || t.contains("mute")
-            || t.contains("stop talking") || t.contains("shush")
-            || t.contains("dont speak") || t.contains("no voice")
-            || t.contains("text only") || t.contains("read only") {
+        // Silence. SB-6: "dont talk", "no talking" and "stop speaking" were all
+        // missing, so they fell through to the speech-ON branch below and did
+        // the exact opposite of what was asked.
+        if has("quiet") || has("silent") || has("mute") || has("shush")
+            || has("stop talking") || has("dont talk") || has("do not talk")
+            || has("no talking") || has("stop speaking") || has("dont speak")
+            || has("no voice") || has("text only") || has("read only") {
             audioOutputEnabled = false
-            // The last thing it says before going quiet, deliberately.
-            TTSService.shared.speak("Silent. I'll write it, not say it.")
+            say("Silent. I'll write it, not say it.", isConfirmation: true)
             return true
         }
 
-        // Back to the glasses / private.
-        if t.contains("speaker off") || t.contains("glasses only")
-            || t.contains("private") || t.contains("headphone")
-            || t.contains("in my ear") {
+        if has("speaker off") || has("glasses only") || has("glasses")
+            || has("private") || has("headphones") || has("in my ear") {
             loudSpeaker = false
-            TTSService.shared.speak("Back to your glasses.")
+            say("Back to your glasses.", isConfirmation: true)
             return true
         }
 
-        // Loudspeaker on — implies speech is on at all.
-        if t.contains("loud") || t.contains("speaker on") || t.contains("speak up") {
+        // "out loud" first — it used to be dead code behind the bare "loud".
+        if has("out loud") || has("loud") || has("loudspeaker")
+            || has("speaker on") || has("speak up") {
             audioOutputEnabled = true
             loudSpeaker = true
-            TTSService.shared.speak("Loudspeaker on.")
+            say("Loudspeaker on.", isConfirmation: true)
             return true
         }
 
-        // Speech back on.
-        if t.contains("speak") || t.contains("talk") || t.contains("unmute")
-            || t.contains("out loud") || t.contains("voice on") {
+        if has("speak") || has("talk") || has("unmute") || has("voice on") {
             audioOutputEnabled = true
-            TTSService.shared.speak("Speaking again.")
+            say("Speaking again.", isConfirmation: true)
             return true
         }
 
-        // Pronunciation line.
-        if t.contains("pronunciation") || t.contains("pronounce")
-            || t.contains("phonetic") || t.contains("pinyin") || t.contains("romaji") {
+        // SB-6: this was a blind toggle that ignored the on/off word, so
+        // "Chappy, pronunciation off" turned it ON whenever it was already off.
+        if has("pronunciation") || has("pronounce") || has("phonetic")
+            || has("pinyin") || has("romaji") {
             let key = "translate_show_pronunciation"
-            let now = !(UserDefaults.standard.object(forKey: key) as? Bool ?? true)
-            UserDefaults.standard.set(now, forKey: key)
-            TTSService.shared.speak(now ? "Pronunciation on." : "Pronunciation off.")
+            let current = (UserDefaults.standard.object(forKey: key) as? Bool) ?? true
+            // Direction is a plain token check — has() requires the leftover to
+            // be connectors only, which "pronunciation" is not, so it would
+            // never see the on/off word and every command became a blind toggle.
+            let wantsOff = tail.contains("off") || tail.contains("hide")
+                || tail.contains("no") || tail.contains("stop")
+            let wantsOn = tail.contains("on") || tail.contains("show")
+            let next = wantsOff ? false : (wantsOn ? true : !current)
+            UserDefaults.standard.set(next, forKey: key)
+            say(next ? "Pronunciation on." : "Pronunciation off.", isConfirmation: true)
             return true
         }
 
         return false
-    }
-
-    /// Is this an instruction to the app, or something to translate?
-    private static func isRepeatCommand(_ text: String, spokenByWearer: Bool) -> Bool {
-        let t = text.lowercased().filter { $0.isLetter || $0.isWhitespace }
-            .trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty, t.count <= 34 else { return false }
-
-        // English: only ever a command when you say the name. Everything else
-        // goes to the person you're talking to, which is the whole point.
-        if t.contains("chappy") || t.contains("chappie") {
-            return repeatWordsEN.contains { t.contains($0) }
-        }
-
-        // AUDIT FIX (TR-H1): the local shortcuts belong to the LOCAL. When it's
-        // you speaking, only your name counts — otherwise a single word you
-        // happen to say gets swallowed instead of translated.
-        guard !spokenByWearer else { return false }
-        return repeatWordsLocal.contains(t)
     }
 
     /// Replay the last thing the OTHER person's side produced. If you ask, you
@@ -805,11 +1007,11 @@ class LiveTranslateViewModel: ObservableObject {
         let spoken = transcript.filter { !$0.isDivider }
         let wanted = spoken.last(where: { $0.fromWearer != askedByWearer }) ?? spoken.last
         guard let turn = wanted, !turn.translated.isEmpty else {
-            TTSService.shared.speak("Nothing to repeat yet.")
+            say("Nothing to repeat yet.", isConfirmation: true)
             return
         }
         print("🔁 [TranslateVM] Verbal repeat — replaying: \(turn.translated.prefix(40))")
-        TTSService.shared.speak(turn.translated)
+        say(turn.translated)
     }
 
     private func appendTurn(heard: String, translated: String) {
@@ -841,6 +1043,15 @@ class LiveTranslateViewModel: ObservableObject {
             fromWearer = Self.sameLanguage(lang, sourceLanguage.rawValue)
         }
         if detected == nil { detected = Self.identify(cleanTranslated) }
+
+        // FS-10: identify() gives up under four characters, so "Ya", "Ok",
+        // "No" and bare numbers fell back to the static mic hint and always
+        // landed on the same side — on the glasses mic every "Ya" the vendor
+        // said appeared as YOU. In a haggle those short turns are most of the
+        // conversation. Conversations alternate: inherit the opposite side.
+        if detected == nil, let last = transcript.last(where: { !$0.isDivider }) {
+            fromWearer = !last.fromWearer
+        }
 
         // VERBAL REPEAT: catch it before it becomes a bubble. The interpreter
         // has been told to stay silent on these, so nothing was spoken over it.
@@ -877,8 +1088,11 @@ class LiveTranslateViewModel: ObservableObject {
         // — and the translation is then a faithful rendering of a sentence you
         // never said. That's how "그렇지. 딱이지?" appeared on a German session.
         // Flag it rather than presenting nonsense as though it were real.
+        // FS-10: this used to check only YOUR side, so a third-language
+        // mistranscription of THEIR speech was drawn undimmed with no warning —
+        // exactly what the flag exists to prevent.
         var misheard = false
-        if fromWearer, let d = detected,
+        if let d = detected,
            !Self.sameLanguage(d, sourceLanguage.rawValue),
            !Self.sameLanguage(d, targetLanguage.rawValue) {
             misheard = true
@@ -1036,8 +1250,19 @@ class LiveTranslateViewModel: ObservableObject {
     /// than our enum does. Translate between the two, or give up honestly.
     private static func language(fromDetected code: String?) -> TranslateLanguage? {
         guard let code else { return nil }
-        var short = String(code.prefix(2)).lowercased()
-        if short == "tl" { short = "fil" }          // Apple's Tagalog, our Filipino
+        // FS-8: match the FULL code first — "yue" was truncated to "yu" and
+        // lost. Then Apple's spellings: it reports Indonesian as Malay far more
+        // often than "id", and every one of those was zeroing the retarget
+        // counter with exactly the detections it needed to accumulate.
+        let full = code.lowercased()
+        if let exact = TranslateLanguage(rawValue: full) { return exact }
+        var short = String(full.prefix(2))
+        switch short {
+        case "tl": short = "fil"
+        case "ms": short = "id"
+        case "yu": short = "yue"
+        default: break
+        }
         return TranslateLanguage(rawValue: short)
     }
 
@@ -1045,8 +1270,15 @@ class LiveTranslateViewModel: ObservableObject {
     /// we're aimed at, aim at it instead. Only ever moves the language THEY
     /// speak — your side stays put.
     private func autoRetarget(to detected: String?, spokenByWearer: Bool) {
-        guard !spokenByWearer,
-              let lang = Self.language(fromDetected: detected),
+        // BUILD 61 FIX: your own turns used to fall into the reset below, which
+        // meant the counter was wiped every time you opened your mouth. In a
+        // real conversation you alternate — you, them, you, them — so "two turns
+        // in a row from them" could NEVER be reached and auto-retarget was
+        // effectively dead. Your speech is not evidence about their language;
+        // it should be ignored, not treated as a contradiction.
+        guard !spokenByWearer else { return }
+
+        guard let lang = Self.language(fromDetected: detected),
               lang != targetLanguage,
               lang != sourceLanguage else {
             retargetCandidate = nil
@@ -1070,7 +1302,7 @@ class LiveTranslateViewModel: ObservableObject {
         let name = lang.displayName
         print("🌐 [TranslateVM] They're speaking \(name) — retargeting")
         targetLanguage = lang            // didSet pushes the new session settings
-        TTSService.shared.speak("They're speaking \(name). Switching.")
+        say("They're speaking \(name). Switching.", isConfirmation: true)
     }
 
     /// Where the session started, in plain words, for the header.
@@ -1176,7 +1408,30 @@ final class CurrencyRates {
         "AE": "AED", "SA": "SAR", "QA": "QAR", "EG": "EGP", "MA": "MAD",
         "AU": "AUD", "NZ": "NZD", "GB": "GBP", "US": "USD", "CA": "CAD",
         "PT": "EUR", "ES": "EUR", "FR": "EUR", "DE": "EUR", "IT": "EUR",
-        "GR": "EUR", "AO": "AOA", "MZ": "MZN", "CV": "CVE"
+        "GR": "EUR", "AO": "AOA", "MZ": "MZN", "CV": "CVE",
+        // FS-9: these were mapped to a language but had no currency, so they
+        // fell through to the language guess — a 20 JOD item (about A$43) was
+        // being shown as "20 AED ≈ A$8.30". Kuwait was worse.
+        "JO": "JOD", "KW": "KWD", "OM": "OMR", "BH": "BHD", "TN": "TND",
+        "LB": "LBP", "CH": "CHF", "MY": "MYR", "BN": "BND", "IL": "ILS",
+        "PK": "PKR", "BD": "BDT", "LK": "LKR", "MM": "MMK", "MN": "MNT",
+        "ZA": "ZAR", "KE": "KES", "NG": "NGN", "PL": "PLN", "CZ": "CZK",
+        "HU": "HUF", "RO": "RON", "SE": "SEK", "NO": "NOK", "DK": "DKK"
+    ]
+
+    /// FS-9: what language you'd expect to be spoken in each country. Used only
+    /// to notice when GPS and the actual conversation disagree.
+    static let expectedLanguage: [String: String] = [
+        "ID": "id", "MY": "id", "BN": "id", "TH": "th", "VN": "vi", "PH": "fil",
+        "KH": "km", "LA": "lo", "CN": "zh", "TW": "zh", "SG": "zh", "HK": "yue",
+        "MO": "yue", "JP": "ja", "KR": "ko", "IN": "hi", "NP": "hi", "TR": "tr",
+        "FR": "fr", "IT": "it", "DE": "de", "AT": "de", "CH": "de", "RU": "ru",
+        "GR": "el", "CY": "el", "PT": "pt", "BR": "pt", "AO": "pt", "MZ": "pt",
+        "ES": "es", "MX": "es", "AR": "es", "CL": "es", "CO": "es", "PE": "es",
+        "UY": "es", "PY": "es", "BO": "es", "EC": "es", "VE": "es", "CR": "es",
+        "PA": "es", "GT": "es", "HN": "es", "NI": "es", "SV": "es", "DO": "es",
+        "CU": "es", "AE": "ar", "SA": "ar", "EG": "ar", "MA": "ar", "JO": "ar",
+        "KW": "ar", "OM": "ar", "BH": "ar", "TN": "ar", "LB": "ar", "QA": "ar"
     ]
 
     /// Fallback when there's no GPS fix yet — language is a decent guess.
@@ -1193,7 +1448,19 @@ final class CurrencyRates {
     /// The currency actually in the till: country if we know it, language if not.
     static func currency(forLanguage lang: String) -> String? {
         let country = (ContextEngine.shared.snapshot.countryCode ?? "").uppercased()
-        if !country.isEmpty, let byCountry = currencyForCountry[country] { return byCountry }
+        if !country.isEmpty, let byCountry = currencyForCountry[country] {
+            // FS-9: the GPS country used to win unconditionally, so an
+            // Indonesian speaker in Johor or on the Batam ferry had "harga 250
+            // ribu" labelled MYR. When where you are and what is being spoken
+            // disagree, we cannot know which currency is meant — and a wrong
+            // price is worse than no price, which is this feature's own rule.
+            if let expected = expectedLanguage[country],
+               expected != lang,
+               currencyForLanguage[lang] != byCountry {
+                return nil
+            }
+            return byCountry
+        }
         return currencyForLanguage[lang]
     }
 
