@@ -131,6 +131,7 @@ class LiveTranslateService: NSObject {
     /// FS-1: observers for the capture engine's safety net.
     private var lifelineTokens: [NSObjectProtocol] = []
     private var wasRecordingBeforeInterruption = false
+    private var lastCaptureRebuild = Date.distantPast
 
     // Image sending
     private var lastImageSendTime: Date?
@@ -209,9 +210,16 @@ class LiveTranslateService: NSObject {
             guard let self, self.isRecording else { return }
             let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
             let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+            // BUILD 64 FIX: .override and .routeConfigurationChange are what
+            // OUR OWN setActive / overrideOutputAudioPort calls produce. Acting
+            // on them meant the first spoken sentence triggered a route change,
+            // which tore down capture, which reconfigured the session, which
+            // produced another route change — a reconfiguration loop that took
+            // the app down after exactly one sentence. Only react to hardware
+            // genuinely appearing or disappearing.
             switch reason {
-            case .oldDeviceUnavailable, .newDeviceAvailable, .routeConfigurationChange, .override:
-                print("🎧 [Translate] Route changed — rebuilding capture")
+            case .oldDeviceUnavailable, .newDeviceAvailable:
+                print("🎧 [Translate] Device changed — rebuilding capture")
                 self.rebuildCapture()
             default: break
             }
@@ -236,6 +244,13 @@ class LiveTranslateService: NSObject {
     }
 
     private func rebuildCapture() {
+        // Never rebuild on top of a rebuild — a storm of these is how a
+        // recoverable hiccup becomes a crash.
+        guard Date().timeIntervalSince(lastCaptureRebuild) > 2.0 else {
+            print("🎧 [Translate] Rebuild already in flight — ignoring")
+            return
+        }
+        lastCaptureRebuild = Date()
         let mic = lastUsePhoneMic
         teardownCapture()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -694,6 +709,21 @@ class LiveTranslateService: NSObject {
             let inputNode = engine.inputNode
             let inputFormat = inputNode.outputFormat(forBus: 0)
 
+            // BUILD 64 FIX (THE CRASH): during a route change the input format
+            // reads back as 0 Hz for a moment. installTap with a zero-rate or
+            // zero-channel format raises "required condition is false:
+            // format.sampleRate == hwFormat.sampleRate" — an ObjC exception
+            // that goes straight through Swift's error handling and kills the
+            // app. Refuse, and let the caller try again.
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                print("⚠️ [Translate] Input format not ready (\(inputFormat.sampleRate) Hz) — deferring")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self, self.isUserSessionActive, !self.isRecording else { return }
+                    self.startRecording(usePhoneMic: usePhoneMic)
+                }
+                return false
+            }
+
             print("🎵 [Translate] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
             print("🎵 [Translate] Target format: \(targetSampleRate) Hz (will auto-resample)")
 
@@ -1106,7 +1136,6 @@ class LiveTranslateService: NSObject {
             pendingPlaybackBuffers = 0
             lastPlaybackChangeAt = Date()
             do {
-                try? AVAudioSession.sharedInstance().setActive(true)
                 engine.prepare()
                 try engine.start()
                 isPlaybackEngineRunning = true
