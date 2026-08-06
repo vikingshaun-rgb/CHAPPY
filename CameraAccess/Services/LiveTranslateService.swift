@@ -39,7 +39,6 @@ class LiveTranslateService: NSObject {
     // Audio buffer management
     private var hasStartedPlaying = false
     private var isPlaybackEngineRunning = false
-    private var playbackConfigToken: NSObjectProtocol?
 
     // Translation settings
     private var sourceLanguage: TranslateLanguage = .en
@@ -64,10 +63,6 @@ class LiveTranslateService: NSObject {
     // TRANSCRIPT v2: the speaker's own words, streaming and finalised.
     var onOriginalDelta: ((String) -> Void)?      // incremental heard text
     var onTurnComplete: ((String, String) -> Void)?  // (heard, translated)
-    /// SB-4: fired when the connection is gone and we are NOT coming back on our
-    /// own. Without this the UI kept saying "Listening" into a dead socket while
-    /// every buffer was silently discarded — and billed.
-    var onDisconnected: ((String) -> Void)?
 
     // State
     private var isRecording = false
@@ -117,8 +112,6 @@ class LiveTranslateService: NSObject {
     /// BUILD 56: session continuity, ported from Live AI.
     private var resumptionHandle: String?
     private var isRenewingSession = false
-    /// SB-7: cancellable so closing Translate can stop a pending reconnect.
-    private var renewWork: DispatchWorkItem?
     private var recoveryAttempts = 0
     /// True from the user opening Translate until they close it. Recovery must
     /// never fire after a deliberate disconnect.
@@ -128,10 +121,6 @@ class LiveTranslateService: NSObject {
     // never straight after connect() — audio sent before setup kills the socket.
     private var shouldResumeRecordingAfterSetup = false
     private var lastUsePhoneMic = false
-    /// FS-1: observers for the capture engine's safety net.
-    private var lifelineTokens: [NSObjectProtocol] = []
-    private var wasRecordingBeforeInterruption = false
-    private var lastCaptureRebuild = Date.distantPast
 
     // Image sending
     private var lastImageSendTime: Date?
@@ -143,120 +132,11 @@ class LiveTranslateService: NSObject {
         setupAudioEngine()
     }
 
-    deinit {
-        // WATCH-LIST: observers were never removed, so they accumulated across
-        // every sleep/wake cycle.
-        lifelineTokens.forEach { NotificationCenter.default.removeObserver($0) }
-        if let token = playbackConfigToken { NotificationCenter.default.removeObserver(token) }
-    }
-
     // MARK: - Audio Engine Setup
 
     private func setupAudioEngine() {
         audioEngine = AVAudioEngine()
         setupPlaybackEngine()
-        installAudioLifelines()
-    }
-
-    /// FS-1: the CAPTURE engine had no safety net whatsoever — no interruption
-    /// observer, no route-change observer, no media-services-reset observer, no
-    /// configuration-change observer. One phone call, alarm, Siri press, or the
-    /// glasses dropping out of range stopped the input engine; isRecording
-    /// stayed true so startRecording() early-returned and the tap never
-    /// delivered another buffer, while the chip still read "Listening".
-    /// GeminiLiveService has solved this for weeks; this is that port.
-    private func installAudioLifelines() {
-        guard lifelineTokens.isEmpty else { return }
-        let nc = NotificationCenter.default
-
-        lifelineTokens.append(nc.addObserver(
-            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self else { return }
-            let raw = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) ?? 0
-            guard let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
-            switch type {
-            case .began:
-                guard self.isRecording else { return }
-                self.wasRecordingBeforeInterruption = true
-                print("📞 [Translate] Interrupted — holding")
-                self.teardownCapture()
-            case .ended:
-                guard self.wasRecordingBeforeInterruption else { return }
-                self.wasRecordingBeforeInterruption = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                    guard let self, self.isUserSessionActive else { return }
-                    print("📞 [Translate] Interruption over — reopening the mic")
-                    self.startRecording(usePhoneMic: self.lastUsePhoneMic)
-                }
-            @unknown default: break
-            }
-        })
-
-        lifelineTokens.append(nc.addObserver(
-            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            guard let self, self.isRecording else { return }
-            print("🔧 [Translate] Media services reset — rebuilding capture")
-            self.rebuildCapture()
-        })
-
-        // A route change rebinds the tap's sample rate. The glasses dropping
-        // from 16 kHz Bluetooth to the 48 kHz built-in mic can otherwise raise
-        // a format-mismatch exception — a crash, not just silence.
-        lifelineTokens.append(nc.addObserver(
-            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, self.isRecording else { return }
-            let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
-            let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
-            // BUILD 64 FIX: .override and .routeConfigurationChange are what
-            // OUR OWN setActive / overrideOutputAudioPort calls produce. Acting
-            // on them meant the first spoken sentence triggered a route change,
-            // which tore down capture, which reconfigured the session, which
-            // produced another route change — a reconfiguration loop that took
-            // the app down after exactly one sentence. Only react to hardware
-            // genuinely appearing or disappearing.
-            switch reason {
-            case .oldDeviceUnavailable, .newDeviceAvailable:
-                print("🎧 [Translate] Device changed — rebuilding capture")
-                self.rebuildCapture()
-            default: break
-            }
-        })
-
-        if let engine = audioEngine {
-            lifelineTokens.append(nc.addObserver(
-                forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-            ) { [weak self] _ in
-                guard let self, self.isRecording else { return }
-                print("🔧 [Translate] Capture graph changed — rebuilding")
-                self.rebuildCapture()
-            })
-        }
-    }
-
-    /// Let go of the microphone without losing the intent to hold it.
-    private func teardownCapture() {
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine?.stop()
-        isRecording = false
-    }
-
-    private func rebuildCapture() {
-        // Never rebuild on top of a rebuild — a storm of these is how a
-        // recoverable hiccup becomes a crash.
-        guard Date().timeIntervalSince(lastCaptureRebuild) > 2.0 else {
-            print("🎧 [Translate] Rebuild already in flight — ignoring")
-            return
-        }
-        lastCaptureRebuild = Date()
-        let mic = lastUsePhoneMic
-        teardownCapture()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self, self.isUserSessionActive else { return }
-            self.startRecording(usePhoneMic: mic)
-        }
     }
 
     private func setupPlaybackEngine() {
@@ -272,9 +152,6 @@ class LiveTranslateService: NSObject {
 
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
-        // Nothing in our own graph should be quiet: full scale at both stages.
-        playerNode.volume = 1.0
-        playbackEngine.mainMixerNode.outputVolume = 1.0
         playbackEngine.prepare()
 
         // A route change (headphones, glasses, the LOUD toggle) tears the graph
@@ -284,7 +161,7 @@ class LiveTranslateService: NSObject {
         // that CoreAudio is still rebuilding, and CoreAudio answers that with an
         // exception rather than an error — an instant crash, not a caught
         // failure. The next audio chunk rebuilds it safely instead.
-        playbackConfigToken = NotificationCenter.default.addObserver(
+        NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: playbackEngine, queue: .main
         ) { [weak self] _ in
@@ -405,14 +282,8 @@ class LiveTranslateService: NSObject {
             return
         }
 
-        // SB-4: NOT reset here any more. connect() runs on every recovery
-        // attempt, so resetting it produced a stack of four "no network" alerts
-        // during a storm while the one actionable message got swallowed. It is
-        // cleared on a successful setupComplete instead.
+        didReportSocketError = false
         isUserSessionActive = true
-        // WATCH-LIST: connect() ran on every recovery attempt and assigned a new
-        // URLSession over the previous one without invalidating it.
-        urlSession?.invalidateAndCancel()
 
         var request = URLRequest(url: url)
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
@@ -432,10 +303,6 @@ class LiveTranslateService: NSObject {
     func disconnect() {
         print("🔌 [Translate] Disconnecting WebSocket")
         isConnected = false
-        // SB-2 / SB-7: kill any pending intent to come back.
-        shouldResumeRecordingAfterSetup = false
-        renewWork?.cancel(); renewWork = nil
-        isRenewingSession = false
         // BUILD 56: a deliberate close must never trigger the recovery logic.
         isUserSessionActive = false
         recoveryAttempts = 0
@@ -446,10 +313,6 @@ class LiveTranslateService: NSObject {
         urlSession = nil
         stopRecording()
         stopPlaybackEngine()
-        // FS-15: nothing ever deactivated the session, so the podcast we
-        // interrupted never resumed after closing Translate.
-        try? AVAudioSession.sharedInstance()
-            .setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     // MARK: - Configuration
@@ -576,17 +439,6 @@ class LiveTranslateService: NSObject {
     /// and moves only the OUTPUT to something everyone can hear.
     func setLoudSpeaker(_ on: Bool) {
         loudSpeaker = on
-        // BUILD 61: LOUD now changes the audio MODE as well as the port, so the
-        // category has to be re-applied — otherwise the toggle moves the sound
-        // to the loudspeaker but leaves it at call volume, which is exactly the
-        // "still not loud enough" you hit.
-        if isRecording {
-            let session = AVAudioSession.sharedInstance()
-            let mode: AVAudioSession.Mode = on ? .default : .voiceChat
-            var opts: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
-            if bluetoothInputAvailable { opts.insert(.allowBluetooth) }
-            try? session.setCategory(.playAndRecord, mode: mode, options: opts)
-        }
         applyOutputRoute()
         // BUILD 59 SAFETY: mark stale, don't restart here. setLoudSpeaker can be
         // called before the audio session is configured at all, and starting an
@@ -623,13 +475,8 @@ class LiveTranslateService: NSObject {
         }
     }
 
-    /// FS-14: returns whether the microphone genuinely opened. The ViewModel
-    /// used to set isRecording unconditionally, so a failed start still showed
-    /// a red button, started the cost clock and suppressed the idle countdown —
-    /// billing you for a microphone that never opened.
-    @discardableResult
-    func startRecording(usePhoneMic: Bool = false) -> Bool {
-        guard !isRecording else { return true }
+    func startRecording(usePhoneMic: Bool = false) {
+        guard !isRecording else { return }
         lastUsePhoneMic = usePhoneMic
 
         do {
@@ -668,31 +515,21 @@ class LiveTranslateService: NSObject {
             print("🔇 [Translate] Echo tail: \(echoTailSeconds)s")
 
             if usePhoneMic {
-                // BUILD 61: .voiceChat routes output through the VOICE path,
-                // which uses the phone-call volume — separately capped, and much
-                // quieter than media even with the side button at maximum. That
-                // is why it wasn't loud enough across a table. We no longer need
-                // .voiceChat for echo cancellation: the buffer-accurate mic gate
-                // is doing that job, and doing it better than the hardware did.
-                // On the loudspeaker, go through the media path and be heard.
-                let mode: AVAudioSession.Mode = loudSpeaker ? .default : .voiceChat
+                // iPhone microphone - best for translating the other person
                 try audioSession.setCategory(
                     .playAndRecord,
-                    mode: mode,
+                    mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
                     options: [.defaultToSpeaker, .allowBluetoothA2DP]
                 )
-                print("🎙️ [Translate] iPhone mic, mode: \(mode == .default ? "media (loud)" : "voice")")
+                print("🎙️ [Translate] Using iPhone mic (translate the other person)")
             } else {
                 // Bluetooth mic (glasses) - best for translating yourself
-                // Through the glasses, keep .voiceChat — the headset path is the
-                // right one there and volume isn't the problem in your ear.
-                let mode: AVAudioSession.Mode = loudSpeaker ? .default : .voiceChat
                 try audioSession.setCategory(
                     .playAndRecord,
-                    mode: mode,
+                    mode: .voiceChat, // AUDIT FIX: .default has NO echo cancellation — the mic heard Chappy's own translation and translated it back, forever
                     options: [.allowBluetooth, .defaultToSpeaker, .allowBluetoothA2DP]
                 )
-                print("🎙️ [Translate] Bluetooth mic, mode: \(mode == .default ? "media (loud)" : "voice")")
+                print("🎙️ [Translate] Using Bluetooth mic (translate yourself)")
             }
             try audioSession.setActive(true)
             applyOutputRoute()
@@ -703,26 +540,11 @@ class LiveTranslateService: NSObject {
 
             guard let engine = audioEngine else {
                 print("❌ [Translate] Audio engine not initialized")
-                return false
+                return
             }
 
             let inputNode = engine.inputNode
             let inputFormat = inputNode.outputFormat(forBus: 0)
-
-            // BUILD 64 FIX (THE CRASH): during a route change the input format
-            // reads back as 0 Hz for a moment. installTap with a zero-rate or
-            // zero-channel format raises "required condition is false:
-            // format.sampleRate == hwFormat.sampleRate" — an ObjC exception
-            // that goes straight through Swift's error handling and kills the
-            // app. Refuse, and let the caller try again.
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                print("⚠️ [Translate] Input format not ready (\(inputFormat.sampleRate) Hz) — deferring")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self, self.isUserSessionActive, !self.isRecording else { return }
-                    self.startRecording(usePhoneMic: usePhoneMic)
-                }
-                return false
-            }
 
             print("🎵 [Translate] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
             print("🎵 [Translate] Target format: \(targetSampleRate) Hz (will auto-resample)")
@@ -736,32 +558,20 @@ class LiveTranslateService: NSObject {
 
             isRecording = true
             print("✅ [Translate] Recording started")
-            return true
 
         } catch {
             print("❌ [Translate] Failed to start recording: \(error.localizedDescription)")
             onError?("Failed to start recording: \(error.localizedDescription)")
-            return false
         }
     }
 
     func stopRecording() {
-        // SB-2: this MUST come before the guard. A settings push or a session
-        // renewal sets shouldResumeRecordingAfterSetup so the mic comes back
-        // after the handshake. Press Stop inside that window and the guard
-        // early-returned, leaving the intent alive — the button said stopped,
-        // the cost meter stopped counting, and the microphone came back up and
-        // kept streaming a private conversation to Google.
-        shouldResumeRecordingAfterSetup = false
         guard isRecording else { return }
         print("🛑 [Translate] Stop recording")
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         isRecording = false
         micGateUntil = .distantPast
-        // FS-16: a phantom count used to survive into the next session.
-        pendingPlaybackBuffers = 0
-        lastPlaybackChangeAt = Date()
     }
 
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -1040,15 +850,7 @@ class LiveTranslateService: NSObject {
                 if (serverContent["turnComplete"] as? Bool) == true {
                     let final = self.accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
                     let heard = self.accumulatedOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
-                    // SB-5 (CRITICAL): this used to require a non-empty
-                    // TRANSLATION. But the system prompt tells the model to stay
-                    // completely silent on voice commands — so on exactly those
-                    // turns `final` is empty, this branch never fired, and the
-                    // command handlers were never reached. Every spoken command
-                    // has been unreachable unless the model DISOBEYED its prompt.
-                    // The same gate also froze the live bubble forever, which in
-                    // turn wedged every queued setting. Deliver on either side.
-                    if !final.isEmpty || !heard.isEmpty {
+                    if !final.isEmpty {
                         print("✅ [Translate] Translation complete: \(final.prefix(80))")
                         // TRANSCRIPT v2: the pair is delivered together so a turn
                         // can never be filed with a translation but no original.
@@ -1101,13 +903,11 @@ class LiveTranslateService: NSObject {
         // Real interpreters are half-duplex, and so is this now: while Chappy is
         // speaking, the microphone sends nothing. We hold the gate for exactly
         // as long as the audio we've queued, plus a short tail for the room.
-        // FS-16: extend the gate only AFTER we know playback can actually
-        // happen — otherwise a dead engine left us mute and deaf for the
-        // duration of audio nobody heard.
-        guard ensurePlaybackReady() else { return }
         let frames = Double(audioData.count / 2)
         let seconds = frames / (playbackFormat?.sampleRate ?? 24000)
         micGateUntil = max(micGateUntil, Date()).addingTimeInterval(seconds)
+
+        guard ensurePlaybackReady() else { return }
         playAudio(audioData)
     }
 
@@ -1246,18 +1046,8 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
         // not a fault. It's what killed your hour-long conversation with an
         // alert that read like a crash. Reconnect silently instead.
         if closeCode.rawValue == 1008 {
-            // SB-7: 1008 is not only the session clock — Google also sends it
-            // for policy and quota. Renewing blindly with no counter and no
-            // backoff turned one rejected resumption handle into a silent 0.4s
-            // reconnect loop for as long as the app was open. A free renewal is
-            // only justified when we actually hold a handle to resume WITH.
-            if resumptionHandle != nil {
-                print("⏳ [Translate] Session-duration abort — auto-renewing")
-                DispatchQueue.main.async { [weak self] in self?.renewSession() }
-            } else {
-                print("⚠️ [Translate] 1008 with no resumption handle — treating as a failure")
-                attemptRecovery("policy close (1008)")
-            }
+            print("⏳ [Translate] Session-duration abort — auto-renewing")
+            DispatchQueue.main.async { [weak self] in self?.renewSession() }
             return
         }
         if closeCode != .goingAway && closeCode != .normalClosure {
@@ -1269,11 +1059,6 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
     /// running, and reconnect with the stored handle. The conversation carries
     /// on — at worst you lose a fraction of a second mid-gap.
     private func renewSession() {
-        // SB-7: the ONLY deferred reconnect in this file that lacked the
-        // isUserSessionActive guard attemptRecovery has. A disconnect landing
-        // inside the 0.4s window was undone by the reconnect, and the
-        // resurrected service restarted the microphone with no UI attached.
-        guard isUserSessionActive else { return }
         guard !isRenewingSession else { return }
         isRenewingSession = true
         // Recording must resume only AFTER setup completes, or the audio we send
@@ -1283,15 +1068,12 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
         webSocket = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
-        renewWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isUserSessionActive else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
             self.isRenewingSession = false
             print("🔁 [Translate] Reconnecting (handle: \(self.resumptionHandle != nil ? "yes" : "none"))")
             self.connect()
         }
-        renewWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
     /// A drop that ISN'T the session clock — a tunnel, a WiFi handover, a 5xx.
@@ -1299,11 +1081,7 @@ extension LiveTranslateService: URLSessionWebSocketDelegate {
     private func attemptRecovery(_ why: String) {
         guard isUserSessionActive else { return }
         guard recoveryAttempts < 3 else {
-            // Terminal. Say so once, and tell the ViewModel so the UI stops lying.
-            DispatchQueue.main.async { [weak self] in
-                self?.onDisconnected?("Connection lost. Tap the mic to reconnect.")
-            }
-            reportSocketError("Connection lost (\(why)). Tap the mic to reconnect.")
+            reportSocketError("Connection lost (\(why)). Close and reopen Translate to reconnect.")
             return
         }
         recoveryAttempts += 1
