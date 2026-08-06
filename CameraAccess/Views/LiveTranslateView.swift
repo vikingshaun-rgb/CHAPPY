@@ -77,6 +77,7 @@ extension String {
             (0x0370...0x03FF).contains(s.value) ||   // Greek
             (0x0400...0x04FF).contains(s.value) ||   // Cyrillic
             (0x0600...0x06FF).contains(s.value) ||   // Arabic
+            (0x0900...0x097F).contains(s.value) ||   // Devanagari (Hindi)
             (0x0E00...0x0E7F).contains(s.value) ||   // Thai
             (0x0E80...0x0EFF).contains(s.value) ||   // Lao
             (0x1780...0x17FF).contains(s.value) ||   // Khmer
@@ -123,13 +124,20 @@ struct ChappyBubble: View {
     var onSave: (() -> Void)? = nil
     /// Hand this line to Messenger, Mail, Telegram — anything installed.
     var onShare: ((String) -> Void)? = nil
+    /// FS-3: every spoken line goes through the view model so "SPEAK off"
+    /// genuinely means silent — bubble taps included.
+    var onSpeak: ((String) -> Void)? = nil
     /// Pronunciation line on or off, remembered across sessions.
     @AppStorage("translate_show_pronunciation") private var showPronunciation = true
 
     /// Formatted amount plus the dollar equivalent, when this line is money.
     private var priceChip: (String, String?)? {
-        let source = wearerLine + " " + foreignLine
-        guard let hit = PriceSpotter.find(in: source, languageCode: foreignCode) else { return nil }
+        // SB-1: scan ONLY the foreign line. Concatenating both put the model's
+        // already-expanded "250,000" next to the transcript's "250 ribu" in one
+        // string, and the multiplier was then applied to the expanded number —
+        // a thousand times too large, rendered 19pt bold with a dollar figure
+        // beside it, on the one line you actually look at mid-haggle.
+        guard let hit = PriceSpotter.find(in: foreignLine, languageCode: foreignCode) else { return nil }
         let money = "\(PriceSpotter.formatted(hit.amount)) \(hit.code)"
         return (money, CurrencyRates.shared.inAUD(hit.amount, currency: hit.code))
     }
@@ -180,14 +188,17 @@ struct ChappyBubble: View {
                 // leads with the line YOU understand; the foreign line sits
                 // under it, still there, still tappable, still shareable.
                 if misheard {
+                    // WATCH-LIST: this is the one message that requires you to
+                    // act, and it was 10pt fixed (ignoring Dynamic Type) inside
+                    // a bubble knocked to 0.6 opacity. Readable now.
                     HStack(spacing: 5) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 10))
                         Text("MISHEARD — SAY IT AGAIN")
-                            .font(.system(size: 10, weight: .heavy))
-                            .tracking(0.4)
+                            .fontWeight(.heavy)
                     }
+                    .font(.footnote)
                     .foregroundColor(.orange)
+                    .accessibilityLabel("Chappy misheard this. Say it again.")
                 }
 
                 Text(wearerLine)
@@ -255,7 +266,7 @@ struct ChappyBubble: View {
                 let line = mine ? foreignLine : wearerLine
                 guard !live, !line.isEmpty, line != "…" else { return }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                TTSService.shared.speak(line)
+                onSpeak?(line)
             }
             // AUDIT FIX (UI-C1): everything else on one press-and-hold. Standard
             // iOS, full-width rows, impossible to mis-tap — and it gives Copy
@@ -263,11 +274,11 @@ struct ChappyBubble: View {
             .contextMenu {
                 if !live {
                     Button {
-                        TTSService.shared.speak(mine ? foreignLine : wearerLine)
+                        onSpeak?(mine ? foreignLine : wearerLine)
                     } label: { Label("Say it again", systemImage: "speaker.wave.2.fill") }
 
                     Button {
-                        TTSService.shared.speak(mine ? wearerLine : foreignLine)
+                        onSpeak?(mine ? wearerLine : foreignLine)
                     } label: { Label("Say the other language", systemImage: "quote.bubble") }
 
                     Button {
@@ -339,7 +350,11 @@ struct LiveTranslateView: View {
                 transcriptArea
                 controlBar
             }
-            .padding()
+            // BUILD 58: was .padding() all round, which added 16pt under the
+            // record button on top of the home-indicator inset and left the
+            // controls floating. Sides and top only — the bar sits low now.
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
         }
         .onAppear {
             viewModel.connect()
@@ -359,7 +374,8 @@ struct LiveTranslateView: View {
             get: { bigText.map { BigLine(text: $0) } },
             set: { bigText = $0?.text }
         )) { line in
-            BigTextView(text: line.text, theme: theme) { bigText = nil }
+            BigTextView(text: line.text, theme: theme,
+                        onSpeak: { viewModel.say($0) }) { bigText = nil }
         }
         .sheet(isPresented: $showPhrases) {
             PhraseListView(viewModel: viewModel, theme: theme)
@@ -439,6 +455,9 @@ struct LiveTranslateView: View {
 
     private var statusText: String {
         if viewModel.isRecording { return "Listening" }
+        // SB-4: this used to say "Listening" into a dead socket while every
+        // buffer was silently discarded — and billed. Say what's true.
+        if viewModel.lostConnection { return "No connection — tap to retry" }
         if viewModel.isAsleep { return "Asleep" }
         if viewModel.isConnected { return "Ready" }
         return "livetranslate.connecting".localized
@@ -446,6 +465,7 @@ struct LiveTranslateView: View {
 
     private var statusColour: Color {
         if viewModel.isRecording { return .red }
+        if viewModel.lostConnection { return .orange }
         if viewModel.isAsleep { return .gray }
         if viewModel.isConnected { return .green }
         return .orange
@@ -557,6 +577,7 @@ struct LiveTranslateView: View {
                 viewModel.swapLanguages()
             } label: {
                 Image(systemName: "arrow.left.arrow.right")
+                    .accessibilityLabel("Swap languages")
                     .font(.title3)
                     .foregroundColor(theme.textPrimary)
                     .padding(12)
@@ -672,7 +693,8 @@ struct LiveTranslateView: View {
                                      misheard: turn.misheard,
                                      onShowBig: { bigText = $0 },
                                      onSave: { viewModel.savePhrase(from: turn) },
-                                     onShare: { shareText = $0 })
+                                     onShare: { shareText = $0 },
+                                     onSpeak: { viewModel.say($0) })
                             .id(turn.id)
                         }
                     }
@@ -701,10 +723,13 @@ struct LiveTranslateView: View {
                     proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
             }
-            // AUDIT FIX (UI-H1): this also fired on every streaming character,
-            // so scrolling back to re-read something yanked you to the bottom
-            // mid-sentence and you could never look at an earlier price while
-            // the conversation continued. New turns still follow; typing doesn't.
+            // FS-13: also follow the LIVE bubble while it grows, otherwise the
+            // translation of what is being said right now slides below the fold
+            // and you have to thumb-scroll one-handed mid-conversation. New
+            // turns always follow; streaming follows too.
+            .onChange(of: viewModel.streamingTranslation) { _, _ in
+                proxy.scrollTo("transcript-bottom", anchor: .bottom)
+            }
         }
     }
 
@@ -759,7 +784,8 @@ struct LiveTranslateView: View {
                     .tracking(0.4)
             }
             .foregroundColor(on ? .white : theme.textSecondary)
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .padding(.horizontal, 15)
+            .frame(minHeight: 44)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(on ? theme.accent : Color.clear)
@@ -771,7 +797,7 @@ struct LiveTranslateView: View {
     }
 
     private var controlBar: some View {
-        VStack(spacing: 9) {
+        VStack(spacing: 8) {
             if viewModel.isRecording {
                 HStack(spacing: 8) {
                     Circle()
@@ -811,6 +837,7 @@ struct LiveTranslateView: View {
             }
             .padding(3)
             .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(theme.cardFill))
+            .fixedSize()
 
             Button {
                 viewModel.toggleRecording()
@@ -823,11 +850,12 @@ struct LiveTranslateView: View {
                     Image(systemName: viewModel.isRecording ? "stop.fill" : "mic.fill")
                         .font(.system(size: 24))
                         .foregroundColor(.white)
+                        .accessibilityLabel(viewModel.isRecording ? "Stop listening" : "Start listening")
                 }
             }
             // Asleep is a valid state to tap from — it wakes and starts.
-            .disabled(!viewModel.isConnected && !viewModel.isAsleep)
-            .opacity((viewModel.isConnected || viewModel.isAsleep) ? 1.0 : 0.5)
+            .disabled(!viewModel.isConnected && !viewModel.isAsleep && !viewModel.lostConnection)
+            .opacity((viewModel.isConnected || viewModel.isAsleep || viewModel.lostConnection) ? 1.0 : 0.5)
 
             // AUDIT FIX (UI-C2): Clear sat directly under the record button and
             // wiped the whole conversation instantly, with no undo. One fumbled
@@ -853,7 +881,7 @@ struct LiveTranslateView: View {
                 }
             }
         }
-        .padding(.bottom, 2)
+        .padding(.bottom, 0)
     }
 
     // MARK: - Video Background
@@ -869,9 +897,9 @@ struct LiveTranslateView: View {
             }
         }
         .onChange(of: streamViewModel.currentVideoFrame) { _, frame in
-            if let frame = frame {
-                viewModel.updateVideoFrame(frame)
-            }
+            // FS-4: forward nil too — that is how the view model learns the
+            // camera has stopped and must stop uploading the last dead frame.
+            viewModel.updateVideoFrame(frame)
         }
     }
 
@@ -915,46 +943,84 @@ enum PriceSpotter {
     ]
 
     /// Returns the amount and the currency code, or nil.
+    ///
+    /// SB-1: the old version took the LARGEST digit group anywhere in the
+    /// sentence and then multiplied it by 1,000 if "ribu" appeared anywhere and
+    /// by 1,000,000 if "juta" appeared anywhere — with no link between the word
+    /// and the number it modifies, and both multipliers stacking. Verified
+    /// results included 250,000,000 IDR for an ordinary "250 ribu" turn, and a
+    /// room number winning over the price. This version binds each number to the
+    /// word that immediately follows it, sums the parts, and refuses to answer
+    /// when two candidates disagree.
     static func find(in text: String, languageCode: String) -> (amount: Double, code: String)? {
         let lower = text.lowercased()
-        let hasMoneyWord = moneyWords.contains { lower.contains($0) }
-
-        // Grab digit groups, tolerating 250.000 / 250,000 / 250 000
-        var best: Double = 0
-        var current = ""
-        var found: [(Double, Int)] = []          // value, digit count
-        func flush() {
-            guard !current.isEmpty else { return }
-            found.append((Double(current) ?? 0, current.count))
-            current = ""
-        }
-        for ch in lower {
-            if ch.isNumber { current.append(ch) }
-            else if (ch == "," || ch == "." || ch == " ") && !current.isEmpty { continue }
-            else { flush() }
-        }
-        flush()
-
-        // AUDIT FIX (TR-C3): "here's my WhatsApp, 0812 3456 7890" collapsed into
-        // one enormous number and showed up as a price. Phone numbers are handed
-        // over constantly in these conversations. Ten digits or more is not money.
-        found.removeAll { $0.1 >= 10 }
-        best = found.map(\.0).max() ?? 0
-
-        // Spoken multipliers: "250 ribu" is 250,000 and "2 juta" is 2,000,000.
-        if lower.contains("ribu") || lower.contains("nghìn") { best *= 1_000 }
-        if lower.contains("juta") || lower.contains("triệu") { best *= 1_000_000 }
-
         guard let code = CurrencyRates.currency(forLanguage: languageCode) else { return nil }
+        let hasMoneyWord = moneyWords.contains { lower.contains($0) }
+        guard hasMoneyWord else { return nil }
 
-        // AUDIT FIX (TR-C3): a bare number is a time, a quantity, a room number,
-        // a date or a phone number far more often than it's money. A wrong price
-        // on screen mid-negotiation is worse than no price, so require a word
-        // that actually means money — the interpreter is instructed to keep the
-        // currency word in, and "harga"/"berapa"/"ribu" carry most of the rest.
-        let bigCurrency = ["IDR", "VND", "KRW", "LAK", "KHR"].contains(code)
-        let threshold: Double = bigCurrency ? 1_000 : 5
-        guard hasMoneyWord, best >= threshold else { return nil }
+        // Tokenise on whitespace and punctuation that can't be a separator.
+        let raw = lower.split(whereSeparator: { $0.isWhitespace || $0 == "/" || $0 == "-" })
+        var tokens: [String] = []
+        for piece in raw { tokens.append(String(piece)) }
+
+        // A number token: digits with optional , or . thousands groups.
+        func numberValue(_ tok: String) -> (value: Double, digits: Int)? {
+            let stripped = tok.filter { $0.isNumber || $0 == "," || $0 == "." || $0 == ":" }
+            guard !stripped.isEmpty, stripped.first?.isNumber == true else { return nil }
+            // A time (10:30, 10.30 with exactly two trailing digits) is not money.
+            if stripped.contains(":") { return nil }
+            let digitsOnly = stripped.filter { $0.isNumber }
+            guard digitsOnly.count > 0, digitsOnly.count < 10 else { return nil }
+            // Proper thousands grouping: 250.000 / 250,000 / 2.500.000
+            let grouped = stripped.split(whereSeparator: { $0 == "," || $0 == "." }).map(String.init)
+            if grouped.count > 1, grouped.dropFirst().allSatisfy({ $0.count == 3 }) {
+                return (Double(digitsOnly) ?? 0, digitsOnly.count)
+            }
+            if grouped.count > 1 { return nil }   // 2,5 or 17.08 — ambiguous, refuse
+            return (Double(digitsOnly) ?? 0, digitsOnly.count)
+        }
+
+        let multipliers: [String: Double] = [
+            "ribu": 1_000, "rb": 1_000, "nghìn": 1_000, "nghin": 1_000, "k": 1_000,
+            "juta": 1_000_000, "jt": 1_000_000, "triệu": 1_000_000, "trieu": 1_000_000
+        ]
+
+        // Build (value x multiplier) pairs, binding each number to the word that
+        // FOLLOWS it. Adjacent parts sum: "2 juta 500 ribu" = 2,500,000.
+        var candidates: [Double] = []
+        var running: Double = 0
+        var sawMultiplier = false
+        var i = 0
+        while i < tokens.count {
+            guard let n = numberValue(tokens[i]) else {
+                if running > 0 { candidates.append(running); running = 0; sawMultiplier = false }
+                i += 1
+                continue
+            }
+            var value = n.value
+            // Already expanded (4+ digits): never multiply it again.
+            if n.digits < 4, i + 1 < tokens.count,
+               let mult = multipliers[tokens[i + 1].filter({ $0.isLetter })] {
+                value *= mult
+                sawMultiplier = true
+                i += 1
+            }
+            running += value
+            i += 1
+        }
+        if running > 0 { candidates.append(running) }
+
+        let bigCurrency = ["IDR", "VND", "KRW", "LAK", "KHR", "COP", "PYG"].contains(code)
+        let floor: Double = bigCurrency ? 1_000 : 5
+        let plausible = candidates.filter { $0 >= floor }
+        guard let best = plausible.max() else { return nil }
+
+        // Two materially different candidates means we can't tell which is the
+        // price. No chip beats a wrong chip — that is this function's own rule.
+        if plausible.count > 1, let low = plausible.min(), best > low * 1.5 { return nil }
+        // A bare number with no multiplier in a big-denomination currency is
+        // more likely a room, a year or a quantity than a price.
+        if bigCurrency, !sawMultiplier, best < 10_000 { return nil }
 
         return (best, code)
     }
@@ -981,6 +1047,7 @@ struct BigLine: Identifiable {
 struct BigTextView: View {
     let text: String
     let theme: ChappyTheme
+    var onSpeak: ((String) -> Void)? = nil
     let onClose: () -> Void
 
     @AppStorage("translate_show_pronunciation") private var showPronunciation = true
@@ -992,13 +1059,18 @@ struct BigTextView: View {
             VStack(spacing: 22) {
                 Spacer()
 
-                Text(text)
-                    .font(.system(size: 46, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                    .multilineTextAlignment(.center)
-                    .minimumScaleFactor(0.35)
-                    .lineLimit(6)
-                    .padding(.horizontal, 26)
+                // WATCH-LIST: lineLimit(6) with no scroll silently truncated a
+                // long pharmacy explanation with "…", in the hands of a stranger
+                // who has no way to scroll it.
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 46, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .minimumScaleFactor(0.4)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 8)
+                }
 
                 if showPronunciation, let roman = text.romanised {
                     Text(roman)
@@ -1013,7 +1085,7 @@ struct BigTextView: View {
 
                 HStack(spacing: 26) {
                     Button {
-                        TTSService.shared.speak(text)
+                        onSpeak?(text)
                     } label: {
                         Label("Say it", systemImage: "speaker.wave.2.fill")
                             .font(.headline)
@@ -1110,7 +1182,8 @@ struct PhraseListView: View {
             get: { bigText.map { BigLine(text: $0) } },
             set: { bigText = $0?.text }
         )) { line in
-            BigTextView(text: line.text, theme: theme) { bigText = nil }
+            BigTextView(text: line.text, theme: theme,
+                        onSpeak: { viewModel.say($0) }) { bigText = nil }
         }
         .sheet(item: Binding(
             get: { shareText.map { BigLine(text: $0) } },
