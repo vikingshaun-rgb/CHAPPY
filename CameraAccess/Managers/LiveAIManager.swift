@@ -6,10 +6,219 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import AudioToolbox
 import CoreLocation
 import CoreMotion
 import MapKit
 import Speech
+
+// MARK: - CHAPPY EARCONS — the sound of being heard
+//
+// DESIGN NOTE (why tones, not speech, on every wake).
+// Every shipping voice assistant answers the wake word with a SOUND, not a
+// sentence, and they all converged on the same shape for the same reasons:
+//
+//   Siri            two-note chime, rising      (~200 ms)
+//   Alexa           single soft tone + light    (~150 ms)
+//   Google          two rising notes            (~180 ms)
+//   Cortana         short rising sweep
+//
+// Three rules fall out of that convergence, and all three matter more with
+// glasses on and the phone in a pocket than they do on a smart speaker:
+//
+//   1. LATENCY. The acknowledgement has to land within about 200 ms or you
+//      start talking over it. Speech synthesis cannot hit that — it has to
+//      allocate a voice and start an engine. A pre-rendered tone can.
+//   2. BREVITY. You wake an assistant dozens of times a day. "Good morning,
+//      how can I help you?" is charming twice and insufferable by lunchtime.
+//      JARVIS in the films is terse for exactly this reason — the personality
+//      is in the ONE line he says, not in a greeting ritual every time.
+//   3. PITCH DIRECTION CARRIES MEANING. Rising = "go ahead, I'm listening".
+//      Falling = "that didn't work". This is near-universal and free to adopt,
+//      and it means you can tell success from failure with the phone pocketed
+//      and no screen at all.
+//
+// So: a tone on EVERY wake, and a spoken greeting only when it is genuinely
+// welcome — the first wake after a long gap, where it reads as Chappy coming
+// on duty rather than as a chatbot clearing its throat.
+//
+// IMPLEMENTATION NOTE (why this does not use AVAudioEngine).
+// The wake tone has to play while the microphone tap is live. Starting another
+// AVAudioEngine at that exact moment is what has repeatedly taken this app's
+// audio stack down — it forces a session reconfiguration and fires
+// AVAudioEngineConfigurationChange at every engine in the process. So the tone
+// is rendered once to a WAV in the caches directory and played through
+// AudioServicesPlaySystemSound, which does not touch the session at all and
+// cannot disturb a live recording. Rendering it in code also means NO new asset
+// files, which matters because this project is built from the command line and
+// adding a resource would mean editing project.pbxproj by hand.
+// MARK: - CHAPPY VOICE — the warmth, kept on a short leash
+//
+// DESIGN NOTE (what "heart" means in a voice assistant, and what it doesn't).
+// The temptation is to make the assistant effusive. That fails fast, for a
+// reason worth stating plainly: you hear these lines dozens of times a day, and
+// anything longer than a clause becomes an obstacle between you and the thing
+// you asked for. Warmth in voice is NOT more words. It is:
+//
+//   1. VARIETY. The same six words every single time is what makes a machine
+//      feel like a machine. Three or four alternates, never repeating twice in
+//      a row, and it stops registering as canned — even though it plainly is.
+//   2. NOTICING. Warmth is remarking on something only a companion would
+//      notice: that it's your first walk of the day, that you've been going for
+//      hours, that it's 2am, that the battery is nearly gone. The content is
+//      caring; the length is one clause.
+//   3. PROPORTION. Big moments get a beat more. Routine ones get almost
+//      nothing. An assistant that celebrates every saved pin equally is
+//      exhausting; one that says "nice one" the first time you find a real
+//      bargain has a personality.
+//
+// So: short lines, rotated, occasionally observant, never chatty.
+enum ChappyVoice {
+    private static var lastPicked: [String: String] = [:]
+
+    /// Pick a line that isn't the one used last time for this key.
+    static func line(_ key: String, _ options: [String]) -> String {
+        guard options.count > 1 else { return options.first ?? "" }
+        let previous = lastPicked[key]
+        let fresh = options.filter { $0 != previous }
+        // Deterministic rotation rather than randomness — Chappy shouldn't
+        // repeat himself, but he also shouldn't feel like a slot machine.
+        let pick = fresh[abs(rotation) % fresh.count]
+        rotation &+= 1
+        lastPicked[key] = pick
+        return pick
+    }
+    private static var rotation = 0
+
+    static func timeOfDay(_ date: Date) -> String {
+        switch Calendar.current.component(.hour, from: date) {
+        case 0..<5:   return "You're up late"
+        case 5..<12:  return "Good morning"
+        case 12..<17: return "Good afternoon"
+        case 17..<22: return "Good evening"
+        default:      return "Evening"
+        }
+    }
+
+    /// Said when the app opens and the ear comes up — Chappy reporting for duty.
+    static func launchGreeting(name: String, date: Date, firstOfDay: Bool) -> String {
+        let part = timeOfDay(date)
+        let who = name.isEmpty ? "" : ", \(name)"
+        if firstOfDay {
+            return line("launch_first", [
+                "\(part)\(who). I'm listening.",
+                "\(part)\(who). Ready when you are.",
+                "\(part)\(who). All set.",
+            ])
+        }
+        return line("launch", [
+            "Ready\(who).",
+            "I'm here\(who).",
+            "Listening\(who).",
+        ])
+    }
+
+    /// Said when he says the name and nothing else.
+    static func bareWake(name: String) -> String {
+        let who = name.isEmpty ? "" : " \(name)"
+        return line("bare_wake", ["Go ahead\(who).", "Yes\(who)?", "I'm listening.", "Mm?"])
+    }
+
+    /// Said when a command was heard but couldn't be actioned.
+    static func stumble() -> String {
+        line("stumble", ["Didn't catch that.", "Sorry - say that again?", "Missed that one."])
+    }
+}
+
+final class ChappyEarcon {
+    static let shared = ChappyEarcon()
+
+    private var wakeID: SystemSoundID = 0
+    private var doneID: SystemSoundID = 0
+    private var failID: SystemSoundID = 0
+    private var tapID: SystemSoundID = 0
+    private var prepared = false
+
+    private init() {}
+
+    /// Render the three tones once. Safe to call repeatedly.
+    func prepare() {
+        guard !prepared else { return }
+        prepared = true
+        // Rising perfect fourth — "listening". A5 → D6.
+        wakeID = register(name: "chappy-wake", notes: [(880.0, 0.075), (1174.7, 0.115)])
+        // Soft single note — "done", deliberately quieter than the wake tone.
+        doneID = register(name: "chappy-done", notes: [(1046.5, 0.110)], gain: 0.22)
+        // Falling minor third — "didn't work".
+        failID = register(name: "chappy-fail", notes: [(659.3, 0.080), (523.3, 0.130)], gain: 0.26)
+        // One short high note, quiet. A click, not a chime.
+        tapID  = register(name: "chappy-tap",  notes: [(1567.98, 0.032)], gain: 0.16)
+    }
+
+    func wake() { play(wakeID) }
+    func done() { play(doneID) }
+    func fail() { play(failID) }
+    /// The button click. Deliberately the shortest and quietest of the four —
+    /// a tap is an acknowledgement, not an announcement. Its whole job is to
+    /// close the loop when the screen gives you nothing: you pressed Remember,
+    /// something happened, you did not have to look.
+    func tap() { play(tapID) }
+
+    private func play(_ id: SystemSoundID) {
+        guard id != 0 else { return }
+        AudioServicesPlaySystemSound(id)
+    }
+
+    /// Render a short sequence of sine notes to a 16-bit mono WAV and register
+    /// it as a system sound. Each note gets a raised-cosine envelope — a bare
+    /// sine switched on and off clicks, and a click is the one thing that makes
+    /// a chime sound cheap.
+    private func register(name: String, notes: [(Double, Double)], gain: Double = 0.30) -> SystemSoundID {
+        let sampleRate = 44100.0
+        var samples: [Int16] = []
+        for (freq, seconds) in notes {
+            let count = Int(sampleRate * seconds)
+            for i in 0..<count {
+                let t = Double(i) / sampleRate
+                let progress = Double(i) / Double(max(count - 1, 1))
+                // Raised-cosine attack/release, ~12% of the note at each end.
+                let edge = 0.12
+                var env = 1.0
+                if progress < edge { env = 0.5 - 0.5 * cos(.pi * progress / edge) }
+                else if progress > 1 - edge { env = 0.5 - 0.5 * cos(.pi * (1 - progress) / edge) }
+                // A touch of second harmonic keeps it from sounding like a test tone.
+                let v = sin(2 * .pi * freq * t) * 0.85 + sin(4 * .pi * freq * t) * 0.15
+                samples.append(Int16(max(-1.0, min(1.0, v * env * gain)) * 32767))
+            }
+        }
+        guard !samples.isEmpty else { return 0 }
+
+        var data = Data()
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        let byteCount = UInt32(samples.count * 2)
+        data.append(contentsOf: Array("RIFF".utf8)); le32(36 + byteCount)
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); le32(16); le16(1); le16(1)
+        le32(UInt32(sampleRate)); le32(UInt32(sampleRate) * 2); le16(2); le16(16)
+        data.append(contentsOf: Array("data".utf8)); le32(byteCount)
+        samples.withUnsafeBufferPointer { data.append(UnsafeBufferPointer(start: $0.baseAddress, count: $0.count)) }
+
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let url = dir.appendingPathComponent("\(name).wav")
+        do { try data.write(to: url, options: .atomic) } catch {
+            print("⚠️ [Earcon] Could not write \(name): \(error.localizedDescription)")
+            return 0
+        }
+        var id: SystemSoundID = 0
+        let status = AudioServicesCreateSystemSoundID(url as CFURL, &id)
+        guard status == kAudioServicesNoError else {
+            print("⚠️ [Earcon] Could not register \(name) (status \(status))")
+            return 0
+        }
+        return id
+    }
+}
 
 // MARK: - Live AI Manager
 
@@ -742,12 +951,31 @@ final class ChappyStandby: NSObject, ObservableObject {
         // Permissions must already be granted. Auto-arm must NEVER be the thing
         // that throws a permission dialog in the user's face at launch, and it
         // must never announce a failure he didn't ask for.
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
-            print("👂 [Standby] Auto-arm skipped (\(reason)) — speech not authorised yet")
+        // SIM FIX (COLD-START): on a genuinely fresh install both of these are
+        // .notDetermined, and silently skipping meant the wake word simply
+        // never worked until the user happened to tap Standby — the one screen
+        // interaction this whole feature exists to avoid. Undetermined is not
+        // "denied": ask once, at launch, while he is looking at the screen
+        // anyway, then arm. Only a real DENIAL is left alone.
+        let speechState = SFSpeechRecognizer.authorizationStatus()
+        let micState = AVAudioSession.sharedInstance().recordPermission
+        if speechState == .notDetermined || micState == .undetermined {
+            print("👂 [Standby] First run — requesting permissions so the ear can arm")
+            SFSpeechRecognizer.requestAuthorization { _ in
+                AVAudioSession.sharedInstance().requestRecordPermission { _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                        self?.autoArmIfWanted(reason: "permissions just granted")
+                    }
+                }
+            }
             return
         }
-        guard AVAudioSession.sharedInstance().recordPermission == .granted else {
-            print("👂 [Standby] Auto-arm skipped (\(reason)) — mic not authorised yet")
+        guard speechState == .authorized else {
+            print("👂 [Standby] Auto-arm skipped (\(reason)) — speech permission denied")
+            return
+        }
+        guard micState == .granted else {
+            print("👂 [Standby] Auto-arm skipped (\(reason)) — mic permission denied")
             return
         }
         print("👂 [Standby] Auto-arming (\(reason))")
@@ -869,13 +1097,32 @@ final class ChappyStandby: NSObject, ObservableObject {
         isListening = true
         starting = false
         installAudioResilience()
+        ChappyEarcon.shared.prepare() // render the tones before they're needed
         ChappyHaptics.shared.connected()
-        // Auto-arm confirms by haptic only — a phone that announces itself out
-        // loud every time you open the app is a phone you stop carrying.
+        // THE ON-DUTY MOMENT. Opening the app — by the Action Button or by
+        // tapping it — should feel like Chappy coming on shift: one short line
+        // that also PROVES, out loud, that the microphone is live. Without it
+        // you have no way to know the ear came up without pulling the phone out
+        // and looking at a chip, which is exactly what this is meant to avoid.
+        //
+        // But it greets on COLD LAUNCH only. auto-arm also fires on every
+        // return to the foreground, and something that talks every time you
+        // flick back from Maps is something you turn off within a day.
         if silentArm {
             silentArm = false
-            print("👂 [Standby] Armed silently")
+            if !Self.greetedThisLaunch, wakeStyle != "silent" {
+                Self.greetedThisLaunch = true
+                ChappyEarcon.shared.wake()
+                let firstOfDay = !Calendar.current.isDateInToday(lastGreetingAt)
+                lastGreetingAt = Date()
+                TTSService.shared.speak(ChappyVoice.launchGreeting(
+                    name: userName, date: Date(), firstOfDay: firstOfDay))
+            } else {
+                print("👂 [Standby] Armed silently (already greeted this launch)")
+            }
         } else {
+            // A deliberate tap on the ear button.
+            ChappyEarcon.shared.wake()
             TTSService.shared.speak("Standby on. I'm listening for my name.")
         }
         // Recognition tasks die after about a minute — quietly renew them.
@@ -1099,6 +1346,110 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
     }
 
+    // MARK: The wake acknowledgement
+
+    /// How Chappy answers his name. See the design note on ChappyEarcon.
+    /// - "tone"     tone every wake, greeting only after a long gap (default)
+    /// - "greeting" tone every wake, greeting every wake (JARVIS, full fat)
+    /// - "silent"   haptic only — for temples, cinemas, night buses
+    private var wakeStyle: String {
+        UserDefaults.standard.string(forKey: "chappy_wake_style") ?? "tone"
+    }
+    private var lastGreetingAt: Date {
+        get { Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: "chappy_last_greeting_at")) }
+        set { UserDefaults.standard.set(newValue.timeIntervalSince1970, forKey: "chappy_last_greeting_at") }
+    }
+    /// Greet once per app launch, not once per foreground.
+    private static var greetedThisLaunch = false
+    /// What he'd like to be called. Blank is fine — the lines read without it.
+    private var userName: String {
+        (UserDefaults.standard.string(forKey: "chappy_user_name") ?? "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Answer the wake word. Tone first and always — it has to land inside
+    /// ~200 ms or the user talks over it — then decide about words.
+    ///
+    /// - Parameter tail: whatever was said AFTER the name in the same breath.
+    ///   "Chappy, navigate to the ATM" must never be answered with "Good
+    ///   morning" — he already told us what he wants and a greeting would just
+    ///   delay it. The greeting is only for a bare "Chappy" said on its own.
+    private func acknowledgeWake(tail: String) {
+        ChappyHaptics.shared.connected()
+        guard wakeStyle != "silent" else { return }
+        ChappyEarcon.shared.wake()
+
+        let bare = tail.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).isEmpty
+        guard bare else { return }
+
+        let now = Date()
+        // A greeting is welcome when Chappy is coming ON DUTY — first wake of
+        // the morning, or after hours of silence. Said on every wake it stops
+        // being warmth and becomes latency.
+        let longGap = now.timeIntervalSince(lastGreetingAt) > 4 * 3600
+        guard wakeStyle == "greeting" || longGap else { return }
+        lastGreetingAt = now
+
+        // Deliberately ONE short clause, and rotated so it never sounds canned.
+        // The JARVIS effect comes from being brief and unhurried, not from a
+        // paragraph of hospitality.
+        TTSService.shared.speak("\(ChappyVoice.timeOfDay(now))\(userName.isEmpty ? "" : ", \(userName)").")
+    }
+
+    /// AUDIT FIX (NAV-TILE): the Navigate tile now asks out loud and listens,
+    /// instead of opening a paid Live AI session. Arms the ear if it isn't
+    /// already, speaks the question, and treats the next thing heard as a
+    /// destination even without the wake word — you just pressed the button, so
+    /// you have already said "I'm talking to you".
+    func promptForDestination() {
+        expectingDestinationUntil = Date().addingTimeInterval(12)
+        if !isListening {
+            silentArm = true
+            start()
+        }
+        TTSService.shared.speak("Where do you want to go?")
+        ChappyHaptics.shared.connected()
+    }
+
+    /// While this is in the future, a sentence with no wake word is still taken
+    /// as a command — specifically as a destination.
+    private var expectingDestinationUntil = Date.distantPast
+
+    /// Same trick for naming a spot you just saved.
+    ///
+    /// WHY THIS EXISTS: Remember always worked — it saved the pin and said so.
+    /// But it named it "spot at 4:53PM near Cresthaven Court", and a list of
+    /// timestamps is not a memory. Six weeks into a trip you will have forty of
+    /// them and not one will mean anything. The pin is only worth saving if you
+    /// can say "the warung with the good coffee" and find it again, so the
+    /// naming has to happen in the two seconds while you still remember why you
+    /// pressed the button — by voice, without taking the phone out.
+    private var expectingSpotNameUntil = Date.distantPast
+
+    /// Save where you are, then ask what to call it.
+    func rememberSpotByVoice() {
+        ChappyEarcon.shared.tap()
+        ContextEngine.shared.start()
+        let spot = TripRecorder.shared.rememberSpot(named: "")
+        ChappyHaptics.shared.straightStep()
+        guard spot.lat != 0 || spot.lon != 0 else {
+            ChappyEarcon.shared.fail()
+            TTSService.shared.speak("Saved, but GPS hasn't locked yet - give it a few seconds outside and try again.")
+            return
+        }
+        ChappyEarcon.shared.done()
+        expectingSpotNameUntil = Date().addingTimeInterval(12)
+        if !isListening {
+            silentArm = true
+            start()
+        }
+        TTSService.shared.speak(ChappyVoice.line("spot_saved", [
+            "Saved. What should I call it?",
+            "Got it. What's it called?",
+            "Pinned. Give it a name?",
+        ]))
+    }
+
     /// The 50s renewal, in one place so the interruption handler can restart it.
     private func restartRenewTimer() {
         restartTimer?.invalidate()
@@ -1211,10 +1562,50 @@ final class ChappyStandby: NSObject, ObservableObject {
         if !awake {
             guard let range = Self.wakeWords.compactMap({ text.range(of: $0, options: .backwards) })
                 .max(by: { $0.upperBound < $1.upperBound })
-            else { return }
+            else {
+                // AUDIT FIX (NAV-TILE): the user just pressed Navigate and was
+                // asked a question out loud. Making him also say the wake word
+                // to answer it would be absurd, so for a few seconds his answer
+                // counts on its own — routed straight to navigation.
+                // Naming a spot beats navigating to one — if both windows are
+                // somehow open, the more recent prompt wins.
+                if Date() < expectingSpotNameUntil, text.count > 1 {
+                    expectingSpotNameUntil = .distantPast
+                    let name = text.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+                    // "call it the blue warung" / "it's the blue warung"
+                    var cleaned = name
+                    for lead in ["call it ", "name it ", "it's ", "its ", "the name is "] {
+                        if cleaned.hasPrefix(lead) { cleaned = String(cleaned.dropFirst(lead.count)) }
+                    }
+                    if TripRecorder.shared.renameLastSpot(to: cleaned) {
+                        ChappyEarcon.shared.done()
+                        ChappyHaptics.shared.straightStep()
+                        TTSService.shared.speak("Saved as \(cleaned).")
+                    } else {
+                        ChappyEarcon.shared.fail()
+                        TTSService.shared.speak("Couldn't rename it, but the spot is saved.")
+                    }
+                    resetRecognition()
+                    return
+                }
+                if Date() < expectingDestinationUntil, text.count > 2 {
+                    expectingDestinationUntil = .distantPast
+                    awake = true
+                    command = "take me to " + text
+                    ChappyHaptics.shared.connected()
+                    print("👂⚡ [Standby] Destination answer accepted without wake word")
+                    lastWordAt = Date()
+                    routeWork?.cancel()
+                    let snapshot = command
+                    let work = DispatchWorkItem { [weak self] in self?.finish(snapshot) }
+                    routeWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: work)
+                }
+                return
+            }
             awake = true
             command = String(text[range.upperBound...])
-            ChappyHaptics.shared.connected()
+            acknowledgeWake(tail: command)
             print("👂⚡ [Standby] Woken")
         } else {
             // Keep only what follows the LAST wake word in the running text
@@ -1244,6 +1635,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             // dropped" and "never heard at all" are indistinguishable — so he
             // repeats himself into a void. Say something.
             print("👂 [Standby] Busy — dropped: \(raw)")
+            ChappyEarcon.shared.fail()
             ChappyHaptics.shared.straightStep()
             TTSService.shared.speak("Still working on the last one.")
             // AUDIT P1 (SB-AWAKE): `awake` was left TRUE here. The next sentence
@@ -1369,9 +1761,21 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("mark this spot") || c.contains("this is home") {
             var name = after(c, ["call it "]) ?? ""
             if c.contains("this is home") { name = "home" }
+            // If he named it in the same breath, take it. If not, ask — same
+            // reasoning as the Remember button: an unnamed pin is a timestamp.
+            if name.isEmpty {
+                rememberSpotByVoice()
+                return
+            }
             let spot = TripRecorder.shared.rememberSpot(named: name)
             ChappyHaptics.shared.straightStep()
-            speak(spot.lat == 0 ? "Saved, but GPS hasn't locked yet." : "Saved \(spot.name).")
+            if spot.lat == 0 {
+                ChappyEarcon.shared.fail()
+                speak("Saved, but GPS hasn't locked yet.")
+            } else {
+                ChappyEarcon.shared.done()
+                speak("Saved \(spot.name).")
+            }
             return
         }
         if c.contains("where was i") || c.contains("where have i been") || c.contains("what did i do today") {
@@ -1544,7 +1948,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             speak("Finding \(dest).")
             let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
-            speak(reply); return
+            // Human ears get the human string; the model-directed one is for
+            // Live AI only. See AUDIT FIX (SPOKEN-LEAK) in NavEngine.navigate.
+            speak(NavEngine.shared.spokenRouteSummary ?? reply); return
         }
         // AUDIT FIX (coverage gap): mode follow-ups re-route the last
         // destination — they worked in-session but not in Standby.
@@ -1555,7 +1961,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             let driving = !(c.contains("foot") || c.contains("walking"))
             speak("Re-routing.")
             let reply = await NavEngine.shared.navigate(to: last, driving: driving)
-            speak(reply); return
+            speak(NavEngine.shared.spokenRouteSummary ?? reply); return
         }
         if c.contains("open google maps") || c.contains("open maps") {
             NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
@@ -1631,7 +2037,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if wantsNav {
                     speak("Finding \(pending).")
                     let reply = await NavEngine.shared.navigate(to: pending, driving: false)
-                    speak(reply); return
+                    speak(NavEngine.shared.spokenRouteSummary ?? reply); return
                 }
                 await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
                 return
@@ -1892,8 +2298,13 @@ final class ChappyStandby: NSObject, ObservableObject {
             // command, and the mic heard it. Never put the wake word inside
             // something Chappy says out loud.
             TTSService.shared.speak("\(reason) Want me to open Live AI so we can talk it through? Just say the word.")
+            ChappyEarcon.shared.fail()
         } else {
-            TTSService.shared.speak("\(reason) Try me again?")
+            // Rotated so the second miss doesn't sound like a stuck record —
+            // the moment a wearer notices the identical phrasing twice is the
+            // moment the thing stops feeling like a companion.
+            ChappyEarcon.shared.fail()
+            TTSService.shared.speak("\(reason) \(ChappyVoice.stumble())")
         }
     }
 }
@@ -2190,6 +2601,9 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
 
     /// NAV PRECISION: street-corner accuracy while navigating, battery-light
     /// hundred-metre mode the rest of the time.
+    /// Ask for Always exactly once, and only when a route actually starts.
+    private var askedForAlways = false
+
     func setPrecision(navigating: Bool) {
         locationManager.desiredAccuracy = navigating
             ? kCLLocationAccuracyBestForNavigation
@@ -2199,9 +2613,31 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         // and the journal stopped. The whole product is phone-in-pocket.
         locationManager.pausesLocationUpdatesAutomatically = !navigating
         locationManager.activityType = navigating ? .otherNavigation : .other
-        if navigating, locationManager.authorizationStatus == .authorizedAlways {
-            locationManager.allowsBackgroundLocationUpdates = true
-        } else if !navigating {
+        // AUDIT P1 (BG-LOCATION) — CONFIRMED: this was gated on
+        // `.authorizedAlways`, and the app only ever calls
+        // requestWhenInUseAuthorization(). So allowsBackgroundLocationUpdates
+        // was NEVER set, and the moment the phone locked mid-route the location
+        // updates stopped: no turn announcements, no journal, no off-route
+        // detection. For an app whose entire premise is phone-in-pocket, that
+        // is the difference between working and not.
+        //
+        // WhenInUse is enough: with allowsBackgroundLocationUpdates = true iOS
+        // keeps delivering while backgrounded and shows the blue indicator, so
+        // the user can always see it's tracking. Always-authorisation is only
+        // needed for updates with the app fully suspended, which we ask for
+        // once, at the moment it actually earns the request — the start of a
+        // real route, not on launch out of nowhere.
+        if navigating {
+            let status = locationManager.authorizationStatus
+            if status == .authorizedAlways || status == .authorizedWhenInUse {
+                locationManager.allowsBackgroundLocationUpdates = true
+                locationManager.showsBackgroundLocationIndicator = true
+            }
+            if status == .authorizedWhenInUse, !askedForAlways {
+                askedForAlways = true
+                locationManager.requestAlwaysAuthorization()
+            }
+        } else {
             locationManager.allowsBackgroundLocationUpdates = false
         }
     }
@@ -2299,7 +2735,9 @@ final class TripRecorder {
     }
 
     struct Spot: Codable {
-        let name: String
+        /// `var` so a spot can be renamed by voice straight after saving —
+        /// "spot at 4:53PM" is not a memory you can use six weeks later.
+        var name: String
         let t: Date
         let lat: Double
         let lon: Double
@@ -2395,6 +2833,19 @@ final class TripRecorder {
         saveSpots()
         print("📍 [Trip] Remembered spot: \(name)")
         return spot
+    }
+
+    /// Rename the spot saved most recently. Returns false if there isn't one or
+    /// the name is unusable, so the caller can say something honest rather than
+    /// claim a success that didn't happen.
+    @discardableResult
+    func renameLastSpot(to newName: String) -> Bool {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 60, !spots.isEmpty else { return false }
+        spots[spots.count - 1].name = trimmed
+        saveSpots()
+        print("📍 [Trip] Renamed last spot to: \(trimmed)")
+        return true
     }
 
     /// Streets/areas passed through today, in order, plus remembered spots.
@@ -2568,6 +3019,9 @@ final class NavEngine: NSObject, ObservableObject {
     private(set) var lastQuery: String?
     /// Whether the last route was a driving route (for Google Maps handoff).
     private(set) var lastDriving = false
+    /// The version of the last route summary meant for HUMAN ears — no
+    /// model-directed instructions in it. Standby speaks this one.
+    private(set) var spokenRouteSummary: String?
 
     /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
     func navigate(to query: String, driving: Bool = false) async -> String {
@@ -2608,6 +3062,12 @@ final class NavEngine: NSObject, ObservableObject {
         let distText = route.distanceMeters >= 2000
             ? String(format: "%.1f kilometers", route.distanceMeters / 1000)
             : "\(Int(route.distanceMeters)) meters"
+        // AUDIT FIX (SPOKEN-LEAK): this single string was returned to BOTH
+        // callers. Live AI feeds it to the model, which is why it ended with a
+        // model-directed instruction — but Standby speaks the return value
+        // VERBATIM, so the wearer heard Chappy say the words "Also tell the
+        // user:" out loud. Two audiences, two strings.
+        spokenRouteSummary = "\(destName). About \(distText), roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(steps[0].instruction). Say 'open Google Maps' for the full map."
         return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction). Also tell the user: say 'open Google Maps' anytime for the full map with turn-by-turn on screen."
     }
 
