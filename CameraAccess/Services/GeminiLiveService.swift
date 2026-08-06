@@ -653,9 +653,27 @@ class GeminiLiveService: NSObject {
         print("🔧 [Gemini] Tool: \(name) args: \(args)")
         switch name {
         case "navigate_to":
-            let mode = (args["mode"] as? String ?? "walk").lowercased()
-            return await NavEngine.shared.navigate(to: args["destination"] as? String ?? "",
-                                                   driving: mode.contains("driv") || mode.contains("car"))
+            // AUDIT FIX (NAV-MODE): the model narrates the mode in its own
+            // words but the TOOL defaults to "walk". So it would say "driving
+            // you there" out loud, pass no mode, get a walking route, and then
+            // the Google Maps hand-off (which reads NavEngine.lastDriving)
+            // opened walking directions — the spoken word and the actual route
+            // disagreed. Fall back to what the USER actually said rather than
+            // to a silent default.
+            let mode = (args["mode"] as? String ?? "").lowercased()
+            let spoken = currentUserLine.lowercased()
+            let saidDrive = ["drive", "driving", "by car", "in the car", "taxi",
+                             "grab", "scooter", "motorbike", "ride"]
+                .contains { spoken.contains($0) }
+            let driving = mode.isEmpty
+                ? saidDrive
+                : (mode.contains("driv") || mode.contains("car") || mode.contains("taxi"))
+            let dest = args["destination"] as? String ?? ""
+            print("🧭 [Gemini] navigate_to '\(dest)' mode='\(mode)' spokenSaidDrive=\(saidDrive) → driving=\(driving)")
+            let summary = await NavEngine.shared.navigate(to: dest, driving: driving)
+            // Ground the narration: tell the model, in the tool result, which
+            // mode it actually got, so it can't invent the other one.
+            return "[route mode: \(driving ? "DRIVING" : "WALKING") — say this mode, not the other] " + summary
         case "get_me_home":
             return await NavEngine.shared.getHome()
         case "stop_navigation":
