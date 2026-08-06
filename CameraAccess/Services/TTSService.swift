@@ -69,10 +69,25 @@ class TTSService: NSObject, ObservableObject {
             // silently and permanently ("standby stops hearing me").
             // .playAndRecord plays exactly as well and never tears down a
             // recording route.
-            try session.setCategory(.playAndRecord, mode: .spokenAudio,
-                                    options: [.duckOthers, .allowBluetooth,
-                                              .allowBluetoothA2DP, .defaultToSpeaker])
-            try session.setActive(true)
+            // FS-2: this used to force mode .spokenAudio on every spoken line,
+            // replacing the .voiceChat mode Translate deliberately sets for
+            // hardware echo cancellation — and because startRecording() is
+            // guarded by !isRecording, .voiceChat was never restored within a
+            // conversation. One bubble tap and AEC was off for the rest of it.
+            // It also added .allowBluetooth (which the iPhone-mic path
+            // deliberately omits, so input could migrate to the glasses) and
+            // cleared the output override set by applyOutputRoute.
+            //
+            // Leave an existing playAndRecord configuration exactly as it is.
+            // Only configure the session when nobody else has.
+            if session.category == .playAndRecord {
+                try session.setActive(true)
+            } else {
+                try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                        options: [.duckOthers, .allowBluetooth,
+                                                  .allowBluetoothA2DP, .defaultToSpeaker])
+                try session.setActive(true)
+            }
         } catch {
             print("⚠️ [TTS] Audio session configuration failed: \(error.localizedDescription) — continuing")
         }
@@ -109,6 +124,24 @@ class TTSService: NSObject, ObservableObject {
     /// Priority: Gemini TTS (natural voice) → Apple system TTS (offline fallback).
     /// The apiKey parameter is accepted for backward compatibility but ignored;
     /// the Gemini key is read from the key store.
+    /// FS-11: for saved phrases and replays we already KNOW the language, and
+    /// the UI promises they work with no connection. Going through the network
+    /// voice first meant a stalled 8-second socket on one bar of EDGE — the
+    /// exact condition the feature exists for — with nothing on screen to say
+    /// so. This path skips the network entirely.
+    func speakOffline(_ text: String, languageCode: String? = nil) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        currentTask?.cancel()
+        stop()
+        isSpeaking = true
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+            await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
+            if !Task.isCancelled { await MainActor.run { self.isSpeaking = false } }
+        }
+    }
+
     func speak(_ text: String, apiKey: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -270,7 +303,7 @@ class TTSService: NSObject, ObservableObject {
 
     // MARK: - System TTS Fallback (offline)
 
-    private func fallbackToSystemTTS(text: String) async {
+    private func fallbackToSystemTTS(text: String, languageCode: String? = nil) async {
         configureAudioSession()
 
         let synthesizer = AVSpeechSynthesizer()
@@ -284,12 +317,31 @@ class TTSService: NSObject, ObservableObject {
         // is unavailable (no signal, which is exactly when you're standing in a
         // market), replaying an Indonesian line read it aloud in an Australian
         // accent. Identify the language on-device and use a matching voice.
+        // WATCH-LIST FIX: NLLanguageRecognizer returns "zh-Hans"/"zh-Hant" but
+        // the installed voices are "zh-CN"/"zh-HK"/"zh-TW", so the prefix match
+        // failed and Chinese was read aloud by the Australian English voice.
+        // Strip the script subtag, and prefer a language we were TOLD.
+        func voiceLanguage(for code: String) -> String? {
+            let base = String(code.split(separator: "-").first ?? "")
+            let voices = AVSpeechSynthesisVoice.speechVoices().map(\.language)
+            if let exact = voices.first(where: { $0.lowercased() == code.lowercased() }) { return exact }
+            if base == "en" { return voices.contains("en-AU") ? "en-AU" : "en-US" }
+            if base == "zh" {
+                if code.lowercased().contains("hant") { return voices.first { $0.hasPrefix("zh-TW") || $0.hasPrefix("zh-HK") } }
+                return voices.first { $0.hasPrefix("zh-CN") } ?? voices.first { $0.hasPrefix("zh") }
+            }
+            return voices.first { $0.hasPrefix(base + "-") || $0 == base }
+        }
+
         var language = "en-AU"
-        let recogniser = NLLanguageRecognizer()
-        recogniser.processString(text)
-        if let code = recogniser.dominantLanguage?.rawValue,
-           AVSpeechSynthesisVoice.speechVoices().contains(where: { $0.language.hasPrefix(code) }) {
-            language = (code == "en") ? "en-AU" : code
+        if let known = languageCode, let v = voiceLanguage(for: known) {
+            language = v
+        } else {
+            let recogniser = NLLanguageRecognizer()
+            recogniser.processString(text)
+            if let code = recogniser.dominantLanguage?.rawValue, let v = voiceLanguage(for: code) {
+                language = v
+            }
         }
         utterance.voice = AVSpeechSynthesisVoice(language: language)
             ?? AVSpeechSynthesisVoice(language: "en-US")
