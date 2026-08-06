@@ -37,6 +37,9 @@ struct SettingsView: View {
     // POCKET LAW: wake word armed the moment the app opens. Default ON —
     // the Action Button gesture exists precisely so the phone stays pocketed.
     @AppStorage("chappy_standby_autoarm") private var standbyAutoArm = true
+    // How Chappy answers his name — see ChappyEarcon's design note.
+    @AppStorage("chappy_wake_style") private var wakeStyle = "tone"
+    @AppStorage("chappy_user_name") private var userName = ""
     // BACKUP & RESTORE
     @State private var showRestoreImporter = false
     @State private var restoreResultMessage = ""
@@ -321,6 +324,31 @@ struct SettingsView: View {
                                     .foregroundColor(AppColors.textSecondary)
                             }
                         }
+                    }
+                    // How Chappy answers his name. Tone always; words rarely.
+                    Picker(selection: $wakeStyle) {
+                        Text("Tone, greeting now and then").tag("tone")
+                        Text("Tone and a greeting every time").tag("greeting")
+                        Text("Silent — buzz only").tag("silent")
+                    } label: {
+                        HStack {
+                            Image(systemName: "bell.badge.fill")
+                                .foregroundColor(.orange)
+                            Text("When you say “Chappy”")
+                                .foregroundColor(AppColors.textPrimary)
+                        }
+                    }
+
+                    HStack {
+                        Image(systemName: "person.fill")
+                            .foregroundColor(.teal)
+                        Text("Call me")
+                            .foregroundColor(AppColors.textPrimary)
+                        Spacer()
+                        TextField("optional", text: $userName)
+                            .multilineTextAlignment(.trailing)
+                            .foregroundColor(AppColors.textSecondary)
+                            .frame(maxWidth: 140)
                     }
                 } header: {
                     Text("Voice")

@@ -175,12 +175,25 @@ struct TurboMetaHomeView: View {
                                     if standby.isListening { standby.handOff() }
                                     showLiveTranslate = true
                                 }
-                                ModeTile(title: "Navigate",
-                                         subtitle: navEngine.isNavigating ? "Navigating — tap for map" : "Talk, then say: navigate to...",
+                                ModeTile(title: "Go",
+                                         subtitle: navEngine.isNavigating
+                                            ? "Navigating — tap for map"
+                                            : (standby.isListening ? "Tap, then say where to" : "Tap to arm, then say where to"),
                                          icon: "location.circle.fill",
                                          accent: .blue,
                                          active: navEngine.isNavigating) {
-                                    if navEngine.isNavigating { showNavMap = true } else { showLiveAI = true }
+                                    // AUDIT FIX (NAV-TILE): tapping this used to
+                                    // silently open a METERED Live AI session,
+                                    // which is not what a button labelled
+                                    // "Navigate" should do and is not what
+                                    // anyone expects. Navigation is a free,
+                                    // on-device Standby command — so arm the
+                                    // ear and ask, instead of burning a session.
+                                    if navEngine.isNavigating {
+                                        showNavMap = true
+                                    } else {
+                                        ChappyStandby.shared.promptForDestination()
+                                    }
                                 }
                             }
                         }
@@ -191,13 +204,17 @@ struct TurboMetaHomeView: View {
                                 showQuickVision = true
                             }
                             QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
-                                ContextEngine.shared.start()
-                                let spot = TripRecorder.shared.rememberSpot(named: "")
+                                // Remember always DID save — but it named the pin
+                                // "spot at 4:53PM near Cresthaven Court", which is
+                                // a timestamp, not a memory. Forty of those and
+                                // none of them mean anything. Now it clicks, saves,
+                                // and asks what to call it, so you can answer
+                                // "the warung with the good coffee" out loud in the
+                                // two seconds while you still remember why you
+                                // pressed it.
+                                ChappyStandby.shared.rememberSpotByVoice()
                                 journalTick += 1
                                 UINotificationFeedbackGenerator().notificationOccurred(.success)
-                                TTSService.shared.speak(spot.lat == 0 && spot.lon == 0
-                                    ? "Saved, but GPS has not locked yet - give it a few seconds outside and try again."
-                                    : "Saved \(spot.name).")
                             }
                             QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
                                               label: continuousVision.isRunning ? "Stop" : "Watch") {
@@ -852,9 +869,12 @@ struct TodayMapSheet: View {
                 coords: TripRecorder.shared.crumbs.map {
                     CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
                 },
-                destination: nil)
+                destination: nil,
+                spots: TripRecorder.shared.spots)
                 .ignoresSafeArea(edges: .bottom)
-                .navigationTitle("Today's Trail")
+                .navigationTitle(TripRecorder.shared.spots.isEmpty
+                                 ? "Today's Trail"
+                                 : "Today's Trail · \(TripRecorder.shared.spots.count) saved")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarTrailing) {
@@ -887,6 +907,12 @@ struct NavMapSheet: View {
 struct RouteMapView: UIViewRepresentable {
     let coords: [CLLocationCoordinate2D]
     let destination: CLLocationCoordinate2D?
+    /// AUDIT FIX (SPOTS-INVISIBLE): Today's Trail drew the breadcrumb line and
+    /// nothing else, so every spot you had carefully remembered was invisible
+    /// on the one screen built to show you where you'd been. Saving a place you
+    /// can never see again is not a feature. Titled pins, so tapping one tells
+    /// you what you called it.
+    var spots: [TripRecorder.Spot] = []
 
     func makeUIView(context: Context) -> MKMapView {
         let map = MKMapView()
@@ -903,8 +929,21 @@ struct RouteMapView: UIViewRepresentable {
         }
         if let d = destination {
             let pin = MKPointAnnotation()
+            pin.title = "Destination"
             pin.coordinate = d
             map.addAnnotation(pin)
+        }
+        for s in spots where s.lat != 0 || s.lon != 0 {
+            let pin = MKPointAnnotation()
+            pin.coordinate = CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon)
+            pin.title = s.name
+            pin.subtitle = [s.street, s.city].compactMap { $0 }.joined(separator: ", ")
+            map.addAnnotation(pin)
+        }
+        // If there is no trail but there ARE spots, frame the spots rather than
+        // dropping the user on a blank world map.
+        if coords.isEmpty, !spots.isEmpty {
+            map.showAnnotations(map.annotations, animated: false)
         }
         return map
     }
@@ -1437,7 +1476,16 @@ struct QuickActionButton: View {
     @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
     private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
-        Button(action: action) {
+        // Every quick action clicks and taps back. These buttons are pressed
+        // one-handed, often without looking — glasses on, walking, phone half
+        // out of a pocket — and a flat control that gives you nothing is one
+        // you press twice because you can't tell whether the first press
+        // landed. Done centrally so no button can be added later and forget.
+        Button {
+            ChappyEarcon.shared.tap()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
             VStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 20))
