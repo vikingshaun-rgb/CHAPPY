@@ -34,6 +34,9 @@ struct SettingsView: View {
     @State private var selectedQuality = UserDefaults.standard.string(forKey: "video_quality") ?? "high"
     @State private var hasAPIKey = false // changed to a State variable
     @State private var hasGoogleAPIKey = false // Google API Key Status
+    // POCKET LAW: wake word armed the moment the app opens. Default ON —
+    // the Action Button gesture exists precisely so the phone stays pocketed.
+    @AppStorage("chappy_standby_autoarm") private var standbyAutoArm = true
     // BACKUP & RESTORE
     @State private var showRestoreImporter = false
     @State private var restoreResultMessage = ""
@@ -303,8 +306,29 @@ struct SettingsView: View {
                                 .foregroundColor(AppColors.textSecondary)
                         }
                     }
+                    // POCKET LAW: the Action Button opens Chappy and the ear
+                    // should already be listening. Off only for the user who
+                    // deliberately wants a quiet, tap-to-listen phone.
+                    Toggle(isOn: $standbyAutoArm) {
+                        HStack {
+                            Image(systemName: "ear.badge.checkmark")
+                                .foregroundColor(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Standby on at launch")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Wake word ready the moment Chappy opens — no need to take the phone out")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
                 } header: {
                     Text("Voice")
+                } footer: {
+                    Text(standbyAutoArm
+                         ? "Say “Chappy” then your command. Turning Standby off by hand keeps it off until you next open the app."
+                         : "You'll need to tap Standby on the home screen each time before voice commands work.")
+                        .font(AppTypography.caption)
                 }
 
                 // Appearance — Chappy theme picker

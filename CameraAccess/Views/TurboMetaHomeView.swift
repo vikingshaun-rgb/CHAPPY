@@ -6,6 +6,7 @@
  */
 
 import SwiftUI
+import UIKit
 import AVFoundation
 import Speech
 import MapKit
@@ -40,6 +41,21 @@ struct TurboMetaHomeView: View {
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
     @ObservedObject private var openClawService = OpenClawNodeService.shared
+
+    /// POCKET LAW: arm the wake word, but never on top of a module that owns
+    /// the microphone. Every one of these covers is a full-screen session; if
+    /// one is up, that module is the thing listening and Standby must stay out
+    /// of its way. It re-arms by itself via resumeAfterHandOff when the module
+    /// closes, and failing that, the next didBecomeActive catches it.
+    private func armStandbyIfClear(reason: String) {
+        guard !showLiveAI, !showLiveTranslate, !showQuickVision,
+              !showLiveStream, !showRTMPStreaming, !showOpenClaw, !showLeanEat
+        else {
+            print("👂 [Standby] Auto-arm skipped (\(reason)) — a module is on screen")
+            return
+        }
+        ChappyStandby.shared.autoArmIfWanted(reason: reason)
+    }
 
     var body: some View {
         NavigationView {
@@ -288,6 +304,23 @@ struct TurboMetaHomeView: View {
                openClawService.loadGatewayToken() != nil {
                 openClawService.connect()
             }
+
+            // POCKET LAW: Action Button → app open → ear already listening.
+            // Delayed a beat so the audio session settles after launch; arming
+            // into a session iOS is still configuring is how the ear ends up
+            // running with no audio reaching it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                armStandbyIfClear(reason: "app opened")
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification)) { _ in
+            // Coming back from a call, another app, or a locked screen. Without
+            // this the ear is armed exactly once per cold launch and any
+            // interruption leaves it closed for the rest of the day.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                armStandbyIfClear(reason: "foreground")
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .liveAITriggered)) { _ in
             // Triggered from Shortcuts — auto-open the Live AI screen
@@ -319,6 +352,11 @@ struct TurboMetaHomeView: View {
             // "Hey Siri, Continuous Vision"
             if !continuousVision.isRunning {
                 continuousVision.start(streamViewModel: streamViewModel)
+            } else {
+                // AUDIT P0 (MH-1): the hand-off was already spent by the router.
+                // Swallowing the notification here stranded the ear just as
+                // thoroughly as a failed start did.
+                ChappyStandby.shared.resumeAfterHandOff()
             }
         }
         .alert("Emergency Contact", isPresented: $showEmergencyContact) {
@@ -366,6 +404,16 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
     private static let maxSessionMinutes: Double = 25
 
     func start(streamViewModel: StreamSessionViewModel) {
+        // AUDIT P0 (MH-1): the router speaks "Watching.", calls handOff() — which
+        // tears down the recognizer, the tap, the engine AND the renew timer —
+        // and then posts the notification that lands here. Every one of the
+        // bail-outs below used to return without giving the microphone back, so
+        // "Chappy, keep watching" with the glasses asleep or the battery at 18%
+        // killed the wake word for the rest of the day. The wearer heard a
+        // refusal and then silence, forever, with no way back except taking the
+        // phone out — the one thing this whole layer exists to avoid.
+        var claimed = false
+        defer { if !claimed { ChappyStandby.shared.resumeAfterHandOff() } }
         guard !isRunning else { return }
         // AUDIT FIX (HIGH): Watch + Talk together = two Chappys narrating over
         // each other, both metered, each stealing the other's audio session.
@@ -390,6 +438,7 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
         if ChappyStandby.shared.isListening { ChappyStandby.shared.handOff() }
 
         isRunning = true
+        claimed = true // from here on, stop() owns returning the ear
         startedAt = Date()
         failures = 0
         statusText = "Starting..."
