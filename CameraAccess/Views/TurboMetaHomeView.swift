@@ -374,13 +374,22 @@ struct TurboMetaHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: .chappyWakeCameraForSnap)) { _ in
             Task { @MainActor in
                 await streamViewModel.startSession()
-                // The glasses need a beat to produce a first frame.
-                try? await Task.sleep(nanoseconds: 1_800_000_000)
-                if let frame = streamViewModel.currentVideoFrame {
+                // WAIT FOR A FRAME, DON'T GUESS AT ONE.
+                // A fixed 1.8s sleep was optimistic: the glasses light comes on
+                // well before the first frame lands, so the check ran early and
+                // Chappy announced the camera wasn't connected while it plainly
+                // was. Poll instead — up to eight seconds, giving up only when
+                // there really is nothing.
+                var frame: UIImage?
+                for _ in 0..<27 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    if let f = streamViewModel.currentVideoFrame { frame = f; break }
+                }
+                if let frame {
                     ChappyStandby.shared.completeSilentSnap(frame)
                 } else {
                     ChappyEarcon.shared.fail()
-                    TTSService.shared.speak("The camera didn't wake up - check the glasses are connected.")
+                    TTSService.shared.speak("The camera didn't wake up - check the glasses are connected in the Meta app.")
                 }
             }
         }
@@ -441,7 +450,13 @@ struct TurboMetaHomeView: View {
                 let charging = UIDevice.current.batteryState == .charging
                             || UIDevice.current.batteryState == .full
                 guard charging else { return }
-                Task { await ChappyMemory.shared.runFactExtraction() }
+                Task {
+                    await ChappyMemory.shared.runFactExtraction()
+                    // DREAMING: read yesterday properly and write it up. One
+                    // cheap call, once a day, on charge and WiFi.
+                    await ChappyMemory.shared.dreamIfDue()
+                    ChappyMemory.shared.fileDayRoute()
+                }
             }
             // Ensure QuickVisionManager has the streamViewModel reference
             quickVisionManager.setStreamViewModel(streamViewModel)
@@ -1780,6 +1795,7 @@ struct MemoryView: View {
 
                 VStack(spacing: 0) {
                     searchBar
+                    suggestionRow
                     filterRow
                     if ingest.isRunning { ingestStrip }
                     if memory.isSearchingDisk { searchingStrip }
@@ -1872,6 +1888,52 @@ struct MemoryView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
         .padding(.horizontal, 16)
         .padding(.top, 10)
+    }
+
+    /// AUTOFILL FROM YOUR OWN WORDS. Places, people and events you have
+    /// actually recorded — not a generic dictionary. Typing three letters of a
+    /// warung you saved six weeks ago finishes it for you.
+    private var suggestions: [String] {
+        let q = searchText.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                   locale: .current)
+        guard q.count >= 2, deepResults == nil else { return [] }
+        var out: [String] = []
+        for e in memory.recent {
+            for candidate in [e.place, e.street, e.city, e.title].compactMap({ $0 }) {
+                let f = candidate.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                          locale: .current)
+                guard f.contains(q), candidate.count < 42,
+                      !out.contains(where: { $0.caseInsensitiveCompare(candidate) == .orderedSame })
+                else { continue }
+                out.append(candidate)
+                if out.count >= 6 { return out }
+            }
+        }
+        return out
+    }
+
+    @ViewBuilder
+    private var suggestionRow: some View {
+        if !suggestions.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(suggestions, id: \.self) { s in
+                        Button { searchText = s } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "magnifyingglass").font(.system(size: 9))
+                                Text(s).font(.caption).lineLimit(1)
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Capsule().fill(theme.accent.opacity(0.18)))
+                            .foregroundColor(theme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.top, 6)
+        }
     }
 
     private var filterRow: some View {
@@ -2225,7 +2287,12 @@ struct MemoryDetailView: View {
                                 Button {
                                     toMaps = true; askTravel = true
                                 } label: {
-                                    actionLabel("Google Maps", "map.fill")
+                                    actionLabel("Directions", "arrow.triangle.turn.up.right.circle.fill")
+                                }
+                                Button {
+                                    showPlaceOnMaps()
+                                } label: {
+                                    actionLabel("See the place", "map.fill")
                                 }
                             }
                             .confirmationDialog("How are you getting there?",
@@ -2357,6 +2424,19 @@ struct MemoryDetailView: View {
                                           driving: mode != "walking")
             dismiss()
         }
+    }
+
+    /// Open Google Maps AT the spot rather than routing to it — for looking at
+    /// what's around it, reading reviews, or finding the real business name.
+    /// Routing and looking are different questions and deserve different buttons.
+    private func showPlaceOnMaps() {
+        let lat = entry.lat ?? 0, lon = entry.lon ?? 0
+        let label = entry.title.addingPercentEncoding(
+            withAllowedCharacters: .urlQueryAllowed) ?? "Saved"
+        let app = URL(string: "comgooglemaps://?q=\(lat),\(lon)&center=\(lat),\(lon)&zoom=17")
+        let web = URL(string: "https://www.google.com/maps/search/?api=1&query=\(lat),\(lon)&query_place_id=&hl=en#\(label)")
+        if let a = app, UIApplication.shared.canOpenURL(a) { UIApplication.shared.open(a) }
+        else if let w = web { UIApplication.shared.open(w) }
     }
 
     private func openInGoogleMaps(mode: String) {
