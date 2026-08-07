@@ -1451,7 +1451,7 @@ struct ChappyVoiceSettingsView: View {
                         let sample = voice.name == "System"
                             ? "G'day Shaun, this is the offline Apple voice."
                             : "G'day Shaun, I'm Chappy - this is my \(voice.name) voice."
-                        TTSService.shared.speak(sample)
+                        TTSService.shared.speak(sample, forceNetworkVoice: true)
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
@@ -1477,7 +1477,7 @@ struct ChappyVoiceSettingsView: View {
 
             Section {
                 Button {
-                    TTSService.shared.speak("No worries - I'll read your answers, translations and alerts in this voice.")
+                    TTSService.shared.speak("No worries - I'll read your answers, translations and alerts in this voice.", forceNetworkVoice: true)
                 } label: {
                     HStack {
                         Image(systemName: tts.isSpeaking ? "speaker.wave.3.fill" : "play.circle.fill")
