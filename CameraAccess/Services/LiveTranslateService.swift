@@ -764,6 +764,14 @@ class LiveTranslateService: NSObject {
             try engine.start()
 
             isRecording = true
+            // Keep the audio thread's copy of "is Chappy talking" fresh without
+            // it ever touching the @Published original.
+            speakingMirrorTimer?.invalidate()
+            speakingMirrorTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                let v = TTSService.shared.isSpeaking
+                self.gateLock.lock(); self.speakingFlagForAudioThread = v; self.gateLock.unlock()
+            }
             print("✅ [Translate] Recording started")
             return true
 
@@ -784,8 +792,18 @@ class LiveTranslateService: NSObject {
         shouldResumeRecordingAfterSetup = false
         guard isRecording else { return }
         print("🛑 [Translate] Stop recording")
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine?.stop()
+        // ORDER MATTERS. removeTap while the engine is still running races the
+        // callback that may be executing on the audio thread at that instant —
+        // one of the ways "press stop" was taking the app down. Stop first, so
+        // no further callbacks can start, THEN detach.
+        if let engine = audioEngine {
+            if engine.isRunning { engine.stop() }
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        speakingMirrorTimer?.invalidate(); speakingMirrorTimer = nil
+        audioQueueLock.lock()
+        pendingAudioChunks.removeAll()
+        audioQueueLock.unlock()
         isRecording = false
         micGateUntil = .distantPast
         // FS-16: a phantom count used to survive into the next session.
@@ -793,19 +811,61 @@ class LiveTranslateService: NSObject {
         lastPlaybackChangeAt = Date()
     }
 
+    // ==================================================================
+    // WHY TRANSLATE HAS BEEN CRASHING ON START AND STOP.
+    //
+    // installTap's callback runs on CoreAudio's REAL-TIME thread. That thread
+    // has a hard deadline measured in milliseconds and three absolute rules:
+    // no memory allocation, no locks, no I/O. This function was breaking all
+    // three, on every single buffer:
+    //
+    //   • base64EncodedString()  — allocates a new String, tens of times a second
+    //   • webSocket.send(...)    — networking, on the audio thread
+    //   • micGateUntil, pendingPlaybackBuffers, audioSendCount — plain vars
+    //     also written from the main thread, with no synchronisation at all
+    //   • TTSService.shared.isSpeaking — a @Published property being written
+    //     from the main thread while this reads it
+    //
+    // Every one of those is a data race. Races don't fail politely: they
+    // corrupt state and crash somewhere unrelated, which is exactly the
+    // "crashes when I press record, crashes when I stop" you've been seeing,
+    // and why it never crashed in the same place twice.
+    //
+    // The fix is the standard real-time audio pattern. The callback now does
+    // the minimum possible — convert samples, hand the bytes to a lock-guarded
+    // queue, return — and a separate serial queue does the base64 and the
+    // networking. Nothing allocates on the audio thread, and nothing shared is
+    // touched without a lock.
+    private let audioQueueLock = NSLock()
+    private var pendingAudioChunks: [Data] = []
+    private let audioSendQueue = DispatchQueue(label: "chappy.translate.audiosend", qos: .userInitiated)
+    private var audioDrainScheduled = false
+    /// Read by the audio thread, written by the main thread — guarded.
+    private var gateLock = NSLock()
+    /// A plain Bool mirror of TTSService.isSpeaking. The audio thread must never
+    /// read a @Published property directly — that is a data race against the
+    /// main thread's publish, and it is undefined behaviour, not a warning.
+    private var speakingFlagForAudioThread = false
+    private var speakingMirrorTimer: Timer?
+
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
         guard buffer.floatChannelData != nil else { return }
 
         // BUILD 58: the authoritative check — is sound still coming out?
-        if pendingPlaybackBuffers > 0 {
+        gateLock.lock()
+        let pending = pendingPlaybackBuffers
+        let lastChange = lastPlaybackChangeAt
+        gateLock.unlock()
+        if pending > 0 {
             // WATCHDOG: three seconds with the counter stuck means a callback
             // never arrived. Let go rather than stay deaf.
-            if Date().timeIntervalSince(lastPlaybackChangeAt) > 3.0 {
-                print("⚠️ [Translate] Playback callback lost — releasing the mic gate")
+            if Date().timeIntervalSince(lastChange) > 3.0 {
+                gateLock.lock()
                 pendingPlaybackBuffers = 0
                 lastPlaybackChangeAt = Date()
+                gateLock.unlock()
             } else {
-                micGateUntil = Date()
+                gateLock.lock(); micGateUntil = Date(); gateLock.unlock()
                 return
             }
         }
@@ -815,8 +875,11 @@ class LiveTranslateService: NSObject {
         // BUILD 54: tapping the speaker on a bubble to repeat a line plays out
         // of the SAME speaker — without this it would restart the exact loop we
         // just killed, one tap at a time.
-        if TTSService.shared.isSpeaking { micGateUntil = Date() }
-        if Date() < micGateUntil.addingTimeInterval(echoTailSeconds) { return }
+        gateLock.lock()
+        if speakingFlagForAudioThread { micGateUntil = Date() }
+        let gateOpenAt = micGateUntil.addingTimeInterval(echoTailSeconds)
+        gateLock.unlock()
+        if Date() < gateOpenAt { return }
 
         let inputSampleRate = buffer.format.sampleRate
 
@@ -874,23 +937,57 @@ class LiveTranslateService: NSObject {
 
     private var audioSendCount = 0
 
+    /// AUDIO THREAD ONLY. Converts the samples and hands the bytes off. That is
+    /// the whole job — see the note on processAudioBuffer for why base64 and
+    /// networking had to leave this function.
     private func sendBufferAsPCM16(_ buffer: AVAudioPCMBuffer) {
-        guard isConnected else { return }
         guard let floatChannelData = buffer.floatChannelData else { return }
-
         let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return }
         let channel = floatChannelData.pointee
 
         var int16Data = [Int16](repeating: 0, count: frameLength)
         for i in 0..<frameLength {
             let sample = channel[i]
-            let clampedSample = max(-1.0, min(1.0, sample))
-            int16Data[i] = Int16(clampedSample * 32767.0)
+            // NaN fails both comparisons, so clamp explicitly rather than
+            // relying on min/max — Int16(nan) is a runtime trap.
+            let clamped = sample.isFinite ? max(-1.0, min(1.0, sample)) : 0
+            int16Data[i] = Int16(clamped * 32767.0)
         }
-
         let data = Data(bytes: int16Data, count: frameLength * MemoryLayout<Int16>.size)
-        let base64Audio = data.base64EncodedString()
 
+        audioQueueLock.lock()
+        pendingAudioChunks.append(data)
+        // Never let the queue grow without bound if the socket stalls — half a
+        // second of backlog is plenty, and dropping old audio beats dropping
+        // the app.
+        if pendingAudioChunks.count > 40 { pendingAudioChunks.removeFirst(pendingAudioChunks.count - 40) }
+        let needsDrain = !audioDrainScheduled
+        if needsDrain { audioDrainScheduled = true }
+        audioQueueLock.unlock()
+
+        if needsDrain { audioSendQueue.async { [weak self] in self?.drainAudioQueue() } }
+    }
+
+    /// BACKGROUND QUEUE. Base64 and the websocket send happen here, where an
+    /// allocation or a stalled socket costs nothing.
+    private func drainAudioQueue() {
+        while true {
+            audioQueueLock.lock()
+            guard !pendingAudioChunks.isEmpty else {
+                audioDrainScheduled = false
+                audioQueueLock.unlock()
+                return
+            }
+            let data = pendingAudioChunks.removeFirst()
+            audioQueueLock.unlock()
+            guard isConnected else { continue }
+            sendEncodedAudio(data)
+        }
+    }
+
+    private func sendEncodedAudio(_ data: Data) {
+        let base64Audio = data.base64EncodedString()
         audioSendCount += 1
         if audioSendCount == 1 || audioSendCount % 50 == 0 {
             print("🎵 [Translate] Sending audio chunk #\(audioSendCount)")
@@ -908,6 +1005,20 @@ class LiveTranslateService: NSObject {
     }
 
     // MARK: - Image Sending
+
+    /// Push plain text into the live session as context — used after a document
+    /// scan so follow-up questions ("how much is the second one?") land with the
+    /// model already knowing what he is looking at.
+    func sendTextContext(_ text: String) {
+        guard isConnected, !text.isEmpty else { return }
+        let event: [String: Any] = [
+            "clientContent": [
+                "turns": [["role": "user", "parts": [["text": text]]]],
+                "turnComplete": false,
+            ]
+        ]
+        sendEvent(event)
+    }
 
     func sendImageFrame(_ image: UIImage) {
         guard isConnected else { return }
