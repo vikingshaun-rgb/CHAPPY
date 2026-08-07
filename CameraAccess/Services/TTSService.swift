@@ -70,6 +70,9 @@ class TTSService: NSObject, ObservableObject {
 
     private var currentTask: Task<Void, Never>?
     private var playbackResilienceInstalled = false
+    /// Once the network voice has failed, stop asking it. Chappy changing voice
+    /// every other sentence is worse than never using the nicer one.
+    static var geminiVoiceGaveUp = false
 
     /// SB-DEADLOCK FIX: `isSpeaking` is the barge-in gate for ChappyStandby —
     /// while it is true the wake word ignores EVERYTHING it hears. It was set
@@ -296,6 +299,31 @@ class TTSService: NSObject, ObservableObject {
             let googleKey = APIKeyManager.shared.getGoogleAPIKey() ?? ""
             let wantsSystemVoice = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
 
+            // RESPONSIVENESS FIX. Gemini TTS is a NETWORK ROUND TRIP — generate
+            // the audio, download it, then play it. On good wifi that's about a
+            // second; on one bar of Indonesian mobile data it is several. Every
+            // short acknowledgement was paying that toll: "Finding IGA",
+            // "Saved", "Standby on" — the exact lines whose entire value is
+            // being immediate. That is most of the "very slow" feeling.
+            //
+            // Apple's on-device voice starts in milliseconds, works with no
+            // signal, and costs nothing. For a short line it is simply the
+            // better tool; the network voice earns its latency only on longer
+            // content where the nicer delivery is actually noticeable.
+            //
+            // VOICE CONSISTENCY. This also fixes Chappy changing sex mid-
+            // conversation — a male line, then a female one. That was the
+            // Gemini call failing intermittently and silently falling back to
+            // the system voice, so the voice tracked the network. Now short
+            // lines are ALWAYS the system voice and long ones are always
+            // Gemini-first, and once Gemini has failed we stop asking it for
+            // the rest of the run rather than flip-flopping every sentence.
+            let isShortAck = trimmed.count <= 90
+            if isShortAck || Self.geminiVoiceGaveUp {
+                await self.fallbackToSystemTTS(text: trimmed)
+                return
+            }
+
             if !googleKey.isEmpty && !wantsSystemVoice {
                 do {
                     try await self.speakWithGemini(text: trimmed, apiKey: googleKey, gen: gen)
@@ -303,7 +331,8 @@ class TTSService: NSObject, ObservableObject {
                     return
                 } catch {
                     if Task.isCancelled { return }
-                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — falling back to system TTS")
+                    Self.geminiVoiceGaveUp = true
+                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — system voice for the rest of this run")
                 }
             } else {
                 print("🔊 [TTS] No Gemini key — using system TTS")
