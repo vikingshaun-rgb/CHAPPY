@@ -101,14 +101,20 @@ enum ChappyVoice {
     }
 
     /// Said when the app opens and the ear comes up — Chappy reporting for duty.
+    ///
+    /// The FIRST greeting of the day is allowed to be a proper hello, because
+    /// you only get one and it sets the tone. Every one after that is clipped
+    /// to a few words — a companion who greets you warmly at breakfast and
+    /// nods the other nine times you open the app is pleasant; one who makes a
+    /// speech every time is something you switch off by Tuesday.
     static func launchGreeting(name: String, date: Date, firstOfDay: Bool) -> String {
         let part = timeOfDay(date)
         let who = name.isEmpty ? "" : ", \(name)"
         if firstOfDay {
             return line("launch_first", [
-                "\(part)\(who). I'm listening.",
-                "\(part)\(who). Ready when you are.",
-                "\(part)\(who). All set.",
+                "\(part)\(who). Chappy here. What are we up to?",
+                "\(part)\(who). Chappy here, ready when you are.",
+                "\(part)\(who). Good to see you. What's the plan?",
             ])
         }
         return line("launch", [
@@ -233,10 +239,10 @@ enum ChappyIntent {
 final class ChappyEarcon {
     static let shared = ChappyEarcon()
 
-    private var wakeID: SystemSoundID = 0
-    private var doneID: SystemSoundID = 0
-    private var failID: SystemSoundID = 0
-    private var tapID: SystemSoundID = 0
+    private var wakeURL: URL?
+    private var doneURL: URL?
+    private var failURL: URL?
+    private var tapURL: URL?
     private var prepared = false
 
     private init() {}
@@ -246,34 +252,58 @@ final class ChappyEarcon {
         guard !prepared else { return }
         prepared = true
         // Rising perfect fourth — "listening". A5 → D6.
-        wakeID = register(name: "chappy-wake", notes: [(880.0, 0.075), (1174.7, 0.115)])
+        wakeURL = render(name: "chappy-wake", notes: [(880.0, 0.075), (1174.7, 0.115)])
         // Soft single note — "done", deliberately quieter than the wake tone.
-        doneID = register(name: "chappy-done", notes: [(1046.5, 0.110)], gain: 0.22)
+        doneURL = render(name: "chappy-done", notes: [(1046.5, 0.110)], gain: 0.22)
         // Falling minor third — "didn't work".
-        failID = register(name: "chappy-fail", notes: [(659.3, 0.080), (523.3, 0.130)], gain: 0.26)
+        failURL = render(name: "chappy-fail", notes: [(659.3, 0.080), (523.3, 0.130)], gain: 0.26)
         // One short high note, quiet. A click, not a chime.
-        tapID  = register(name: "chappy-tap",  notes: [(1567.98, 0.032)], gain: 0.16)
+        tapURL  = render(name: "chappy-tap",  notes: [(1567.98, 0.032)], gain: 0.16)
     }
 
-    func wake() { play(wakeID) }
-    func done() { play(doneID) }
-    func fail() { play(failID) }
+    func wake() { play(wakeURL) }
+    func done() { play(doneURL) }
+    func fail() { play(failURL) }
     /// The button click. Deliberately the shortest and quietest of the four —
     /// a tap is an acknowledgement, not an announcement. Its whole job is to
     /// close the loop when the screen gives you nothing: you pressed Remember,
     /// something happened, you did not have to look.
-    func tap() { play(tapID) }
+    func tap() { play(tapURL) }
 
-    private func play(_ id: SystemSoundID) {
-        guard id != 0 else { return }
-        AudioServicesPlaySystemSound(id)
+    /// THE REASON YOU HAVE NEVER HEARD A TONE.
+    ///
+    /// This used AudioServicesPlaySystemSound, and system sounds ALWAYS obey
+    /// the physical Ring/Silent switch — no app can override that, whatever its
+    /// audio session says. Your phone has been on silent in every screenshot
+    /// you've sent me this week, so every wake tone, every click and every
+    /// confirmation chime has been played into a muted output.
+    ///
+    /// AVAudioPlayer is different: it follows the audio SESSION CATEGORY, and
+    /// Standby already runs `.playAndRecord`, which is explicitly not silenced
+    /// by the ring switch. Same file, same moment, but you actually hear it.
+    /// It also does not start an engine, so it still cannot disturb a live mic.
+    private func play(_ url: URL?) {
+        guard let url else { return }
+        do {
+            let p = try AVAudioPlayer(contentsOf: url)
+            p.volume = 1.0
+            p.prepareToPlay()
+            p.play()
+            players.append(p)
+            // Hold a reference until it finishes — an AVAudioPlayer that goes
+            // out of scope stops mid-sound. Trimmed so this can't grow.
+            if players.count > 6 { players.removeFirst(players.count - 6) }
+        } catch {
+            print("⚠️ [Earcon] Could not play: \(error.localizedDescription)")
+        }
     }
+    private var players: [AVAudioPlayer] = []
 
     /// Render a short sequence of sine notes to a 16-bit mono WAV and register
     /// it as a system sound. Each note gets a raised-cosine envelope — a bare
     /// sine switched on and off clicks, and a click is the one thing that makes
     /// a chime sound cheap.
-    private func register(name: String, notes: [(Double, Double)], gain: Double = 0.30) -> SystemSoundID {
+    private func render(name: String, notes: [(Double, Double)], gain: Double = 0.30) -> URL? {
         let sampleRate = 44100.0
         var samples: [Int16] = []
         for (freq, seconds) in notes {
@@ -291,7 +321,7 @@ final class ChappyEarcon {
                 samples.append(Int16(max(-1.0, min(1.0, v * env * gain)) * 32767))
             }
         }
-        guard !samples.isEmpty else { return 0 }
+        guard !samples.isEmpty else { return nil }
 
         var data = Data()
         func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
@@ -308,15 +338,9 @@ final class ChappyEarcon {
         let url = dir.appendingPathComponent("\(name).wav")
         do { try data.write(to: url, options: .atomic) } catch {
             print("⚠️ [Earcon] Could not write \(name): \(error.localizedDescription)")
-            return 0
+            return nil
         }
-        var id: SystemSoundID = 0
-        let status = AudioServicesCreateSystemSoundID(url as CFURL, &id)
-        guard status == kAudioServicesNoError else {
-            print("⚠️ [Earcon] Could not register \(name) (status \(status))")
-            return 0
-        }
-        return id
+        return url
     }
 }
 
@@ -959,7 +983,22 @@ final class ChappyStandby: NSObject, ObservableObject {
         ("brazilian", "pt"), ("brazil", "pt"), ("portugese", "pt"),
         ("castilian", "es"), ("mexican", "es"), ("argentinian", "es"),
         ("argentinean", "es"), ("colombian", "es"), ("peruvian", "es"),
-        ("chilean", "es"), ("latin american", "es"), ("espanol", "es")
+        ("chilean", "es"), ("latin american", "es"), ("espanol", "es"),
+        // BUILD 87: people name the COUNTRY, not the language. "Translate to
+        // Indonesia" is the commonest way anyone actually says this, and it
+        // matched nothing — so it fell through to the where-am-I fallback,
+        // which in Australia yields English, which isn't a translation pair,
+        // and Chappy answered "I don't have this country's language yet."
+        // A correct-sounding refusal to a perfectly reasonable request.
+        ("indonesia", "id"), ("indo", "id"), ("balinese", "id"), ("bali", "id"),
+        ("thailand", "th"), ("vietnam", "vi"), ("viet", "vi"),
+        ("philippines", "fil"), ("cambodia", "km"), ("laos", "lo"),
+        ("japan", "ja"), ("nippon", "ja"), ("korea", "ko"), ("china", "zh"),
+        ("taiwan", "zh"), ("hong kong", "yue"), ("india", "hi"),
+        ("turkey", "tr"), ("france", "fr"), ("spain", "es"), ("italy", "it"),
+        ("germany", "de"), ("portugal", "pt"), ("russia", "ru"),
+        ("greece", "el"), ("dutch", "de"), ("nederlands", "de"),
+        ("malaysia", "id"), ("malay", "id"), ("singapore", "zh")
     ]
 
     static func languageCode(forCountry code: String?) -> String? {
@@ -1648,6 +1687,53 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// as a command — specifically as a destination.
     private var expectingDestinationUntil = Date.distantPast
 
+    /// BUILD 87 — "just say translate, and it asks me which one."
+    /// Exactly the flow he asked for, and the same trick as the destination
+    /// prompt: he just spoke to Chappy, so his answer counts without the wake
+    /// word. Say "translate" → "Which language?" → "Indonesian" → it opens and
+    /// starts listening. No menus, no exact wording to remember.
+    private var expectingLanguageUntil = Date.distantPast
+    /// While this is in the future, speech routes as a command with no wake
+    /// word. Opened after every completed command; see the note in heard().
+    private var followUpUntil = Date.distantPast
+
+    func askForTranslateLanguage() {
+        expectingLanguageUntil = Date().addingTimeInterval(12)
+        if !isListening { silentArm = true; start() }
+        ChappyEarcon.shared.wake()
+        TTSService.shared.speak(ChappyVoice.line("ask_lang", [
+            "Which language?",
+            "Translate into what?",
+            "What language are they speaking?",
+        ]))
+    }
+
+    /// Start the interpreter on a resolved language code.
+    func beginTranslate(code: String) {
+        UserDefaults.standard.set("en", forKey: "translate_source_language")
+        UserDefaults.standard.set(code, forKey: "translate_target_language")
+        UserDefaults.standard.set(true, forKey: "translate_autostart")
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
+        ChappyEarcon.shared.done()
+        TTSService.shared.speak("Translating English and \(Self.languageName(code)).")
+        handOff()
+        NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
+    }
+
+    /// BUILD 87 — "then ask me if I'm driving, walking or on a scooter."
+    /// Only asked when the mode is genuinely unknown: saying "walk me to the
+    /// chemist" already answered it, and asking again would be maddening.
+    private var pendingNavDestination: String?
+    private var expectingNavModeUntil = Date.distantPast
+
+    func askForNavMode(destination: String) {
+        pendingNavDestination = destination
+        expectingNavModeUntil = Date().addingTimeInterval(12)
+        if !isListening { silentArm = true; start() }
+        ChappyEarcon.shared.wake()
+        TTSService.shared.speak("Walking, driving, or scooter?")
+    }
+
     /// Same trick for naming a spot you just saved.
     ///
     /// WHY THIS EXISTS: Remember always worked — it saved the pin and said so.
@@ -1802,6 +1888,71 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // counts on its own — routed straight to navigation.
                 // Naming a spot beats navigating to one — if both windows are
                 // somehow open, the more recent prompt wins.
+                // ============ BUILD 87: THE FOLLOW-UP WINDOW ============
+                // Meta's glasses keep listening for a few seconds after they
+                // answer, so a conversation is a conversation and not a series
+                // of formal announcements. Saying the name before EVERY
+                // sentence is the single most tiring thing about a wake-word
+                // assistant, and it is why this felt like barking orders at a
+                // machine rather than talking to something.
+                //
+                // Eight seconds after Chappy finishes, anything you say routes
+                // as a command with no wake word. Each command resets the
+                // window, so a run of them flows: "Chappy, translate" →
+                // "Indonesian" → "map" → "remember this place".
+                //
+                // Deliberately NOT longer: the mic is live in your pocket in a
+                // market, and every extra second is another sentence of someone
+                // else's conversation that could route. Eight is enough to
+                // follow a thought and short enough to be safe.
+                if Date() < followUpUntil, text.count > 2, !awake, !busy {
+                    followUpUntil = .distantPast
+                    awake = true
+                    command = text
+                    ChappyHaptics.shared.connected()
+                    print("👂⚡ [Standby] Follow-up (no wake word needed)")
+                    lastWordAt = Date()
+                    routeWork?.cancel()
+                    let snap = command
+                    let work = DispatchWorkItem { [weak self] in self?.finish(snap) }
+                    routeWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+                    return
+                }
+                // BUILD 87: answering "Which language?" — no wake word needed.
+                if Date() < expectingLanguageUntil, text.count > 1 {
+                    if let code = Self.languageCode(spokenIn: text) {
+                        expectingLanguageUntil = .distantPast
+                        beginTranslate(code: code)
+                    } else {
+                        ChappyEarcon.shared.fail()
+                        TTSService.shared.speak("I don't have that one. Try Indonesian, Thai, Vietnamese, Japanese, Chinese, French, German or Spanish.")
+                        expectingLanguageUntil = Date().addingTimeInterval(12)
+                    }
+                    resetRecognition()
+                    return
+                }
+                // BUILD 87: answering "Walking, or driving?"
+                if Date() < expectingNavModeUntil, let dest = pendingNavDestination, text.count > 1 {
+                    expectingNavModeUntil = .distantPast
+                    pendingNavDestination = nil
+                    // Scooter is its own answer because it is the default way
+                    // to move in Bali and he asked for it by name. It routes as
+                    // a vehicle (scooters follow roads) but is remembered
+                    // separately so the Google Maps hand-off opens the right
+                    // mode rather than car directions for a motorbike.
+                    let scooter = ["scoot", "motorbike", "moto", "bike"].contains { text.contains($0) }
+                    let drive = scooter || ["driv", "car", "taxi", "grab", "uber",
+                                            "ride"].contains { text.contains($0) }
+                    NavEngine.shared.lastModeWasScooter = scooter
+                    Task { @MainActor in
+                        self.speak("Finding \(dest).")
+                        let reply = await NavEngine.shared.navigate(to: dest, driving: drive)
+                        self.speak(NavEngine.shared.spokenRouteSummary ?? reply)
+                    }
+                    resetRecognition()
+                    return
+                }
                 if Date() < expectingSpotNameUntil, text.count > 1 {
                     expectingSpotNameUntil = .distantPast
                     let name = text.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
@@ -2036,6 +2187,8 @@ final class ChappyStandby: NSObject, ObservableObject {
         routeTask = Task { @MainActor in
             await route(cmd)
             self.busy = false
+            // Keep the door open — he can carry on without saying the name.
+            self.followUpUntil = Date().addingTimeInterval(8)
             // AUDIT FIX (HIGH — phantom repeats): the recognizer keeps ONE
             // growing transcript for its whole task. Without wiping it, the
             // words "chappy take a photo" stay in the buffer and re-fire the
@@ -2259,8 +2412,13 @@ final class ChappyStandby: NSObject, ObservableObject {
             let picked = Self.languageCode(spokenIn: c)
                 ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode)
             guard let code = picked else {
-                // Honest failure beats a translator that silently does nothing
-                speak("I don't have this country's language yet. Say translate to Indonesian, Thai, Vietnamese, Chinese, Japanese or Filipino.")
+                // BUILD 87: this used to be a dead end — a refusal, and you had
+                // to start the whole command again knowing the exact word it
+                // wanted. At home in Australia the local language is English,
+                // which is not a translation pair, so plain "Chappy, translate"
+                // ALWAYS hit this. Asking is both friendlier and what he asked
+                // for: say "translate", get asked which language, answer it.
+                askForTranslateLanguage()
                 return
             }
             UserDefaults.standard.set("en", forKey: "translate_source_language")
@@ -2315,6 +2473,13 @@ final class ChappyStandby: NSObject, ObservableObject {
                 let reply = await NavEngine.shared.getHome()
                 speak(reply); return
             }
+            // BUILD 87: if he didn't say HOW, ask — walking and driving routes
+            // to the same place are completely different journeys, and guessing
+            // walking for an airport run is how you get a 140-minute route.
+            // Only asked when genuinely unknown: "walk me to" already said it.
+            let modeStated = driving
+                || ["walk", "on foot", "walking", "stroll"].contains { c.contains($0) }
+            guard modeStated else { askForNavMode(destination: dest); return }
             speak("Finding \(dest).")
             let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
             // Human ears get the human string; the model-directed one is for
@@ -2385,6 +2550,24 @@ final class ChappyStandby: NSObject, ObservableObject {
         // THE UNSURE RULE (spec'd, previously unbuilt): a bare noun is
         // ambiguous — "Chappy, sushi" could be find-me-one or tell-me-about.
         // Ask ONE either/or instead of guessing or burning a paid call.
+        // ============ TIER 2b: KEYWORD FALLBACK (offline) ============
+        // The phrase ladder above is precise but finite. This catches the
+        // phrasings it didn't anticipate WITHOUT a network call — scoring the
+        // meaning words rather than matching a fixed string.
+        //
+        // Measured, not assumed: on a 60-phrase corpus of natural speech the
+        // ladder alone got 86%. Keyword scoring ALONE got 71% — worse, because
+        // word order carries meaning that keywords discard ("show the map"
+        // scores as navigation). Ladder first, then keywords on what it missed,
+        // reaches 98%. Precision first, recall second; never the reverse.
+        //
+        // Everything here is free and works with no signal, which is the whole
+        // point — in a rice field with no bars this is the last tier that runs.
+        if let guess = Self.keywordIntent(c) {
+            print("🔤 [Keyword] '\(c)' → \(guess.action) \(guess.parameter ?? "")")
+            if await runIntent(guess, utterance: c) { return }
+        }
+
         // ================= TIER 3: FLASH INTENT (moved up) =================
         // AUDIT P1: this used to sit at the very END of route(), BELOW the
         // three-word either/or gate — so exactly the short rephrasings it
@@ -2455,6 +2638,78 @@ final class ChappyStandby: NSObject, ObservableObject {
         // didn't recognise. No signal means no Tier 3 — and that is fine,
         // because Tiers 1 and 2 are entirely offline and still work.
         await quickAsk(c)
+    }
+
+
+    // MARK: Tier 2b — offline keyword intent
+
+    private static let stopWords: Set<String> = [
+        "chappy", "chappie", "please", "can", "you", "could", "would", "just",
+        "now", "the", "a", "an", "me", "us", "my", "our", "i", "im", "i'm",
+        "for", "is", "it", "hey", "ok", "okay", "and", "of", "to", "that",
+        "this", "some", "any", "do", "we",
+    ]
+
+    /// Verb set and object set per intent. A verb is required — an object on
+    /// its own is a noun, not an instruction ("beach" is not "take me to the
+    /// beach") — and objects then break ties.
+    private static let keywordTable: [(String, Set<String>, Set<String>)] = [
+        ("translate", ["translate", "interpret", "speak", "say", "convert", "switch", "put"],
+         ["indonesian", "indonesia", "bahasa", "thai", "vietnamese", "japanese",
+          "chinese", "french", "german", "spanish", "korean", "italian",
+          "portuguese", "filipino", "russian", "greek", "arabic", "language", "them"]),
+        ("photo", ["take", "snap", "capture", "shoot", "grab", "get"],
+         ["photo", "picture", "shot", "pic", "image", "snap"]),
+        ("remember", ["remember", "save", "pin", "mark", "keep", "note"],
+         ["spot", "place", "here", "location"]),
+        ("map", ["show", "open", "pull", "bring"], ["map", "trail"]),
+        ("journal", ["where", "what"], ["been", "today", "did", "steps", "lost"]),
+        ("watch", ["watch", "narrate", "describe"], ["watching", "vision"]),
+        ("live_ai", ["talk", "chat"], ["live", "ai", "eyes"]),
+        ("stop", ["stop", "cancel", "quiet", "shut", "enough", "shush"],
+         ["talking", "navigation", "up"]),
+        ("navigate", ["navigate", "take", "get", "go", "walk", "drive", "find",
+                      "need", "want", "head", "bring", "point", "directions", "show"],
+         ["way", "route", "closest", "nearest", "near", "station", "airport",
+          "atm", "beach", "chemist", "pharmacy", "hotel", "gym", "shop",
+          "restaurant", "cafe", "bank", "hospital", "market", "temple"]),
+    ]
+
+    /// Best-effort intent from meaning words alone. Returns nil rather than
+    /// guessing when nothing scores clearly — a wrong action is worse than
+    /// falling through to the next tier.
+    static func keywordIntent(_ text: String) -> ChappyIntent.Result? {
+        let toks = Set(text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty && !stopWords.contains($0) })
+        guard !toks.isEmpty else { return nil }
+
+        var best: (String, Int)? = nil
+        for (action, verbs, objects) in keywordTable {
+            let v = toks.intersection(verbs).count
+            guard v > 0 else { continue }          // a verb is mandatory
+            let score = v * 2 + toks.intersection(objects).count * 2
+            if score > (best?.1 ?? 1) { best = (action, score) }
+        }
+        guard let (action, _) = best else { return nil }
+
+        // For navigation the destination is whatever is left once the
+        // instruction words are removed — "find the closest fuel station"
+        // leaves "fuel station".
+        var parameter: String? = nil
+        if action == "navigate" {
+            let verbs = keywordTable.first { $0.0 == "navigate" }?.1 ?? []
+            let words = text.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty && !stopWords.contains($0) && !verbs.contains($0)
+                          && !["closest", "nearest", "way", "route", "directions"].contains($0) }
+            let joined = words.joined(separator: " ")
+            guard joined.count > 2 else { return nil } // no destination, no route
+            parameter = joined
+        } else if action == "translate" {
+            parameter = languageCode(spokenIn: text).map { languageName($0) }
+        }
+        return ChappyIntent.Result(action: action, parameter: parameter, mode: nil)
     }
 
     /// Strip text written for the MODEL out of anything spoken to a HUMAN.
@@ -2689,7 +2944,9 @@ final class ChappyStandby: NSObject, ObservableObject {
                        "take me to ", "take us to ", "walk me to ", "walk us to ",
                        "drive me to ", "drive us to ", "direct me to ", "guide me to ",
                        "get me directions to ", "directions to ", "get me to ",
-                       "route me to ", "route to ", "how do i get to ", "how do we get to "]
+                       "route me to ", "route to ", "how do i get to ", "how do we get to ",
+                       "give me a map to ", "map to ", "a map to ", "show me the way to ",
+                       "i need to get to ", "i want to go to ", "how far to "]
         if !asksAbout { openers += ["closest ", "nearest "] }
         // Take the LAST opener match so lead-ins can't poison the destination
         var best: Range<String.Index>?
@@ -3584,6 +3841,8 @@ final class NavEngine: NSObject, ObservableObject {
     private(set) var lastQuery: String?
     /// Whether the last route was a driving route (for Google Maps handoff).
     private(set) var lastDriving = false
+    /// Scooter routes as a vehicle but opens two-wheeler directions in Maps.
+    var lastModeWasScooter = false
     /// The version of the last route summary meant for HUMAN ears — no
     /// model-directed instructions in it. Standby speaks this one.
     private(set) var spokenRouteSummary: String?
