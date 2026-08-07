@@ -432,7 +432,7 @@ class TTSService: NSObject, ObservableObject {
                 let audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
                 try Task.checkCancellation()
                 print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
-                await playPCM(audio, gen: gen)
+                try await playPCM(audio, gen: gen)
                 return
             } catch TTSError.modelNotFound {
                 print("⚠️ [TTS] Model \(model) not found — trying next")
