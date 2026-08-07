@@ -2079,6 +2079,56 @@ final class ChappyStandby: NSObject, ObservableObject {
         "one sec", "hold on", "wait a minute", "give me a second",
     ]
 
+    /// Words that cannot end a finished sentence. If the last thing you said
+    /// was one of these, you were still going.
+    static let danglingWords: Set<String> = [
+        "to", "at", "in", "on", "for", "from", "with", "into", "onto", "near",
+        "by", "about", "of", "and", "or", "but", "the", "a", "an", "my", "our",
+        "that", "this", "these", "those", "is", "was", "are", "it", "me", "us",
+        "him", "her", "them", "some", "any", "than", "then", "if", "when",
+        "because", "towards", "toward", "up", "down", "over",
+    ]
+
+    /// Openers that mean nothing on their own — the useful half is still coming.
+    static let openerFragments: Set<String> = [
+        "take me", "take us", "get me", "get us", "show me", "tell me",
+        "find me", "find the", "find a", "where is", "wheres", "where's",
+        "what is", "whats", "what's", "how much", "how far", "how long",
+        "call it", "log this", "note this", "navigate me", "navigate us",
+        "remind me", "look for", "search for", "book me", "order me",
+    ]
+
+    /// THE HESITATION RULE (build 90, finally implemented).
+    ///
+    /// Silence is only an ending if what came before it was a complete thought.
+    /// "Take me to… um… that place near the beach" pauses in the middle, and a
+    /// pure timeout fires on "take me to" and throws the rest away.
+    ///
+    /// So a fragment that cannot possibly be finished — a trailing preposition,
+    /// a bare opener, pure filler — buys three seconds. Anything that reads as
+    /// complete still fires immediately, so "stop" stays instant. Hesitation is
+    /// allowed; decisiveness is not punished.
+    static func looksUnfinished(_ t: String) -> Bool {
+        let text = t.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !text.isEmpty else { return false }
+
+        // Words the extendable branch already handles get their own, SHORTER
+        // window. Routing them here would make a bare "translate" sit silent
+        // for three seconds, which is the opposite of the point.
+        if extendableCommands.contains(text) { return false }
+        // A complete command is never unfinished, however it happens to end.
+        if terminalCommands.contains(text) { return false }
+
+        if fillerWords.contains(text) { return true }
+        if openerFragments.contains(text) { return true }
+
+        let words = text.split(separator: " ").map(String.init)
+        guard let last = words.last else { return false }
+        if fillerWords.contains(last) { return true }
+        if danglingWords.contains(last) { return true }
+        return false
+    }
+
     func askForTranslateLanguage() {
         expectingLanguageUntil = Date().addingTimeInterval(12)
         if !isListening { silentArm = true; start() }
@@ -2707,7 +2757,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             "thats it", "close live", "stop live", "close live ai", "end it",
             "shut it down", "close translate", "close this"].contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
             ChappyEarcon.shared.done()
-            LiveAIManager.shared.stop()
+            // NOT stop() — LiveAIManager has stopSession() (async) and
+            // triggerStop() (the fire-and-forget wrapper the UI uses).
+            LiveAIManager.shared.triggerStop()
             ContinuousVisionManager.shared.stop(announce: false)
             NotificationCenter.default.post(name: .chappyCloseModules, object: nil)
             speak("Done.")
@@ -4663,8 +4715,9 @@ final class NavEngine: NSObject, ObservableObject {
             ContextEngine.shared.setPrecision(navigating: true)
             updateCard()
             let mins = max(1, Int(route.durationSec / 60))
-            spokenRouteSummary = "Back to \(name). Roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(route.steps[0].instruction)"
-            TTSService.shared.speak(spokenRouteSummary)
+            let line = "Back to \(name). Roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(route.steps[0].instruction)"
+            spokenRouteSummary = line
+            TTSService.shared.speak(line)
         }
     }
 
