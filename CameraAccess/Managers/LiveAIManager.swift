@@ -278,6 +278,10 @@ final class ChappyEarcon {
     private var doneURL: URL?
     private var failURL: URL?
     private var tapURL: URL?
+    private var thinkURL: URL?
+    private var stillURL: URL?
+    private var askURL: URL?
+    private var thinkTimer: Timer?
     private var prepared = false
 
     private init() {}
@@ -304,7 +308,48 @@ final class ChappyEarcon {
         // One short high note, quiet. A click, not a chime.
         // A click, not a chime — short ring, well under the voice.
         tapURL  = render(name: "chappy-tap",  notes: [(1046.50, 0.12)], gain: 0.16)
+
+        // BUILD 110 — THE MISSING CUES.
+        //
+        // THINKING is the important one. Between your question and the answer
+        // there was silence, and silence reads as broken — so you repeat
+        // yourself, which makes it worse. One soft low note, repeated while a
+        // call is in flight, stopping the instant speech starts. Deliberately
+        // quiet and low: it has to be noticeable and completely ignorable at
+        // the same time.
+        thinkURL = render(name: "chappy-think", notes: [(220.00, 0.16)], gain: 0.10)
+        // STILL LISTENING — the follow-up window is open, you can keep going
+        // without saying the name again. Two very quiet taps, so it reads as
+        // "go on" rather than as a new event.
+        stillURL = render(name: "chappy-still", notes: [(523.25, 0.09), (523.25, 0.09)], gain: 0.09)
+        // A QUESTION FOR YOU — rising and left UNRESOLVED. A suggestion is a
+        // question and should sound like one; every other cue lands, this one
+        // hangs. You will know it is waiting for an answer without being told.
+        askURL  = render(name: "chappy-ask", notes: [(523.25, 0.22), (698.46, 0.60)], gain: 0.22)
     }
+
+    /// The thinking pulse. Safe to call twice; safe to stop when not running.
+    func startThinking() {
+        guard thinkTimer == nil else { return }
+        prepare()
+        play(thinkURL)
+        thinkTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            // Never talk over the voice — the moment Chappy speaks, the
+            // waiting is over and the pulse has done its job.
+            if TTSService.shared.isSpeaking { self.stopThinking(); return }
+            self.play(self.thinkURL)
+        }
+    }
+
+    func stopThinking() {
+        thinkTimer?.invalidate()
+        thinkTimer = nil
+    }
+
+    func stillListening() { play(stillURL) }
+    /// Use ONLY when Chappy is asking something and expects an answer.
+    func askingYou() { play(askURL) }
 
     func wake() { play(wakeURL) }
     func done() { play(doneURL) }
@@ -1835,6 +1880,102 @@ final class ChappyStandby: NSObject, ObservableObject {
             .trimmingCharacters(in: .whitespaces)
     }
 
+    // BUILD 110 — THE GREETING THAT KNOWS SOMETHING.
+    //
+    // "Good morning sir" is a butler. "Morning. Four jobs, first at half nine,
+    // and it's raining in Caboolture" is the thing you actually asked for.
+    // The difference is not the voice — it is that one of them TELLS YOU
+    // SOMETHING and the other performs politeness at you.
+    //
+    // Three rules, all of them about restraint:
+    //   1. ONE LINE. The personality lives in the line, not in a ritual.
+    //   2. NEVER THE SAME WORDS TWICE. Repetition is the biggest robot tell
+    //      there is, and the cheapest thing in here to fix.
+    //   3. SHUT UP SOMETIMES. Open the app twice in five minutes and the
+    //      second one gets a tone and nothing else. Restraint reads as
+    //      confidence; being greeted every time reads as a machine.
+    //
+    // It costs nothing in speed: everything it says is already in memory, and
+    // a short line goes through the on-device voice, which starts instantly.
+    // The slow voice is only ever used for long answers.
+
+    private static let greetOpeners: [String] = [
+        "Morning", "Morning to you", "Right, morning", "Good morning"
+    ]
+    private static let dayOpeners: [String] = [
+        "Afternoon", "Right then", "Afternoon to you", "Back with you"
+    ]
+    private static let eveOpeners: [String] = [
+        "Evening", "Evening to you", "Right, evening"
+    ]
+    private static let lateOpeners: [String] = [
+        "You're up late", "Still going", "Late one"
+    ]
+
+    /// Spoken once when the app opens, if enough time has passed. Never blocks
+    /// anything — the app is fully usable while it talks.
+    func launchGreeting() {
+        guard wakeStyle != "silent" else { return }
+        // Not on every foreground. Twice in five minutes is grating.
+        let gap = Date().timeIntervalSince(lastGreetingAt)
+        guard gap > 900 else { return }
+        lastGreetingAt = Date()
+
+        let h = Calendar.current.component(.hour, from: Date())
+        let pool: [String]
+        switch h {
+        case 5..<12:  pool = Self.greetOpeners
+        case 12..<17: pool = Self.dayOpeners
+        case 17..<23: pool = Self.eveOpeners
+        default:      pool = Self.lateOpeners
+        }
+        // Rotated rather than random, so the same line never lands twice in a
+        // row even by chance.
+        let idx = UserDefaults.standard.integer(forKey: "chappy_greet_idx")
+        UserDefaults.standard.set(idx + 1, forKey: "chappy_greet_idx")
+        var line = pool[idx % pool.count]
+        if !userName.isEmpty { line += " \(userName)." } else { line += "." }
+
+        // THE USEFUL HALF. One fact, whichever is most worth knowing right
+        // now — and nothing at all if there genuinely isn't one. A greeting
+        // that invents something to say is worse than a short one.
+        if let fact = Self.greetingFact() { line += " \(fact)" }
+
+        ChappyEarcon.shared.wake()
+        TTSService.shared.speak(line)
+    }
+
+    /// The one thing worth leading with. Ordered by how much it matters.
+    static func greetingFact() -> String? {
+        let df = DateFormatter(); df.dateFormat = "h:mm"
+
+        // Overdue beats everything.
+        let od = ChappyReminders.shared.overdue()
+        if od.count == 1 { return "\(od[0].title) is overdue." }
+        if od.count > 1 { return "\(od.count) things overdue." }
+
+        // Then what's next in the diary, because that is what you can act on.
+        if let e = ChappyCalendar.shared.next(), let start = e.startDate,
+           Calendar.current.isDateInToday(start) {
+            let jobs = ChappyCalendar.shared.today().filter { !$0.isAllDay }.count
+            if jobs > 1 {
+                return "\(jobs) on today, first at \(df.string(from: start))."
+            }
+            return "\(e.title ?? "Something") at \(df.string(from: start))."
+        }
+
+        // Then reminders due today.
+        let t = ChappyReminders.shared.today().filter { $0.deliveredAt == nil }
+        if t.count == 1 { return "One thing on: \(t[0].title)." }
+        if t.count > 1 { return "\(t.count) things on today." }
+
+        // Then the visa, if it is close enough to matter.
+        if let v = ChappyReminders.shared.visaLine() { return v }
+
+        // Otherwise say nothing extra. An empty day is allowed to be quiet.
+        return nil
+    }
+
     /// Answer the wake word. Tone first and always — it has to land inside
     /// ~200 ms or the user talks over it — then decide about words.
     ///
@@ -2425,6 +2566,8 @@ final class ChappyStandby: NSObject, ObservableObject {
                         || Self.fillerWords.contains(where: { t == $0 || t.hasSuffix(" " + $0) }) {
                         if Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
                             followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
+                            // "Go on" — you can keep talking without the name.
+                            ChappyEarcon.shared.stillListening()
                         }
                         return
                     }
@@ -2496,7 +2639,9 @@ final class ChappyStandby: NSObject, ObservableObject {
                     NavEngine.shared.lastModeWasScooter = scooter
                     Task { @MainActor in
                         self.speak("Finding \(dest).")
+                        ChappyEarcon.shared.startThinking()
                         let reply = await NavEngine.shared.navigate(to: dest, driving: drive)
+                        ChappyEarcon.shared.stopThinking()
                         self.speak(NavEngine.shared.spokenRouteSummary ?? reply)
                         // BUILD 104: the direct path offered the map; THIS path
                         // — the one you land on whenever you didn't say how you
@@ -3301,7 +3446,9 @@ final class ChappyStandby: NSObject, ObservableObject {
                 || ["walk", "on foot", "walking", "stroll"].contains { c.contains($0) }
             guard modeStated else { askForNavMode(destination: dest); return }
             speak("Finding \(dest).")
+            ChappyEarcon.shared.startThinking()
             let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
+            ChappyEarcon.shared.stopThinking()
             // Human ears get the human string; the model-directed one is for
             // Live AI only. See AUDIT FIX (SPOKEN-LEAK) in NavEngine.navigate.
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
@@ -3400,7 +3547,9 @@ final class ChappyStandby: NSObject, ObservableObject {
         // total silence — indistinguishable from not being heard, so he repeats
         // himself. A tone costs nothing and closes the loop.
         ChappyEarcon.shared.tap()
+        ChappyEarcon.shared.startThinking()
         if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
+        ChappyEarcon.shared.stopThinking()
             print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
             CostMeter.shared.addTTSChars(c.count) // AUDIT P2: was invisible to "cost check"
             if await runIntent(intent, utterance: c) { return }
@@ -4414,6 +4563,7 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
             ChappyReminders.shared.checkPlaceTriggers()
             await ChappyReminders.shared.checkLeaveBy()
             await ChappyCalendar.shared.checkLeaveBy()
+            ChappyCalendar.shared.checkHeadsUp()
         }
         // PHASE 4 STEP 5: and the navigator (speaks turns when close)
         Task { @MainActor in NavEngine.shared.updateLocation(loc) }
@@ -6114,7 +6264,15 @@ final class ChappyMemory: ObservableObject {
     func migrateLegacyStoresIfNeeded() {
         guard !UserDefaults.standard.bool(forKey: Self.migrationKey) else { return }
         UserDefaults.standard.set(true, forKey: Self.migrationKey)
+        // SPEED FIX (build 109): this looped every old spot, photo and note ON
+        // THE MAIN THREAD at launch. On a full store that is a visible freeze
+        // on the first screen you look at.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.migrateNow()
+        }
+    }
 
+    private func migrateNow() {
         let trip = TripRecorder.shared
         var moved = 0
 
@@ -7334,6 +7492,10 @@ final class ChappyReminders: NSObject, ObservableObject {
     func stopTicking() { tickTimer?.invalidate(); tickTimer = nil }
 
     private func tick() {
+        // Calendar warnings ride here rather than on the location fix: half
+        // his jobs are REMOTE, so he never moves, so a movement-driven check
+        // would never fire for exactly the events that matter most.
+        ChappyCalendar.shared.checkHeadsUp()
         guard !TTSService.shared.isSpeaking else { return }
         let ready = due().filter { $0.deliveredAt == nil }
         guard let first = ready.first else { return }
@@ -7376,6 +7538,66 @@ final class ChappyReminders: NSObject, ObservableObject {
         guard !line.isEmpty else { return }
         ChappyEarcon.shared.wake()
         TTSService.shared.speak(line)
+    }
+
+    /// BUILD 113 — TOMORROW, TONIGHT.
+    ///
+    /// A morning brief tells you about a day you are already standing in. By
+    /// then it is too late to do anything about an eight o'clock job or a
+    /// dinner someone else put in the shared calendar. The useful brief is the
+    /// one the night before, while you can still act on it.
+    ///
+    /// Matters most for shared calendars specifically: your partner adds
+    /// something at four in the afternoon and, without this, you find out
+    /// about it when it is already happening.
+    private var eveningBriefedOn: String {
+        get { UserDefaults.standard.string(forKey: "chappy_eve_brief_day") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_eve_brief_day") }
+    }
+
+    func eveningBriefIfDue() {
+        guard UserDefaults.standard.object(forKey: "chappy_evening_brief") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_evening_brief") else { return }
+        let key = ChappyMemory.dayKey(Date())
+        guard eveningBriefedOn != key else { return }
+        let h = Calendar.current.component(.hour, from: Date())
+        guard h >= 18, h < 23 else { return }
+        let line = tomorrowText()
+        guard !line.isEmpty else { eveningBriefedOn = key; return }
+        eveningBriefedOn = key
+        ChappyEarcon.shared.wake()
+        TTSService.shared.speak(line)
+    }
+
+    func tomorrowText() -> String {
+        let cal = Calendar.current
+        guard let start = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: Date())),
+              let end = cal.date(byAdding: .day, value: 1, to: start) else { return "" }
+        let events = ChappyCalendar.shared.events(from: start, to: end)
+        let jobs = events.filter { !$0.isAllDay }
+        let due = open.filter {
+            guard let f = $0.effectiveFire else { return false }
+            return f >= start && f < end
+        }
+        guard !jobs.isEmpty || !due.isEmpty else { return "" }
+
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        var parts: [String] = ["Tomorrow."]
+        if let first = jobs.first, let s = first.startDate {
+            if jobs.count == 1 {
+                parts.append("\(first.title ?? "One thing") at \(df.string(from: s)).")
+            } else {
+                parts.append("\(jobs.count) on, first at \(df.string(from: s)) - \(first.title ?? "").")
+                if let last = jobs.last, let l = last.startDate {
+                    parts.append("Last one \(df.string(from: l)).")
+                }
+            }
+        }
+        if !due.isEmpty {
+            parts.append("\(due.count) reminder\(due.count == 1 ? "" : "s"): "
+                         + due.prefix(3).map { $0.title }.joined(separator: ", ") + ".")
+        }
+        return parts.joined(separator: " ")
     }
 
     func briefText() -> String {
@@ -8193,8 +8415,197 @@ final class ChappyCalendar: ObservableObject {
 
     func isEnabled(_ cal: EKCalendar) -> Bool { isOn(cal) }
 
+    // BUILD 111 — PER-CALENDAR BEHAVIOUR.
+    //
+    // Twelve calendars treated identically is unusable: your Geeks2U jobs and
+    // a birthday should not get the same treatment, and reading all of it out
+    // every morning is how you end up switching the whole thing off.
+    //
+    // Four behaviours, one tap each, set once:
+    //   PING   spoken and notified before it starts, plus leave-by
+    //   BRIEF  read out in the morning, silent otherwise   (the default)
+    //   SHOW   visible in the diary, never spoken
+    //   IGNORE not read at all
+    enum Behaviour: String, CaseIterable {
+        case ping, brief, show, ignore
+        var label: String {
+            switch self {
+            case .ping:   return "Ping me"
+            case .brief:  return "In the brief"
+            case .show:   return "Just show it"
+            case .ignore: return "Ignore"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .ping:   return "Warned before it starts, and told when to leave"
+            case .brief:  return "Read out in the morning, silent the rest of the day"
+            case .show:   return "Appears in the diary, never spoken"
+            case .ignore: return "Not read at all"
+            }
+        }
+    }
+
+    func behaviour(for cal: EKCalendar) -> Behaviour {
+        if let raw = UserDefaults.standard.string(forKey: "chappy_calb_" + cal.calendarIdentifier),
+           let b = Behaviour(rawValue: raw) { return b }
+        // SENSIBLE UNTIL TOLD OTHERWISE. A work calendar full of jobs wants
+        // warning about; a holiday calendar does not. Guessing right by
+        // default beats a settings screen nobody opens.
+        let t = cal.title.lowercased()
+        if ["job", "work", "geek", "shift", "roster", "booking"].contains(where: { t.contains($0) }) {
+            return .ping
+        }
+        if ["holiday", "birthday", "school"].contains(where: { t.contains($0) }) {
+            return .show
+        }
+        return .brief
+    }
+
+    func setBehaviour(_ b: Behaviour, for cal: EKCalendar) {
+        UserDefaults.standard.set(b.rawValue, forKey: "chappy_calb_" + cal.calendarIdentifier)
+    }
+
+    /// How long before it starts you want telling. Per calendar, because a job
+    /// and a dinner do not need the same runway.
+    /// BUILD 113: this capped at two hours, so there was no way to say "tell
+    /// me the day before". Some things — a booking, a flight, anything you
+    /// have to prepare for — are useless as a thirty-minute warning.
+    func leadMinutes(for cal: EKCalendar) -> Int {
+        let v = UserDefaults.standard.integer(forKey: "chappy_call_" + cal.calendarIdentifier)
+        return v > 0 ? v : 30
+    }
+
+    /// Plain English for a lead time, however long it is.
+    nonisolated static func leadLabel(_ m: Int) -> String {
+        if m >= 1440 { let d = m / 1440; return d == 1 ? "the day before" : "\(d) days before" }
+        if m >= 60 { let h = m / 60; let r = m % 60
+            return r == 0 ? "\(h) hour\(h == 1 ? "" : "s") before"
+                          : "\(h)h \(r)m before" }
+        return "\(m) minutes before"
+    }
+
+    func setLeadMinutes(_ m: Int, for cal: EKCalendar) {
+        UserDefaults.standard.set(m, forKey: "chappy_call_" + cal.calendarIdentifier)
+    }
+
+    // BUILD 114 — PER-EVENT OVERRIDE.
+    //
+    // A flight and a dentist appointment can live in the same calendar, and no
+    // per-calendar setting can tell them apart. So any single event can be
+    // lifted above — or dropped below — whatever its calendar says.
+    //
+    //   IMPORTANT  day before AND an hour before, time-sensitive so it pierces
+    //              Focus and quiet hours. Flights, payments, bookings — the
+    //              things where late is the same as never.
+    //   NORMAL     whatever the calendar is set to.
+    //   MUTED      silent, still visible. A recurring thing you don't need.
+    //
+    // NOTHING IS WRITTEN BACK TO EVENTKIT. The flags live here, so a shared
+    // calendar is never modified and whoever shares it sees nothing.
+    enum EventLevel: String { case important, normal, muted }
+
+    /// FINGERPRINT, NOT IDENTIFIER.
+    /// A subscribed feed — your Geeks2U one — can regenerate event IDs when it
+    /// refreshes, which would silently detach an "important" flag from its
+    /// event. Title plus start time plus calendar survives that. It is the
+    /// kind of thing that looks fine for a week and then stops working in
+    /// Ubud, which is exactly when it would matter.
+    nonisolated static func fingerprint(_ e: EKEvent) -> String {
+        let t = (e.title ?? "").lowercased()
+            .folding(options: [.diacriticInsensitive], locale: .current)
+            .prefix(40)
+        let start = Int((e.startDate ?? Date()).timeIntervalSince1970)
+        let cal = e.calendar?.calendarIdentifier ?? "?"
+        return "\(t)|\(start)|\(cal)"
+    }
+
+    private var eventLevels: [String: String] {
+        get { (UserDefaults.standard.dictionary(forKey: "chappy_event_levels") as? [String: String]) ?? [:] }
+        set {
+            // Capped, oldest-ish dropped, so this can never grow unbounded.
+            var v = newValue
+            if v.count > 400 { v = Dictionary(uniqueKeysWithValues: Array(v).suffix(400)) }
+            UserDefaults.standard.set(v, forKey: "chappy_event_levels")
+        }
+    }
+
+    func level(for e: EKEvent) -> EventLevel {
+        guard let raw = eventLevels[Self.fingerprint(e)],
+              let l = EventLevel(rawValue: raw) else { return .normal }
+        return l
+    }
+
+    func setLevel(_ l: EventLevel, for e: EKEvent) {
+        var v = eventLevels
+        let key = Self.fingerprint(e)
+        if l == .normal { v.removeValue(forKey: key) } else { v[key] = l.rawValue }
+        eventLevels = v
+    }
+
+    /// THE RESOLVER. Event override first, calendar behaviour second. One
+    /// function, so every path — heads-up, leave-by, both briefs — agrees.
+    func effectiveBehaviour(for e: EKEvent) -> Behaviour {
+        switch level(for: e) {
+        case .important: return .ping
+        case .muted:     return .show
+        case .normal:    return e.calendar.map { behaviour(for: $0) } ?? .brief
+        }
+    }
+
+    /// THE HEADS-UP. Fires once per event, N minutes before it starts, only
+    /// for calendars set to Ping. Separate from leave-by: leave-by depends on
+    /// a route lookup succeeding, and a warning you actually need should not
+    /// depend on the network being up.
+    private var headsUpDone: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "chappy_cal_headsup") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue.suffix(80)), forKey: "chappy_cal_headsup") }
+    }
+
+    func checkHeadsUp() {
+        guard authorised else { return }
+        var done = headsUpDone
+        // Three days, because a lead time can now be a day or two.
+        for e in upcoming(days: 3) {
+            guard let start = e.startDate, !e.isAllDay,
+                  effectiveBehaviour(for: e) == .ping else { continue }
+            let important = level(for: e) == .important
+            let mins = start.timeIntervalSinceNow / 60
+            // An important event warns TWICE: the day before, so you can act,
+            // and an hour before, so you don't forget you acted.
+            let leads: [Double] = important
+                ? [1440, 60]
+                : [Double(e.calendar.map { leadMinutes(for: $0) } ?? 30)]
+            let fp = Self.fingerprint(e)
+            var fired = false
+            for lead in leads {
+                let key = "\(fp)#\(Int(lead))"
+                guard !done.contains(key), mins > 0, mins <= lead else { continue }
+                // Don't fire the day-before slot for something that is already
+                // an hour away — you'd get both at once.
+                if lead > 120, mins < 120 { done.insert(key); continue }
+                done.insert(key); fired = true; break
+            }
+            guard fired else { continue }
+            headsUpDone = done
+            let df = DateFormatter(); df.dateFormat = "h:mm a"
+            var spoken = "\(e.title ?? "Something") at \(df.string(from: start))"
+            if let l = e.location, !l.isEmpty {
+                spoken += ", \(l.split(separator: ",").first.map(String.init) ?? l)"
+            }
+            spoken += ". \(Self.leadLabel(Int(mins.rounded())).replacingOccurrences(of: " before", with: ""))."
+            if important { ChappyHaptics.shared.reminderUrgent() }
+            else { ChappyHaptics.shared.reminderDue() }
+            ChappyNotify.announce(.nav, spoken: spoken,
+                                  title: (important ? "⚑ " : "") + (e.title ?? "Coming up"),
+                                  body: Self.leadLabel(Int(mins.rounded())).replacingOccurrences(of: " before", with: "")
+                                      + ((e.location.map { " · " + $0 }) ?? ""),
+                                  critical: important)
+        }
+    }
+
     private var activeCalendars: [EKCalendar]? {
-        let on = allCalendars.filter(isOn)
+        let on = allCalendars.filter { isOn($0) && behaviour(for: $0) != .ignore }
         return on.isEmpty ? nil : on
     }
 
@@ -8235,9 +8646,18 @@ final class ChappyCalendar: ObservableObject {
     // MARK: Speaking it
 
     /// One line per event, short enough to be heard rather than read.
+    /// Only Ping and Brief calendars are ever read aloud. "Just show it" means
+    /// exactly that — visible in the diary, never spoken at you.
+    private func spokenWorthy(_ e: EKEvent) -> Bool {
+        if level(for: e) == .important { return true }   // always, whatever the calendar says
+        if level(for: e) == .muted { return false }
+        let b = effectiveBehaviour(for: e)
+        return b == .ping || b == .brief
+    }
+
     func agendaLine(limit: Int = 4) -> String? {
-        let t = today().filter { !($0.isAllDay) && ($0.endDate ?? Date()) > Date() }
-        let allDay = today().filter { $0.isAllDay }
+        let t = today().filter { !($0.isAllDay) && ($0.endDate ?? Date()) > Date() && spokenWorthy($0) }
+        let allDay = today().filter { $0.isAllDay && spokenWorthy($0) }
         guard !t.isEmpty || !allDay.isEmpty else { return nil }
         let df = DateFormatter(); df.dateFormat = "h:mm a"
         var parts: [String] = []
@@ -8271,6 +8691,7 @@ final class ChappyCalendar: ObservableObject {
         for e in upcoming(days: 1) {
             guard let start = e.startDate, !e.isAllDay,
                   let where_ = e.location, !where_.isEmpty,
+                  effectiveBehaviour(for: e) == .ping,
                   let id = e.eventIdentifier, !warned.contains(id) else { continue }
             let minsAway = start.timeIntervalSinceNow / 60
             // Only worth a route lookup inside a sensible window.
