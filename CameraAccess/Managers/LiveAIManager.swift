@@ -3139,6 +3139,16 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
     /// Ask for Always exactly once, and only when a route actually starts.
     private var askedForAlways = false
 
+    /// True only when Info.plist declares the `location` background mode.
+    /// Touching allowsBackgroundLocationUpdates without it is a hard crash, so
+    /// this is checked rather than assumed. See the note in setPrecision.
+    static let backgroundLocationAllowed: Bool = {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        let ok = modes.contains("location")
+        print("🧭 [Context] Background location mode: \(ok ? "PRESENT" : "ABSENT — nav stops tracking when backgrounded")")
+        return ok
+    }()
+
     func setPrecision(navigating: Bool) {
         locationManager.desiredAccuracy = navigating
             ? kCLLocationAccuracyBestForNavigation
@@ -3162,17 +3172,37 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         // needed for updates with the app fully suspended, which we ask for
         // once, at the moment it actually earns the request — the start of a
         // real route, not on launch out of nowhere.
+        // ==================================================================
+        // THE "NAVIGATE TO IGA" CRASH — and it is mine, from build 73.
+        //
+        // Apple: setting `allowsBackgroundLocationUpdates = true` when the app
+        // does NOT declare `location` in UIBackgroundModes is a FATAL ERROR.
+        // Not an exception you can catch — the process is killed outright.
+        //
+        // Before build 73 this line was gated on `.authorizedAlways`, which the
+        // app never requests, so it NEVER RAN and the crash never happened. My
+        // "fix" widened the gate to `.authorizedWhenInUse` — which is true — so
+        // the line finally executed, and the first voice command that started a
+        // real route killed the app instantly. Say "navigate to IGA", get a
+        // route, hit setPrecision(navigating: true), dead.
+        //
+        // Exactly the same class of mistake as the audio background mode, and I
+        // made it twice: assuming an entitlement is present instead of checking.
+        // Now it is checked at runtime, so the app is correct whether or not
+        // the Info.plist declares it — and adding the entitlement later needs
+        // no code change, it just starts working.
         if navigating {
             let status = locationManager.authorizationStatus
-            if status == .authorizedAlways || status == .authorizedWhenInUse {
+            if Self.backgroundLocationAllowed,
+               status == .authorizedAlways || status == .authorizedWhenInUse {
                 locationManager.allowsBackgroundLocationUpdates = true
                 locationManager.showsBackgroundLocationIndicator = true
             }
-            if status == .authorizedWhenInUse, !askedForAlways {
+            if Self.backgroundLocationAllowed, status == .authorizedWhenInUse, !askedForAlways {
                 askedForAlways = true
                 locationManager.requestAlwaysAuthorization()
             }
-        } else {
+        } else if Self.backgroundLocationAllowed {
             locationManager.allowsBackgroundLocationUpdates = false
         }
     }
