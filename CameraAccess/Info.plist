@@ -64,6 +64,10 @@
 	<array>
 		<string>_bonjour._tcp</string>
 	</array>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Chappy reads your calendars so it can tell you what's on, warn you when to leave, and keep appointments alongside your reminders.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Chappy reads your calendars so it can tell you what's on and warn you when to leave.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Chappy needs camera to capture photos</string>
 	<key>NSLocalNetworkUsageDescription</key>
@@ -97,6 +101,7 @@
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 		<string>external-accessory</string>
+		<string>location</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
