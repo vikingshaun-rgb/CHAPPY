@@ -409,6 +409,26 @@ class GeminiLiveService: NSObject {
                         ["name": "save_observation",
                          "description": "Save a notable observation to the travel journal - an interesting shop, price, landmark or fact worth remembering. Use this UNPROMPTED when you notice something notable.",
                          "parameters": ["type": "OBJECT", "properties": ["text": ["type": "STRING"]], "required": ["text"]]],
+                        // PHASE 5.5 — anything said mid-conversation can become a
+                        // reminder without breaking the conversation to do it.
+                        ["name": "set_reminder",
+                         "description": "Set a reminder for the user. Use this WHENEVER they say anything that implies they want to be reminded, prompted or nudged about something later - even in passing, even mid-sentence, and even if they don't use the word 'remind'. Examples that should all call this: 'I must not forget to book that ferry tomorrow', 'chase that up on Friday', 'remind me about this later', 'I need to take the tablet at 8 every morning'. Work out the time from what they said and what time it is now. Prefer setting something over asking.",
+                         "parameters": ["type": "OBJECT", "properties": [
+                            "text": ["type": "STRING", "description": "What to remind them of, phrased as an instruction to them, e.g. 'Book the ferry'"],
+                            "iso_time": ["type": "STRING", "description": "When it should fire, ISO 8601 with the local offset, e.g. 2026-09-14T18:30:00+08:00. Omit if this is a place reminder or has no time."],
+                            "daily_time": ["type": "STRING", "description": "For something that happens at the same LOCAL time every day wherever they are, e.g. medication: 'HH:mm' in 24h. Use instead of iso_time."],
+                            "place": ["type": "STRING", "description": "Fire it when they arrive somewhere instead of at a time, e.g. 'supermarket', 'home', 'the hotel'."],
+                            "repeat_rule": ["type": "STRING", "description": "Optional. 'd1' daily, 'd3' every 3 days, 'w1' weekly, 'w1:mon,fri' those weekdays, 'm1' monthly. Add ! to count from when they complete it rather than the schedule, e.g. 'd3!' for laundry."],
+                            "must_not_miss": ["type": "BOOLEAN", "description": "True for flights, medication, visas - anything that should break through Do Not Disturb."]
+                         ], "required": ["text"]]],
+                        ["name": "list_reminders",
+                         "description": "Read back what the user has due today, overdue, and coming up. Use when they ask what's on, what they have to do, or how their day looks."],
+                        ["name": "complete_reminder",
+                         "description": "Mark a reminder done when the user says they have done it.",
+                         "parameters": ["type": "OBJECT", "properties": ["text": ["type": "STRING", "description": "Roughly what the reminder said - matching is fuzzy."]], "required": ["text"]]],
+                        ["name": "query_memory",
+                         "description": "Search everything Chappy has ever stored - places saved, photos taken and captioned, conversations translated, documents scanned, notes logged, past chats. Use this BEFORE saying you don't know something about the user's own past. Free and instant.",
+                         "parameters": ["type": "OBJECT", "properties": ["query": ["type": "STRING", "description": "Words to look for, e.g. 'warung coffee', 'scooter price', 'temple monkeys'"]], "required": ["query"]]],
                         ["name": "alert_when_near",
                          "description": "Watch the user's location and tell them when they get near a place (like their bus stop or a landmark).",
                          "parameters": ["type": "OBJECT", "properties": ["place": ["type": "STRING"]], "required": ["place"]]],
@@ -689,6 +709,57 @@ class GeminiLiveService: NSObject {
         case "save_observation":
             TripRecorder.shared.addObservation(args["text"] as? String ?? "")
             return "Noted in the journal."
+        case "set_reminder":
+            let text = (args["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count > 1 else { return "Nothing to remind them of." }
+            var when: Date?
+            if let iso = args["iso_time"] as? String {
+                let f = ISO8601DateFormatter()
+                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                when = f.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+            }
+            let daily = args["daily_time"] as? String
+            let place = (args["place"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rule = args["repeat_rule"] as? String
+            let urgent = (args["must_not_miss"] as? Bool) ?? false
+            // The frame goes with it. "Remind me to order THIS" only means
+            // anything six weeks later if the picture came too.
+            let frame = await MainActor.run {
+                LiveAIManager.shared.streamViewModel?.currentVideoFrame?
+                    .jpegData(compressionQuality: 0.4)
+            }
+            let saved = await MainActor.run {
+                ChappyReminders.shared.add(title: text, at: when,
+                                           floatingTime: daily,
+                                           place: (place?.isEmpty == false) ? place : nil,
+                                           repeatRule: rule,
+                                           leadMinutes: (place?.isEmpty == false) ? 5 : nil,
+                                           escalate: urgent,
+                                           thumbnail: frame,
+                                           source: "live-ai")
+            }
+            if let p = place, !p.isEmpty { return "Reminder set: '\(saved.title)' when they get to \(p). Confirm it briefly." }
+            if let d = daily { return "Reminder set: '\(saved.title)' at \(d) local every day. Confirm it briefly." }
+            if let w = when {
+                let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+                return "Reminder set: '\(saved.title)' for \(f.string(from: w)). Confirm it briefly, in a few words."
+            }
+            return "Saved '\(saved.title)' to the list with no time. Ask when they want it."
+        case "list_reminders":
+            return await MainActor.run { ChappyReminders.shared.spokenList() }
+        case "complete_reminder":
+            let want = (args["text"] as? String ?? "").lowercased()
+            return await MainActor.run { () -> String in
+                guard let t = ChappyReminders.shared.open.first(where: {
+                    $0.title.lowercased().contains(want) || want.contains($0.title.lowercased())
+                }) else { return "No open reminder matches that - tell them so." }
+                ChappyReminders.shared.complete(t.id)
+                return "Marked '\(t.title)' done."
+            }
+        case "query_memory":
+            let q = args["query"] as? String ?? ""
+            let answer = await MainActor.run { ChappyMemory.shared.spokenRecall(q, limit: 6) }
+            return answer ?? "Nothing stored about '\(q)'. Say so honestly rather than guessing."
         case "alert_when_near":
             return await NavEngine.shared.alertWhenNear(args["place"] as? String ?? "")
         case "open_website":
@@ -1767,4 +1838,6 @@ extension Notification.Name {
     static let chappyShowMap = Notification.Name("chappyShowMap")
     /// PHASE 5: open the memory browser by voice.
     static let chappyOpenMemory = Notification.Name("chappyOpenMemory")
+    /// PHASE 5.5: open the reminders list by voice.
+    static let chappyOpenReminders = Notification.Name("chappyOpenReminders")
 }
