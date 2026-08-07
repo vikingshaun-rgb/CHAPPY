@@ -7206,6 +7206,18 @@ final class ChappyReminders: NSObject, ObservableObject {
     // MARK: - Permission
 
     func requestPermission() {
+        // BUILD 116 — THE DELEGATE MUST BE SET REGARDLESS.
+        //
+        // registerCategories() was only called INSIDE the permission callback,
+        // and only when it returned true. So if permission was already decided
+        // — which it is on every launch after the first — the action buttons
+        // and the foreground handler could end up unregistered, and a
+        // notification would either not show while you were in the app or
+        // arrive with no Done / Snooze buttons on it.
+        //
+        // Setting the delegate is free and safe to do every launch. Do it
+        // first, then ask.
+        registerCategories()
         UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound, .badge, .timeSensitive]) { ok, _ in
                 DispatchQueue.main.async {
@@ -7223,6 +7235,25 @@ final class ChappyReminders: NSObject, ObservableObject {
     // snoozed ten minutes, or pushed until you're home — from the same screen
     // it appeared on. Siri gives you a fixed-interval snooze and nothing else;
     // "when I'm home" is the one people actually want and nobody offers it.
+    /// Honest answer to "are notifications actually on?", for the diagnostics
+    /// screen — so this never has to be guessed at again.
+    func authorisationReport(_ done: @escaping (String) -> Void) {
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let state: String
+            switch s.authorizationStatus {
+            case .authorized:     state = "On"
+            case .provisional:    state = "Quiet only — no sound or banner"
+            case .denied:         state = "OFF — turn on in Settings › Chappy › Notifications"
+            case .notDetermined:  state = "Never asked — reopen Chappy"
+            default:              state = "Unknown"
+            }
+            let alerts = s.alertSetting == .enabled ? "banners on" : "BANNERS OFF"
+            let sound = s.soundSetting == .enabled ? "sound on" : "SOUND OFF"
+            let lock = s.lockScreenSetting == .enabled ? "lock screen on" : "lock screen off"
+            done("\(state) · \(alerts) · \(sound) · \(lock)")
+        }
+    }
+
     func registerCategories() {
         let done = UNNotificationAction(identifier: "CHAPPY_DONE",
                                         title: "Done", options: [])
@@ -7293,6 +7324,98 @@ final class ChappyReminders: NSObject, ObservableObject {
         all.filter { $0.doneAt != nil }
             .sorted { ($0.doneAt ?? .distantPast) > ($1.doneAt ?? .distantPast) }
             .prefix(limit).map { $0 }
+    }
+
+    // BUILD 115 — CATEGORIES YOU NEVER HAVE TO CHOOSE.
+    //
+    // Every task app on earth loses people at the same moment: the dropdown
+    // where you pick a list. So Chappy doesn't ask.
+    //
+    // Every reminder already knows where it came from — a job calendar, a
+    // saved place, a Live AI conversation, a flight. The category IS that
+    // provenance, and it is free. Manual override exists; you will rarely
+    // need it.
+    enum Category: String, CaseIterable {
+        case work, travel, money, places, health, home, general
+
+        var label: String {
+            switch self {
+            case .work:    return "Work"
+            case .travel:  return "Travel"
+            case .money:   return "Money"
+            case .places:  return "Places"
+            case .health:  return "Health"
+            case .home:    return "Home"
+            case .general: return "General"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .work:    return "briefcase.fill"
+            case .travel:  return "airplane"
+            case .money:   return "creditcard.fill"
+            case .places:  return "mappin"
+            case .health:  return "heart.fill"
+            case .home:    return "house.fill"
+            case .general: return "tray.fill"
+            }
+        }
+        /// Same four choices as calendars, so there is one thing to learn.
+        var defaultPings: Bool { self == .work || self == .travel || self == .money || self == .health }
+    }
+
+    /// Derived, then overridden. Tags win, then the words themselves, then
+    /// where it came from.
+    nonisolated static func category(of e: ChappyMemory.Entry) -> Category {
+        if let raw = UserDefaults.standard.string(forKey: "chappy_rcat_" + e.id.uuidString),
+           let c = Category(rawValue: raw) { return c }
+
+        let t = (e.title + " " + e.body).lowercased()
+        let tags = e.tags.joined(separator: " ")
+
+        if !(e.placeTrigger ?? "").isEmpty { return .places }
+        if tags.contains("job") || tags.contains("work")
+            || ["invoice", "job ", "client", "shift", "geeks", "quote", "callout"]
+                .contains(where: { t.contains($0) }) { return .work }
+        if ["flight", "visa", "passport", "check in", "check-in", "boarding", "hotel",
+            "airbnb", "booking", "ferry", "airport", "onward"]
+            .contains(where: { t.contains($0) }) { return .travel }
+        if ["pay", "invoice", "rent", "bill", "transfer", "insurance", "renew", "subscription"]
+            .contains(where: { t.contains($0) }) { return .money }
+        if ["tablet", "pill", "medication", "dentist", "doctor", "vaccin", "jab", "script"]
+            .contains(where: { t.contains($0) }) { return .health }
+        if ["laundry", "washing", "bins", "shopping", "groceries", "milk", "clean"]
+            .contains(where: { t.contains($0) }) { return .home }
+        if e.source == "records-fold" || e.source == "live-ai" { return .general }
+        return .general
+    }
+
+    nonisolated static func setCategory(_ c: Category, for id: UUID) {
+        UserDefaults.standard.set(c.rawValue, forKey: "chappy_rcat_" + id.uuidString)
+    }
+
+    /// Per-category behaviour — the mirror of the calendar picker, so there is
+    /// one idea to learn rather than two.
+    nonisolated static func categoryPings(_ c: Category) -> Bool {
+        if let v = UserDefaults.standard.object(forKey: "chappy_rcatping_" + c.rawValue) as? Bool { return v }
+        return c.defaultPings
+    }
+    nonisolated static func setCategoryPings(_ on: Bool, _ c: Category) {
+        UserDefaults.standard.set(on, forKey: "chappy_rcatping_" + c.rawValue)
+    }
+
+    func inCategory(_ c: Category) -> [ChappyMemory.Entry] {
+        open.filter { Self.category(of: $0) == c }
+    }
+
+    /// Which categories actually have something in them — no empty chips.
+    var liveCategories: [Category] {
+        var seen: [Category] = []
+        for r in open {
+            let c = Self.category(of: r)
+            if !seen.contains(c) { seen.append(c) }
+        }
+        return Category.allCases.filter { seen.contains($0) }
     }
 
     // MARK: - Creating
@@ -7497,7 +7620,9 @@ final class ChappyReminders: NSObject, ObservableObject {
         // would never fire for exactly the events that matter most.
         ChappyCalendar.shared.checkHeadsUp()
         guard !TTSService.shared.isSpeaking else { return }
-        let ready = due().filter { $0.deliveredAt == nil }
+        let ready = due().filter {
+            $0.deliveredAt == nil && Self.categoryPings(Self.category(of: $0))
+        }
         guard let first = ready.first else { return }
         // QUIET HOURS: still marked delivered and still on the list, just not
         // spoken aloud at 3am. It surfaces in the morning brief instead.
