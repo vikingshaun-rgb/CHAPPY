@@ -8,6 +8,7 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import AVKit
 import Speech
 import MapKit
 
@@ -37,9 +38,11 @@ struct TurboMetaHomeView: View {
     @State private var showMapSheet = false
     // CHAPPY STANDBY — the wake-word ear
     @StateObject private var standby = ChappyStandby.shared
+    @StateObject private var memory = ChappyMemory.shared
     @State private var showQuickVision = false
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
+    @State private var showMemory = false
     @ObservedObject private var openClawService = OpenClawNodeService.shared
 
     /// POCKET LAW: arm the wake word, but never on top of a module that owns
@@ -47,6 +50,15 @@ struct TurboMetaHomeView: View {
     /// one is up, that module is the thing listening and Standby must stay out
     /// of its way. It re-arms by itself via resumeAfterHandOff when the module
     /// closes, and failing that, the next didBecomeActive catches it.
+    /// One line under the Memory row so the store is never a black box:
+    /// you can see it filling up without opening it.
+    private var memoryDetailLine: String {
+        let n = memory.recent.count
+        if n == 0 { return "Everything Chappy stores, in one place" }
+        let today = memory.recent.filter { Calendar.current.isDateInToday($0.at) }.count
+        return "\(n) stored · \(today) today · searchable"
+    }
+
     private func armStandbyIfClear(reason: String) {
         guard !showLiveAI, !showLiveTranslate, !showQuickVision,
               !showLiveStream, !showRTMPStreaming, !showOpenClaw, !showLeanEat
@@ -125,6 +137,17 @@ struct TurboMetaHomeView: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .tint(.blue)
+                                    // Straight to Google Maps mid-route, without
+                                    // opening Chappy's map first. Chappy keeps
+                                    // speaking the turns either way.
+                                    Button {
+                                        NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                                    } label: {
+                                        Label("Google", systemImage: "arrow.triangle.turn.up.right.diamond")
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.green)
                                     Button { navEngine.stop(announce: true) } label: {
                                         Label("Stop", systemImage: "xmark.circle")
                                             .frame(maxWidth: .infinity)
@@ -201,7 +224,14 @@ struct TurboMetaHomeView: View {
                         // QUICK ACTIONS
                         HStack(spacing: 10) {
                             QuickActionButton(icon: "camera.fill", label: "Snap") {
-                                showQuickVision = true
+                                // SNAP is now the SILENT one. It used to open
+                                // Quick Vision — the identical thing the Look
+                                // tile does — so the button had no job of its
+                                // own. Photo, quietly described, stored. No
+                                // talking: you take it because you want it
+                                // later, not to be told about it now.
+                                ChappyStandby.shared.snapSilently()
+                                journalTick += 1
                             }
                             QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
                                 // Remember always DID save — but it named the pin
@@ -261,6 +291,13 @@ struct TurboMetaHomeView: View {
 
                         // MORE
                         VStack(spacing: 8) {
+                            // PHASE 5 — the one spot. Sits first because it is
+                            // the thing you come back to, not a setting.
+                            MoreRow(icon: "brain",
+                                    title: "Memory",
+                                    detail: memoryDetailLine) {
+                                showMemory = true
+                            }
                             MoreRow(icon: "link.circle.fill", title: "OpenClaw",
                                     detail: openClawService.connectionState == .connected ? "Connected" : "Home computer bridge") {
                                 showOpenClaw = true
@@ -306,11 +343,48 @@ struct TurboMetaHomeView: View {
             .fullScreenCover(isPresented: $showOpenClaw) {
                 OpenClawChatView(streamViewModel: streamViewModel)
             }
+            .fullScreenCover(isPresented: $showMemory) {
+                MemoryView()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyOpenMemory)) { _ in
+            showLiveAI = false; showQuickVision = false; showLiveTranslate = false
+            showMemory = true
         }
         .onAppear {
             // GPS from app-open (not just Live AI) — journal, Remember and
             // the Map button all need a fix before any session starts
             ContextEngine.shared.start()
+
+            // PHASE 5 — fold the old scattered stores into the one spot. Runs
+            // exactly once ever; the old files are left untouched, so a bad
+            // migration costs nothing but a flag reset.
+            TripRecorder.shared.loadVisualNotes()
+            ChappyMemory.shared.migrateLegacyStoresIfNeeded()
+            // PHASE 5 — every Live AI conversation ever recorded, folded into
+            // the one spot. Free and instant: headline, transcript, and a
+            // location recovered from the breadcrumb trail. The AI pass that
+            // pulls the durable facts out runs later, on charge.
+            ChappyMemory.shared.foldInConversationRecords()
+
+            // PHASE 5 — anything the glasses captured with Chappy closed.
+            // Self-gating: does nothing unless charging, on WiFi, and at
+            // least six hours since the last look. Delayed so it never
+            // competes with arming the ear at launch.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                ChappyIngest.shared.runIfConditionsAreRight()
+            }
+            // Same conditions, same reasoning: reading a hundred old
+            // conversations properly is an overnight job, not a launch job.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                guard ChappyMemory.shared.factsPending > 0,
+                      ChappyIngest.onWiFi() else { return }
+                UIDevice.current.isBatteryMonitoringEnabled = true
+                let charging = UIDevice.current.batteryState == .charging
+                            || UIDevice.current.batteryState == .full
+                guard charging else { return }
+                Task { await ChappyMemory.shared.runFactExtraction() }
+            }
             // Ensure QuickVisionManager has the streamViewModel reference
             quickVisionManager.setStreamViewModel(streamViewModel)
             // Ensure LiveAIManager has the streamViewModel reference
@@ -345,6 +419,14 @@ struct TurboMetaHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .chappyOpenTranslate)) { _ in
             showLiveTranslate = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyCloseModules)) { _ in
+            // Close every cover. Standby gets the ear back via the modules'
+            // own resumeAfterHandOff, and the 20s expiry catches any that miss.
+            showLiveAI = false; showLiveTranslate = false; showQuickVision = false
+            showLiveStream = false; showRTMPStreaming = false; showOpenClaw = false
+            showLeanEat = false; showMapSheet = false; showNavMap = false
+            ChappyStandby.shared.resumeAfterHandOff()
         }
         .onReceive(NotificationCenter.default.publisher(for: .chappyShowMap)) { _ in
             showMapSheet = true
@@ -439,20 +521,20 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
         // AUDIT FIX (HIGH): Watch + Talk together = two Chappys narrating over
         // each other, both metered, each stealing the other's audio session.
         guard !LiveAIManager.shared.isRunning else {
-            TTSService.shared.speak("Live AI is already running - stop that first.")
+            TTSService.shared.speak("We're already talking. Finish this one first.")
             return
         }
         self.streamViewModel = streamViewModel
 
         guard streamViewModel.hasActiveDevice else {
-            TTSService.shared.speak("Glasses not connected - pair them in the Meta AI app first.")
+            TTSService.shared.speak("I can't find your glasses. They'll need pairing in the Meta app first.")
             return
         }
         // AUDIT FIX: battery guard (Standby had one, this didn't)
         UIDevice.current.isBatteryMonitoringEnabled = true
         let lvl = UIDevice.current.batteryLevel
         if lvl >= 0 && lvl < 0.20 {
-            TTSService.shared.speak("Battery's under twenty percent - watching would drain it fast.")
+            TTSService.shared.speak("You're under twenty percent. Watching would finish it off.")
             return
         }
         // AUDIT FIX: the wake-word ear must let go of the mic, and be restored
@@ -502,7 +584,7 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
             Task { @MainActor in await vm.stopSession() }
         }
         if announce {
-            TTSService.shared.speak("Continuous vision off.")
+            TTSService.shared.speak("Alright, I'll stop watching.")
         }
         // AUDIT FIX: the ear comes back after a voice-started Watch session
         ChappyStandby.shared.resumeAfterHandOff()
@@ -548,7 +630,7 @@ final class ContinuousVisionManager: NSObject, ObservableObject {
             // limit, no battery stop and no spend ceiling — a forgotten
             // session narrated the inside of a bag for hours, billing all day.
             if Date().timeIntervalSince(startedAt) > Self.maxSessionMinutes * 60 {
-                TTSService.shared.speak("That's twenty five minutes of watching - I'll stop here to save battery and cost. Say watch again to carry on.")
+                TTSService.shared.speak("That's twenty five minutes of watching - I'll stop there to save your battery. Say watch again whenever.")
                 stop(announce: false)
                 return
             }
@@ -869,13 +951,30 @@ struct TodayMapSheet: View {
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationView {
-            RouteMapView(
-                coords: TripRecorder.shared.crumbs.map {
-                    CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
-                },
-                destination: nil,
-                spots: TripRecorder.shared.spots)
-                .ignoresSafeArea(edges: .bottom)
+            ZStack(alignment: .bottom) {
+                RouteMapView(
+                    coords: TripRecorder.shared.crumbs.map {
+                        CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                    },
+                    destination: nil,
+                    spots: TripRecorder.shared.spots)
+                    .ignoresSafeArea(edges: .bottom)
+
+                // The same escape hatch as the route map: one tap to the real
+                // thing, from wherever you happen to be looking.
+                Button {
+                    NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                } label: {
+                    Label("Open in Google Maps", systemImage: "map.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.blue))
+                        .foregroundColor(.white)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 28)
+            }
                 .navigationTitle(TripRecorder.shared.spots.isEmpty
                                  ? "Today's Trail"
                                  : "Today's Trail · \(TripRecorder.shared.spots.count) saved")
@@ -895,15 +994,36 @@ struct NavMapSheet: View {
 
     var body: some View {
         NavigationView {
-            RouteMapView(coords: navEngine.routeCoords, destination: navEngine.destinationCoord)
-                .ignoresSafeArea(edges: .bottom)
-                .navigationTitle(navEngine.destinationName)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("Done") { dismiss() }
-                    }
+            ZStack(alignment: .bottom) {
+                RouteMapView(coords: navEngine.routeCoords, destination: navEngine.destinationCoord)
+                    .ignoresSafeArea(edges: .bottom)
+
+                // BUILD 90: this map is a PICTURE. It draws the line and
+                // nothing else — no lane guidance, no live traffic, no
+                // rerouting when you miss a turn. Fine for walking to the
+                // shops; not what you want driving to Brisbane airport. One
+                // tap hands the same destination to Google Maps already
+                // navigating, in the right mode (two-wheeler for a scooter).
+                Button {
+                    NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                } label: {
+                    Label("Turn-by-turn in Google Maps", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.blue))
+                        .foregroundColor(.white)
                 }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 28)
+            }
+            .navigationTitle(navEngine.destinationName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
         }
     }
 }
@@ -1537,5 +1657,719 @@ struct MoreRow: View {
             .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
         }
         .buttonStyle(.plain)
+    }
+}
+
+
+// =====================================================================
+// MARK: - MEMORY BROWSER (PHASE 5 — the reference GUI)
+// =====================================================================
+//
+// One screen, one list, one search box. Everything Chappy has ever stored
+// is reachable from here, in the order it happened, with a filter row for
+// the nine categories and a card for each memory.
+//
+// DESIGN RULES, learned from the modules that came before it:
+//   · SEARCH IS INSTANT AND OFFLINE. It filters the last 30 days as you type
+//     with zero network and zero cost. "Search everything" is a deliberate
+//     second tap, because reading a year off disk is not something to do on
+//     every keystroke.
+//   · NOTHING IS HIDDEN BEHIND A MENU. Filters are visible chips. Sort is
+//     always newest-first, because that is what a diary is.
+//   · EVERY MEMORY IS A CARD WITH A PLACE AND A TIME. If it has coordinates
+//     you can navigate back to it or open it in Google Maps. That is what
+//     turns a list into something worth keeping.
+//   · IT WORKS ON A PLANE. No screen in here needs the network.
+
+struct MemoryView: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var memory = ChappyMemory.shared
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @StateObject private var ingest = ChappyIngest.shared
+    @State private var searchText = ""
+    @State private var selectedKinds: Set<ChappyMemory.Kind> = []
+    @State private var pinnedOnly = false
+    @State private var deepResults: [ChappyMemory.Entry]?
+    @State private var detail: ChappyMemory.Entry?
+    @State private var stats: ChappyMemory.Stats?
+    @State private var showStats = false
+    @State private var exportURL: URL?
+    @State private var showExport = false
+
+    private var query: ChappyMemory.Query {
+        var q = ChappyMemory.Query()
+        q.text = searchText
+        q.kinds = selectedKinds
+        q.pinnedOnly = pinnedOnly
+        return q
+    }
+
+    /// Deep results win while they exist; any change to the query clears them,
+    /// so the list can never quietly show stale answers to a new question.
+    private var results: [ChappyMemory.Entry] {
+        if let d = deepResults { return d }
+        return memory.search(query)
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                               startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    searchBar
+                    filterRow
+                    if ingest.isRunning { ingestStrip }
+                    if memory.isSearchingDisk { searchingStrip }
+                    if deepResults != nil { deepStrip }
+                    listBody
+                }
+            }
+            .navigationTitle("Memory")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") { dismiss() }
+                        .foregroundColor(theme.accent)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            ChappyMemory.shared.stats { s in
+                                stats = s; showStats = true
+                            }
+                        } label: { Label("Storage", systemImage: "internaldrive") }
+                        Button {
+                            ChappyMemory.shared.exportAll { url in
+                                exportURL = url
+                                showExport = url != nil
+                            }
+                        } label: { Label("Export everything", systemImage: "square.and.arrow.up") }
+                        Button {
+                            Task { await ChappyIngest.shared.run(manual: true) }
+                        } label: { Label("Import from the glasses", systemImage: "eyeglasses") }
+                        Button {
+                            ChappyMemory.shared.reload()
+                            deepResults = nil
+                        } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .foregroundColor(theme.accent)
+                    }
+                }
+            }
+        }
+        .sheet(item: $detail) { e in
+            MemoryDetailView(entry: e, theme: theme)
+        }
+        .alert("Memory storage", isPresented: $showStats) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(statsMessage)
+        }
+        .sheet(isPresented: $showExport) {
+            if let u = exportURL { ChappyShareSheet(items: [u]) }
+        }
+    }
+
+    /// Built outside the alert builder — a long string concatenation inside a
+    /// ViewBuilder is exactly the shape that makes the type-checker give up
+    /// and blame an unrelated line.
+    private var statsMessage: String {
+        guard let s = stats else { return "Counting…" }
+        var out = "\(s.total) memories across \(s.days) days.\n"
+        out += "\(s.photos) with photos, \(s.pinned) pinned.\n"
+        out += "Using \(ByteCountFormatter.string(fromByteCount: s.bytes, countStyle: .file)) on this phone."
+        if let o = s.oldest {
+            out += "\nOldest: " + DateFormatter.localizedString(from: o, dateStyle: .medium, timeStyle: .none)
+        }
+        return out
+    }
+
+    // MARK: Pieces
+
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(theme.textSecondary)
+            TextField("Search your memories", text: $searchText)
+                .foregroundColor(theme.textPrimary)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .onChange(of: searchText) { _ in deepResults = nil }
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""; deepResults = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(theme.textSecondary)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+    }
+
+    private var filterRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                chip(label: "All", on: selectedKinds.isEmpty && !pinnedOnly) {
+                    selectedKinds.removeAll(); pinnedOnly = false; deepResults = nil
+                }
+                chip(label: "Pinned", icon: "pin.fill", on: pinnedOnly) {
+                    pinnedOnly.toggle(); deepResults = nil
+                }
+                ForEach(ChappyMemory.Kind.allCases) { k in
+                    chip(label: k.label, icon: k.icon, on: selectedKinds.contains(k)) {
+                        if selectedKinds.contains(k) { selectedKinds.remove(k) }
+                        else { selectedKinds.insert(k) }
+                        deepResults = nil
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func chip(label: String, icon: String? = nil,
+                      on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if let i = icon { Image(systemName: i).font(.caption2) }
+                Text(label).font(.caption).fontWeight(.medium)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(Capsule().fill(on ? theme.accent.opacity(0.25) : theme.cardFill))
+            .overlay(Capsule().stroke(on ? theme.accent : Color.clear, lineWidth: 1))
+            .foregroundColor(on ? theme.accent : theme.textSecondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var ingestStrip: some View {
+        HStack(spacing: 8) {
+            ProgressView().scaleEffect(0.7)
+            Text(ingest.progress.isEmpty ? "Reading the glasses captures…" : ingest.progress)
+                .font(.caption).foregroundColor(theme.textSecondary)
+            Spacer()
+        }
+        .padding(.horizontal, 20).padding(.bottom, 6)
+    }
+
+    private var searchingStrip: some View {
+        HStack(spacing: 8) {
+            ProgressView().scaleEffect(0.7)
+            Text("Reading the whole history…")
+                .font(.caption).foregroundColor(theme.textSecondary)
+            Spacer()
+        }
+        .padding(.horizontal, 20).padding(.bottom, 6)
+    }
+
+    private var deepStrip: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.caption).foregroundColor(theme.accent)
+            Text("Showing results from all time")
+                .font(.caption).foregroundColor(theme.textSecondary)
+            Spacer()
+            Button("Recent only") { deepResults = nil }
+                .font(.caption).foregroundColor(theme.accent)
+        }
+        .padding(.horizontal, 20).padding(.bottom, 6)
+    }
+
+    /// Computed OUTSIDE the ViewBuilder. Result builders can hold local
+    /// bindings, but the type-checker times out on big ones and the error it
+    /// gives you ("unable to type-check in reasonable time") points at the
+    /// wrong line. Cheaper to keep the builder dumb.
+    private var groups: [(key: String, day: Date, items: [ChappyMemory.Entry])] {
+        memory.grouped(results)
+    }
+
+    private var listBody: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14, pinnedViews: [.sectionHeaders]) {
+                if groups.isEmpty {
+                    emptyState
+                } else {
+                    ForEach(groups, id: \.key) { g in
+                        Section {
+                            ForEach(g.items) { e in
+                                MemoryRow(entry: e, theme: theme)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { detail = e }
+                            }
+                        } header: {
+                            dayHeader(g.day, count: g.items.count)
+                        }
+                    }
+                }
+                // The second tap: read everything off disk, once, deliberately.
+                if deepResults == nil && !query.isEmpty {
+                    Button {
+                        ChappyMemory.shared.searchEverything(query) { hits in
+                            deepResults = hits
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "clock.arrow.circlepath")
+                            Text("Search everything, not just the last 30 days")
+                            Spacer()
+                        }
+                        .font(.footnote)
+                        .foregroundColor(theme.accent)
+                        .padding(14)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                }
+                Color.clear.frame(height: 40)
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    private func dayHeader(_ day: Date, count: Int) -> some View {
+        let df = DateFormatter()
+        df.dateFormat = "EEEE d MMMM"
+        let title = Calendar.current.isDateInToday(day) ? "Today"
+                  : (Calendar.current.isDateInYesterday(day) ? "Yesterday"
+                     : df.string(from: day))
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("\(count)")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            // THE DAY'S HEADLINE. Written locally and free; the AI version
+            // (Dreaming) replaces the text later without touching this view.
+            Text(ChappyMemory.shared.summary(for: day)
+                 ?? ChappyMemory.shared.localSummary(for: day))
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary)
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(theme.bgBottom.opacity(0.96))
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "brain")
+                .font(.system(size: 40))
+                .foregroundColor(theme.textSecondary.opacity(0.5))
+            Text(query.isEmpty ? "Nothing stored yet" : "No memories match that")
+                .font(.subheadline).foregroundColor(theme.textPrimary)
+            Text(query.isEmpty
+                 ? "Snap a photo, save a spot or say \"log this\" and it lands here."
+                 : "Try fewer words, or search everything below.")
+                .font(.caption)
+                .foregroundColor(theme.textSecondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
+        .padding(.horizontal, 40)
+    }
+}
+
+// MARK: - One row
+
+struct MemoryRow: View {
+    let entry: ChappyMemory.Entry
+    let theme: ChappyTheme
+
+    private var timeText: String {
+        let df = DateFormatter()
+        df.dateFormat = "h:mm a"
+        return df.string(from: entry.at)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            if entry.hasPhoto, let img = ChappyMemory.shared.thumbnail(for: entry.id) {
+                Image(uiImage: img)
+                    .resizable().scaledToFill()
+                    .frame(width: 46, height: 46)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+            } else {
+                Image(systemName: entry.kind.icon)
+                    .font(.system(size: 17))
+                    .foregroundColor(theme.accent.opacity(0.85))
+                    .frame(width: 46, height: 46)
+                    .background(RoundedRectangle(cornerRadius: 9).fill(theme.cardFill))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    if entry.pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 9)).foregroundColor(theme.accent)
+                    }
+                    Text(entry.title)
+                        .font(.subheadline)
+                        .foregroundColor(theme.textPrimary)
+                        .lineLimit(2)
+                }
+                HStack(spacing: 6) {
+                    Text(timeText)
+                    if let p = entry.place ?? entry.street ?? entry.city {
+                        Text("·"); Text(p).lineLimit(1)
+                    }
+                }
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.5))
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+    }
+}
+
+// MARK: - The card
+//
+// Every memory carries a time and (usually) a place, so every card can offer
+// the two things you actually want six weeks later: take me back there, and
+// show me that on the real map.
+
+struct MemoryDetailView: View {
+    let entry: ChappyMemory.Entry
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @State private var editing = false
+    @State private var draftTitle = ""
+    @State private var pinned = false
+    @State private var confirmDelete = false
+    @State private var showOriginal = false
+    @State private var region = MKCoordinateRegion()
+
+    private var hasCoords: Bool {
+        if let la = entry.lat, let lo = entry.lon { return la != 0 || lo != 0 }
+        return false
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                               startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if entry.hasPhoto, let img = ChappyMemory.shared.thumbnail(for: entry.id) {
+                            Image(uiImage: img)
+                                .resizable().scaledToFit()
+                                .frame(maxWidth: .infinity)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                        }
+
+                        HStack(spacing: 8) {
+                            Image(systemName: entry.kind.icon)
+                                .foregroundColor(theme.accent)
+                            Text(entry.kind.label.uppercased())
+                                .font(.caption).fontWeight(.semibold)
+                                .foregroundColor(theme.accent)
+                            Spacer()
+                            Button {
+                                pinned.toggle()
+                                ChappyMemory.shared.setPinned(id: entry.id, pinned)
+                            } label: {
+                                Image(systemName: pinned ? "pin.fill" : "pin")
+                                    .foregroundColor(pinned ? theme.accent : theme.textSecondary)
+                            }
+                        }
+
+                        if editing {
+                            TextField("Label", text: $draftTitle)
+                                .font(.title3)
+                                .foregroundColor(theme.textPrimary)
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+                            HStack {
+                                Button("Save") {
+                                    ChappyMemory.shared.relabel(id: entry.id, to: draftTitle)
+                                    editing = false
+                                }
+                                .foregroundColor(theme.accent)
+                                Button("Cancel") { editing = false }
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                        } else {
+                            Text(entry.title)
+                                .font(.title3).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                                .onTapGesture { draftTitle = entry.title; editing = true }
+                        }
+
+                        if !entry.body.isEmpty {
+                            Text(entry.body)
+                                .font(.callout)
+                                .foregroundColor(theme.textPrimary.opacity(0.85))
+                        }
+
+                        Text(fullStamp)
+                            .font(.caption)
+                            .foregroundColor(theme.textSecondary)
+
+                        if !entry.tags.isEmpty {
+                            HStack(spacing: 6) {
+                                ForEach(entry.tags, id: \.self) { t in
+                                    Text(t)
+                                        .font(.caption2)
+                                        .padding(.horizontal, 8).padding(.vertical, 4)
+                                        .background(Capsule().fill(theme.cardFill))
+                                        .foregroundColor(theme.textSecondary)
+                                }
+                            }
+                        }
+
+                        if hasCoords {
+                            Map(coordinateRegion: $region,
+                                annotationItems: [MemoryPin(coord: coord)]) { pin in
+                                MapMarker(coordinate: pin.coord, tint: theme.accent)
+                            }
+                            .frame(height: 170)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                            .allowsHitTesting(false)
+
+                            HStack(spacing: 10) {
+                                Button {
+                                    NavEngine.shared.navigateBack(
+                                        to: coord, name: entry.title, driving: false)
+                                    dismiss()
+                                } label: {
+                                    actionLabel("Take me back", "figure.walk")
+                                }
+                                Button {
+                                    openInGoogleMaps()
+                                } label: {
+                                    actionLabel("Google Maps", "map.fill")
+                                }
+                            }
+                        } else {
+                            Text("No location was recorded for this one.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                        }
+
+                        // THE ORIGINAL. Only shown when the memory came from
+                        // the photo library, because iOS gives no public way
+                        // to open Photos at a specific asset — a button that
+                        // just opens Photos to the top of your camera roll is
+                        // worse than no button. This loads the real file.
+                        if entry.assetID != nil {
+                            Button {
+                                showOriginal = true
+                            } label: {
+                                actionLabel(entry.kind == .video ? "Play the video"
+                                                                 : "See the full photo",
+                                            entry.kind == .video ? "play.circle.fill"
+                                                                 : "photo")
+                            }
+                            Text("The full-resolution file stays in your photo library, ready to post or edit.")
+                                .font(.caption2)
+                                .foregroundColor(theme.textSecondary)
+                        }
+
+                        Button(role: .destructive) {
+                            confirmDelete = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "trash")
+                                Text("Forget this")
+                                Spacer()
+                            }
+                            .font(.footnote)
+                            .foregroundColor(.red.opacity(0.85))
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 6)
+                    }
+                    .padding(18)
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+            .alert("Forget this memory?", isPresented: $confirmDelete) {
+                Button("Forget", role: .destructive) {
+                    ChappyMemory.shared.forget(id: entry.id)
+                    dismiss()
+                }
+                Button("Keep it", role: .cancel) { }
+            } message: {
+                Text("This deletes it from the store permanently.")
+            }
+        }
+        .fullScreenCover(isPresented: $showOriginal) {
+            OriginalMediaView(assetID: entry.assetID ?? "", title: entry.title, theme: theme)
+        }
+        .onAppear {
+            pinned = entry.pinned
+            if hasCoords {
+                region = MKCoordinateRegion(center: coord,
+                    span: MKCoordinateSpan(latitudeDelta: 0.004, longitudeDelta: 0.004))
+            }
+        }
+    }
+
+    private var coord: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: entry.lat ?? 0, longitude: entry.lon ?? 0)
+    }
+
+    private var fullStamp: String {
+        let df = DateFormatter()
+        df.dateFormat = "EEEE d MMMM yyyy, h:mm a"
+        var s = df.string(from: entry.at)
+        if let p = entry.place ?? entry.street { s += "\n\(p)" }
+        if let c = entry.city { s += entry.street == nil ? "\n\(c)" : ", \(c)" }
+        if let c = entry.country { s += ", \(c)" }
+        return s
+    }
+
+    private func actionLabel(_ text: String, _ icon: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+            Text(text).font(.caption).fontWeight(.medium)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+        .foregroundColor(theme.accent)
+    }
+
+    private func openInGoogleMaps() {
+        let lat = entry.lat ?? 0, lon = entry.lon ?? 0
+        let app = URL(string: "comgooglemaps://?daddr=\(lat),\(lon)&directionsmode=walking")
+        let web = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lon)&travelmode=walking")
+        if let a = app, UIApplication.shared.canOpenURL(a) {
+            UIApplication.shared.open(a)
+        } else if let w = web {
+            UIApplication.shared.open(w)
+        }
+    }
+}
+
+struct MemoryPin: Identifiable {
+    let id = UUID()
+    let coord: CLLocationCoordinate2D
+}
+
+// NOTE: the export sheet reuses ChappyShareSheet (LiveTranslateView.swift).
+// Declaring a second ShareSheet here would collide with the one
+// PhotoPreviewView already owns — a build 57 lesson, not repeated.
+
+
+// MARK: - The original file
+//
+// iOS has no public URL that opens Photos at a particular asset, so a
+// "open in Photos" button would either do nothing or drop you at the top of
+// your camera roll. This loads the real asset instead — full-resolution
+// photo, or the actual video playing — straight from the library, without
+// ever copying it into Chappy's storage.
+
+struct OriginalMediaView: View {
+    let assetID: String
+    let title: String
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: UIImage?
+    @State private var player: AVPlayer?
+    @State private var loading = true
+    @State private var failed = false
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if let p = player {
+                VideoPlayer(player: p)
+                    .ignoresSafeArea()
+                    .onAppear { p.play() }
+                    .onDisappear { p.pause() }
+            } else if let img = image {
+                Image(uiImage: img)
+                    .resizable().scaledToFit()
+                    .ignoresSafeArea()
+            } else if loading {
+                VStack(spacing: 12) {
+                    ProgressView().tint(.white)
+                    Text("Fetching the original…")
+                        .font(.caption).foregroundColor(.white.opacity(0.7))
+                    // iCloud-optimised libraries download on demand, which can
+                    // take a moment on a slow connection. Saying so beats a
+                    // spinner that looks stuck.
+                    Text("If it's stored in iCloud this can take a few seconds.")
+                        .font(.caption2).foregroundColor(.white.opacity(0.4))
+                }
+            } else if failed {
+                VStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 34)).foregroundColor(.white.opacity(0.6))
+                    Text("Couldn't load the original")
+                        .foregroundColor(.white)
+                    Text("It may have been deleted from your photo library. The memory is still here.")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                }
+            }
+
+            VStack {
+                HStack {
+                    Button {
+                        player?.pause()
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 30))
+                            .foregroundColor(.white.opacity(0.8))
+                            .shadow(radius: 4)
+                    }
+                    Spacer()
+                }
+                .padding(18)
+                Spacer()
+                Text(title)
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 30)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .task {
+            let (img, av) = await ChappyIngest.shared.loadOriginal(assetID: assetID)
+            loading = false
+            if let av {
+                player = AVPlayer(playerItem: AVPlayerItem(asset: av))
+            } else if let img {
+                image = img
+            } else {
+                failed = true
+            }
+        }
     }
 }

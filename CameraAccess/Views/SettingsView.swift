@@ -39,7 +39,19 @@ struct SettingsView: View {
     @AppStorage("chappy_standby_autoarm") private var standbyAutoArm = true
     // How Chappy answers his name — see ChappyEarcon's design note.
     @AppStorage("chappy_wake_style") private var wakeStyle = "tone"
-    @AppStorage("chappy_user_name") private var userName = ""
+    @AppStorage("chappy_user_name") private var userName = "Shaun"
+    /// Falls back to this when location and history can't decide.
+    @AppStorage("translate_usual_language") private var usualLanguage = ""
+    /// PHASE 5 — glasses capture ingest. Defaults ON: the whole point is that
+    /// "Hey Meta, take a picture" works with Chappy closed and still ends up
+    /// in memory without you doing anything.
+    @AppStorage("chappy_ingest_enabled") private var ingestEnabled = true
+    @State private var ingestStatus = ""
+    @State private var recordsStatus = ""
+    /// Counted once in onAppear. `factsPending` decodes the whole conversation
+    /// archive out of UserDefaults, which is not something to do on every
+    /// SwiftUI body evaluation.
+    @State private var recordsPending = 0
     // BACKUP & RESTORE
     @State private var showRestoreImporter = false
     @State private var restoreResultMessage = ""
@@ -309,6 +321,77 @@ struct SettingsView: View {
                                 .foregroundColor(AppColors.textSecondary)
                         }
                     }
+                    // PHASE 5 — what the glasses captured on their own.
+                    // "Hey Meta, take a picture" works with Chappy closed, and
+                    // this is how those photos and clips become memories.
+                    Toggle(isOn: $ingestEnabled) {
+                        HStack {
+                            Image(systemName: "eyeglasses")
+                                .foregroundColor(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Import glasses captures")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Photos and videos you took with \"Hey Meta\" get captioned and filed — only while charging on Wi-Fi, so it costs no battery or data")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    Button {
+                        ingestStatus = "Looking…"
+                        Task {
+                            await ChappyIngest.shared.run(manual: true)
+                            ingestStatus = ChappyIngest.shared.lastResult
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "square.and.arrow.down")
+                                .foregroundColor(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Import now")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ingestStatus.isEmpty
+                                     ? (ChappyIngest.shared.lastRun == nil
+                                        ? "Never run — turn on auto-import in the Meta AI app first"
+                                        : "Last checked " + DateFormatter.localizedString(
+                                            from: ChappyIngest.shared.lastRun ?? Date(),
+                                            dateStyle: .short, timeStyle: .short))
+                                     : ingestStatus)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                    // PHASE 5 — the old Live AI conversations. Folded in at
+                    // launch; this is the AI pass that reads them properly.
+                    Button {
+                        recordsStatus = "Reading…"
+                        Task {
+                            await ChappyMemory.shared.runFactExtraction(manual: true)
+                            recordsPending = ChappyMemory.shared.factsPending
+                            recordsStatus = recordsPending == 0
+                                ? "All caught up"
+                                : "\(recordsPending) still to read"
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "text.book.closed")
+                                .foregroundColor(.purple)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Read my old conversations")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(recordsStatus.isEmpty
+                                     ? (recordsPending == 0
+                                        ? "All caught up — everything in Records is in Memory"
+                                        : "\(recordsPending) conversations still to read through")
+                                     : recordsStatus)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                            Spacer()
+                        }
+                    }
                     // POCKET LAW: the Action Button opens Chappy and the ear
                     // should already be listening. Off only for the user who
                     // deliberately wants a quiet, tap-to-listen phone.
@@ -350,6 +433,32 @@ struct SettingsView: View {
                             .foregroundColor(AppColors.textSecondary)
                             .frame(maxWidth: 140)
                     }
+                    // Pin the language you'll mostly need. Before a trip you
+                    // know where you're going but aren't there yet, so location
+                    // can't help and "last used" is empty — this fills that gap.
+                    Picker(selection: $usualLanguage) {
+                        Text("Ask me each time").tag("")
+                        Text("Indonesian").tag("id")
+                        Text("Thai").tag("th")
+                        Text("Vietnamese").tag("vi")
+                        Text("Filipino").tag("fil")
+                        Text("Japanese").tag("ja")
+                        Text("Korean").tag("ko")
+                        Text("Chinese").tag("zh")
+                        Text("French").tag("fr")
+                        Text("German").tag("de")
+                        Text("Spanish").tag("es")
+                        Text("Italian").tag("it")
+                        Text("Portuguese").tag("pt")
+                    } label: {
+                        HStack {
+                            Image(systemName: "character.bubble.fill")
+                                .foregroundColor(AppColors.translate)
+                            Text("Usual language")
+                                .foregroundColor(AppColors.textPrimary)
+                        }
+                    }
+
                     NavigationLink {
                         VoiceCheckView()
                     } label: {
@@ -578,6 +687,12 @@ struct SettingsView: View {
             .onAppear {
                 // Refresh API key state on appear
                 refreshAPIKeyStatus()
+                // Counted once, off the main thread: this decodes the whole
+                // conversation archive out of UserDefaults.
+                DispatchQueue.global(qos: .utility).async {
+                    let n = ChappyMemory.shared.factsPending
+                    DispatchQueue.main.async { recordsPending = n }
+                }
             }
         }
     }

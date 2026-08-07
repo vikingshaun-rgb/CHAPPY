@@ -38,6 +38,12 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
     /// asking every time is worse. A line across the screen says it plainly and
     /// costs nothing.
     let isDivider: Bool
+    /// BUILD 98: a photographed menu / sign / brochure, translated. It lives in
+    /// the SAME transcript as the speech, because that is where it happened —
+    /// scroll back a week later and the menu is sitting next to what you both
+    /// said about it. JPEG rather than a file path so it survives in the saved
+    /// conversation with no separate asset store.
+    let documentJPEG: Data?
     /// BUILD 58: the transcriber came back with a language that is neither
     /// yours nor theirs — so it misheard, and everything downstream of it is
     /// built on a wrong sentence. Better to say so than to show the user a line
@@ -53,7 +59,8 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
          sourceCode: String,
          targetCode: String,
          isDivider: Bool = false,
-         misheard: Bool = false) {
+         misheard: Bool = false,
+         documentJPEG: Data? = nil) {
         self.id = id
         self.at = at
         self.original = original
@@ -64,6 +71,7 @@ struct TranslateTurn: Identifiable, Codable, Equatable {
         self.targetCode = targetCode
         self.isDivider = isDivider
         self.misheard = misheard
+        self.documentJPEG = documentJPEG
     }
 }
 
@@ -97,6 +105,77 @@ extension String {
         guard CFStringTransform(m, nil, kCFStringTransformToLatin, false) else { return nil }
         let out = (m as String).trimmingCharacters(in: .whitespacesAndNewlines)
         return (out.isEmpty || out == self) ? nil : out
+    }
+}
+
+
+/// A photographed menu / sign / label, translated. Deliberately NOT a speech
+/// bubble: it isn't something anyone said, and dressing it as one would make
+/// the transcript lie about what happened. Wide, bordered, with the photo, so
+/// scrolling back a week later it reads as "here is the thing he showed me".
+struct DocumentCard: View {
+    let jpeg: Data?
+    let original: String
+    let translated: String
+    let at: Date?
+    let theme: ChappyTheme
+    var onReadAloud: (() -> Void)? = nil
+    var onBig: ((String) -> Void)? = nil
+    @State private var showOriginal = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.text.viewfinder")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(theme.accent)
+                Text("SCANNED")
+                    .font(.system(size: 11, weight: .heavy))
+                    .tracking(0.8)
+                    .foregroundColor(theme.accent)
+                if let at {
+                    Text(at.formatted(date: .omitted, time: .shortened))
+                        .font(AppTypography.caption)
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+                Spacer()
+                Button { showOriginal.toggle() } label: {
+                    Text(showOriginal ? "English" : "Original")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(theme.accent)
+                }
+            }
+
+            if let jpeg, let ui = UIImage(data: jpeg) {
+                Image(uiImage: ui)
+                    .resizable().scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: 130)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
+            Text(showOriginal ? original : translated)
+                .font(.system(size: 15))
+                .foregroundColor(theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+
+            HStack(spacing: 14) {
+                Button { onReadAloud?() } label: {
+                    Label("Read aloud", systemImage: "speaker.wave.2.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                Button { onBig?(showOriginal ? original : translated) } label: {
+                    Label("Show them", systemImage: "textformat.size.larger")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                Spacer()
+            }
+            .foregroundColor(theme.accent)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16).fill(theme.cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(theme.accent.opacity(0.35), lineWidth: 1))
     }
 }
 
@@ -356,13 +435,27 @@ struct LiveTranslateView: View {
             .padding(.horizontal, 16)
             .padding(.top, 10)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyRetargetTranslate)) { note in
+            // "Chappy, switch to Thai" while a session is live — retarget in
+            // place rather than tearing down and starting again.
+            if let code = note.object as? String,
+               let lang = TranslateLanguage(rawValue: code) {
+                viewModel.targetLanguage = lang
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyWakeCameraForScan)) { _ in
+            startVideoStream()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { viewModel.scanDocument() }
+        }
         .onAppear {
+            ChappyStandby.LiveTranslateIsOpen = true
             viewModel.connect()
             if viewModel.imageEnhanceEnabled {
                 startVideoStream()
             }
         }
         .onDisappear {
+            ChappyStandby.LiveTranslateIsOpen = false
             viewModel.disconnect()
             stopVideoStream()
         }
@@ -678,6 +771,14 @@ struct LiveTranslateView: View {
                     ForEach(viewModel.transcript) { turn in
                         if turn.isDivider {
                             dividerRow(turn)
+                        } else if turn.documentJPEG != nil {
+                            DocumentCard(jpeg: turn.documentJPEG,
+                                         original: turn.original,
+                                         translated: turn.translated,
+                                         at: turn.at,
+                                         theme: theme,
+                                         onReadAloud: { viewModel.readLastScan() },
+                                         onBig: { bigText = $0 })
                         } else {
                         ChappyBubble(wearerLine: turn.fromWearer ? turn.original : turn.translated,
                                      foreignLine: turn.fromWearer ? turn.translated : turn.original,
@@ -873,6 +974,26 @@ struct LiveTranslateView: View {
                               icon: "mic.fill",
                               on: viewModel.usePhoneMic) {
                     viewModel.switchMicSource()
+                }
+
+                // SCAN — the menu he's holding up. Sits with the other controls
+                // because it belongs to the conversation, not to a separate mode.
+                toggleSegment(viewModel.isScanning ? "READING" : "SCAN",
+                              icon: "doc.text.viewfinder",
+                              on: viewModel.isScanning) {
+                    // The camera is normally OFF during a conversation — running
+                    // it continuously to watch for text would flatten both
+                    // batteries for a feature used a few times a day. So spin it
+                    // up for the scan, give it a beat to produce a frame, then
+                    // let it go again.
+                    if streamViewModel.currentVideoFrame == nil {
+                        startVideoStream()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                            viewModel.scanDocument()
+                        }
+                    } else {
+                        viewModel.scanDocument()
+                    }
                 }
 
                 // SAY — pronunciation line under non-Latin script.
