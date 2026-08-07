@@ -78,6 +78,8 @@
 	<string>Chappy uses motion to know if you are walking, riding or in a vehicle.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Chappy saves photos you capture by voice to your photo library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Chappy reads the photos and videos you capture with your glasses so it can caption them and file them in your memory.</string>
 	<key>NSSiriUsageDescription</key>
 	<string>Chappy needs Needs siri to talk to chappy</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
