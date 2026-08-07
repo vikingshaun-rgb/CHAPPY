@@ -3,6 +3,7 @@
  * Profile — device management and settings
  */
 
+import EventKit
 import SwiftUI
 import MWDATCore
 import UniformTypeIdentifiers
@@ -48,10 +49,15 @@ struct SettingsView: View {
     @AppStorage("chappy_ingest_enabled") private var ingestEnabled = true
     @State private var ingestStatus = ""
     @State private var recordsStatus = ""
+    /// Default OFF — the online model hears brand names far better, and it
+    /// falls back to on-device by itself the moment there is no signal.
+    @AppStorage("chappy_hearing_offline_only") private var hearingOfflineOnly = false
     /// Counted once in onAppear. `factsPending` decodes the whole conversation
     /// archive out of UserDefaults, which is not something to do on every
     /// SwiftUI body evaluation.
     @State private var recordsPending = 0
+    @AppStorage("chappy_quiet_hours") private var quietHours = true
+    @AppStorage("chappy_morning_brief") private var morningBrief = true
     // BACKUP & RESTORE
     @State private var showRestoreImporter = false
     @State private var restoreResultMessage = ""
@@ -361,6 +367,74 @@ struct SettingsView: View {
                                     .foregroundColor(AppColors.textSecondary)
                             }
                             Spacer()
+                        }
+                    }
+                    NavigationLink {
+                        CalendarPickerView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "calendar").foregroundColor(.purple)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Calendars")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("iCloud, Outlook, Google — whatever's on this phone. Choose which ones Chappy reads out")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    // PHASE 5.5 — the pocket channel, one switch per kind.
+                    NavigationLink {
+                        NotificationChannelsView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "bell.badge").foregroundColor(.pink)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("What Chappy can notify you about")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Only fires when speaking wouldn't have reached you — so it never doubles up on the voice")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    // PHASE 5.5 — reminders that don't wake the house.
+                    Toggle(isOn: $quietHours) {
+                        HStack {
+                            Image(systemName: "moon.zzz.fill").foregroundColor(.indigo)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Quiet hours 10pm – 7am")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Reminders land silently overnight and come back in the morning brief. Anything marked must-not-miss — flights, visas, medication — still comes through")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    Toggle(isOn: $morningBrief) {
+                        HStack {
+                            Image(systemName: "sun.horizon.fill").foregroundColor(.yellow)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Morning brief")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("One spoken paragraph the first time you pick the phone up: what's due, what's overdue, the weather, and your visa countdown")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    // BUILD 104 — how well the ear hears proper nouns.
+                    Toggle(isOn: $hearingOfflineOnly) {
+                        HStack {
+                            Image(systemName: "ear.trianglebadge.exclamationmark")
+                                .foregroundColor(.teal)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Offline hearing only")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Off is better: Chappy uses Apple's online speech model, which is far better at names like McDonald's or Gojek. Turn on to stay fully offline — free either way, and it falls back by itself with no signal")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
                         }
                     }
                     // PHASE 5 — the old Live AI conversations. Folded in at
@@ -1738,5 +1812,146 @@ struct VoiceCheckView: View {
         .navigationTitle("Voice check")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { rows = ChappyStandby.diagnostics() }
+    }
+}
+
+/// One switch per kind of notification. Deliberately granular: the fastest way
+/// to make someone turn off ALL your notifications is to make them take the
+/// noisy one to get the useful one.
+struct NotificationChannelsView: View {
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    var body: some View {
+        Form {
+            Section {
+                Text("Chappy speaks when it can. A notification only fires when it couldn't have — the app closed, the ear stood down, or the glasses off your face. So these never repeat something you already heard.")
+                    .font(AppTypography.caption)
+                    .foregroundColor(AppColors.textSecondary)
+            }
+            Section("Reminders") {
+                HStack {
+                    Image(systemName: "bell.fill").foregroundColor(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Always on").foregroundColor(AppColors.textPrimary)
+                        Text("Every reminder notifies — spoken if Chappy is running, a banner if it isn't. Long-press the banner for Done, 10 minutes, or When I'm home. Quiet hours and the morning brief are the switches for these, back on the main settings page.")
+                            .font(AppTypography.caption)
+                            .foregroundColor(AppColors.textSecondary)
+                    }
+                }
+                Button("Test a reminder notification in 15 seconds") {
+                    ChappyReminders.shared.add(
+                        title: "Test reminder - long-press me",
+                        at: Date().addingTimeInterval(15),
+                        source: "test")
+                }
+            }
+            Section("Everything else") {
+                ForEach(ChappyNotify.Channel.allCases, id: \.rawValue) { ch in
+                    ChannelToggle(channel: ch)
+                }
+            }
+            Section {
+                Button("Send me a test notification") {
+                    ChappyNotify.post(.system,
+                                      title: "Chappy",
+                                      body: "That's what one looks like. Long-press a reminder to snooze it from here.",
+                                      force: true)
+                }
+            } footer: {
+                Text("Lock the phone first — it won't show while you're looking at this screen, by design.")
+            }
+        }
+        .navigationTitle("Notifications")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct ChannelToggle: View {
+    let channel: ChappyNotify.Channel
+    @State private var on = true
+    var body: some View {
+        Toggle(isOn: $on) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(channel.label).foregroundColor(AppColors.textPrimary)
+                Text(channel.detail)
+                    .font(AppTypography.caption)
+                    .foregroundColor(AppColors.textSecondary)
+            }
+        }
+        .onAppear {
+            on = UserDefaults.standard.object(forKey: channel.key) == nil
+                ? channel.defaultOn
+                : UserDefaults.standard.bool(forKey: channel.key)
+        }
+        .onChange(of: on) { newValue in
+            UserDefaults.standard.set(newValue, forKey: channel.key)
+        }
+    }
+}
+
+/// One row per calendar, grouped by the account it came from. Everything is
+/// on until switched off — the common case is muting a work calendar on
+/// holiday, not hunting through a checklist before anything happens at all.
+struct CalendarPickerView: View {
+    @StateObject private var cal = ChappyCalendar.shared
+    @AppStorage("chappy_cal_leaveby") private var leaveBy = true
+    @State private var tick = 0
+
+    var body: some View {
+        Form {
+            if !cal.authorised {
+                Section {
+                    Text("Chappy can't see your calendars yet.")
+                        .foregroundColor(AppColors.textPrimary)
+                    Button("Allow calendar access") { ChappyCalendar.shared.requestAccess() }
+                    Text("If nothing happens, iOS has already asked once — turn it on in Settings › Chappy › Calendars.")
+                        .font(AppTypography.caption).foregroundColor(AppColors.textSecondary)
+                }
+            } else {
+                Section {
+                    Toggle(isOn: $leaveBy) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Tell me when to leave").foregroundColor(AppColors.textPrimary)
+                            Text("For any appointment with a place on it, worked out from real travel time from where you actually are — not a fixed countdown")
+                                .font(AppTypography.caption).foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                }
+                ForEach(sources, id: \.self) { source in
+                    Section(source) {
+                        ForEach(cal.allCalendars.filter { ($0.source?.title ?? "Other") == source },
+                                id: \.calendarIdentifier) { c in
+                            Button {
+                                ChappyCalendar.shared.setOn(c, !ChappyCalendar.shared.isEnabled(c))
+                                tick += 1
+                            } label: {
+                                HStack {
+                                    Circle()
+                                        .fill(Color(cgColor: c.cgColor ?? UIColor.gray.cgColor))
+                                        .frame(width: 10, height: 10)
+                                    Text(c.title).foregroundColor(AppColors.textPrimary)
+                                    Spacer()
+                                    if ChappyCalendar.shared.isEnabled(c) {
+                                        Image(systemName: "checkmark").foregroundColor(.accentColor)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .id(tick)
+            }
+        }
+        .navigationTitle("Calendars")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { ChappyCalendar.shared.requestAccess() }
+    }
+
+    private var sources: [String] {
+        var seen: [String] = []
+        for c in cal.allCalendars {
+            let s = c.source?.title ?? "Other"
+            if !seen.contains(s) { seen.append(s) }
+        }
+        return seen
     }
 }
