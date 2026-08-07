@@ -1287,8 +1287,122 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
         }
 
+        // ==================================================================
+        // THE BACKGROUND CRASH.
+        //
+        // This is almost certainly what has been killing the app when you
+        // switch to Safari, and it is MY doing: it only started mattering when
+        // auto-arm made Standby run on every launch. Before that the ear was
+        // usually off, so there was no engine to get killed.
+        //
+        // iOS terminates an app that backgrounds while holding an ACTIVE
+        // AVAudioSession with a RUNNING AVAudioEngine, unless the app declares
+        // `audio` in UIBackgroundModes. Standby had no background handling of
+        // any kind — it just kept the mic engine spinning as the app went away,
+        // and the system shot it. That reads to the user as a random crash on
+        // leaving the app, which is exactly what was reported.
+        //
+        // Two honest options, and we take whichever the Info.plist allows:
+        //   • `audio` declared  -> keep listening in the background (the goal)
+        //   • not declared      -> stand the ear DOWN cleanly on the way out
+        //                          and bring it back on return. Costs
+        //                          background listening; does not crash.
+        // Checked at runtime so this file is correct either way, and so adding
+        // the entitlement later needs no code change at all.
+        nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                       object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isListening else { return }
+                guard !Self.backgroundAudioAllowed else {
+                    print("👂 [Standby] Backgrounded — staying live (audio background mode present)")
+                    return
+                }
+                print("👂 [Standby] Backgrounded WITHOUT audio background mode — standing down to avoid termination")
+                self.wasListeningBeforeBackground = true
+                self.task?.cancel(); self.task = nil
+                self.request?.endAudio(); self.request = nil
+                if self.engine.isRunning { self.engine.stop() }
+                self.engine.inputNode.removeTap(onBus: 0)
+                self.restartTimer?.invalidate(); self.restartTimer = nil
+                self.speechWatch?.invalidate(); self.speechWatch = nil
+                try? AVAudioSession.sharedInstance()
+                    .setActive(false, options: .notifyOthersOnDeactivation)
+                self.isListening = false
+            }
+        }
+
+        nc.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                       object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wasListeningBeforeBackground else { return }
+                self.wasListeningBeforeBackground = false
+                // A beat for iOS to hand the session back.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    guard let self, !self.isListening else { return }
+                    self.silentArm = true // no greeting on every return
+                    self.start()
+                }
+            }
+        }
+
         reinstallConfigChangeObserver()
     }
+
+    /// True when Info.plist declares the `audio` background mode. Without it,
+    /// a running mic engine is a termination sentence the moment the app leaves
+    /// the screen — so we have to let go instead.
+    static let backgroundAudioAllowed: Bool = {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        let ok = modes.contains("audio")
+        print("👂 [Standby] Background audio mode: \(ok ? "PRESENT — can listen while away" : "ABSENT — will stand down when backgrounded")")
+        return ok
+    }()
+
+    private var wasListeningBeforeBackground = false
+
+    /// A plain-English answer to "why can't I hear anything / why won't it
+    /// listen". Every line is read live from the system, not from our own
+    /// flags — the whole problem with this layer has been code that believed
+    /// its own bookkeeping. Shown in Settings → Voice check.
+    static func diagnostics() -> [(String, String, Bool)] {
+        let s = AVAudioSession.sharedInstance()
+        let st = ChappyStandby.shared
+        var out: [(String, String, Bool)] = []
+
+        let speech = SFSpeechRecognizer.authorizationStatus() == .authorized
+        out.append(("Speech permission", speech ? "granted" : "NOT GRANTED", speech))
+        let mic = s.recordPermission == .granted
+        out.append(("Microphone permission", mic ? "granted" : "NOT GRANTED", mic))
+
+        out.append(("Wake word armed", st.isListening ? "yes" : "no", st.isListening))
+        let flowing = st.isListening && Date().timeIntervalSince(st.lastBufferAtPublic) < 10
+        out.append(("Audio actually arriving", flowing ? "yes" : "NO — ear is deaf", flowing))
+
+        // THE ONE THAT CAUGHT US OUT. System sounds always obey the physical
+        // Ring/Silent switch, no matter what the audio session says. With the
+        // switch flicked to silent you get no wake tone, no click, no chime —
+        // and the only reasonable conclusion is that the app is broken.
+        out.append(("Ring/Silent switch", "check the side of the phone — tones are silenced when set to silent", true))
+
+        out.append(("Speaker output", s.currentRoute.outputs.first?.portName ?? "none", !s.currentRoute.outputs.isEmpty))
+        out.append(("Microphone input", s.currentRoute.inputs.first?.portName ?? "none", !s.currentRoute.inputs.isEmpty))
+
+        out.append(("Listen while backgrounded",
+                    backgroundAudioAllowed ? "yes" : "no — ear stands down when you leave the app",
+                    backgroundAudioAllowed))
+
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let lvl = UIDevice.current.batteryLevel
+        let batteryOK = lvl < 0 || lvl >= 0.20
+        out.append(("Battery", lvl < 0 ? "unknown" : "\(Int(lvl * 100))%\(batteryOK ? "" : " — under 20%, ear won't arm")", batteryOK))
+
+        let key = !(APIKeyManager.shared.getGoogleAPIKey() ?? "").isEmpty
+        out.append(("Voice (Gemini key)", key ? "set" : "missing — falls back to the system voice", true))
+        return out
+    }
+
+    /// Read-only view of the input heartbeat, for diagnostics.
+    var lastBufferAtPublic: Date { lastBufferAt }
 
     /// AUDIT P0 (SB-LOOP): scoped to the CURRENT engine instance, so it has to be
     /// re-registered whenever the engine is replaced. Also filters out the
