@@ -1751,8 +1751,20 @@ extension Notification.Name {
     static let chappyCapturePhoto = Notification.Name("chappyCapturePhoto")
     static let chappyOpenTranslate = Notification.Name("chappyOpenTranslate")
     static let chappyOpenGoogleMaps = Notification.Name("chappyOpenGoogleMaps")
+    /// BUILD 90: "close", "done", "exit" — dismiss whatever module is on screen.
+    /// Live AI could be opened by voice but only closed by a button, which is
+    /// useless with the phone in a pocket.
+    static let chappyCloseModules = Notification.Name("chappyCloseModules")
+    /// Change the language of a translate session that is already running.
+    static let chappyRetargetTranslate = Notification.Name("chappyRetargetTranslate")
+    /// Voice-triggered scan when the camera isn't already streaming.
+    static let chappyWakeCameraForScan = Notification.Name("chappyWakeCameraForScan")
+    /// Silent snap when the camera isn't already streaming.
+    static let chappyWakeCameraForSnap = Notification.Name("chappyWakeCameraForSnap")
     /// Background-only Live AI start (no UI). Kept separate from
     /// .liveAITriggered so one trigger can never start two sessions.
     static let liveAIBackgroundStart = Notification.Name("liveAIBackgroundStart")
     static let chappyShowMap = Notification.Name("chappyShowMap")
+    /// PHASE 5: open the memory browser by voice.
+    static let chappyOpenMemory = Notification.Name("chappyOpenMemory")
 }
