@@ -4793,6 +4793,28 @@ final class TripRecorder {
         return best
     }
 
+    /// One line for a whole day of breadcrumbs — the streets in order and the
+    /// distance. Thousands of points become something you can actually read.
+    func routeSummary(for day: Date) -> String {
+        let pool: [Crumb]
+        if Calendar.current.isDateInToday(day) { pool = crumbs }
+        else if let d = try? Data(contentsOf: crumbsURL(for: day)),
+                let c = try? JSONDecoder().decode([Crumb].self, from: d) { pool = c }
+        else { return "" }
+        guard pool.count > 2 else { return "" }
+        var route: [String] = []
+        for c in pool {
+            if let s = c.street ?? c.city, route.last != s, !route.contains(s) { route.append(s) }
+        }
+        guard !route.isEmpty else { return "" }
+        let total = zip(pool, pool.dropFirst()).reduce(0.0) {
+            $0 + TripRecorder.meters($1.0.lat, $1.0.lon, $1.1.lat, $1.1.lon)
+        }
+        let dist = total >= 2000 ? String(format: "%.0f km", total / 1000)
+                                 : "\(Int(total.rounded())) m"
+        return route.prefix(6).joined(separator: " → ") + " — \(dist)"
+    }
+
     /// Spoken guidance for "trace my steps back" — the day's route in reverse.
     func retraceGuidance() -> String {
         guard crumbs.count > 1 else {
@@ -5057,6 +5079,13 @@ final class NavEngine: NSObject, ObservableObject {
             stepIndex += 1
             if stepIndex >= steps.count {
                 ChappyHaptics.shared.arrival()
+                // GAP CLOSED: you could route somewhere, walk there and arrive,
+                // and nothing was ever written down. The .route category existed
+                // and nothing wrote to it.
+                ChappyMemory.shared.remember(.route,
+                    title: "Went to \(destinationName)",
+                    tags: ["arrived", "navigation"],
+                    source: "nav")
                 // Arriving is the one nav event worth a banner — you get it
                 // with the phone in a pocket, or find it later on the lock
                 // screen if you missed the voice. Turns are NOT notified:
@@ -5269,6 +5298,7 @@ final class ChappyMemory: ObservableObject {
         case spend        // money noted
         case day          // the day's own summary paragraph
         case reminder     // a memory with a trigger on it
+        case appointment  // something that was in the diary and has happened
 
         var id: String { rawValue }
 
@@ -5285,6 +5315,7 @@ final class ChappyMemory: ObservableObject {
             case .spend: return "Spend"
             case .day:   return "Days"
             case .reminder: return "Reminders"
+            case .appointment: return "Diary"
             }
         }
 
@@ -5301,6 +5332,7 @@ final class ChappyMemory: ObservableObject {
             case .spend: return "creditcard.fill"
             case .day:   return "book.closed.fill"
             case .reminder: return "bell.fill"
+            case .appointment: return "calendar"
             }
         }
     }
@@ -5888,6 +5920,89 @@ final class ChappyMemory: ObservableObject {
             out += " — around " + places.prefix(4).joined(separator: ", ")
         }
         return out
+    }
+
+    // MARK: - Dreaming: the nightly read-through
+    //
+    // Until now the day header was a TALLY — "4 places, 8 notes" — counted
+    // locally and free. Useful, but it is not a summary and it does not know
+    // what your day was about.
+    //
+    // This reads the day's memories once, overnight on charge and WiFi, and
+    // writes one paragraph. It runs over YESTERDAY, not today, because a day
+    // is not summarisable until it has finished. One cheap call per day.
+
+    private static let dreamKey = "chappy_dreamed_days"
+
+    func dreamIfDue() async {
+        guard UserDefaults.standard.object(forKey: "chappy_dreaming") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_dreaming") else { return }
+        guard let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date())
+        else { return }
+        let key = Self.dayKey(yesterday)
+        var done = Set(UserDefaults.standard.stringArray(forKey: Self.dreamKey) ?? [])
+        guard !done.contains(key), summary(for: yesterday) == nil else { return }
+
+        let items = recent.filter { Self.dayKey($0.at) == key && $0.kind != .day }
+        guard items.count >= 3 else { done.insert(key)
+            UserDefaults.standard.set(Array(done.suffix(120)), forKey: Self.dreamKey); return }
+
+        if let paragraph = await Self.writeDaySummary(items, dayName: key) {
+            setSummary(paragraph, for: yesterday)
+            print("🌙 [Dreaming] \(key): \(paragraph)")
+        }
+        done.insert(key)
+        UserDefaults.standard.set(Array(done.suffix(120)), forKey: Self.dreamKey)
+    }
+
+    static func writeDaySummary(_ items: [Entry], dayName: String) async -> String? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        let lines = items.sorted { $0.at < $1.at }.prefix(120).map {
+            "\(df.string(from: $0.at)) [\($0.kind.rawValue)] \($0.oneLine)"
+        }.joined(separator: "\n")
+
+        let prompt = """
+        These are the things an assistant recorded for one traveller on \(dayName) -         places, photos, notes, conversations, jobs and trips, in order.
+
+        Write ONE paragraph, 2 to 3 sentences, saying what the day actually WAS.         Write it TO him, in second person, plainly - "You spent the morning..."         Name the places and the things that mattered. Skip anything routine.         No preamble, no bullet points, no "this day was".
+
+        \(lines)
+        """
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": [["text": prompt]]]],
+            "generationConfig": ["temperature": 0.4, "maxOutputTokens": 700],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 40
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (d, r) = try? await URLSession.shared.data(for: req),
+              (r as? HTTPURLResponse)?.statusCode == 200,
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let c = j["candidates"] as? [[String: Any]],
+              let content = c.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let t = parts.first?["text"] as? String else { return nil }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// THE DAY'S ROUTE, as one line rather than four hundred breadcrumbs.
+    func fileDayRoute() {
+        let key = "chappy_route_filed"
+        var done = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        guard let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) else { return }
+        let day = Self.dayKey(yesterday)
+        guard !done.contains(day) else { return }
+        done.insert(day)
+        UserDefaults.standard.set(Array(done.suffix(120)), forKey: key)
+        let line = TripRecorder.shared.routeSummary(for: yesterday)
+        guard !line.isEmpty else { return }
+        rememberAt(.route, title: line, lat: nil, lon: nil,
+                   tags: ["route", "day"], source: "trail", at: yesterday)
     }
 
     // MARK: - Spoken recall (the free tier of "what do you remember about…")
@@ -8088,8 +8203,16 @@ final class ChappyCalendar: ObservableObject {
     func events(from: Date, to: Date) -> [EKEvent] {
         guard authorised else { return [] }
         let p = store.predicateForEvents(withStart: from, end: to, calendars: activeCalendars)
-        return store.events(matching: p)
+        let raw = store.events(matching: p)
             .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+        // SAME EVENT, TWO CALENDARS. Subscribing to a feed that is ALSO shared
+        // through Exchange is a completely normal thing to end up with, and it
+        // should not double every job in the diary or warn you twice.
+        var seen = Set<String>()
+        return raw.filter { e in
+            let key = "\(e.title ?? "")|\(Int((e.startDate ?? .distantPast).timeIntervalSince1970))"
+            return seen.insert(key).inserted
+        }
     }
 
     func today() -> [EKEvent] {
@@ -8178,12 +8301,19 @@ final class ChappyCalendar: ObservableObject {
         let cal = Calendar.current
         let start = cal.date(byAdding: .day, value: -2, to: Date()) ?? Date()
         for e in events(from: start, to: Date()) {
-            guard let id = e.eventIdentifier, !filed.contains(id),
-                  let ended = e.endDate, ended < Date(), !e.isAllDay else { continue }
-            filed.insert(id)
+            guard let ended = e.endDate, ended < Date(), !e.isAllDay else { continue }
+            // DEDUPE BY WHAT IT IS, NOT BY ITS ID.
+            // The same Geeks2U job arrives on two calendars — the Exchange one
+            // and the subscribed ICS feed — with a DIFFERENT eventIdentifier in
+            // each. Keying on the id filed every job twice, which is exactly
+            // what showed up in the memory list. Title plus start time is the
+            // thing that is actually unique.
+            let key = "\(e.title ?? "")|\(Int((e.startDate ?? ended).timeIntervalSince1970))"
+            guard !filed.contains(key) else { continue }
+            filed.insert(key)
             var body = ""
             if let n = e.notes, !n.isEmpty { body = n }
-            ChappyMemory.shared.rememberAt(.note,
+            ChappyMemory.shared.rememberAt(.appointment,
                 title: e.title ?? "Appointment",
                 body: body,
                 lat: nil, lon: nil,
