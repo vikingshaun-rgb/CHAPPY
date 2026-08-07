@@ -1920,21 +1920,7 @@ struct CalendarPickerView: View {
                     Section(source) {
                         ForEach(cal.allCalendars.filter { ($0.source?.title ?? "Other") == source },
                                 id: \.calendarIdentifier) { c in
-                            Button {
-                                ChappyCalendar.shared.setOn(c, !ChappyCalendar.shared.isEnabled(c))
-                                tick += 1
-                            } label: {
-                                HStack {
-                                    Circle()
-                                        .fill(Color(cgColor: c.cgColor ?? UIColor.gray.cgColor))
-                                        .frame(width: 10, height: 10)
-                                    Text(c.title).foregroundColor(AppColors.textPrimary)
-                                    Spacer()
-                                    if ChappyCalendar.shared.isEnabled(c) {
-                                        Image(systemName: "checkmark").foregroundColor(.accentColor)
-                                    }
-                                }
-                            }
+                            CalendarRow(cal: c, tick: $tick)
                         }
                     }
                 }
@@ -1953,5 +1939,77 @@ struct CalendarPickerView: View {
             if !seen.contains(s) { seen.append(s) }
         }
         return seen
+    }
+}
+
+/// BUILD 111 — one row per calendar, with what Chappy should DO about it.
+///
+/// Four behaviours, because twelve calendars treated identically is unusable:
+/// your jobs and a birthday should not get the same treatment, and reading all
+/// of it out every morning is how you end up switching the whole thing off.
+///
+/// It guesses sensibly first — anything that looks like work defaults to Ping,
+/// holidays and birthdays to Show — so this screen is somewhere you go to
+/// disagree, not somewhere you have to visit before anything works.
+struct CalendarRow: View {
+    let cal: EKCalendar
+    @Binding var tick: Int
+    @State private var behaviour: ChappyCalendar.Behaviour = .brief
+    @State private var lead: Int = 30
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color(cgColor: cal.cgColor ?? UIColor.gray.cgColor))
+                    .frame(width: 10, height: 10)
+                Text(cal.title)
+                    .foregroundColor(AppColors.textPrimary)
+                Spacer()
+                Button {
+                    ChappyCalendar.shared.setOn(cal, !ChappyCalendar.shared.isEnabled(cal))
+                    tick += 1
+                } label: {
+                    Image(systemName: ChappyCalendar.shared.isEnabled(cal)
+                          ? "checkmark.circle.fill" : "circle")
+                        .foregroundColor(ChappyCalendar.shared.isEnabled(cal)
+                                         ? .accentColor : AppColors.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if ChappyCalendar.shared.isEnabled(cal) {
+                Picker("", selection: $behaviour) {
+                    ForEach(ChappyCalendar.Behaviour.allCases, id: \.rawValue) { b in
+                        Text(b.label).tag(b)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: behaviour) { newValue in
+                    ChappyCalendar.shared.setBehaviour(newValue, for: cal)
+                }
+
+                Text(behaviour.detail)
+                    .font(AppTypography.caption)
+                    .foregroundColor(AppColors.textSecondary)
+
+                if behaviour == .ping {
+                    Stepper("Warn me \(ChappyCalendar.leadLabel(lead))",
+                            value: $lead, in: 5...2880, step: lead >= 120 ? 60 : 5)
+                        .font(AppTypography.caption)
+                        .onChange(of: lead) { newValue in
+                            ChappyCalendar.shared.setLeadMinutes(newValue, for: cal)
+                        }
+                    Text("Plus a leave-by warning worked out from real travel time, for anything with an address on it.")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            behaviour = ChappyCalendar.shared.behaviour(for: cal)
+            lead = ChappyCalendar.shared.leadMinutes(for: cal)
+        }
     }
 }

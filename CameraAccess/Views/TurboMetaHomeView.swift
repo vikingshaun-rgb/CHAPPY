@@ -45,6 +45,8 @@ struct TurboMetaHomeView: View {
     @State private var showOpenClaw = false
     @State private var showMemory = false
     @State private var showReminders = false
+    @State private var cachedReminderLine = ""
+    @State private var cachedMemoryLine = ""
     @ObservedObject private var openClawService = OpenClawNodeService.shared
 
     /// POCKET LAW: arm the wake word, but never on top of a module that owns
@@ -54,19 +56,40 @@ struct TurboMetaHomeView: View {
     /// closes, and failing that, the next didBecomeActive catches it.
     /// One line under the Memory row so the store is never a black box:
     /// you can see it filling up without opening it.
+    // SPEED FIX (build 109). These two lines filtered the ENTIRE memory array
+    // and ran reminder queries every time SwiftUI drew the home screen — and
+    // it redraws constantly, because the orb is animating. Hundreds of full
+    // passes a second, computing something that changes once an hour.
+    //
+    // Now computed once when the screen appears and after anything that could
+    // change them. Nothing about what you see is different; it just stops
+    // doing the work over and over.
     private var remindersDetailLine: String {
-        let od = ChappyReminders.shared.overdue().count
-        let t = ChappyReminders.shared.today().count
-        if od > 0 { return "\(od) overdue · \(t) today" }
-        if t > 0 { return "\(t) today · say \"remind me to…\"" }
-        return "Say \"Chappy, remind me to…\" — or tap to add"
+        cachedReminderLine.isEmpty
+            ? "Say \"Chappy, remind me to…\" — or tap to add"
+            : cachedReminderLine
     }
 
     private var memoryDetailLine: String {
-        let n = memory.recent.count
-        if n == 0 { return "Everything Chappy stores, in one place" }
-        let today = memory.recent.filter { Calendar.current.isDateInToday($0.at) }.count
-        return "\(n) stored · \(today) today · searchable"
+        cachedMemoryLine.isEmpty
+            ? "Everything Chappy stores, in one place"
+            : cachedMemoryLine
+    }
+
+    private func refreshHomeCounts() {
+        let od = ChappyReminders.shared.overdue().count
+        let t = ChappyReminders.shared.today().count
+        if od > 0 { cachedReminderLine = "\(od) overdue · \(t) today" }
+        else if t > 0 { cachedReminderLine = "\(t) today · say \"remind me to…\"" }
+        else { cachedReminderLine = "Say \"Chappy, remind me to…\" — or tap to add" }
+
+        let all = memory.recent.count
+        if all == 0 {
+            cachedMemoryLine = "Everything Chappy stores, in one place"
+        } else {
+            let today = memory.recent.filter { Calendar.current.isDateInToday($0.at) }.count
+            cachedMemoryLine = "\(all) stored · \(today) today · searchable"
+        }
     }
 
     private func armStandbyIfClear(reason: String) {
@@ -405,6 +428,13 @@ struct TurboMetaHomeView: View {
             // GPS from app-open (not just Live AI) — journal, Remember and
             // the Map button all need a fix before any session starts
             ContextEngine.shared.start()
+            refreshHomeCounts()
+            // BUILD 110 — the greeting. Delayed just enough that the reminder
+            // and calendar counts are loaded, so it has something true to say.
+            // Never blocks: the app is fully usable while it talks.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                ChappyStandby.shared.launchGreeting()
+            }
 
             // PHASE 5 — fold the old scattered stores into the one spot. Runs
             // exactly once ever; the old files are left untouched, so a bad
@@ -432,6 +462,9 @@ struct TurboMetaHomeView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                 ChappyReminders.shared.rescheduleAll()
                 ChappyReminders.shared.morningBriefIfDue()
+                // …and the one that is actually useful: tomorrow, tonight,
+                // while you can still do something about it.
+                ChappyReminders.shared.eveningBriefIfDue()
             }
 
             // PHASE 5 — anything the glasses captured with Chappy closed.
@@ -2574,6 +2607,8 @@ struct RemindersView: View {
     @State private var showAdd = false
     @State private var editing: ChappyMemory.Entry?
     @State private var showDone = false
+    @State private var todaysEvents: [EKEvent] = []
+    @State private var diaryTick = 0
 
     var body: some View {
         NavigationView {
@@ -2618,7 +2653,12 @@ struct RemindersView: View {
         }
         .sheet(isPresented: $showAdd) { ReminderEditor(entry: nil, theme: theme) }
         .sheet(item: $editing) { e in ReminderEditor(entry: e, theme: theme) }
-        .onAppear { ChappyReminders.shared.requestPermission() }
+        .onAppear {
+            ChappyReminders.shared.requestPermission()
+            todaysEvents = ChappyCalendar.shared.today().filter {
+                ($0.endDate ?? Date()) > Date()
+            }
+        }
     }
 
     /// ONE LIST. A thing you have to BE AT and a thing you have to DO are the
@@ -2626,9 +2666,10 @@ struct RemindersView: View {
     /// one of them gets missed.
     @ViewBuilder
     private var diarySection: some View {
-        let events = ChappyCalendar.shared.today().filter {
-            ($0.endDate ?? Date()) > Date()
-        }
+        // SPEED FIX (build 109): this ran a fresh EventKit predicate query on
+        // every render. A calendar does not change between two frames of a
+        // scroll — fetched once on appear instead.
+        let events = todaysEvents
         if !events.isEmpty {
             Text("IN THE DIARY")
                 .font(.caption2).fontWeight(.heavy).tracking(0.6)
@@ -2640,8 +2681,19 @@ struct RemindersView: View {
                         .font(.system(size: 17)).foregroundColor(.purple)
                         .frame(width: 34, height: 34)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(e.title ?? "Appointment")
-                            .font(.subheadline).foregroundColor(theme.textPrimary).lineLimit(2)
+                        HStack(spacing: 5) {
+                            // BUILD 114: the flag says this one is handled —
+                            // day before, hour before, and it pierces Focus.
+                            if ChappyCalendar.shared.level(for: e) == .important {
+                                Image(systemName: "flag.fill")
+                                    .font(.system(size: 10)).foregroundColor(.orange)
+                            } else if ChappyCalendar.shared.level(for: e) == .muted {
+                                Image(systemName: "bell.slash.fill")
+                                    .font(.system(size: 10)).foregroundColor(theme.textSecondary)
+                            }
+                            Text(e.title ?? "Appointment")
+                                .font(.subheadline).foregroundColor(theme.textPrimary).lineLimit(2)
+                        }
                         HStack(spacing: 6) {
                             Text(e.isAllDay ? "All day" : Self.time(e.startDate))
                             if let l = e.location, !l.isEmpty {
@@ -2656,7 +2708,22 @@ struct RemindersView: View {
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
                 .padding(.horizontal, 16)
+                // MARK IT WHERE YOU SEE IT. No second screen, no separate list
+                // to maintain — long-press the thing you're already looking at.
+                .contextMenu {
+                    Button {
+                        ChappyCalendar.shared.setLevel(.important, for: e); diaryTick += 1
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    } label: { Label("Important — warn me twice", systemImage: "flag.fill") }
+                    Button {
+                        ChappyCalendar.shared.setLevel(.normal, for: e); diaryTick += 1
+                    } label: { Label("Normal", systemImage: "circle") }
+                    Button {
+                        ChappyCalendar.shared.setLevel(.muted, for: e); diaryTick += 1
+                    } label: { Label("Mute this one", systemImage: "bell.slash") }
+                }
             }
+            .id(diaryTick)
         }
     }
 
