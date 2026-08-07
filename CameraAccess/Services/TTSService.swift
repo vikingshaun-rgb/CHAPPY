@@ -98,6 +98,10 @@ class TTSService: NSObject, ObservableObject {
     private var speakingWatchdog: Task<Void, Never>?
     /// When the current utterance was started — lets callers detect a stuck flag.
     private(set) var speakingSince: Date?
+    /// The last line spoken aloud. Kept so "what?" / "say that again" can
+    /// replay it — the single most natural thing to say when you mishear
+    /// someone, and it had no handler anywhere in the app.
+    private(set) var lastSpokenLine: String = ""
 
     override private init() {
         super.init()
@@ -353,6 +357,7 @@ class TTSService: NSObject, ObservableObject {
         currentTask?.cancel()
         stop()
 
+        lastSpokenLine = trimmed
         let gen = beginSpeaking(estimatedCharacters: trimmed.count)
         currentTask = Task { [weak self] in
             guard let self else { return }

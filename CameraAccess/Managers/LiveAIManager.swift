@@ -11,6 +11,8 @@ import CoreLocation
 import CoreMotion
 import MapKit
 import Speech
+import Photos
+import Network
 
 // MARK: - CHAPPY EARCONS — the sound of being heard
 //
@@ -131,6 +133,38 @@ enum ChappyVoice {
     }
 
     /// Said when a command was heard but couldn't be actioned.
+    /// THE PART THAT READS AS HEART.
+    ///
+    /// Warmth in an assistant is not politeness — "certainly, I'd be happy to"
+    /// is a call centre, not a companion. It is NOTICING: remarking on
+    /// something only someone paying attention would know. That it's your first
+    /// walk of the day. That you've been going for hours. That it's 2am. That
+    /// the battery won't last the walk home.
+    ///
+    /// One clause, occasionally, unprompted. Said every time it becomes
+    /// wallpaper, so these fire at most once each per day.
+    static func notice(hour: Int, walkedMinutes: Int, batteryPercent: Int, spotsToday: Int) -> String? {
+        if (1...15).contains(batteryPercent) {
+            return line("notice_batt", [
+                "You're down to \(batteryPercent) percent, by the way.",
+                "Battery's getting low - \(batteryPercent) percent left.",
+            ])
+        }
+        if hour >= 23 || hour < 4 {
+            return line("notice_late", ["Late one tonight.", "Still going, I see."])
+        }
+        if walkedMinutes >= 120 {
+            return line("notice_long", [
+                "You've been out a good few hours now.",
+                "That's a fair walk you've done today.",
+            ])
+        }
+        if spotsToday >= 5 {
+            return line("notice_spots", ["You've found a few keepers today."])
+        }
+        return nil
+    }
+
     static func stumble() -> String {
         line("stumble", ["Didn't catch that.", "Sorry - say that again?", "Missed that one."])
     }
@@ -252,13 +286,23 @@ final class ChappyEarcon {
         guard !prepared else { return }
         prepared = true
         // Rising perfect fourth — "listening". A5 → D6.
-        wakeURL = render(name: "chappy-wake", notes: [(880.0, 0.075), (1174.7, 0.115)])
+        // BUILD 90: retuned an octave down with soft edges. The old set was
+        // bright sines with a strong second harmonic — technically a "chime",
+        // audibly a microwave. These are warmer and sit under the voice.
+        // Rising perfect fifth, D5 → A5. Warm, welcoming, unmistakably "go
+        // ahead". Long enough to ring, short enough not to delay you.
+        wakeURL = render(name: "chappy-wake", notes: [(587.33, 0.34), (880.00, 0.52)], gain: 0.30)
         // Soft single note — "done", deliberately quieter than the wake tone.
-        doneURL = render(name: "chappy-done", notes: [(1046.5, 0.110)], gain: 0.22)
+        // One warm note, left to ring. Settled, finished, no fuss.
+        doneURL = render(name: "chappy-done", notes: [(659.25, 0.55)], gain: 0.24)
         // Falling minor third — "didn't work".
-        failURL = render(name: "chappy-fail", notes: [(659.3, 0.080), (523.3, 0.130)], gain: 0.26)
+        // Falling minor third, G4 → E4. Reads as "no" in every culture that
+        // has ever built a doorbell, and it is impossible to mistake for the
+        // wake tone even with the phone in a pocket.
+        failURL = render(name: "chappy-fail", notes: [(392.00, 0.30), (329.63, 0.46)], gain: 0.26)
         // One short high note, quiet. A click, not a chime.
-        tapURL  = render(name: "chappy-tap",  notes: [(1567.98, 0.032)], gain: 0.16)
+        // A click, not a chime — short ring, well under the voice.
+        tapURL  = render(name: "chappy-tap",  notes: [(1046.50, 0.12)], gain: 0.16)
     }
 
     func wake() { play(wakeURL) }
@@ -303,23 +347,70 @@ final class ChappyEarcon {
     /// it as a system sound. Each note gets a raised-cosine envelope — a bare
     /// sine switched on and off clicks, and a click is the one thing that makes
     /// a chime sound cheap.
+    /// WHY THE OLD TONES SOUNDED CHEAP, AND WHAT ACTUALLY FIXES IT.
+    ///
+    /// The previous version was a sine wave faded in and out. That is the sound
+    /// of a test signal, not an instrument, and no amount of retuning rescues
+    /// it. Listening to how Meta, Apple, Google and Amazon build theirs, the
+    /// same four properties show up every time — and none of them is the pitch:
+    ///
+    /// 1. FAST ATTACK, LONG DECAY. Struck objects — bells, chimes, keys — reach
+    ///    full volume in about four milliseconds and then ring out. Fading IN
+    ///    over 30% of the note, which is what the old code did, produces a
+    ///    swell: a doorbell that sounds like a car reversing.
+    ///
+    /// 2. PARTIALS THAT DECAY AT DIFFERENT RATES. This is the big one. In a
+    ///    real bell the high partials die away much faster than the fundamental,
+    ///    so the sound starts bright and mellows as it rings. Hold every partial
+    ///    at a constant level and the ear hears a synthesiser instantly.
+    ///
+    /// 3. SLIGHT INHARMONICITY. Perfect integer multiples sound like an organ.
+    ///    Real bells have partials a little off — the 4.16 below is what gives
+    ///    the faint metallic shimmer that reads as "expensive".
+    ///
+    /// 4. NOTES THAT OVERLAP. A two-note chime where the first note still rings
+    ///    under the second is a musical gesture. Played end to end they are two
+    ///    beeps. Meta's overlap; so do these.
+    ///
+    /// Rising interval for "listening", falling for "that failed" — that part is
+    /// near-universal across every assistant and free to adopt.
     private func render(name: String, notes: [(Double, Double)], gain: Double = 0.30) -> URL? {
         let sampleRate = 44100.0
+        // ratio to the fundamental · relative loudness · how fast it dies away
+        let partials: [(Double, Double, Double)] = [
+            (1.00, 1.00, 1.00),   // the note you hear
+            (2.00, 0.42, 0.62),   // octave — body
+            (3.01, 0.20, 0.42),   // twelfth — brightness at the strike
+            (4.16, 0.11, 0.26),   // deliberately NOT 4.0 — the metallic shimmer
+            (5.43, 0.05, 0.18),   // a whisper of air, gone almost at once
+        ]
+        // Notes overlap by a third of their length so the chime is one gesture.
+        let overlap = 0.34
+        var starts: [Double] = []
+        var cursor = 0.0
+        for (_, dur) in notes { starts.append(cursor); cursor += dur * (1 - overlap) }
+        let total = (starts.last ?? 0) + (notes.last?.1 ?? 0.2)
+        let count = Int(sampleRate * total)
+        guard count > 0 else { return nil }
+
         var samples: [Int16] = []
-        for (freq, seconds) in notes {
-            let count = Int(sampleRate * seconds)
-            for i in 0..<count {
-                let t = Double(i) / sampleRate
-                let progress = Double(i) / Double(max(count - 1, 1))
-                // Raised-cosine attack/release, ~12% of the note at each end.
-                let edge = 0.12
-                var env = 1.0
-                if progress < edge { env = 0.5 - 0.5 * cos(.pi * progress / edge) }
-                else if progress > 1 - edge { env = 0.5 - 0.5 * cos(.pi * (1 - progress) / edge) }
-                // A touch of second harmonic keeps it from sounding like a test tone.
-                let v = sin(2 * .pi * freq * t) * 0.85 + sin(4 * .pi * freq * t) * 0.15
-                samples.append(Int16(max(-1.0, min(1.0, v * env * gain)) * 32767))
+        samples.reserveCapacity(count)
+        for i in 0..<count {
+            let t = Double(i) / sampleRate
+            var v = 0.0
+            for (n, note) in notes.enumerated() {
+                let local = t - starts[n]
+                guard local >= 0, local < note.1 else { continue }
+                // 4 ms strike, then each partial rings out on its own clock.
+                let attack = min(1.0, local / 0.004)
+                for (ratio, amp, decayScale) in partials {
+                    let tau = note.1 * 0.42 * decayScale
+                    v += amp * exp(-local / tau) * sin(2 * .pi * note.0 * ratio * local) * attack
+                }
             }
+            // Normalised for the partial stack so `gain` still means loudness.
+            let out = max(-1.0, min(1.0, v * gain * 0.55))
+            samples.append(Int16(out * 32767))
         }
         guard !samples.isEmpty else { return nil }
 
@@ -1001,6 +1092,32 @@ final class ChappyStandby: NSObject, ObservableObject {
         ("malaysia", "id"), ("malay", "id"), ("singapore", "zh")
     ]
 
+
+    /// Where he IS — but only when that is genuinely a foreign language.
+    /// English-to-English is not a translation, it is a mirror.
+    static func localLanguageIfForeign() -> String? {
+        guard let code = languageCode(forCountry: ContextEngine.shared.snapshot.countryCode),
+              code != "en" else { return nil }
+        return code
+    }
+
+    /// The last language he actually held a conversation in. On a trip this is
+    /// almost always what he wants next, and it is what turns "open translate"
+    /// into something that just starts.
+    static func lastUsedTranslateLanguage() -> String? {
+        guard let c = UserDefaults.standard.string(forKey: "translate_last_used_language"),
+              !c.isEmpty, c != "en", supportedCodes.contains(c) else { return nil }
+        return c
+    }
+
+    /// A language he can pin in Settings — useful before a trip, when he knows
+    /// where he is going but is not there yet.
+    static func usualTranslateLanguage() -> String? {
+        guard let c = UserDefaults.standard.string(forKey: "translate_usual_language"),
+              !c.isEmpty, c != "en", supportedCodes.contains(c) else { return nil }
+        return c
+    }
+
     static func languageCode(forCountry code: String?) -> String? {
         guard let code, let mapped = countryLanguage[code.uppercased()],
               supportedCodes.contains(mapped) else { return nil }
@@ -1241,14 +1358,30 @@ final class ChappyStandby: NSObject, ObservableObject {
         let lvl = UIDevice.current.batteryLevel
         if lvl >= 0 && lvl < 0.20 {
             starting = false
-            announceArmFailure("Battery is under twenty percent - standby stays off to save it.")
+            announceArmFailure("You're low on battery, so I'll stay quiet and save what's left.")
             return
         }
 
         let session = AVAudioSession.sharedInstance()
+        // ============ LEAVING "HEY META" ALONE ============
+        // Bluetooth HFP is an EXCLUSIVE link: whoever claims the glasses'
+        // microphone owns it, and nothing else can hear through it. `.allowBluetooth`
+        // let Standby grab it — so simply having Chappy armed could stop
+        // "Hey Meta" working, which is a lousy trade for a wake word that runs
+        // perfectly well on the phone's own mic in your pocket.
+        //
+        // Standby now asks for the built-in mic and leaves the glasses free.
+        // Translate and Live AI still take the glasses when you actually want
+        // them to — those are deliberate, foreground acts. This one is ambient,
+        // and ambient features should not quietly disable your other assistant.
         try? session.setCategory(.playAndRecord, mode: .spokenAudio,
-                                 options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
+                                 options: [.duckOthers, .defaultToSpeaker, .allowBluetoothA2DP])
         try? session.setActive(true)
+        // Prefer the phone's own mic explicitly — A2DP alone still lets iOS
+        // pick a headset input on some routes.
+        if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+            try? session.setPreferredInput(builtIn)
+        }
 
         guard startRecognition() else { starting = false; return }
         isListening = true
@@ -1273,15 +1406,37 @@ final class ChappyStandby: NSObject, ObservableObject {
                 ChappyEarcon.shared.wake()
                 let firstOfDay = !Calendar.current.isDateInToday(lastGreetingAt)
                 lastGreetingAt = Date()
-                TTSService.shared.speak(ChappyVoice.launchGreeting(
-                    name: userName, date: Date(), firstOfDay: firstOfDay))
+                // BUILD 90: this was hitting the short-line fast path and
+                // coming out in Apple's on-device voice — the "computery"
+                // sound. The greeting is the one line worth a second of
+                // latency: it is the first thing you hear each day and it sets
+                // what Chappy sounds like.
+                var greeting = ChappyVoice.launchGreeting(
+                    name: userName, date: Date(), firstOfDay: firstOfDay)
+                // A single observation, at most once a day, and only when there
+                // is genuinely something a companion would mention.
+                UIDevice.current.isBatteryMonitoringEnabled = true
+                let pct = Int(max(UIDevice.current.batteryLevel, 0) * 100)
+                let noticedToday = Calendar.current.isDateInToday(
+                    Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: "chappy_last_notice_at")))
+                if !noticedToday,
+                   let n = ChappyVoice.notice(
+                       hour: Calendar.current.component(.hour, from: Date()),
+                       walkedMinutes: TripRecorder.shared.crumbs.count,
+                       batteryPercent: pct,
+                       spotsToday: TripRecorder.shared.spots.filter {
+                           Calendar.current.isDateInToday($0.t) }.count) {
+                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "chappy_last_notice_at")
+                    greeting += " " + n
+                }
+                TTSService.shared.speak(greeting, forceNetworkVoice: true)
             } else {
                 print("👂 [Standby] Armed silently (already greeted this launch)")
             }
         } else {
             // A deliberate tap on the ear button.
             ChappyEarcon.shared.wake()
-            TTSService.shared.speak("Standby on. I'm listening for my name.")
+            TTSService.shared.speak("I'm listening.")
         }
         // Recognition tasks die after about a minute — quietly renew them.
         restartRenewTimer()
@@ -1377,7 +1532,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
         // Genuinely can't come back — say so rather than pretending.
         isListening = false
-        TTSService.shared.speak("Standby dropped out - tap the ear to bring me back.")
+        TTSService.shared.speak("I've lost my hearing for a moment. Tap the ear and I'll be back.")
     }
 
     /// AUDIT FIX (SB-H1): Standby had NO interruption handling at all — Live AI
@@ -1635,7 +1790,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     private static var greetedThisLaunch = false
     /// What he'd like to be called. Blank is fine — the lines read without it.
     private var userName: String {
-        (UserDefaults.standard.string(forKey: "chappy_user_name") ?? "")
+        // Seeded rather than blank — a greeting with no name in it is the
+        // thing he asked me to fix, and an empty Settings field he has to find
+        // first is not an answer. Changeable in Settings → Voice → Call me.
+        (UserDefaults.standard.string(forKey: "chappy_user_name") ?? "Shaun")
             .trimmingCharacters(in: .whitespaces)
     }
 
@@ -1668,6 +1826,73 @@ final class ChappyStandby: NSObject, ObservableObject {
         TTSService.shared.speak("\(ChappyVoice.timeOfDay(now))\(userName.isEmpty ? "" : ", \(userName)").")
     }
 
+
+    // ==================================================================
+    // SNAP — the silent one.
+    //
+    // Snap and Look used to do the IDENTICAL thing: both opened Quick Vision,
+    // took one photo and spoke one answer. Two buttons, same behaviour. So Snap
+    // had no job of its own, which is the gap this fills:
+    //
+    //   SNAP   photo, described quietly, stored. Says nothing.
+    //   LOOK   photo, answer spoken aloud. "What is this?"
+    //   WATCH  continuous narration.
+    //
+    // Three modes, no overlap. Snap is a visual journal — you take it because
+    // you want it later, not because you want to be told about it now.
+    func snapSilently() {
+        ChappyEarcon.shared.tap()
+        guard let vm = LiveAIManager.shared.streamViewModel,
+              let frame = vm.currentVideoFrame else {
+            NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            return
+        }
+        completeSilentSnap(frame)
+    }
+
+    func completeSilentSnap(_ frame: UIImage) {
+        ChappyHaptics.shared.shutter()
+        let thumb = frame.jpegData(compressionQuality: 0.4)
+        // Store it immediately with a placeholder — the photo must never be lost
+        // waiting on a network call that might not come back.
+        let note = TripRecorder.shared.addVisualNote(caption: "Photo", thumbnail: thumb)
+        Task { @MainActor in
+            if let caption = await Self.describe(frame) {
+                TripRecorder.shared.updateCaption(id: note.id, to: caption)
+            }
+        }
+        // A tone, not a sentence. The whole point is that it doesn't talk.
+        ChappyEarcon.shared.done()
+    }
+
+    /// One line, cheap and quiet. Never spoken unless he asks for it.
+    static func describe(_ image: UIImage) async -> String? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let jpeg = image.jpegData(compressionQuality: 0.5),
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": [
+                ["text": "Describe this photo in ONE short line, under 12 words, as a note-to-self for finding it again later. No preamble. Example: 'handwritten warung sign, opening hours in Indonesian'."],
+                ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ]]],
+            "generationConfig": ["temperature": 0.2, "maxOutputTokens": 300],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 15
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let c = json["candidates"] as? [[String: Any]],
+              let content = c.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let t = parts.first?["text"] as? String else { return nil }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// AUDIT FIX (NAV-TILE): the Navigate tile now asks out loud and listens,
     /// instead of opening a paid Live AI session. Arms the ear if it isn't
     /// already, speaks the question, and treats the next thing heard as a
@@ -1687,6 +1912,148 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// as a command — specifically as a destination.
     private var expectingDestinationUntil = Date.distantPast
 
+
+    // ==================================================================
+    // PROMPT ETIQUETTE — the seven things a person does that a state
+    // machine doesn't expect.
+    //
+    // Every prompt below ("Which language?", "Walking or driving?", "What
+    // should I call it?") used to own the NEXT THING YOU SAID, whatever it
+    // was. That produced some genuinely bad outcomes: answering "never mind"
+    // to the naming prompt saved a spot literally called "never mind", and
+    // "actually, take me home instead" was geocoded as a destination named
+    // "actually take me home instead".
+    //
+    // These checks run BEFORE any specific prompt handler, so a person can do
+    // the three things people always do: back out, change their mind, or ask
+    // you to say it again.
+
+    private var anyPromptOpen: Bool {
+        let now = Date()
+        return now < expectingLanguageUntil || now < expectingNavModeUntil
+            || now < expectingSpotNameUntil || now < expectingDestinationUntil
+            || now < expectingMapsAnswerUntil
+    }
+
+    func closeAllPrompts() {
+        expectingLanguageUntil = .distantPast
+        expectingNavModeUntil = .distantPast
+        expectingSpotNameUntil = .distantPast
+        expectingDestinationUntil = .distantPast
+        expectingMapsAnswerUntil = .distantPast
+        pendingNavDestination = nil
+    }
+
+    private static let cancelWords: Set<String> = [
+        "never mind", "nevermind", "cancel", "cancel that", "forget it",
+        "forget that", "leave it", "stop", "no thanks", "no thank you",
+        "don't worry", "dont worry", "skip it", "not now", "drop it",
+    ]
+    private static let repeatWords: Set<String> = [
+        "what", "what?", "sorry", "pardon", "say again", "say that again",
+        "repeat that", "repeat", "come again", "what was that", "huh",
+    ]
+    /// Openers strong enough that hearing one mid-prompt means he has changed
+    /// his mind, not answered. Deliberately narrow — "walking" must NOT count
+    /// as a new command when the question was "walking or driving?".
+    private static let mindChangeOpeners: [String] = [
+        "actually", "instead", "no wait", "wait", "hang on", "forget that",
+        "chappy", "take me to", "navigate to", "translate", "remember this",
+        "take me home", "open maps", "show the map", "let's talk",
+    ]
+
+    /// Returns true when it fully handled the utterance.
+    private func handlePromptEtiquette(_ text: String) -> Bool {
+        guard anyPromptOpen else { return false }
+        let t = text.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+
+        // 1. BACKING OUT. "Never mind" is not a language, a travel mode or the
+        //    name of a warung, and treating it as one is how you end up with a
+        //    saved spot called "never mind".
+        if Self.cancelWords.contains(t) || Self.cancelWords.contains(where: { t.hasSuffix(" " + $0) }) {
+            closeAllPrompts()
+            ChappyEarcon.shared.done()
+            TTSService.shared.speak(ChappyVoice.line("cancelled", [
+                "No worries.", "Alright, forget it.", "Sure, dropped.",
+            ]))
+            resetRecognition()
+            return true
+        }
+
+        // 2. "SAY THAT AGAIN". The most natural thing in the world when you
+        //    mishear someone, and it had no handler at all. Replays the line
+        //    and KEEPS the prompt open so he can still answer it.
+        if Self.repeatWords.contains(t) {
+            let again = TTSService.shared.lastSpokenLine
+            extendOpenPrompts(by: 12)
+            TTSService.shared.speak(again.isEmpty ? "Sorry - I hadn't said anything yet." : again)
+            resetRecognition()
+            return true
+        }
+
+        // 3. CHANGING HIS MIND. If what he said reads as a different COMMAND,
+        //    run that instead of forcing it into the answer slot.
+        if Self.mindChangeOpeners.contains(where: { t.hasPrefix($0) || t.contains(" " + $0 + " ") }) {
+            var cleaned = t
+            for lead in ["actually ", "no wait ", "wait ", "hang on ", "instead "] {
+                if cleaned.hasPrefix(lead) { cleaned = String(cleaned.dropFirst(lead.count)) }
+            }
+            closeAllPrompts()
+            print("👂 [Standby] Changed his mind mid-prompt → '\(cleaned)'")
+            busy = true
+            routeTask?.cancel()
+            routeTask = Task { @MainActor in
+                await self.route(cleaned)
+                self.busy = false
+                self.followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
+                self.resetRecognition()
+            }
+            return true
+        }
+        return false
+    }
+
+
+    /// Split "remember this spot and take me home" into two commands — but only
+    /// when both halves genuinely look like instructions on their own. Without
+    /// that test, "fish and chips" and "black and white" become two commands,
+    /// which is far worse than missing a compound.
+    static func splitCompound(_ text: String) -> [String] {
+        let seps = [" and then ", " then ", " and also ", " and "]
+        for sep in seps {
+            guard let r = text.range(of: sep) else { continue }
+            let a = String(text[text.startIndex..<r.lowerBound])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            let b = String(text[r.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard a.count > 2, b.count > 2,
+                  looksLikeCommand(a), looksLikeCommand(b) else { continue }
+            return [a, b]
+        }
+        return [text]
+    }
+
+    /// Cheap test: does this half start with something imperative?
+    private static func looksLikeCommand(_ t: String) -> Bool {
+        let verbs = ["navigate", "take", "get", "go", "walk", "drive", "find",
+                     "remember", "save", "pin", "mark", "translate", "snap",
+                     "photo", "look", "watch", "show", "open", "map", "log",
+                     "note", "stop", "call", "head", "bring"]
+        guard let first = t.split(separator: " ").first.map(String.init) else { return false }
+        return verbs.contains(first)
+    }
+
+    /// Keep whichever prompts are open alive a little longer.
+    private func extendOpenPrompts(by seconds: TimeInterval) {
+        let now = Date()
+        let new = now.addingTimeInterval(seconds)
+        if now < expectingLanguageUntil { expectingLanguageUntil = new }
+        if now < expectingNavModeUntil { expectingNavModeUntil = new }
+        if now < expectingSpotNameUntil { expectingSpotNameUntil = new }
+        if now < expectingDestinationUntil { expectingDestinationUntil = new }
+        if now < expectingMapsAnswerUntil { expectingMapsAnswerUntil = new }
+    }
+
     /// BUILD 87 — "just say translate, and it asks me which one."
     /// Exactly the flow he asked for, and the same trick as the destination
     /// prompt: he just spoke to Chappy, so his answer counts without the wake
@@ -1696,6 +2063,21 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// While this is in the future, speech routes as a command with no wake
     /// word. Opened after every completed command; see the note in heard().
     private var followUpUntil = Date.distantPast
+    /// When the current run of follow-ups began. The window resets on every
+    /// utterance, so without a ceiling it could stay open all afternoon in a
+    /// crowd — and a live routing mic in a market is how someone else's
+    /// sentence becomes your command.
+    private var followUpOpenedAt = Date.distantPast
+    static let followUpSeconds: TimeInterval = 12
+    static let followUpMaxRun: TimeInterval = 45
+
+    /// Speech that carries no instruction. Hearing these should HOLD the door
+    /// open — that is precisely what they mean — not be routed as a command.
+    static let fillerWords: Set<String> = [
+        "um", "uh", "er", "erm", "hmm", "mmm", "ah", "oh", "so", "well",
+        "like", "you know", "let me think", "hang on", "just a sec",
+        "one sec", "hold on", "wait a minute", "give me a second",
+    ]
 
     func askForTranslateLanguage() {
         expectingLanguageUntil = Date().addingTimeInterval(12)
@@ -1712,6 +2094,7 @@ final class ChappyStandby: NSObject, ObservableObject {
     func beginTranslate(code: String) {
         UserDefaults.standard.set("en", forKey: "translate_source_language")
         UserDefaults.standard.set(code, forKey: "translate_target_language")
+        UserDefaults.standard.set(code, forKey: "translate_last_used_language")
         UserDefaults.standard.set(true, forKey: "translate_autostart")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
         ChappyEarcon.shared.done()
@@ -1905,10 +2288,30 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // market, and every extra second is another sentence of someone
                 // else's conversation that could route. Eight is enough to
                 // follow a thought and short enough to be safe.
-                if Date() < followUpUntil, text.count > 2, !awake, !busy {
+                if Date() < followUpUntil, !awake, !busy {
+                    let t = text.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+
+                    // Filler is not a command — it is a person thinking. Hold
+                    // the door and say nothing.
+                    if t.count < 3 || Self.fillerWords.contains(t)
+                        || Self.fillerWords.contains(where: { t == $0 || t.hasSuffix(" " + $0) }) {
+                        if Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
+                            followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
+                        }
+                        return
+                    }
+
+                    // The ceiling: a window that resets forever is a mic that
+                    // never closes.
+                    guard Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun else {
+                        followUpUntil = .distantPast
+                        print("👂 [Standby] Follow-up run hit its ceiling — name required again")
+                        return
+                    }
+
                     followUpUntil = .distantPast
                     awake = true
-                    command = text
+                    command = t
                     ChappyHaptics.shared.connected()
                     print("👂⚡ [Standby] Follow-up (no wake word needed)")
                     lastWordAt = Date()
@@ -1917,6 +2320,24 @@ final class ChappyStandby: NSObject, ObservableObject {
                     let work = DispatchWorkItem { [weak self] in self?.finish(snap) }
                     routeWork = work
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+                    return
+                }
+                // Back out, change your mind, or ask him to repeat — checked
+                // before any prompt gets to claim what you said.
+                if handlePromptEtiquette(text) { return }
+
+                // BUILD 90: answering "Want turn by turn in Google Maps?"
+                if Date() < expectingMapsAnswerUntil, text.count > 1 {
+                    expectingMapsAnswerUntil = .distantPast
+                    let yes = ["yes", "yeah", "yep", "sure", "please", "ok", "okay",
+                               "go on", "do it", "open"].contains { text.contains($0) }
+                    if yes {
+                        ChappyEarcon.shared.done()
+                        NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                    } else {
+                        TTSService.shared.speak("No worries.")
+                    }
+                    resetRecognition()
                     return
                 }
                 // BUILD 87: answering "Which language?" — no wake word needed.
@@ -1967,7 +2388,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                         TTSService.shared.speak("Saved as \(cleaned).")
                     } else {
                         ChappyEarcon.shared.fail()
-                        TTSService.shared.speak("Couldn't rename it, but the spot is saved.")
+                        TTSService.shared.speak("Couldn't catch the name, but the spot's safe.")
                     }
                     resetRecognition()
                     return
@@ -2036,9 +2457,26 @@ final class ChappyStandby: NSObject, ObservableObject {
             finish(cleanTail)
             return
         }
+        // ============ THINKING TIME ============
+        // 0.6s of silence meant "he's finished". Real speech does not work
+        // that way: "take me to… um… that place near the beach" pauses in the
+        // middle, and the old code fired on "take me to" and threw the rest
+        // away. Silence is only an ending if what came before it was a
+        // complete thought.
+        //
+        // So an INCOMPLETE fragment — a bare preposition, a trailing "to", a
+        // command opener with nothing after it — gets up to three seconds to
+        // finish. A complete command still fires immediately, so "stop" stays
+        // instant. Hesitation is allowed; decisiveness is not punished.
         let debounce: Double
-        if Self.extendableCommands.contains(cleanTail) {
-            debounce = 0.40
+        if Self.looksUnfinished(cleanTail) {
+            debounce = 3.0
+        } else if Self.extendableCommands.contains(cleanTail) {
+            // BUILD 90: 0.40s was too tight for "translate … to Indonesian".
+            // The tail arrives as a separate recogniser partial and any natural
+            // pause expired the window, firing bare "translate" and losing the
+            // language. Words that commonly take a tail get longer.
+            debounce = ["translate", "navigate", "go", "map to"].contains(cleanTail) ? 0.75 : 0.45
         } else {
             let wordCount = snapshot.split(separator: " ").count
             debounce = wordCount <= 3 ? 0.6 : (wordCount <= 6 ? 0.85 : 1.1)
@@ -2080,6 +2518,8 @@ final class ChappyStandby: NSObject, ObservableObject {
         "what can i say", "what can you do",
         "spent today", "cost check", "usage today",
         "where was i", "what street", "i'm lost", "im lost",
+        // PHASE 5 — complete, harmless, and nothing extends them.
+        "open memory", "show my memories", "memory browser",
     ]
 
     /// Prefixes that MUST NOT instant-fire, because a real command extends
@@ -2141,6 +2581,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         if interrupts.contains(cleaned) {
             TTSService.shared.stop()
             routeTask?.cancel()
+            // An interrupt cancels the QUESTION too. Cutting Chappy off
+            // mid-question and then having the next thing you say swallowed by
+            // that same question is the opposite of being interrupted.
+            closeAllPrompts()
             busy = false
             awake = false; command = ""
             routeWork?.cancel(); routeWork = nil
@@ -2157,7 +2601,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             print("👂 [Standby] Busy — dropped: \(raw)")
             ChappyEarcon.shared.fail()
             ChappyHaptics.shared.straightStep()
-            TTSService.shared.speak("Still working on the last one.")
+            TTSService.shared.speak("One thing at a time - still on the last.")
             // AUDIT P1 (SB-AWAKE): `awake` was left TRUE here. The next sentence
             // was then routed with no wake word at all — an overheard
             // conversation could fire a command — and renew() is guarded on
@@ -2177,7 +2621,13 @@ final class ChappyStandby: NSObject, ObservableObject {
         // paid calls, from one spoken sentence.
         routeWork?.cancel(); routeWork = nil
         guard !cmd.isEmpty else {
-            TTSService.shared.speak("Yes?")
+            // A bare "Chappy" used to answer "Yes?" and then CLOSE — so having
+            // paused to think, you had to say the name again. That punished
+            // exactly the moment you needed a second, which is the opposite of
+            // what a follow-up window is for. Answering the name opens the door.
+            followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
+            followUpOpenedAt = Date()
+            TTSService.shared.speak(ChappyVoice.line("yes", ["Yes?", "Go on.", "I'm here."]))
             resetRecognition()
             return
         }
@@ -2185,8 +2635,27 @@ final class ChappyStandby: NSObject, ObservableObject {
         busy = true
         routeTask?.cancel()
         routeTask = Task { @MainActor in
-            await route(cmd)
+            // COMPOUND COMMANDS. "Remember this spot and take me home" used to
+            // run the first half and silently drop the second — route() returns
+            // on its first match and nothing ever split the sentence.
+            //
+            // Capped at two parts on purpose. Splitting a rambling sentence into
+            // five actions is worse than doing one thing well, and "fish and
+            // chips" must never become two commands — which is why the split
+            // only happens when BOTH halves independently look like commands.
+            let parts = Self.splitCompound(cmd)
+            for (i, part) in parts.enumerated() {
+                if i > 0 {
+                    // Let the first action finish speaking before the next.
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                }
+                await route(part)
+            }
+            if parts.count > 1 { print("👂 [Standby] Ran \(parts.count) commands in one sentence") }
             self.busy = false
+            if Date().timeIntervalSince(self.followUpOpenedAt) > Self.followUpMaxRun {
+                self.followUpOpenedAt = Date()   // fresh run after a real command
+            }
             // Keep the door open — he can carry on without saying the name.
             self.followUpUntil = Date().addingTimeInterval(8)
             // AUDIT FIX (HIGH — phantom repeats): the recognizer keeps ONE
@@ -2231,9 +2700,22 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT FIX (P0): "stop navigation" was swallowed by hasPrefix("stop")
         // so navigation could never be stopped by voice; and contains("enough")
         // silenced innocent sentences like "is 500,000 rupiah enough for dinner".
+        // BUILD 90: he opened Live AI and could not get out of it by voice —
+        // the only exit was a button on a screen he could not see. Anything
+        // that reads as "shut this down" now closes whatever module is open.
+        if ["close", "close it", "exit", "go back", "done", "finish", "that's it",
+            "thats it", "close live", "stop live", "close live ai", "end it",
+            "shut it down", "close translate", "close this"].contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
+            ChappyEarcon.shared.done()
+            LiveAIManager.shared.stop()
+            ContinuousVisionManager.shared.stop(announce: false)
+            NotificationCenter.default.post(name: .chappyCloseModules, object: nil)
+            speak("Done.")
+            return
+        }
         if c.contains("stop navigation") || c.contains("stop navigating")
             || c.contains("cancel navigation") || c.contains("stop the route") {
-            NavEngine.shared.stop(); speak("Navigation stopped."); return
+            NavEngine.shared.stop(); speak("Route's off."); return
         }
         if c == "stop" || c == "cancel" || c.hasPrefix("stop talking")
             || c.contains("never mind") || c.contains("cancel that")
@@ -2259,20 +2741,25 @@ final class ChappyStandby: NSObject, ObservableObject {
                      "snap a photo", "snap that", "snap this", "capture this",
                      "capture that", "photo quick"]) != nil
             || c == "photo" || c == "take photo" {
-            NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
-            // AUDIT FIX: don't claim success when the camera isn't running.
-            if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
-                speak("Photo taken.")
-            } else {
-                speak("Camera isn't running - open Talk or Look first, then I can shoot.")
-            }
+            // Silent by design — see snapSilently(). A tone confirms it; there
+            // is nothing to say about a photo taken to look at later.
+            snapSilently()
             return
         }
         if let note = after(c, ["log this", "note this", "write this down", "make a note", "jot this down"]) {
             if note.count > 2 {
                 TripRecorder.shared.addObservation(note)
                 ChappyHaptics.shared.straightStep()
-                speak("Logged.")
+                // AUDIT FIX (PHASE 5): this block was pasted twice, so every
+                // "log this" in front of the camera stored TWO identical photos
+                // — and, once memory was wired in, two identical memories.
+                // You usually log something BECAUSE of what is in front of you.
+                // Quietly keep the picture with the words.
+                if let f = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
+                    TripRecorder.shared.addVisualNote(caption: note,
+                                                      thumbnail: f.jpegData(compressionQuality: 0.4))
+                }
+                speak("Noted.")
             } else {
                 speak("What should I log?")
             }
@@ -2293,12 +2780,72 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyHaptics.shared.straightStep()
             if spot.lat == 0 {
                 ChappyEarcon.shared.fail()
-                speak("Saved, but GPS hasn't locked yet.")
+                speak("Saved it, though GPS hasn't settled - it may be a little off.")
             } else {
                 ChappyEarcon.shared.done()
                 speak("Saved \(spot.name).")
             }
             return
+        }
+        if c.contains("what did i photograph") || c.contains("what did i snap")
+            || c.contains("what photos") {
+            let today = TripRecorder.shared.todaysVisualNotes()
+            guard !today.isEmpty else { speak("Nothing photographed today."); return }
+            let list = today.suffix(6).map { $0.caption }.joined(separator: ", ")
+            speak("\(today.count) today. \(list).")
+            return
+        }
+        // ---------- PHASE 5 — MEMORY RECALL (free, offline, instant) ----------
+        // Sits ABOVE the journal answers on purpose: "what do you remember
+        // about the warung" is a memory question, and the journal only knows
+        // about today.
+        if let subject = after(c, ["what do you remember about", "what do you know about",
+                                   "do you remember", "remind me about",
+                                   "search my memory for", "search memory for",
+                                   "look up in memory", "find in my memory",
+                                   "when did i see", "when did we see",
+                                   "have i been to", "where did i see"]) {
+            // "do you remember" on its own is a question, not a search.
+            // Without this, an empty subject matches EVERY memory and Chappy
+            // reads four random things back at you.
+            guard subject.trimmingCharacters(in: .whitespaces).count > 2 else {
+                speak("Remember what?"); return
+            }
+            if let answer = ChappyMemory.shared.spokenRecall(subject) {
+                ChappyEarcon.shared.done()
+                speak(answer)
+            } else {
+                ChappyEarcon.shared.fail()
+                speak("Nothing stored about \(subject) yet.")
+            }
+            return
+        }
+        if c.contains("open memory") || c.contains("open my memory")
+            || c.contains("show my memories") || c.contains("show me my memories")
+            || c.contains("open the memory") || c.contains("memory browser")
+            || c.contains("show my memory") {
+            NotificationCenter.default.post(name: .chappyOpenMemory, object: nil)
+            ChappyEarcon.shared.done()
+            speak("Memory's open."); return
+        }
+        if c.contains("import from the glasses") || c.contains("import my photos")
+            || c.contains("check the glasses") || c.contains("import from glasses")
+            || c.contains("get my photos") || c.contains("import photos") {
+            speak("Checking what the glasses have.")
+            Task { await ChappyIngest.shared.run(manual: true) }
+            return
+        }
+        if c.contains("read my old conversations") || c.contains("go through my records")
+            || c.contains("read through records") || c.contains("catch up on records") {
+            speak("Reading through them now.")
+            Task { await ChappyMemory.shared.runFactExtraction(manual: true) }
+            return
+        }
+        if c.contains("how many memories") || c.contains("what have you stored")
+            || c.contains("how much do you remember") {
+            let n = ChappyMemory.shared.recent.count
+            speak(n == 0 ? "Nothing stored yet."
+                         : "\(n) memories in the last month, all searchable."); return
         }
         if c.contains("where was i") || c.contains("where have i been") || c.contains("what did i do today") {
             speak(TripRecorder.shared.todaySummary()); return
@@ -2401,16 +2948,60 @@ final class ChappyStandby: NSObject, ObservableObject {
         // translate it) — it used to launch the whole metered session.
         if c.contains("translate this") || c.contains("translate that")
             || c.contains("translate the sign") || c.contains("translate the menu") {
-            speak("Reading it.")
+            speak("Let me read it.")
             QuickVisionManager.shared.triggerQuickVision(customPrompt:
                 "Read the text in this image and translate it into English. Say the original briefly, then the translation. Two short spoken sentences.")
             return
         }
+        // "Switch to Thai", "change the language to German", "make it Spanish"
+        // — a language change, not a new session. If translate is already open
+        // this retargets it; if not, it starts there.
+        if ["switch to", "change to", "change the language", "make it", "now in",
+            "put it in", "swap to"].contains(where: { c.contains($0) }),
+           let newCode = Self.languageCode(spokenIn: c) {
+            UserDefaults.standard.set(newCode, forKey: "translate_target_language")
+            UserDefaults.standard.set(newCode, forKey: "translate_last_used_language")
+            NotificationCenter.default.post(name: .chappyRetargetTranslate, object: newCode)
+            ChappyEarcon.shared.done()
+            speak("Switching to \(Self.languageName(newCode)).")
+            if !LiveTranslateIsOpen {
+                UserDefaults.standard.set(true, forKey: "translate_autostart")
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
+                handOff()
+                NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
+            }
+            return
+        }
         if c.hasPrefix("translate") || c.contains("interpreter")
+            || c == "open translate" || c == "start translate" || c == "open the translator"
+            || c == "start translating" || c == "open interpreter"
             || c.contains("help me talk to") || c.contains("talk to them")
             || (c.contains("translate") && (c.contains("mode") || c.contains("for me"))) {
+            // ============ WHICH LANGUAGE, WITHOUT ASKING ============
+            // "Open translate and just start" is the right instinct, and it
+            // works everywhere except where he is right now: at home the local
+            // language is English, and English-to-English is not a translator.
+            // Location alone therefore fails precisely when he tests it.
+            //
+            // So location is only ONE of four sources, tried in the order that
+            // is most likely to be right:
+            //
+            //   1. what he just SAID          — "translate to Thai" wins always
+            //   2. where he IS                — but only if it isn't English
+            //   3. what he used LAST          — mid-trip this is nearly always
+            //                                   the answer, and it is what makes
+            //                                   "open translate" just work in a
+            //                                   week of Indonesian conversations
+            //   4. his usual language          — set once in Settings
+            //
+            // Only if all four come up empty does it ask. And even a wrong
+            // guess self-corrects: auto-retarget switches after two turns in
+            // another language, so the cost of guessing is a few seconds, while
+            // the cost of asking every single time is a worse product.
             let picked = Self.languageCode(spokenIn: c)
-                ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode)
+                ?? Self.localLanguageIfForeign()
+                ?? Self.lastUsedTranslateLanguage()
+                ?? Self.usualTranslateLanguage()
             guard let code = picked else {
                 // BUILD 87: this used to be a dead end — a refusal, and you had
                 // to start the whole command again knowing the exact word it
@@ -2423,6 +3014,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             UserDefaults.standard.set("en", forKey: "translate_source_language")
             UserDefaults.standard.set(code, forKey: "translate_target_language")
+            UserDefaults.standard.set(code, forKey: "translate_last_used_language")
             UserDefaults.standard.set(true, forKey: "translate_autostart")
             // AUDIT P0 (MH-3): this stamp was READ by LiveTranslateViewModel and
             // written NOWHERE. A missing key reads back as 0.0, the viewmodel's
@@ -2437,13 +3029,13 @@ final class ChappyStandby: NSObject, ObservableObject {
             return
         }
         if c.contains("keep watching") || c.contains("continuous vision") || c.contains("narrate") {
-            speak("Watching.")
+            speak("Eyes open.")
             handOff()
             NotificationCenter.default.post(name: .continuousVisionTriggered, object: nil)
             return
         }
         if c.contains("stop navigation") || c.contains("cancel navigation") {
-            NavEngine.shared.stop(); speak("Navigation stopped."); return
+            NavEngine.shared.stop(); speak("Route's off."); return
         }
         // AUDIT P1 (RG-HOME): only two phrasings were handled, so "take us
         // home" at 2am fell all the way through to the either/or prompt.
@@ -2451,7 +3043,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             "walk me home", "walk us home", "head home", "go home", "get home",
             "way home", "back to the hotel", "take us back to the hotel",
             "navigate home"].contains(where: { c.contains($0) }) {
-            speak("Finding your way home.")
+            speak("Let me get you home.")
             let reply = await NavEngine.shared.getHome()
             speak(reply); return
         }
@@ -2469,7 +3061,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             // AUDIT FIX: "take me to home" bypassed the saved-home handler
             if ["home", "hotel", "the hotel", "my hotel", "our hotel", "the room"]
                 .contains(dest.lowercased()) {
-                speak("Heading home.")
+                speak("Right, heading home.")
                 let reply = await NavEngine.shared.getHome()
                 speak(reply); return
             }
@@ -2484,7 +3076,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
             // Human ears get the human string; the model-directed one is for
             // Live AI only. See AUDIT FIX (SPOKEN-LEAK) in NavEngine.navigate.
-            speak(NavEngine.shared.spokenRouteSummary ?? reply); return
+            speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            if NavEngine.shared.isNavigating { offerGoogleMaps(driving: driving) }
+            return
         }
         // AUDIT FIX (coverage gap): mode follow-ups re-route the last
         // destination — they worked in-session but not in Standby.
@@ -2493,7 +3087,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             "on foot", "walking instead", "by motorbike"].contains(where: { c.contains($0) }),
            c.split(separator: " ").count <= 5 {
             let driving = !(c.contains("foot") || c.contains("walking"))
-            speak("Re-routing.")
+            speak("Finding you another way.")
             let reply = await NavEngine.shared.navigate(to: last, driving: driving)
             speak(NavEngine.shared.spokenRouteSummary ?? reply); return
         }
@@ -2507,7 +3101,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("good deal") || c.contains("good price") || c.contains("ripped off")
             || c.contains("should this cost") || c.contains("is that fair")
             || c.contains("worth it") || c.contains("too expensive") {
-            speak("Checking.")
+            speak("Let me look.")
             QuickVisionManager.shared.triggerQuickVision(customPrompt:
                 "Identify the item and any marked price in this photo. Then judge the price: is it fair for this region, or high? Answer in two short spoken sentences: what it is and the going rate, then a verdict with a number to counter-offer if it's high. Context: \(ContextEngine.shared.contextHeader())")
             return
@@ -2518,7 +3112,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         if (c.hasPrefix("read th") || c.hasPrefix("read it") || c.contains("read this sign") || c.contains("read that sign") || c.contains("read the menu")) || c.contains("read it") || c.contains("read me")
             || c.contains("what does this say") || c.contains("what does that say")
             || (c.contains("what does") && c.contains("say")) {
-            speak("Reading.")
+            speak("Reading that now.")
             QuickVisionManager.shared.triggerQuickVision(customPrompt:
                 "Read ALL visible text in this image aloud, verbatim and in order. If it is in another language, read it then translate it. No commentary.")
             return
@@ -2533,14 +3127,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
         if c.contains("what's this") || c.contains("what is this") || c.contains("what am i looking at")
             || c.contains("what's that") || c.contains("what is that") || c.contains("look at this") {
-            speak("Looking.")
+            speak("Having a look.")
             QuickVisionManager.shared.triggerQuickVision()
             return
         }
         // AUTO-ESCALATION: if this is really a conversation, don't fake it
         // with a one-shot — hand it to Live AI and carry the question over.
         if needsDeepSession(c) {
-            speak("That needs a proper chat - opening Live AI.")
+            speak("That deserves a proper conversation - give me a moment.")
             UserDefaults.standard.set(c, forKey: "chappy_pending_question")
             handOff()
             NotificationCenter.default.post(name: .liveAITriggered, object: nil)
@@ -2712,6 +3306,25 @@ final class ChappyStandby: NSObject, ObservableObject {
         return ChappyIntent.Result(action: action, parameter: parameter, mode: nil)
     }
 
+    /// BUILD 90: after a route is found, OFFER the real thing.
+    /// Chappy's own map is a picture — it shows the line but gives no lane
+    /// guidance, no live traffic, no rerouting. For walking to the shops that
+    /// is enough; for driving to Brisbane airport it is not. So the offer is
+    /// made out loud, and "yes" opens Google Maps already navigating.
+    private var expectingMapsAnswerUntil = Date.distantPast
+    /// Set by the translate view while it is on screen, so a language change
+    /// retargets the live session instead of opening a second one.
+    static var LiveTranslateIsOpen = false
+    private var LiveTranslateIsOpen: Bool { Self.LiveTranslateIsOpen }
+
+    func offerGoogleMaps(driving: Bool) {
+        expectingMapsAnswerUntil = Date().addingTimeInterval(10)
+        if !isListening { silentArm = true; start() }
+        TTSService.shared.speak(driving
+            ? "Want turn by turn in Google Maps?"
+            : "Want me to open it in Google Maps?")
+    }
+
     /// Strip text written for the MODEL out of anything spoken to a HUMAN.
     /// NavEngine returns one string to two audiences and the tail is an
     /// instruction to the model; the wearer should never hear it.
@@ -2742,7 +3355,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             if homeWords.contains(p.lowercased()) {
                 // AUDIT P2: getHome()'s string is written for the MODEL and
                 // contains "Tell the user:". Standby speaks it verbatim.
-                speak("Heading home.")
+                speak("Right, heading home.")
                 let r = await NavEngine.shared.getHome()
                 speak(NavEngine.shared.spokenRouteSummary ?? Self.stripModelDirectives(r))
                 return true
@@ -2767,7 +3380,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             var code = p.isEmpty ? nil : Self.languageCode(forName: p)
             if code == "en" { code = nil } // fall through to the local language
             guard let target = code ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode) else {
-                speak("I don't have that language yet."); return true
+                speak("I don't speak that one yet, sorry."); return true
             }
             UserDefaults.standard.set("en", forKey: "translate_source_language")
             UserDefaults.standard.set(target, forKey: "translate_target_language")
@@ -2779,18 +3392,18 @@ final class ChappyStandby: NSObject, ObservableObject {
             return true
 
         case "look":
-            speak("Looking.")
+            speak("Having a look.")
             QuickVisionManager.shared.triggerQuickVision(customPrompt: p.isEmpty ? nil : "Look and answer: \(p)")
             return true
 
         case "photo":
             NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
-            // AUDIT P1: this said "Photo taken." unconditionally, re-introducing
+            // AUDIT P1: this said "Got it." unconditionally, re-introducing
             // a bug the ladder had already fixed. With the phone pocketed and
             // the camera not streaming, nothing is captured and Chappy claims
             // success — the wearer walks off believing he has the shot.
             if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
-                ChappyEarcon.shared.done(); speak("Photo taken.")
+                ChappyEarcon.shared.done(); speak("Got it.")
             } else {
                 ChappyEarcon.shared.fail()
                 speak("Camera isn't running - open Talk or Look first.")
@@ -2805,7 +3418,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // find out weeks later when the spot is in the ocean.
                 if spot.lat == 0 && spot.lon == 0 {
                     ChappyEarcon.shared.fail()
-                    speak("Saved, but GPS hasn't locked yet.")
+                    speak("Saved it, though GPS hasn't settled - it may be a little off.")
                 } else {
                     ChappyEarcon.shared.done()
                     ChappyHaptics.shared.straightStep()
@@ -2819,7 +3432,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak("Map's up."); return true
 
         case "watch":
-            speak("Watching."); handOff()
+            speak("Eyes open."); handOff()
             NotificationCenter.default.post(name: .continuousVisionTriggered, object: nil)
             return true
 
@@ -2837,7 +3450,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             TTSService.shared.stop()
             ChappyHaptics.shared.straightStep()
             if NavEngine.shared.isNavigating {
-                speak("Stop navigation too, or just quiet?")
+                speak("Just quiet, or stop the route as well?")
             }
             return true
 
@@ -2900,7 +3513,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
         }
         TripRecorder.shared.addObservation("Computer job: \(job)")
-        speak("Job saved for the computer: \(job). It runs when the computer's awake.")
+        speak("Right, I'll get the computer onto \(job) when it's awake.")
     }
 
     // MARK: Helpers
@@ -3286,7 +3899,7 @@ final class CostMeter {
             UserDefaults.standard.set(warned, forKey: spokenKey)
             DispatchQueue.main.async {
                 Task { @MainActor in ChappyHaptics.shared.costNudge() }
-                TTSService.shared.speak("Heads up - roughly \(Int(threshold)) dollars of AI usage today.")
+                TTSService.shared.speak("Quick heads up - you're around \(Int(threshold)) dollars for the day.")
             }
         }
     }
@@ -3560,6 +4173,10 @@ final class TripRecorder {
         /// `var` so a spot can be renamed by voice straight after saving —
         /// "spot at 4:53PM" is not a memory you can use six weeks later.
         var name: String
+        /// PHASE 5: the id of this spot's entry in ChappyMemory, so a rename
+        /// here renames it there too. Optional so every spot saved before
+        /// Phase 5 still decodes.
+        var memID: UUID?
         let t: Date
         let lat: Double
         let lon: Double
@@ -3588,6 +4205,85 @@ final class TripRecorder {
         return docs.appendingPathComponent("chappy-notes-\(df.string(from: date)).json")
     }
     private(set) var notes: [String] = []
+
+    /// BUILD 99 — SILENT CAPTURE.
+    /// A photo on its own is a photo. A photo with one line describing it is
+    /// something you can find again: "the handwritten sign outside the warung",
+    /// "the blue scooter with the dented panel". The description is what makes
+    /// a gallery searchable, and it costs a fraction of a cent per shot.
+    ///
+    /// Deliberately built BEFORE the memory phase rather than after. Every shot
+    /// taken between now and then arrives already labelled — wait, and you land
+    /// in Indonesia with a gallery of unlabelled images and a memory store with
+    /// nothing to work with.
+    struct VisualNote: Codable, Identifiable {
+        var id: UUID = UUID()
+        let at: Date
+        /// One line, generated quietly. Never spoken unless asked.
+        var caption: String
+        let lat: Double
+        let lon: Double
+        var street: String?
+        var city: String?
+        /// Small JPEG. Full resolution stays in the photo library.
+        var thumbnail: Data?
+        /// PHASE 5: the matching ChappyMemory entry, so a caption that lands
+        /// a second after the shutter updates both.
+        var memID: UUID?
+    }
+
+    private(set) var visualNotes: [VisualNote] = []
+
+    private var visualNotesURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("chappy-visual-notes.json")
+    }
+
+    func loadVisualNotes() {
+        guard let d = try? Data(contentsOf: visualNotesURL),
+              let n = try? JSONDecoder().decode([VisualNote].self, from: d) else { return }
+        visualNotes = n
+    }
+
+    @discardableResult
+    func addVisualNote(caption: String, thumbnail: Data?) -> VisualNote {
+        let snap = ContextEngine.shared.snapshot
+        var note = VisualNote(at: Date(), caption: caption,
+                              lat: snap.latitude ?? 0, lon: snap.longitude ?? 0,
+                              street: snap.street, city: snap.city,
+                              thumbnail: thumbnail)
+        // PHASE 5 — WRITE THROUGH TO THE ONE SPOT.
+        // TripRecorder keeps its own copy because the home screen counts and
+        // the "what did I photograph today" answer already read from it, and
+        // breaking a certified Phase 4 path to tidy up storage is a bad trade.
+        // The memory store is what SEARCH and RECALL read; this is the sensor
+        // buffer that feeds it.
+        let mem = ChappyMemory.shared.remember(.photo, title: caption,
+                                               tags: ["snap", "photo"],
+                                               thumbnail: thumbnail,
+                                               source: "snap")
+        note.memID = mem.id
+        visualNotes.append(note)
+        if visualNotes.count > 500 { visualNotes.removeFirst(visualNotes.count - 500) }
+        if let d = try? JSONEncoder().encode(visualNotes) { try? d.write(to: visualNotesURL) }
+        print("📸 [Trip] Visual note: \(caption)")
+        return note
+    }
+
+    func updateCaption(id: UUID, to caption: String) {
+        guard let i = visualNotes.firstIndex(where: { $0.id == id }) else { return }
+        visualNotes[i].caption = caption
+        if let mid = visualNotes[i].memID {
+            ChappyMemory.shared.relabel(id: mid, to: caption)
+        }
+        if let d = try? JSONEncoder().encode(visualNotes) { try? d.write(to: visualNotesURL) }
+        print("📸 [Trip] Captioned: \(caption)")
+    }
+
+    /// "What did I photograph today?"
+    func todaysVisualNotes() -> [VisualNote] {
+        visualNotes.filter { Calendar.current.isDateInToday($0.at) }
+    }
 
     private init() {
         if let d = try? Data(contentsOf: crumbsURL(for: Date())),
@@ -3647,10 +4343,19 @@ final class TripRecorder {
             name = "spot at \(df.string(from: Date()))"
             if let s = snap.street { name += " near \(s)" }
         }
-        let spot = Spot(name: name, t: Date(),
+        var spot = Spot(name: name, t: Date(),
                         lat: snap.latitude ?? lastCrumb?.lat ?? 0,
                         lon: snap.longitude ?? lastCrumb?.lon ?? 0,
                         street: snap.street, city: snap.city, country: snap.country)
+        // PHASE 5 — write through to the one spot.
+        let mem = ChappyMemory.shared.rememberAt(.place, title: name,
+                                                 lat: spot.lat == 0 ? nil : spot.lat,
+                                                 lon: spot.lon == 0 ? nil : spot.lon,
+                                                 street: spot.street, city: spot.city,
+                                                 country: spot.country,
+                                                 tags: ["spot", "saved"],
+                                                 source: "remember")
+        spot.memID = mem.id
         spots.append(spot)
         saveSpots()
         print("📍 [Trip] Remembered spot: \(name)")
@@ -3665,6 +4370,9 @@ final class TripRecorder {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.count <= 60, !spots.isEmpty else { return false }
         spots[spots.count - 1].name = trimmed
+        if let mid = spots[spots.count - 1].memID {
+            ChappyMemory.shared.relabel(id: mid, to: trimmed)
+        }
         saveSpots()
         print("📍 [Trip] Renamed last spot to: \(trimmed)")
         return true
@@ -3724,12 +4432,42 @@ final class TripRecorder {
         let snap = ContextEngine.shared.snapshot
         if let s = snap.street { line += " (near \(s))" }
         notes.append(line)
+        // PHASE 5 — the observation itself, without the time prefix (the store
+        // has a real timestamp, so a time inside the text is just noise).
+        ChappyMemory.shared.remember(.note, title: text,
+                                     tags: ["note", "observation"],
+                                     source: "journal")
         let snapshot = notes
         let url = notesURL(for: Date())
         ioQueue.async {
             if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
         }
         print("📝 [Trip] Observation: \(text)")
+    }
+
+    /// PHASE 5 — THE BREADCRUMB TRICK.
+    ///
+    /// The crumb closest in time to `when`. This is what places a photo that
+    /// carries no GPS of its own: the glasses have no receiver, so a capture
+    /// may arrive with a timestamp and nothing else — but the trail already
+    /// knows where you were every twenty-five metres all day, app open or not.
+    ///
+    /// Reads the day file when the date is not today, so a photo that syncs
+    /// three days late still lands in the right street.
+    func nearestCrumb(to when: Date, within: TimeInterval = 900) -> Crumb? {
+        let pool: [Crumb]
+        if Calendar.current.isDateInToday(when) {
+            pool = crumbs
+        } else if let d = try? Data(contentsOf: crumbsURL(for: when)),
+                  let c = try? JSONDecoder().decode([Crumb].self, from: d) {
+            pool = c
+        } else {
+            return nil
+        }
+        guard let best = pool.min(by: {
+            abs($0.t.timeIntervalSince(when)) < abs($1.t.timeIntervalSince(when))
+        }), abs(best.t.timeIntervalSince(when)) <= within else { return nil }
+        return best
     }
 
     /// Spoken guidance for "trace my steps back" — the day's route in reverse.
@@ -3895,6 +4633,41 @@ final class NavEngine: NSObject, ObservableObject {
         return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction). Also tell the user: say 'open Google Maps' anytime for the full map with turn-by-turn on screen."
     }
 
+    /// PHASE 5 — "take me back" from a memory card.
+    ///
+    /// Deliberately does NOT re-run the place search. The memory already holds
+    /// the exact coordinates you stood at; looking the name up again finds a
+    /// DIFFERENT warung with the same name three streets over, which is the
+    /// single most annoying way for a memory to be wrong.
+    func navigateBack(to dest: CLLocationCoordinate2D, name: String, driving: Bool = false) {
+        Task { @MainActor in
+            let snap = ContextEngine.shared.snapshot
+            guard let lat = snap.latitude, let lon = snap.longitude else {
+                TTSService.shared.speak("No GPS fix yet - give it a few seconds and try again.")
+                return
+            }
+            var routed = await googleRoute(fromLat: lat, fromLon: lon, to: dest, driving: driving)
+            if routed == nil {
+                routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: dest, driving: driving)
+            }
+            guard let route = routed, !route.steps.isEmpty else {
+                TTSService.shared.speak("I couldn't find a route back to \(name).")
+                return
+            }
+            steps = route.steps
+            routeCoords = route.coords
+            destinationCoord = dest
+            destinationName = name
+            stepIndex = 0
+            isNavigating = true
+            ContextEngine.shared.setPrecision(navigating: true)
+            updateCard()
+            let mins = max(1, Int(route.durationSec / 60))
+            spokenRouteSummary = "Back to \(name). Roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(route.steps[0].instruction)"
+            TTSService.shared.speak(spokenRouteSummary)
+        }
+    }
+
     func getHome() async -> String {
         if let home = TripRecorder.shared.spots.last(where: { ["home", "hotel", "my hotel", "the hotel"].contains($0.name.lowercased()) }) {
             return await navigate(to: home.name)
@@ -3910,7 +4683,7 @@ final class NavEngine: NSObject, ObservableObject {
         nextInstruction = ""
         distanceText = ""
         destinationCoord = nil
-        if announce { TTSService.shared.speak("Navigation stopped.") }
+        if announce { TTSService.shared.speak("Route's off.") }
     }
 
     /// Fed by ContextEngine on every fix: speaks turns, detects off-route.
@@ -3921,7 +4694,7 @@ final class NavEngine: NSObject, ObservableObject {
             if dw < 150 {
                 watchTarget = nil
                 ChappyHaptics.shared.proximity()
-                speakNav("Heads up - you are about \(Int(dw)) meters from \(w.name).")
+                speakNav("\(w.name) is about \(Int(dw)) meters away.")
             }
         }
         guard isNavigating, stepIndex < steps.count else { return }
@@ -3953,7 +4726,7 @@ final class NavEngine: NSObject, ObservableObject {
             if nearest > 60 {
                 lastReroute = Date()
                 ChappyHaptics.shared.offRoute()
-                speakNav("You are off the route. Recalculating.")
+                speakNav("You've come off the route. Give me a second.")
                 let name = destinationName
                 Task { _ = await self.navigate(to: name) }
             }
@@ -4076,5 +4849,1604 @@ final class NavEngine: NSObject, ObservableObject {
             coords.append(CLLocationCoordinate2D(latitude: Double(lat) / 1e5, longitude: Double(lon) / 1e5))
         }
         return coords
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY MEMORY (PHASE 5 — STEP 1: THE ONE SPOT)
+// =====================================================================
+//
+// Everything Chappy remembers now lands in ONE place, in ONE format.
+//
+// Before this, memory was scattered across four different files with four
+// different shapes: spots in chappy-spots.json, observations in
+// chappy-notes-<date>.json, photos in chappy-visual-notes.json, and
+// translate conversations nowhere at all. Nothing could be searched across,
+// nothing shared a timestamp format, and "what was that place on Tuesday"
+// had no single thing to ask.
+//
+// WHY AN APPEND-ONLY LOG AND NOT A DATABASE
+// SQLite was the plan on paper. A log won for four practical reasons that
+// matter more on a phone in Indonesia than they do on a desk:
+//   1. CRASH-SAFE BY CONSTRUCTION. A memory is one line, written once, never
+//      rewritten. A crash mid-write loses at most the line being written —
+//      never the file. Every rewrite-the-whole-array store we already have
+//      can lose the lot.
+//   2. NO MIGRATIONS. Adding a field to a JSON line is free. Adding a column
+//      to SQLite on a phone you cannot debug in the field is not.
+//   3. HUMAN-READABLE. Every entry is a line of text you can read, grep,
+//      export, or email to yourself. If the app ever dies for good, the
+//      memories survive as a folder of readable files.
+//   4. DELETABLE BY DAY. One file per day means "forget last Tuesday" is a
+//      file deletion, not a query.
+// Speed is not a concern at this scale: a heavy day is ~40 KB, a year ~15 MB,
+// and search only ever parses the days it needs.
+//
+// TWO LEVELS
+//   RAW LOG      — every event, timestamped, categorised, located.
+//   DAY SUMMARY  — one paragraph per day, written after the fact.
+// Recall over months reads summaries first (small, fast, cheap to feed an AI)
+// and only drills into the raw log for the day it lands on. That is the same
+// shape a human diary has, and for the same reason.
+//
+// WHAT IS NOT STORED
+// Credentials, tokens, passwords — never, by law of the master plan. Full-
+// resolution photos stay in the photo library; memory keeps a thumbnail.
+// Verbatim translate transcripts carry an expiry (see `expires`) because a
+// recording of somebody else talking is not the same kind of thing as a note
+// you wrote about your own day.
+
+final class ChappyMemory: ObservableObject {
+    static let shared = ChappyMemory()
+
+    // MARK: Categories
+    //
+    // Deliberately few. Nine buckets a person can hold in their head beats
+    // forty an algorithm assigned. Free-text `tags` carry the fine detail.
+    enum Kind: String, Codable, CaseIterable, Identifiable {
+        case place        // a spot you saved
+        case photo        // a silent snap, captioned
+        case video        // a clip the glasses recorded, summarised
+        case note         // an observation, yours or Chappy's
+        case talk         // a translated conversation
+        case scan         // a document or menu read
+        case route        // somewhere you navigated to
+        case ask          // something you asked and the answer
+        case spend        // money noted
+        case day          // the day's own summary paragraph
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .place: return "Places"
+            case .photo: return "Photos"
+            case .video: return "Videos"
+            case .note:  return "Notes"
+            case .talk:  return "Talks"
+            case .scan:  return "Scans"
+            case .route: return "Trips"
+            case .ask:   return "Asked"
+            case .spend: return "Spend"
+            case .day:   return "Days"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .place: return "mappin.circle.fill"
+            case .photo: return "camera.fill"
+            case .video: return "video.fill"
+            case .note:  return "text.alignleft"
+            case .talk:  return "bubble.left.and.bubble.right.fill"
+            case .scan:  return "doc.text.viewfinder"
+            case .route: return "arrow.triangle.turn.up.right.circle.fill"
+            case .ask:   return "questionmark.circle.fill"
+            case .spend: return "creditcard.fill"
+            case .day:   return "book.closed.fill"
+            }
+        }
+    }
+
+    // MARK: The entry
+    //
+    // Every field except id/at/kind/title is optional on purpose: a memory
+    // written with no GPS fix is still a memory, and refusing to store it
+    // because the sky was cloudy is how you end up with gaps.
+    struct Entry: Codable, Identifiable, Equatable {
+        var id: UUID = UUID()
+        /// WHEN. Always set. Encoded as ISO-8601 so the raw file is readable.
+        var at: Date
+        /// WHAT KIND. The one required category.
+        var kind: Kind
+        /// THE LABEL — one short line, the thing you read in a list.
+        var title: String
+        /// THE DETAIL — the full text, if there is more than the label.
+        var body: String = ""
+        /// WHERE.
+        var lat: Double?
+        var lon: Double?
+        var street: String?
+        var city: String?
+        var country: String?
+        /// A resolved place name when one is known (Phase 5 Step 4 fills this
+        /// from Google Places; stored as TEXT so it works offline forever).
+        var place: String?
+        /// Free-text tags for search. Lowercase, no spaces inside a tag.
+        var tags: [String] = []
+        /// True when a thumbnail JPEG exists on disk under this id.
+        var hasPhoto: Bool = false
+        /// Pinned memories survive every sweep and sort to the top of a day.
+        var pinned: Bool = false
+        /// Set for anything that should age out on its own. Nil = keep forever.
+        var expires: Date?
+        /// Which part of Chappy wrote this. Useful when a module misbehaves.
+        var source: String = ""
+        /// PHOTO LIBRARY LINK. The PhotoKit local identifier of the original,
+        /// for anything imported from the glasses. Memory holds a thumbnail
+        /// and a summary; the full-resolution file stays in the library and
+        /// this is how we get back to it. Nil for everything Chappy made itself.
+        var assetID: String?
+
+        /// One line for a list row, and for feeding an AI cheaply.
+        var oneLine: String {
+            var s = title
+            if let p = place ?? street ?? city, !p.isEmpty { s += " — \(p)" }
+            return s
+        }
+
+        /// Everything searchable about this entry, folded once.
+        var searchBlob: String {
+            ([title, body, place ?? "", street ?? "", city ?? "", country ?? ""]
+                + tags + [kind.rawValue, kind.label])
+                .joined(separator: " ")
+                .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        }
+    }
+
+    // MARK: Published state (UI reads this; only ever written on main)
+    @Published private(set) var recent: [Entry] = []
+    @Published private(set) var isSearchingDisk = false
+    @Published private(set) var lastError: String?
+
+    /// How many days of log are held in memory for instant search.
+    /// Older days live on disk and are read only when a search asks for them.
+    static let hotDays = 30
+
+    private let io = DispatchQueue(label: "chappy.memory.io", qos: .utility)
+    private let thumbCache = NSCache<NSString, UIImage>()
+    private var summaries: [String: String] = [:]   // "yyyy-MM-dd" -> paragraph
+
+    // MARK: Paths
+
+    private var docs: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+    /// Documents/ChappyMemory/
+    ///
+    /// NOT `lazy`. A lazy var is initialised on whichever thread touches it
+    /// first and Swift does not synchronise that — and these are touched from
+    /// the main thread (a write starting) and the io queue (a search running)
+    /// at the same time. Built eagerly by a static function instead, which
+    /// runs once, before anything can race for it.
+    private static func makeDir(_ sub: String?) -> URL {
+        var u = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ChappyMemory", isDirectory: true)
+        if let s = sub { u = u.appendingPathComponent(s, isDirectory: true) }
+        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+        return u
+    }
+    private(set) var root: URL = ChappyMemory.makeDir(nil)
+    private var thumbsDir: URL = ChappyMemory.makeDir("thumbs")
+    private var summariesURL: URL { root.appendingPathComponent("summaries.json") }
+
+    static let dayKeyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    static func dayKey(_ d: Date) -> String { dayKeyFormatter.string(from: d) }
+
+    private func dayURL(_ d: Date) -> URL {
+        root.appendingPathComponent("day-\(Self.dayKey(d)).jsonl")
+    }
+    private func thumbURL(_ id: UUID) -> URL {
+        thumbsDir.appendingPathComponent("\(id.uuidString).jpg")
+    }
+
+    // MARK: Codec
+    //
+    // One encoder/decoder, made once. JSONEncoder is not cheap to build and
+    // this runs on every single memory written.
+    private let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601      // readable in the raw file
+        e.outputFormatting = []                // ONE LINE per entry — required
+        return e
+    }()
+    private let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
+    private init() {
+        loadSummaries()
+        loadHotDays()
+    }
+
+    // MARK: - Writing
+
+    /// THE ONE WAY IN. Every module that wants to remember something calls
+    /// this and nothing else.
+    ///
+    /// Returns the stored entry so a caller can update it later (a photo whose
+    /// caption arrives from the network a second after the shutter, say).
+    @discardableResult
+    func remember(_ kind: Kind,
+                  title: String,
+                  body: String = "",
+                  tags: [String] = [],
+                  thumbnail: Data? = nil,
+                  expiresInDays: Int? = nil,
+                  source: String = "",
+                  at when: Date = Date(),
+                  assetID: String? = nil) -> Entry {
+
+        let snap = ContextEngine.shared.snapshot
+        var e = Entry(at: when, kind: kind,
+                      title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                      body: body)
+        e.lat = snap.latitude
+        e.lon = snap.longitude
+        e.street = snap.street
+        e.city = snap.city
+        e.country = snap.country
+        e.tags = normalise(tags)
+        e.source = source
+        e.assetID = assetID
+        e.hasPhoto = (thumbnail != nil)
+        if let d = expiresInDays {
+            e.expires = Calendar.current.date(byAdding: .day, value: d, to: when)
+        }
+        if e.title.isEmpty { e.title = fallbackTitle(for: kind, at: when) }
+
+        write(e, thumbnail: thumbnail)
+        return e
+    }
+
+    /// Store an entry that already knows its own location (migration, or a
+    /// memory about somewhere you are not standing right now).
+    @discardableResult
+    func rememberAt(_ kind: Kind, title: String, body: String = "",
+                    lat: Double?, lon: Double?, street: String? = nil,
+                    city: String? = nil, country: String? = nil,
+                    tags: [String] = [], thumbnail: Data? = nil,
+                    expiresInDays: Int? = nil, source: String = "",
+                    at when: Date = Date(), assetID: String? = nil) -> Entry {
+        var e = Entry(at: when, kind: kind,
+                      title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                      body: body)
+        e.lat = lat; e.lon = lon
+        e.street = street; e.city = city; e.country = country
+        e.tags = normalise(tags)
+        e.source = source
+        e.assetID = assetID
+        e.hasPhoto = (thumbnail != nil)
+        if let d = expiresInDays {
+            e.expires = Calendar.current.date(byAdding: .day, value: d, to: when)
+        }
+        if e.title.isEmpty { e.title = fallbackTitle(for: kind, at: when) }
+        write(e, thumbnail: thumbnail)
+        return e
+    }
+
+    /// Append one line to the day file. Never rewrites, never blocks the caller.
+    private func write(_ e: Entry, thumbnail: Data?) {
+        // Publish immediately so the UI and any in-flight search see it now.
+        setRecent(insert: e)
+
+        let url = dayURL(e.at)
+        let thumbURL = self.thumbURL(e.id)
+        io.async { [weak self] in
+            guard let self else { return }
+            guard var line = try? self.encoder.encode(e) else {
+                self.setError("Could not encode a memory"); return
+            }
+            line.append(0x0A)   // newline — this is what makes it a JSONL file
+            do {
+                if FileManager.default.fileExists(atPath: url.path) {
+                    // APPEND. The whole point: never rewrite what is already safe.
+                    let h = try FileHandle(forWritingTo: url)
+                    defer { try? h.close() }
+                    try h.seekToEnd()
+                    try h.write(contentsOf: line)
+                } else {
+                    try line.write(to: url, options: .atomic)
+                }
+                if let t = thumbnail { try? t.write(to: thumbURL, options: .atomic) }
+            } catch {
+                self.setError("Memory write failed: \(error.localizedDescription)")
+                print("⚠️ [Memory] write failed: \(error.localizedDescription)")
+            }
+        }
+        print("🧠 [Memory] \(e.kind.rawValue): \(e.title)")
+    }
+
+    /// Change the label of an entry already written (captions arrive late;
+    /// spots get renamed by voice two seconds after being saved).
+    func relabel(id: UUID, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        mutate(id: id) { $0.title = trimmed }
+    }
+
+    func setPinned(id: UUID, _ pinned: Bool) {
+        mutate(id: id) { $0.pinned = pinned; if pinned { $0.expires = nil } }
+    }
+
+    func addTag(id: UUID, _ tag: String) {
+        let t = normalise([tag])
+        guard let first = t.first else { return }
+        mutate(id: id) { if !$0.tags.contains(first) { $0.tags.append(first) } }
+    }
+
+    /// A rewrite of ONE day file. Rare by design — the log is append-only for
+    /// everything that happens in the normal course of a day, and this path
+    /// only runs when you deliberately edit or delete a memory.
+    private func mutate(id: UUID, _ change: @escaping (inout Entry) -> Void) {
+        guard let existing = (recent.first { $0.id == id }) else {
+            // Not hot — find it on disk.
+            io.async { [weak self] in
+                guard let self else { return }
+                for url in self.dayFiles() {
+                    var entries = self.readDay(url)
+                    guard let i = entries.firstIndex(where: { $0.id == id }) else { continue }
+                    change(&entries[i])
+                    self.rewrite(day: url, entries: entries)
+                    let updated = entries[i]
+                    self.setRecent(replace: updated)
+                    return
+                }
+            }
+            return
+        }
+        var copy = existing
+        change(&copy)
+        setRecent(replace: copy)
+        let url = dayURL(copy.at)
+        io.async { [weak self] in
+            guard let self else { return }
+            var entries = self.readDay(url)
+            if let i = entries.firstIndex(where: { $0.id == id }) {
+                entries[i] = copy
+                self.rewrite(day: url, entries: entries)
+            }
+        }
+    }
+
+    /// Delete one memory (and its thumbnail).
+    func forget(id: UUID) {
+        setRecent(remove: id)
+        let thumb = thumbURL(id)
+        io.async { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.removeItem(at: thumb)
+            for url in self.dayFiles() {
+                var entries = self.readDay(url)
+                guard entries.contains(where: { $0.id == id }) else { continue }
+                entries.removeAll { $0.id == id }
+                self.rewrite(day: url, entries: entries)
+                return
+            }
+        }
+    }
+
+    /// Delete a whole day. One file, one deletion — this is the reason the
+    /// log is split by day in the first place.
+    func forgetDay(_ d: Date) {
+        let url = dayURL(d)
+        let key = Self.dayKey(d)
+        let ids = recent.filter { Self.dayKey($0.at) == key }.map { $0.id }
+        for i in ids { setRecent(remove: i) }
+        io.async { [weak self] in
+            guard let self else { return }
+            for e in self.readDay(url) where e.hasPhoto {
+                try? FileManager.default.removeItem(at: self.thumbURL(e.id))
+            }
+            try? FileManager.default.removeItem(at: url)
+            DispatchQueue.main.async {
+                self.summaries.removeValue(forKey: key)
+                self.saveSummaries()
+            }
+        }
+    }
+
+    private func rewrite(day url: URL, entries: [Entry]) {
+        var out = Data()
+        for e in entries {
+            guard var line = try? encoder.encode(e) else { continue }
+            line.append(0x0A)
+            out.append(line)
+        }
+        if out.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        } else {
+            try? out.write(to: url, options: .atomic)
+        }
+    }
+
+    // MARK: - Reading
+
+    private func dayFiles() -> [URL] {
+        let all = (try? FileManager.default.contentsOfDirectory(at: root,
+                     includingPropertiesForKeys: nil)) ?? []
+        return all.filter { $0.lastPathComponent.hasPrefix("day-")
+                         && $0.pathExtension == "jsonl" }
+                  .sorted { $0.lastPathComponent > $1.lastPathComponent }   // newest first
+    }
+
+    /// Parse one day file. A corrupt line is skipped, never fatal — losing one
+    /// memory to a bad write is survivable; losing the day is not.
+    private func readDay(_ url: URL) -> [Entry] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        var out: [Entry] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let d = line.data(using: .utf8),
+                  let e = try? decoder.decode(Entry.self, from: d) else {
+                print("⚠️ [Memory] skipped an unreadable line in \(url.lastPathComponent)")
+                continue
+            }
+            out.append(e)
+        }
+        return out
+    }
+
+    /// Load the hot window at launch. Runs off the main thread; publishes once.
+    private func loadHotDays() {
+        io.async { [weak self] in
+            guard let self else { return }
+            let files = self.dayFiles().prefix(Self.hotDays)
+            var all: [Entry] = []
+            for f in files { all.append(contentsOf: self.readDay(f)) }
+            let swept = self.sweepExpired(all)
+            let sorted = swept.sorted { $0.at > $1.at }
+            DispatchQueue.main.async {
+                self.recent = sorted
+                print("🧠 [Memory] \(sorted.count) memories loaded from \(files.count) days")
+            }
+        }
+    }
+
+    /// Force a reload (after a migration, or a restore from backup).
+    func reload() { loadHotDays(); loadSummaries() }
+
+    /// Drop anything past its expiry that is not pinned. Verbatim conversation
+    /// transcripts are the reason this exists.
+    @discardableResult
+    private func sweepExpired(_ entries: [Entry]) -> [Entry] {
+        let now = Date()
+        let dead = entries.filter { e in
+            guard let x = e.expires, !e.pinned else { return false }
+            return x < now
+        }
+        guard !dead.isEmpty else { return entries }
+        print("🧹 [Memory] \(dead.count) expired memories swept")
+        let deadIDs = Set(dead.map { $0.id })
+        // Rewrite each affected day once.
+        let days = Set(dead.map { Self.dayKey($0.at) })
+        for key in days {
+            guard let d = Self.dayKeyFormatter.date(from: key) else { continue }
+            let url = dayURL(d)
+            var kept = readDay(url)
+            kept.removeAll { deadIDs.contains($0.id) }
+            rewrite(day: url, entries: kept)
+        }
+        for e in dead where e.hasPhoto {
+            try? FileManager.default.removeItem(at: thumbURL(e.id))
+        }
+        return entries.filter { !deadIDs.contains($0.id) }
+    }
+
+    // MARK: - Search
+    //
+    // TWO TIERS, same shape as the command router.
+    //   Tier 1 — the hot window, in memory, instant, free, works on a plane.
+    //   Tier 2 — the whole history, read from disk on a background queue.
+    // Nothing here calls the network. Tier 3 (asking an AI to interpret a
+    // fuzzy question) plugs in later on top of these, not instead of them.
+
+    struct Query {
+        var text: String = ""
+        var kinds: Set<Kind> = []
+        var from: Date?
+        var to: Date?
+        var pinnedOnly = false
+        var photosOnly = false
+
+        var isEmpty: Bool {
+            text.trimmingCharacters(in: .whitespaces).isEmpty
+                && kinds.isEmpty && from == nil && to == nil
+                && !pinnedOnly && !photosOnly
+        }
+    }
+
+    /// Instant, offline, over the hot window.
+    func search(_ q: Query) -> [Entry] { Self.match(recent, q) }
+
+    /// The whole history. Calls back on the main thread.
+    func searchEverything(_ q: Query, completion: @escaping ([Entry]) -> Void) {
+        DispatchQueue.main.async { self.isSearchingDisk = true }
+        io.async { [weak self] in
+            guard let self else { return }
+            var all: [Entry] = []
+            for f in self.dayFiles() { all.append(contentsOf: self.readDay(f)) }
+            let hits = Self.match(all, q).sorted { $0.at > $1.at }
+            DispatchQueue.main.async {
+                self.isSearchingDisk = false
+                completion(hits)
+            }
+        }
+    }
+
+    /// The matcher. Every word in the query must appear somewhere in the
+    /// entry — AND, not OR. "laksa warung" should not return every warung.
+    static func match(_ entries: [Entry], _ q: Query) -> [Entry] {
+        let needle = q.text
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .split(whereSeparator: { $0 == " " || $0 == "," })
+            .map(String.init)
+            .filter { $0.count > 1 || $0.allSatisfy(\.isNumber) }
+
+        return entries.filter { e in
+            if !q.kinds.isEmpty && !q.kinds.contains(e.kind) { return false }
+            if q.pinnedOnly && !e.pinned { return false }
+            if q.photosOnly && !e.hasPhoto { return false }
+            if let f = q.from, e.at < f { return false }
+            if let t = q.to, e.at > t { return false }
+            guard !needle.isEmpty else { return true }
+            let blob = e.searchBlob
+            for w in needle where !blob.contains(w) { return false }
+            return true
+        }
+        .sorted {
+            if $0.pinned != $1.pinned { return $0.pinned }
+            return $0.at > $1.at
+        }
+    }
+
+    /// Grouped by day, newest day first — the shape the browser draws.
+    func grouped(_ entries: [Entry]) -> [(key: String, day: Date, items: [Entry])] {
+        var buckets: [String: [Entry]] = [:]
+        for e in entries { buckets[Self.dayKey(e.at), default: []].append(e) }
+        return buckets.keys.sorted(by: >).compactMap { key in
+            guard let d = Self.dayKeyFormatter.date(from: key) else { return nil }
+            let items = (buckets[key] ?? []).sorted {
+                if $0.pinned != $1.pinned { return $0.pinned }
+                return $0.at > $1.at
+            }
+            return (key: key, day: d, items: items)
+        }
+    }
+
+    // MARK: - Day summaries
+
+    func summary(for day: Date) -> String? { summaries[Self.dayKey(day)] }
+
+    func setSummary(_ text: String, for day: Date) {
+        summaries[Self.dayKey(day)] = text
+        saveSummaries()
+    }
+
+    private func loadSummaries() {
+        io.async { [weak self] in
+            guard let self,
+                  let d = try? Data(contentsOf: self.summariesURL),
+                  let s = try? JSONDecoder().decode([String: String].self, from: d)
+            else { return }
+            DispatchQueue.main.async { self.summaries = s }
+        }
+    }
+
+    private func saveSummaries() {
+        let snapshot = summaries
+        let url = summariesURL
+        io.async {
+            if let d = try? JSONEncoder().encode(snapshot) {
+                try? d.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    /// A local, free, offline summary of a day — no AI needed. This is the
+    /// floor; the AI version (Phase 5 Step 3, "Dreaming") replaces the text
+    /// but not the plumbing.
+    func localSummary(for day: Date) -> String {
+        let key = Self.dayKey(day)
+        let items = recent.filter { Self.dayKey($0.at) == key }
+        guard !items.isEmpty else { return "Nothing recorded." }
+        var counts: [Kind: Int] = [:]
+        for i in items { counts[i.kind, default: 0] += 1 }
+        var places: [String] = []
+        for i in items {
+            if let p = i.place ?? i.street ?? i.city, !places.contains(p) { places.append(p) }
+        }
+        var parts: [String] = []
+        for k in Kind.allCases where (counts[k] ?? 0) > 0 && k != .day {
+            parts.append("\(counts[k] ?? 0) \(k.label.lowercased())")
+        }
+        var out = parts.joined(separator: ", ")
+        if !places.isEmpty {
+            out += " — around " + places.prefix(4).joined(separator: ", ")
+        }
+        return out
+    }
+
+    // MARK: - Spoken recall (the free tier of "what do you remember about…")
+
+    /// A short spoken answer built entirely on-device. Returns nil when there
+    /// is genuinely nothing, so the caller can say something honest rather
+    /// than invent.
+    func spokenRecall(_ text: String, limit: Int = 4) -> String? {
+        var q = Query(); q.text = text
+        let hits = search(q)
+        guard !hits.isEmpty else { return nil }
+        let df = DateFormatter()
+        df.dateFormat = "EEEE"
+        let lines = hits.prefix(limit).map { e -> String in
+            let when = Calendar.current.isDateInToday(e.at) ? "today"
+                     : (Calendar.current.isDateInYesterday(e.at) ? "yesterday"
+                        : df.string(from: e.at))
+            return "\(e.oneLine), \(when)"
+        }
+        return "\(hits.count) \(hits.count == 1 ? "memory" : "memories"). " + lines.joined(separator: ". ") + "."
+    }
+
+    // MARK: - Thumbnails
+
+    func thumbnail(for id: UUID) -> UIImage? {
+        let key = id.uuidString as NSString
+        if let cached = thumbCache.object(forKey: key) { return cached }
+        guard let d = try? Data(contentsOf: thumbURL(id)),
+              let img = UIImage(data: d) else { return nil }
+        thumbCache.setObject(img, forKey: key)
+        return img
+    }
+
+    // MARK: - Housekeeping / stats
+
+    struct Stats {
+        var total = 0
+        var days = 0
+        var photos = 0
+        var pinned = 0
+        var bytes: Int64 = 0
+        var oldest: Date?
+    }
+
+    func stats(completion: @escaping (Stats) -> Void) {
+        io.async { [weak self] in
+            guard let self else { return }
+            var s = Stats()
+            let files = self.dayFiles()
+            s.days = files.count
+            var oldest: Date?
+            for f in files {
+                let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
+                s.bytes += size
+                for e in self.readDay(f) {
+                    s.total += 1
+                    if e.hasPhoto { s.photos += 1 }
+                    if e.pinned { s.pinned += 1 }
+                    if oldest == nil || e.at < oldest! { oldest = e.at }
+                }
+            }
+            if let t = try? FileManager.default.contentsOfDirectory(at: self.thumbsDir, includingPropertiesForKeys: [.fileSizeKey]) {
+                for u in t {
+                    let size = (try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? Int64) ?? 0
+                    s.bytes += size
+                }
+            }
+            s.oldest = oldest
+            DispatchQueue.main.async { completion(s) }
+        }
+    }
+
+    /// Everything, as one text file you can email to yourself. The escape
+    /// hatch that makes a proprietary store acceptable.
+    func exportAll(completion: @escaping (URL?) -> Void) {
+        io.async { [weak self] in
+            guard let self else { DispatchQueue.main.async { completion(nil) }; return }
+            var text = "CHAPPY MEMORY EXPORT\n\(Date())\n\n"
+            let df = DateFormatter()
+            df.dateFormat = "yyyy-MM-dd HH:mm"
+            for f in self.dayFiles().reversed() {
+                let entries = self.readDay(f).sorted { $0.at < $1.at }
+                guard !entries.isEmpty else { continue }
+                let key = String(f.lastPathComponent.dropFirst(4).dropLast(6))
+                text += "\n===== \(key) =====\n"
+                if let s = self.summaries[key] { text += "\(s)\n\n" }
+                for e in entries {
+                    text += "[\(df.string(from: e.at))] \(e.kind.label.uppercased()): \(e.title)\n"
+                    if !e.body.isEmpty { text += "    \(e.body)\n" }
+                    if let p = e.place ?? e.street ?? e.city { text += "    at \(p)\n" }
+                }
+            }
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent("chappy-memory-\(Self.dayKey(Date())).txt")
+            try? text.data(using: .utf8)?.write(to: out, options: .atomic)
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    // MARK: - Migration
+    //
+    // The old scattered stores are read ONCE and folded in, so nothing from
+    // before Phase 5 is lost and there is genuinely only one place to look
+    // from here on. The old files are left on disk untouched — this is a
+    // copy, not a move, so a bad migration costs nothing.
+
+    private static let migrationKey = "chappy_memory_migrated_v1"
+
+    func migrateLegacyStoresIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.migrationKey) else { return }
+        UserDefaults.standard.set(true, forKey: Self.migrationKey)
+
+        let trip = TripRecorder.shared
+        var moved = 0
+
+        // Saved spots.
+        for s in trip.spots {
+            rememberAt(.place, title: s.name,
+                       lat: s.lat, lon: s.lon,
+                       street: s.street, city: s.city, country: s.country,
+                       tags: ["spot"], source: "migration", at: s.t)
+            moved += 1
+        }
+
+        // Captioned photos (thumbnails come across too).
+        for v in trip.visualNotes {
+            rememberAt(.photo, title: v.caption,
+                       lat: v.lat == 0 ? nil : v.lat, lon: v.lon == 0 ? nil : v.lon,
+                       street: v.street, city: v.city,
+                       tags: ["snap"], thumbnail: v.thumbnail,
+                       source: "migration", at: v.at)
+            moved += 1
+        }
+
+        // Today's observations. Older per-day note files are picked up below.
+        for n in trip.notes {
+            rememberAt(.note, title: n, lat: nil, lon: nil,
+                       tags: ["observation"], source: "migration")
+            moved += 1
+        }
+
+        // Historic note files: chappy-notes-YYYY-MM-DD.json
+        let docsDir = docs
+        if let all = try? FileManager.default.contentsOfDirectory(at: docsDir, includingPropertiesForKeys: nil) {
+            for f in all where f.lastPathComponent.hasPrefix("chappy-notes-") {
+                let key = String(f.lastPathComponent.dropFirst("chappy-notes-".count).dropLast(5))
+                guard let day = Self.dayKeyFormatter.date(from: key),
+                      !Calendar.current.isDateInToday(day),
+                      let d = try? Data(contentsOf: f),
+                      let lines = try? JSONDecoder().decode([String].self, from: d) else { continue }
+                for line in lines {
+                    rememberAt(.note, title: line, lat: nil, lon: nil,
+                               tags: ["observation"], source: "migration", at: day)
+                    moved += 1
+                }
+            }
+        }
+
+        print("🧠 [Memory] migration complete — \(moved) memories folded in")
+        // Give the writes a beat to land, then rebuild the hot window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.reload()
+        }
+    }
+
+    // MARK: - Internals
+
+    private func normalise(_ tags: [String]) -> [String] {
+        var seen: [String] = []
+        for t in tags {
+            let clean = t.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: " ", with: "-")
+            if !clean.isEmpty, !seen.contains(clean), clean.count <= 24 { seen.append(clean) }
+        }
+        return Array(seen.prefix(8))
+    }
+
+    private func fallbackTitle(for kind: Kind, at when: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "h:mma"
+        return "\(kind.label.dropLast()) at \(df.string(from: when))"
+    }
+
+    // THREADING LAW (learned the hard way in build 80): a @Published property
+    // written off the main thread deadlocks Combine's lock on the main thread
+    // and the app is killed by the watchdog. Every publish goes through here.
+    private func setRecent(insert e: Entry) {
+        if Thread.isMainThread { recent.insert(e, at: 0) }
+        else { DispatchQueue.main.async { [weak self] in self?.recent.insert(e, at: 0) } }
+    }
+    private func setRecent(replace e: Entry) {
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            if let i = self.recent.firstIndex(where: { $0.id == e.id }) { self.recent[i] = e }
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    }
+    private func setRecent(remove id: UUID) {
+        let apply: () -> Void = { [weak self] in self?.recent.removeAll { $0.id == id } }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    }
+    private func setError(_ msg: String?) {
+        if Thread.isMainThread { lastError = msg }
+        else { DispatchQueue.main.async { [weak self] in self?.lastError = msg } }
+    }
+}
+
+
+// =====================================================================
+// MARK: - GLASSES CAPTURE INGEST (PHASE 5 — STEP 2)
+// =====================================================================
+//
+// "Hey Meta, take a picture." "Hey Meta, take a video."
+//
+// This is the capture path that works when Chappy is CLOSED. The glasses
+// record to their own storage, the Meta AI app syncs them over WiFi, iOS
+// auto-import drops them in the photo library, and this reads them from
+// there. No session, no battery cost, no app open, 24 hours a day.
+//
+// WHY THIS AND NOT SDK RECORDING
+// The DAT SDK hands Chappy a live frame stream. That is the right tool for
+// looking at something and describing it, and the wrong tool for making a
+// video you would actually post: the stream is preview-grade and it only
+// exists while a session is open. The glasses' own recorder produces the
+// real file at full resolution. So the glasses capture, and Chappy's whole
+// job is to find it, understand it, and file it.
+//
+// WHAT IT COSTS
+// One cheap vision call per photo. For a video: frames plus an on-device
+// transcript folded into ONE call. Twenty captures a day is a fraction of a
+// cent. It runs on charge and WiFi, so it costs no battery you would notice
+// and no cellular data at all.
+//
+// WHAT IT NEVER DOES
+// It never copies or moves the video. The file stays in the photo library at
+// full resolution, ready to post or edit; memory keeps a summary, a
+// thumbnail and the library id. Copying video into app storage is the one
+// decision here that would fill the phone.
+//
+// REQUIRES: NSPhotoLibraryUsageDescription in Info.plist.
+
+/// One-shot claim. Whoever calls `claim()` first gets true; everyone after
+/// gets false. Used to make sure a checked continuation resumes exactly once
+/// when two callbacks are racing for it.
+final class ResumeOnce {
+    private let lock = NSLock()
+    private var taken = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if taken { return false }
+        taken = true
+        return true
+    }
+}
+
+final class ChappyIngest: ObservableObject {
+    static let shared = ChappyIngest()
+
+    @Published private(set) var isRunning = false
+    @Published private(set) var progress = ""
+    @Published private(set) var lastResult = ""
+
+    /// Library ids already turned into memories. Kept as a set of strings so
+    /// re-running the ingest can never produce a second copy of anything —
+    /// the one failure mode that would make this feature worse than useless.
+    private var seen: Set<String> = []
+    private let seenKey = "chappy_ingest_seen_v1"
+    private let watermarkKey = "chappy_ingest_watermark"
+    private let lastRunKey = "chappy_ingest_last_run"
+
+    /// Album names the Meta app has used. Checked first; if none of them
+    /// exist we fall back to "everything new in the library", which is right
+    /// anyway for anyone who has auto-import writing straight to the camera roll.
+    private static let metaAlbumNames = [
+        "Meta AI", "Meta View", "Ray-Ban Meta", "Meta Glasses", "Meta",
+    ]
+
+    /// Videos longer than this are summarised from frames alone. On-device
+    /// speech on a 20-minute clip is minutes of CPU for a paragraph that the
+    /// pictures would have given us anyway — and the clips that matter for
+    /// what was SAID (a haggle, a set of directions) are short.
+    private static let maxTranscribeSeconds: Double = 120
+    /// Frames sampled from a video. Twelve is enough for Flash to tell what
+    /// happened without turning one clip into a photo album.
+    private static let maxFrames = 12
+    /// A single run never processes more than this, so the first ingest on a
+    /// library with 4,000 holiday photos in it does not run for an hour.
+    private static let maxPerRun = 40
+
+    private init() {
+        seen = Set(UserDefaults.standard.stringArray(forKey: seenKey) ?? [])
+    }
+
+    var lastRun: Date? {
+        let t = UserDefaults.standard.double(forKey: lastRunKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+
+    /// The watermark is the moment ingest was first switched on. Anything
+    /// older than it is your existing photo library, not glasses captures,
+    /// and swallowing ten years of camera roll into a travel memory store is
+    /// not a helpful surprise. You can move it back deliberately in Settings.
+    var watermark: Date {
+        get {
+            let t = UserDefaults.standard.double(forKey: watermarkKey)
+            if t > 0 { return Date(timeIntervalSince1970: t) }
+            let now = Date()
+            UserDefaults.standard.set(now.timeIntervalSince1970, forKey: watermarkKey)
+            return now
+        }
+        set { UserDefaults.standard.set(newValue.timeIntervalSince1970, forKey: watermarkKey) }
+    }
+
+    // MARK: - When it runs
+    //
+    // Foreground-triggered on purpose. A true background task needs a new
+    // Info.plist capability and a BGTaskScheduler identifier, and every
+    // Info.plist change so far has cost a build. Opening Chappy once while
+    // it charges overnight is a thing you already do.
+
+    /// Called when the app becomes active. Runs only if the conditions are
+    /// right, and says nothing at all if they are not.
+    func runIfConditionsAreRight() {
+        guard UserDefaults.standard.object(forKey: "chappy_ingest_enabled") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_ingest_enabled") else { return }
+        guard !isRunning else { return }
+        if let last = lastRun, Date().timeIntervalSince(last) < 6 * 3600 { return }
+
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let charging = UIDevice.current.batteryState == .charging
+                    || UIDevice.current.batteryState == .full
+        guard charging else {
+            print("📥 [Ingest] Skipped — not charging")
+            return
+        }
+        guard ChappyIngest.onWiFi() else {
+            print("📥 [Ingest] Skipped — not on WiFi")
+            return
+        }
+        Task { await run(manual: false) }
+    }
+
+    /// WiFi test via NWPathMonitor — one long-lived monitor started once.
+    /// (The getifaddrs trick works too, but it pokes at BSD headers that
+    /// Swift only re-exports by accident, and this is a supported API.)
+    private static let pathMonitor: NWPathMonitor = {
+        let m = NWPathMonitor()
+        m.start(queue: DispatchQueue(label: "chappy.ingest.net", qos: .utility))
+        return m
+    }()
+
+    static func onWiFi() -> Bool {
+        let path = pathMonitor.currentPath
+        return path.status == .satisfied && path.usesInterfaceType(.wifi)
+    }
+
+    // MARK: - The run
+
+    @MainActor
+    func run(manual: Bool) async {
+        guard !isRunning else { return }
+        isRunning = true
+        progress = "Asking for photo access…"
+        defer { isRunning = false; progress = "" }
+
+        let status = await withCheckedContinuation { (c: CheckedContinuation<PHAuthorizationStatus, Never>) in
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { c.resume(returning: $0) }
+        }
+        guard status == .authorized || status == .limited else {
+            lastResult = "Photo access is off. Settings → Chappy → Photos."
+            if manual { TTSService.shared.speak("I need photo access to read what the glasses captured.") }
+            return
+        }
+
+        let assets = candidates()
+        guard !assets.isEmpty else {
+            lastResult = "Nothing new from the glasses."
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastRunKey)
+            if manual { TTSService.shared.speak("Nothing new to import.") }
+            return
+        }
+
+        var photos = 0, videos = 0, failed = 0
+        for (i, asset) in assets.enumerated() {
+            progress = "Reading \(i + 1) of \(assets.count)…"
+            let ok: Bool
+            if asset.mediaType == .video {
+                ok = await ingestVideo(asset)
+                if ok { videos += 1 }
+            } else {
+                ok = await ingestPhoto(asset)
+                if ok { photos += 1 }
+            }
+            if ok {
+                seen.insert(asset.localIdentifier)
+                UserDefaults.standard.set(Array(seen), forKey: seenKey)
+            } else {
+                failed += 1
+            }
+        }
+
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastRunKey)
+        var summary = "\(photos + videos) filed"
+        if videos > 0 { summary += " (\(videos) video\(videos == 1 ? "" : "s"))" }
+        if failed > 0 { summary += ", \(failed) couldn't be read" }
+        lastResult = summary
+        print("📥 [Ingest] \(summary)")
+        if manual {
+            ChappyEarcon.shared.done()
+            TTSService.shared.speak(photos + videos == 0
+                ? "Nothing new to import."
+                : "Imported \(photos + videos) from the glasses.")
+        }
+    }
+
+    /// New media since the watermark that we have not already filed.
+    private func candidates() -> [PHAsset] {
+        let opts = PHFetchOptions()
+        opts.predicate = NSPredicate(format: "creationDate > %@", watermark as NSDate)
+        opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+
+        var found: [PHAsset] = []
+
+        // Prefer a Meta album if one exists — it is the only signal iOS gives
+        // us about where a photo actually came from.
+        let albums = PHAssetCollection.fetchAssetCollections(with: .album,
+                                                             subtype: .any, options: nil)
+        var usedAlbum = false
+        albums.enumerateObjects { collection, _, _ in
+            guard let title = collection.localizedTitle,
+                  Self.metaAlbumNames.contains(where: {
+                      title.localizedCaseInsensitiveContains($0) })
+            else { return }
+            usedAlbum = true
+            let assets = PHAsset.fetchAssets(in: collection, options: opts)
+            assets.enumerateObjects { a, _, _ in found.append(a) }
+        }
+
+        if !usedAlbum {
+            // No Meta album: auto-import is writing straight to the camera
+            // roll, which is the common setup. Everything new counts.
+            let all = PHAsset.fetchAssets(with: opts)
+            all.enumerateObjects { a, _, _ in found.append(a) }
+        }
+
+        found = found.filter { !seen.contains($0.localIdentifier) }
+        if found.count > Self.maxPerRun {
+            print("📥 [Ingest] \(found.count) waiting — taking the oldest \(Self.maxPerRun) this run")
+            found = Array(found.prefix(Self.maxPerRun))
+        }
+        return found
+    }
+
+    // MARK: - Photos
+
+    private func ingestPhoto(_ asset: PHAsset) async -> Bool {
+        guard let image = await requestImage(asset, maxDimension: 1024) else { return false }
+        let when = asset.creationDate ?? Date()
+        let described = await ChappyStandby.describe(image)
+        let caption = described ?? "Photo from the glasses"
+        let loc = placeFor(asset, at: when)
+
+        ChappyMemory.shared.rememberAt(
+            .photo, title: caption,
+            lat: loc.lat, lon: loc.lon,
+            street: loc.street, city: loc.city, country: loc.country,
+            tags: ["glasses", "capture"],
+            thumbnail: thumbnailData(image),
+            source: "glasses-import",
+            at: when,
+            assetID: asset.localIdentifier)
+        return true
+    }
+
+    // MARK: - Video
+    //
+    // Three cheap inputs, one call: what it looked like (frames), what was
+    // said (on-device speech, free), and where and when it happened (already
+    // known). That combination is what turns "IMG_4471.mov" into "haggling
+    // over the scooter hire on Jalan Monkey Forest, settled at 70k".
+
+    private func ingestVideo(_ asset: PHAsset) async -> Bool {
+        guard let avAsset = await requestAVAsset(asset) else { return false }
+        let when = asset.creationDate ?? Date()
+        let seconds = asset.duration
+        let frames = await keyFrames(from: avAsset, count: Self.maxFrames)
+        guard !frames.isEmpty else { return false }
+
+        // TRANSCRIPTION CAP, enforced rather than merely mentioned. A file
+        // recogniser has no seek — you cannot ask it for the first two minutes
+        // of a twenty-minute clip — so the honest choice is to transcribe
+        // short videos fully and say plainly that a long one wasn't done.
+        var spoken = ""
+        var tooLongToHear = false
+        if seconds <= Self.maxTranscribeSeconds, let url = (avAsset as? AVURLAsset)?.url {
+            let heard = await Self.transcribe(url)
+            spoken = heard ?? ""
+        } else if seconds > Self.maxTranscribeSeconds {
+            tooLongToHear = true
+        }
+
+        let written = await Self.summariseVideo(frames: frames,
+                                                spoken: spoken,
+                                                seconds: seconds)
+        let summary = written ?? "Video from the glasses, \(Int(seconds)) seconds"
+
+        let loc = placeFor(asset, at: when)
+        var body = "\(Int(seconds)) second video."
+        if !spoken.isEmpty {
+            body += "\n\nWhat was said:\n\(spoken)"
+        } else if tooLongToHear {
+            body += "\n\n(Too long to transcribe on-device — summarised from the picture only.)"
+        }
+        body += "\n\nThe full-resolution video is still in your photo library."
+
+        ChappyMemory.shared.rememberAt(
+            .video, title: summary, body: body,
+            lat: loc.lat, lon: loc.lon,
+            street: loc.street, city: loc.city, country: loc.country,
+            tags: ["glasses", "video", "capture"],
+            thumbnail: thumbnailData(frames[frames.count / 2]),
+            source: "glasses-import",
+            at: when,
+            assetID: asset.localIdentifier)
+        return true
+    }
+
+    /// On-device speech from a video file. Free, offline, and it never leaves
+    /// the phone — which matters, because a video of a conversation contains
+    /// somebody else's voice.
+    static func transcribe(_ url: URL) async -> String? {
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized,
+              let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")),
+              recognizer.isAvailable else { return nil }
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+
+        // RESUME EXACTLY ONCE. Two callbacks race here — the recogniser and
+        // the watchdog — and resuming a continuation twice is a crash, not a
+        // warning. A plain captured `var` would also be a mutable local shared
+        // by two escaping closures, which strict concurrency rejects outright.
+        let gate = ResumeOnce()
+        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+            let task = recognizer.recognitionTask(with: request) { result, error in
+                if let r = result, r.isFinal {
+                    if gate.claim() { c.resume(returning: r.bestTranscription.formattedString) }
+                } else if error != nil {
+                    if gate.claim() { c.resume(returning: nil) }
+                }
+            }
+            // A file recogniser that never calls back would hang the whole
+            // ingest run. Give it a ceiling and move on.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 90) {
+                guard gate.claim() else { return }
+                task.cancel()
+                c.resume(returning: nil)
+            }
+        }
+    }
+
+    /// One Flash call: frames + transcript + duration → one line.
+    static func summariseVideo(frames: [UIImage], spoken: String, seconds: Double) async -> String? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+
+        var parts: [[String: Any]] = [[
+            "text": "These are \(frames.count) frames sampled evenly from a "
+                  + "\(Int(seconds)) second video recorded on smart glasses, in order."
+                  + (spoken.isEmpty ? ""
+                     : "\n\nThis is what was said during it (on-device transcript, may be imperfect):\n\(spoken)")
+                  + "\n\nWrite ONE line, under 20 words, describing what happened — "
+                  + "the kind of line that would let someone find this clip again months later. "
+                  + "No preamble, no 'this video shows'. "
+                  + "Example: 'haggling over scooter hire, settled at 70 thousand'."
+        ]]
+        for f in frames {
+            guard let jpeg = f.jpegData(compressionQuality: 0.4) else { continue }
+            parts.append(["inline_data": ["mime_type": "image/jpeg",
+                                          "data": jpeg.base64EncodedString()]])
+        }
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": parts]],
+            // Flash reasons before it answers, so the budget has to cover the
+            // thinking as well as the sentence. 120 was the build-88 mistake.
+            "generationConfig": ["temperature": 0.2, "maxOutputTokens": 500],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 45
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let c = json["candidates"] as? [[String: Any]],
+              let content = c.first?["content"] as? [String: Any],
+              let ps = content["parts"] as? [[String: Any]],
+              let t = ps.first?["text"] as? String else { return nil }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func keyFrames(from asset: AVAsset, count: Int) async -> [UIImage] {
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 640, height: 640)
+        let duration = CMTimeGetSeconds(asset.duration)
+        guard duration > 0 else { return [] }
+        let n = max(1, min(count, Int(duration / 2) + 1))
+        var out: [UIImage] = []
+        for i in 0..<n {
+            let t = CMTime(seconds: duration * (Double(i) + 0.5) / Double(n), preferredTimescale: 600)
+            // ObjC exception territory if the asset is unreadable — the throwing
+            // API is the safe one, and a failed frame is not a failed video.
+            if let cg = try? gen.copyCGImage(at: t, actualTime: nil) {
+                out.append(UIImage(cgImage: cg))
+            }
+        }
+        return out
+    }
+
+    // MARK: - Location
+    //
+    // THE BREADCRUMB TRICK.
+    // Glasses photos may or may not carry GPS — the glasses have no receiver
+    // of their own and whether the phone's fix survives into the file is not
+    // something to assume. It barely matters: TripRecorder has been writing a
+    // breadcrumb every 25 metres all day. Any capture with a TIMESTAMP can be
+    // placed by finding the nearest crumb. Free, offline, and it works for
+    // photos taken with Chappy closed and the phone in a pocket.
+
+    private struct Placed {
+        var lat: Double?; var lon: Double?
+        var street: String?; var city: String?; var country: String?
+    }
+
+    private func placeFor(_ asset: PHAsset, at when: Date) -> Placed {
+        var p = Placed()
+        if let l = asset.location {
+            p.lat = l.coordinate.latitude
+            p.lon = l.coordinate.longitude
+        }
+        if let crumb = TripRecorder.shared.nearestCrumb(to: when, within: 900) {
+            if p.lat == nil { p.lat = crumb.lat; p.lon = crumb.lon }
+            p.street = crumb.street
+            p.city = crumb.city
+        }
+        if p.city == nil, Calendar.current.isDateInToday(when) {
+            let s = ContextEngine.shared.snapshot
+            p.street = p.street ?? s.street
+            p.city = s.city
+            p.country = s.country
+        }
+        return p
+    }
+
+    // MARK: - PhotoKit plumbing
+
+    private func requestImage(_ asset: PHAsset, maxDimension: CGFloat) async -> UIImage? {
+        let opts = PHImageRequestOptions()
+        opts.isNetworkAccessAllowed = true      // iCloud-optimised originals
+        opts.deliveryMode = .highQualityFormat
+        opts.resizeMode = .exact
+        opts.isSynchronous = false
+        let gate = ResumeOnce()
+        return await withCheckedContinuation { (c: CheckedContinuation<UIImage?, Never>) in
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: CGSize(width: maxDimension, height: maxDimension),
+                contentMode: .aspectFit, options: opts) { image, info in
+                    // requestImage calls back TWICE for an iCloud asset: a
+                    // degraded thumbnail first, the real one after. Skip the
+                    // first, and never resume twice.
+                    if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
+                    if gate.claim() { c.resume(returning: image) }
+                }
+        }
+    }
+
+    private func requestAVAsset(_ asset: PHAsset) async -> AVAsset? {
+        let opts = PHVideoRequestOptions()
+        opts.isNetworkAccessAllowed = true
+        opts.deliveryMode = .highQualityFormat
+        opts.version = .current
+        let gate = ResumeOnce()
+        return await withCheckedContinuation { (c: CheckedContinuation<AVAsset?, Never>) in
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: opts) { av, _, _ in
+                if gate.claim() { c.resume(returning: av) }
+            }
+        }
+    }
+
+    private func thumbnailData(_ image: UIImage) -> Data? {
+        let target: CGFloat = 400
+        let scale = min(1, target / max(image.size.width, image.size.height))
+        guard scale < 1 else { return image.jpegData(compressionQuality: 0.5) }
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let r = UIGraphicsImageRenderer(size: size)
+        let small = r.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+        return small.jpegData(compressionQuality: 0.5)
+    }
+
+    /// Open the original in the app (full resolution, straight from the
+    /// library). There is no public URL that opens Photos at a specific
+    /// asset, so pretending there is would just be a button that does nothing.
+    func loadOriginal(assetID: String) async -> (UIImage?, AVAsset?) {
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
+        guard let asset = fetched.firstObject else { return (nil, nil) }
+        if asset.mediaType == .video {
+            return (nil, await requestAVAsset(asset))
+        }
+        return (await requestImage(asset, maxDimension: 2400), nil)
+    }
+}
+
+
+// =====================================================================
+// MARK: - THE RECORDS FOLD-IN (PHASE 5 — one spot means one spot)
+// =====================================================================
+//
+// Every Live AI conversation you have ever had lives in ConversationStorage:
+// up to a hundred of them, whole transcripts, no search, no location, no
+// categories, and a screen that can only be scrolled. That is an archive,
+// not a memory.
+//
+// This folds them in. TWO STAGES, on purpose.
+//
+//   STAGE 1 — instant, free, offline, runs at launch.
+//   Every conversation becomes ONE memory: a headline taken from what you
+//   actually opened with, the full transcript in the body, and — the good
+//   part — a LOCATION, recovered by matching the conversation's timestamp
+//   against the breadcrumb trail. Conversations that were never located
+//   suddenly know which street you were standing on.
+//
+//   STAGE 2 — overnight, on charge and WiFi, throttled.
+//   One cheap call per conversation pulls out the few DURABLE facts buried
+//   in it and files each as its own small memory. Sixty messages of "yeah",
+//   "okay" and "what about that one" do not become sixty memories; the three
+//   things worth keeping become three.
+//
+// The old store is never touched. It is a copy, not a move, so the Records
+// screen keeps working exactly as it does today and nothing is at risk if
+// the extraction gets something wrong.
+
+extension ChappyMemory {
+
+    private static let recordsMigratedKey = "chappy_memory_records_migrated_v1"
+    private static let extractedKey = "chappy_memory_facts_extracted_v1"
+    /// Conversations processed per extraction run. A hundred calls in one
+    /// burst is a rate-limit response and a hundred failures; fifteen a night
+    /// clears the whole backlog in a week and nobody notices.
+    private static let extractPerRun = 15
+
+    // MARK: Stage 1 — headlines, transcripts and places
+
+    func foldInConversationRecords() {
+        guard !UserDefaults.standard.bool(forKey: Self.recordsMigratedKey) else { return }
+        UserDefaults.standard.set(true, forKey: Self.recordsMigratedKey)
+
+        // Off the main thread: loadAllConversations decodes the entire
+        // archive out of UserDefaults and each transcript is a string build.
+        // At launch, on main, that is a visible stutter for no reason.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.foldInConversationRecordsNow()
+        }
+    }
+
+    private func foldInConversationRecordsNow() {
+        let records = ConversationStorage.shared.loadAllConversations()
+        guard !records.isEmpty else {
+            print("🧠 [Records] Nothing to fold in")
+            return
+        }
+
+        var folded = 0
+        for r in records {
+            let title = Self.headline(for: r)
+            let body = Self.transcript(of: r)
+
+            // THE BREADCRUMB TRICK AGAIN. A conversation record stores no
+            // location at all — but the trail knows where you were when it
+            // happened, so every one of these can be put on the map.
+            let crumb = TripRecorder.shared.nearestCrumb(to: r.timestamp, within: 1800)
+
+            rememberAt(.ask,
+                       title: title,
+                       body: body,
+                       lat: crumb?.lat, lon: crumb?.lon,
+                       street: crumb?.street, city: crumb?.city,
+                       tags: ["live-ai", "conversation", "records"],
+                       source: "records-fold",
+                       at: r.timestamp)
+            folded += 1
+        }
+        print("🧠 [Records] Folded in \(folded) conversations")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.reload()
+        }
+    }
+
+    /// What you opened with, which is nearly always what the conversation was
+    /// about. Falls back to the first thing Chappy said, then to the date —
+    /// never to a placeholder that tells you nothing.
+    static func headline(for r: ConversationRecord) -> String {
+        let firstUser = r.messages.first(where: { $0.role == .user })?.content
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if firstUser.count > 3 { return String(firstUser.prefix(80)) }
+
+        let firstAny = r.messages.first?.content
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if firstAny.count > 3 { return "Chappy said: " + String(firstAny.prefix(70)) }
+
+        let df = DateFormatter()
+        df.dateFormat = "EEEE d MMMM, h:mma"
+        return "Conversation on \(df.string(from: r.timestamp))"
+    }
+
+    /// The transcript, capped. A very long session is genuinely worth keeping,
+    /// but not at the cost of a memory file measured in megabytes — and the
+    /// original is still sitting untouched in Records either way.
+    static func transcript(of r: ConversationRecord, limit: Int = 6000) -> String {
+        var out = ""
+        for m in r.messages {
+            let who = m.role == .user ? "You" : "Chappy"
+            let line = "\(who): \(m.content.trimmingCharacters(in: .whitespacesAndNewlines))\n"
+            if out.count + line.count > limit {
+                out += "…(transcript continues — the full version is in Records)"
+                break
+            }
+            out += line
+        }
+        return out
+    }
+
+    // MARK: Stage 2 — the facts worth keeping
+
+    private var extractedIDs: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: Self.extractedKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: Self.extractedKey) }
+    }
+
+    /// How many conversations are still waiting to be read properly.
+    var factsPending: Int {
+        let done = extractedIDs
+        return ConversationStorage.shared.loadAllConversations()
+            .filter { !done.contains($0.id.uuidString) }
+            .filter { $0.messages.count >= 4 }
+            .count
+    }
+
+    /// Runs on charge and WiFi. Reads a handful of old conversations properly
+    /// and files what was actually learned in them.
+    func runFactExtraction(manual: Bool = false) async {
+        var done = extractedIDs
+        let pending = ConversationStorage.shared.loadAllConversations()
+            .filter { !done.contains($0.id.uuidString) }
+            // Under four messages is "hello" and a false start. Nothing to learn.
+            .filter { $0.messages.count >= 4 }
+            .prefix(Self.extractPerRun)
+
+        guard !pending.isEmpty else {
+            if manual { TTSService.shared.speak("Nothing left to read through.") }
+            return
+        }
+        print("🧠 [Records] Reading \(pending.count) conversations for durable facts")
+
+        var filed = 0
+        for r in pending {
+            let facts = await Self.extractFacts(from: r)
+            let crumb = TripRecorder.shared.nearestCrumb(to: r.timestamp, within: 1800)
+            for f in facts {
+                rememberAt(.note, title: f,
+                           lat: crumb?.lat, lon: crumb?.lon,
+                           street: crumb?.street, city: crumb?.city,
+                           tags: ["learned", "live-ai"],
+                           source: "records-extract",
+                           at: r.timestamp)
+                filed += 1
+            }
+            // Marked done whether or not anything came back. A conversation
+            // with nothing durable in it is a finished job, not a retry.
+            done.insert(r.id.uuidString)
+            extractedIDs = done
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+
+        print("🧠 [Records] \(filed) facts filed from \(pending.count) conversations")
+        if manual {
+            ChappyEarcon.shared.done()
+            TTSService.shared.speak(filed == 0
+                ? "Read them through - nothing worth keeping in those."
+                : "Filed \(filed) thing\(filed == 1 ? "" : "s") from \(pending.count) old conversations.")
+        }
+    }
+
+    /// One cheap call. Asks for the things that are still true next month —
+    /// not a summary, which is what you get if you ask for a summary and is
+    /// almost never what you want to search for later.
+    static func extractFacts(from r: ConversationRecord) async -> [String] {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return [] }
+
+        let text = transcript(of: r, limit: 12000)
+        guard text.count > 80 else { return [] }
+
+        let prompt = """
+        Below is a transcript between a traveller and his AI assistant.
+
+        Pull out ONLY the things that are still worth knowing in a month — \
+        a place and what it was like, a price he was quoted or paid, a name, \
+        a preference he stated, a fact about somewhere he was, a decision he made.
+
+        Ignore small talk, the assistant's explanations, anything that was only \
+        true at that moment (the weather, what time it was, what was in front of him).
+
+        Return a JSON array of at most 3 strings. Each string is ONE short line, \
+        under 15 words, written so it makes sense on its own months later.
+        If there is nothing durable in it, return [].
+
+        Return ONLY the JSON array, nothing else.
+
+        TRANSCRIPT:
+        \(text)
+        """
+
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": [["text": prompt]]]],
+            // Flash reasons before answering, so the budget covers the thinking
+            // as well as the answer. This is the build-88 lesson, kept.
+            "generationConfig": ["temperature": 0.1, "maxOutputTokens": 800],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 30
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let c = json["candidates"] as? [[String: Any]],
+              let content = c.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let raw = parts.first?["text"] as? String
+        else { return [] }
+
+        // Flash sometimes wraps JSON in a code fence however firmly you ask.
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = cleaned.firstIndex(of: "["), let end = cleaned.lastIndex(of: "]") {
+            cleaned = String(cleaned[start...end])
+        }
+        guard let d = cleaned.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: d) as? [String]
+        else { return [] }
+
+        return arr
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count > 6 && $0.count < 160 }
+            .prefix(3)
+            .map { $0 }
     }
 }
