@@ -2609,6 +2609,7 @@ struct RemindersView: View {
     @State private var showDone = false
     @State private var todaysEvents: [EKEvent] = []
     @State private var diaryTick = 0
+    @State private var selectedCategory: ChappyReminders.Category? = nil
 
     var body: some View {
         NavigationView {
@@ -2618,10 +2619,11 @@ struct RemindersView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         briefCard
+                        categoryChips
                         diarySection
-                        section("Overdue", reminders.overdue(), .red)
-                        section("Today", reminders.today().filter { $0.deliveredAt == nil }, theme.accent)
-                        section("Waiting on a place", reminders.placeReminders(), .cyan)
+                        section("Overdue", inFilter(reminders.overdue()), .red)
+                        section("Today", inFilter(reminders.today().filter { $0.deliveredAt == nil }), theme.accent)
+                        section("Waiting on a place", inFilter(reminders.placeReminders()), .cyan)
                         section("Coming up", reminders.upcoming().filter {
                             !Calendar.current.isDateInToday($0.effectiveFire ?? Date())
                         }, theme.textSecondary)
@@ -2730,6 +2732,49 @@ struct RemindersView: View {
     private static func time(_ d: Date?) -> String {
         guard let d else { return "" }
         let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    // BUILD 115 — CATEGORY CHIPS. Derived from where each reminder came from,
+    // so you never had to pick one. Only categories that actually have
+    // something in them appear — no empty shelves.
+    @ViewBuilder
+    private var categoryChips: some View {
+        let cats = reminders.liveCategories
+        if cats.count > 1 {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    chipButton(nil, "All", "square.grid.2x2")
+                    ForEach(cats, id: \.rawValue) { c in
+                        chipButton(c, c.label, c.icon)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.bottom, 2)
+        }
+    }
+
+    private func chipButton(_ c: ChappyReminders.Category?, _ label: String, _ icon: String) -> some View {
+        let on = (selectedCategory == c)
+        return Button {
+            selectedCategory = (selectedCategory == c) ? nil : c
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.caption2)
+                Text(label).font(.caption).fontWeight(.medium)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(Capsule().fill(on ? theme.accent.opacity(0.25) : theme.cardFill))
+            .overlay(Capsule().stroke(on ? theme.accent : Color.clear, lineWidth: 1))
+            .foregroundColor(on ? theme.accent : theme.textSecondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Applies the chip filter to any section.
+    private func inFilter(_ items: [ChappyMemory.Entry]) -> [ChappyMemory.Entry] {
+        guard let c = selectedCategory else { return items }
+        return items.filter { ChappyReminders.category(of: $0) == c }
     }
 
     private var briefCard: some View {
