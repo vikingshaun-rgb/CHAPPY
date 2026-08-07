@@ -6787,10 +6787,16 @@ extension ChappyMemory {
 
         print("🧠 [Records] \(filed) facts filed from \(pending.count) conversations")
         if filed > 0 {
-            ChappyNotify.post(.memory,
-                title: "Read \(pending.count) old conversations",
-                body: "\(filed) thing\(filed == 1 ? "" : "s") worth keeping filed into memory.",
-                opens: .chappyOpenMemory)
+            // ChappyMemory is not main-actor bound (it is written to from the
+            // audio and ingest queues), and ChappyNotify is. Hop across.
+            let count = pending.count
+            let n = filed
+            await MainActor.run {
+                ChappyNotify.post(.memory,
+                    title: "Read \(count) old conversations",
+                    body: "\(n) thing\(n == 1 ? "" : "s") worth keeping filed into memory.",
+                    opens: .chappyOpenMemory)
+            }
         }
         if manual {
             ChappyEarcon.shared.done()
