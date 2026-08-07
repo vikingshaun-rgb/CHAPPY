@@ -2398,7 +2398,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
             print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
             CostMeter.shared.addTTSChars(c.count) // AUDIT P2: was invisible to "cost check"
-            if await runIntent(intent) { return }
+            if await runIntent(intent, utterance: c) { return }
         }
 
         // AUDIT P1 (SB-LOOP2): the ANSWER branch used to sit BELOW the ask, so a
@@ -2473,7 +2473,7 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// handlers the string ladder uses — no second implementation to drift.
     /// Returns false if we couldn't action it, so the caller can fall through
     /// to a plain answer rather than pretending.
-    private func runIntent(_ intent: ChappyIntent.Result) async -> Bool {
+    private func runIntent(_ intent: ChappyIntent.Result, utterance: String) async -> Bool {
         let p = intent.parameter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         switch intent.action {
         case "navigate":
@@ -2495,7 +2495,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             // AUDIT P2: mode came ONLY from the classifier, so "we're getting a
             // Grab to the airport" produced a walking route when Flash left
             // mode empty. Trust the utterance as well as the classification.
-            let modeHay = ((intent.mode ?? "") + " " + c).lowercased()
+            let modeHay = ((intent.mode ?? "") + " " + utterance).lowercased()
             let driving = ["drive", "driving", "car", "taxi", "grab", "scooter",
                            "motorbike", "moto", "ride"].contains { modeHay.contains($0) }
             speak("Finding \(p).")
