@@ -124,6 +124,151 @@ class LiveTranslateViewModel: ObservableObject {
 
     /// Use iPhone microphone (instead of the glasses mic) 
     /// Glasses mic suits translating yourself; iPhone mic suits translating the other person
+
+    // ==================================================================
+    // SCAN — the menu, the sign, the brochure he's holding up.
+    //
+    // THE DESIGN PROBLEM IS LENGTH, NOT TRANSLATION. A menu has forty items.
+    // Translating it is easy; reciting forty dishes into someone's ear is
+    // useless. So this is not "translate this document" — it is "let me ASK
+    // things about this document". Chappy gives one sentence out loud, puts
+    // the full text on screen where it can be read at leisure, and hands the
+    // extracted text back to the live session so the next question —
+    // "how much is the second one?" — lands with the model already knowing.
+    //
+    // The conversation never closes. He is mid-sentence with a vendor; the
+    // whole point is that this happens inside that, not instead of it.
+
+    @Published var isScanning = false
+
+    /// Grab what the glasses can see and translate it.
+    func scanDocument() {
+        guard !isScanning else { return }
+        guard let frame = currentVideoFrame,
+              Date().timeIntervalSince(lastFrameAt) < 3.0 else {
+            // The camera is off. Ask the view to wake it and come back — an
+            // honest "hang on" beats him holding a menu up at nothing.
+            NotificationCenter.default.post(name: .chappyWakeCameraForScan, object: nil)
+            say("One moment, waking the camera.")
+            return
+        }
+        isScanning = true
+        let acks = ["Let me look.", "Reading that now.", "Hang on, having a look."]
+        say(acks[transcript.count % acks.count])
+
+        Task { @MainActor in
+            defer { isScanning = false }
+            let target = targetLanguage.displayName
+            guard let result = await Self.readDocument(frame, into: "English", from: target) else {
+                self.say("I couldn't read that one. Try holding it a bit steadier.")
+                return
+            }
+
+            // The card, in the transcript, where it happened.
+            let jpeg = frame.jpegData(compressionQuality: 0.5)
+            let turn = TranslateTurn(
+                original: result.original,
+                translated: result.translated,
+                fromWearer: false,
+                sourceCode: self.targetLanguage.rawValue,
+                targetCode: self.sourceLanguage.rawValue,
+                documentJPEG: jpeg)
+            self.transcript.append(turn)
+            self.lastScannedText = result.translated
+
+            // PHASE 5 — a scanned menu or sign is one of the most useful
+            // things to have six weeks later, and the only one you literally
+            // cannot re-take once you have walked away. Kept forever, with
+            // the photo, no expiry.
+            ChappyMemory.shared.remember(.scan,
+                title: result.summary,
+                body: "Original (\(target)):\n\(result.original)\n\nEnglish:\n\(result.translated)",
+                tags: ["scan", "document", target.lowercased()],
+                thumbnail: frame.jpegData(compressionQuality: 0.4),
+                source: "translate-scan")
+
+            // Hand it to the live session so follow-up questions land with
+            // context. This is what makes "how much is the second one" work.
+            self.translateService?.sendTextContext(
+                "The user just photographed this text. Original: \(result.original)\n" +
+                "English: \(result.translated)\n" +
+                "Answer questions about it briefly if asked. Do not read it all out unless asked.")
+
+            // ONE SENTENCE out loud. Never the whole document unprompted.
+            self.say(result.summary)
+        }
+    }
+
+    /// The most recent scan, so "read it" and "read that again" work.
+    private(set) var lastScannedText: String = ""
+
+    /// Read the whole thing aloud — only when he asks.
+    func readLastScan() {
+        guard !lastScannedText.isEmpty else {
+            say("Nothing scanned yet."); return
+        }
+        say(lastScannedText)
+    }
+
+    struct ScanResult {
+        let original: String
+        let translated: String
+        let summary: String
+    }
+
+    /// One-shot vision call. Deliberately NOT the live session: that returns
+    /// conversational audio, and what a card needs is clean structured text he
+    /// can read, save and scroll back to.
+    static func readDocument(_ image: UIImage, into english: String, from foreign: String) async -> ScanResult? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let jpeg = image.jpegData(compressionQuality: 0.6),
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+
+        let prompt = """
+        This photo shows text — a menu, sign, label, brochure or document, probably in \(foreign).
+        Reply with ONLY JSON, no markdown fences:
+        {"original":"...","translated":"...","summary":"..."}
+        original   = the text exactly as printed, line breaks preserved.
+        translated = a natural English translation, same line structure.
+        summary    = ONE short spoken sentence describing what it is and the key numbers.
+                     Example: "It's a menu. Twelve dishes, twenty to sixty thousand rupiah."
+                     Never list every item here.
+        If there is no readable text, set all three to "".
+        """
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": [
+                ["text": prompt],
+                ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+            ]]],
+            "generationConfig": ["temperature": 0, "maxOutputTokens": 2000,
+                                 "responseMimeType": "application/json"],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 20
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let raw = parts.first?["text"] as? String else { return nil }
+
+        let cleaned = raw.replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let d = cleaned.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let orig = o["original"] as? String, !orig.isEmpty,
+              let tran = o["translated"] as? String else { return nil }
+        let sum = (o["summary"] as? String) ?? "Here's what it says."
+        return ScanResult(original: orig, translated: tran, summary: sum)
+    }
+
     // MARK: The misheard nudge
 
     /// Consecutive turns the transcriber got wrong. Reset by any good turn.
@@ -469,9 +614,66 @@ class LiveTranslateViewModel: ObservableObject {
         }
     }
 
+    /// How much of the transcript has already been filed as a memory, so
+    /// stopping and starting the mic three times in one conversation files
+    /// one memory with three parts, not three copies of the same chat.
+    private var archivedTurnCount = 0
+
+    /// PHASE 5 — a conversation is ONE memory, not forty.
+    ///
+    /// Forty rows of "yes" / "how much" / "thank you" is not something anyone
+    /// searches. What you want six weeks later is "the scooter hire in Ubud",
+    /// and the useful text is the foreign side plus the English beside it.
+    ///
+    /// EXPIRY, and why. The verbatim words of a stranger you met once are a
+    /// different kind of thing from a note you wrote about your own day, so
+    /// the full transcript ages out after 60 days unless you pin it. The
+    /// headline — what it was about, where, when — is kept forever with no
+    /// expiry, so recall still works after the words are gone.
+    private func archiveConversationToMemory() {
+        let fresh = transcript.dropFirst(archivedTurnCount).filter {
+            !$0.original.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        guard fresh.count >= 2 else { return }
+        archivedTurnCount = transcript.count
+
+        let lang = targetLanguage.displayName
+        let place = ContextEngine.shared.snapshot.street
+            ?? ContextEngine.shared.snapshot.city
+        var title = "Conversation in \(lang)"
+        if let p = place { title += " at \(p)" }
+
+        // The gist line: the longest thing the OTHER person said, in English.
+        // It is nearly always the sentence that says what the chat was about.
+        let theirs = fresh.filter { !$0.fromWearer }
+        let gist = theirs.max(by: { $0.translated.count < $1.translated.count })?.translated ?? ""
+
+        var body = ""
+        for t in fresh {
+            let who = t.fromWearer ? "Me" : "Them"
+            body += "\(who): \(t.translated)\n"
+            if !t.original.isEmpty && t.original != t.translated {
+                body += "    (\(t.original))\n"
+            }
+        }
+
+        // TWO entries on purpose: a permanent headline and an expiring body.
+        ChappyMemory.shared.remember(.talk,
+            title: gist.isEmpty ? title : "\(title) — \(String(gist.prefix(80)))",
+            tags: ["talk", lang.lowercased(), "conversation"],
+            source: "translate")
+        ChappyMemory.shared.remember(.talk,
+            title: "Full transcript — \(lang)",
+            body: body,
+            tags: ["transcript", lang.lowercased()],
+            expiresInDays: 60,
+            source: "translate")
+    }
+
     func stopRecording() {
         translateService?.stopRecording()
         isRecording = false
+        archiveConversationToMemory()
         stopCostCheckpoint()
         // Bank only the minutes the microphone was actually open.
         if let start = sessionStartAt {
@@ -1012,6 +1214,22 @@ class LiveTranslateViewModel: ObservableObject {
     @discardableResult
     private func handleSettingCommand(_ text: String) -> Bool {
         guard let tail = Self.commandTail(text) else { return false }
+
+        // "Chappy, read this" — mid-conversation, hands full, someone holding a
+        // menu up in front of you. This is the whole point of the feature: it
+        // has to happen INSIDE the conversation, not instead of it.
+        let joined = tail.joined(separator: " ")
+        if ["read this", "read that", "scan this", "scan that", "read it",
+            "scan", "what does this say", "what does that say", "read the menu",
+            "read the sign", "translate this", "translate that"].contains(joined) {
+            scanDocument()
+            return true
+        }
+        if ["read it out", "read it all", "read the whole thing", "read that out",
+            "read it aloud", "read all of it"].contains(joined) {
+            readLastScan()
+            return true
+        }
         func has(_ p: String) -> Bool { Self.has(tail, p) }
 
         if has("polite") || has("formal") || has("respectful") {
