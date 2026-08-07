@@ -72,7 +72,19 @@ class TTSService: NSObject, ObservableObject {
     private var playbackResilienceInstalled = false
     /// Once the network voice has failed, stop asking it. Chappy changing voice
     /// every other sentence is worse than never using the nicer one.
-    static var geminiVoiceGaveUp = false
+    private static var geminiGaveUpAt: Date?
+    /// AUDIT P2: this used to latch forever on a single transient error, so one
+    /// bad moment of signal cost the nicer voice until the app was restarted.
+    /// Thirty minutes is long enough to stop it flip-flopping sentence to
+    /// sentence, short enough that a tunnel doesn't cost you the rest of the day.
+    static var geminiVoiceGaveUp: Bool {
+        get {
+            guard let t = geminiGaveUpAt else { return false }
+            if Date().timeIntervalSince(t) > 1800 { geminiGaveUpAt = nil; return false }
+            return true
+        }
+        set { geminiGaveUpAt = newValue ? Date() : nil }
+    }
 
     /// SB-DEADLOCK FIX: `isSpeaking` is the barge-in gate for ChappyStandby —
     /// while it is true the wake word ignores EVERYTHING it hears. It was set
@@ -282,7 +294,19 @@ class TTSService: NSObject, ObservableObject {
         }
     }
 
-    func speak(_ text: String, apiKey: String? = nil) {
+    /// - Parameters:
+    ///   - languageCode: AUDIT P1. The short-line fast path bypassed the
+    ///     Gemini call, and with it the language handling — a short Indonesian
+    ///     or Thai line was read aloud in an Australian accent. Pass the
+    ///     language when you know it.
+    ///   - forceNetworkVoice: AUDIT P1. Every voice sample in Settings is under
+    ///     90 characters, so the fast path sent them ALL to the system voice —
+    ///     the voice picker and "Test the voice" demonstrated a voice you were
+    ///     not choosing. Settings passes true so you hear the real thing.
+    func speak(_ text: String,
+               apiKey: String? = nil,
+               languageCode: String? = nil,
+               forceNetworkVoice: Bool = false) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -318,15 +342,16 @@ class TTSService: NSObject, ObservableObject {
             // lines are ALWAYS the system voice and long ones are always
             // Gemini-first, and once Gemini has failed we stop asking it for
             // the rest of the run rather than flip-flopping every sentence.
-            let isShortAck = trimmed.count <= 90
+            let isShortAck = trimmed.count <= 90 && !forceNetworkVoice
             if isShortAck || Self.geminiVoiceGaveUp {
-                await self.fallbackToSystemTTS(text: trimmed)
+                await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
                 return
             }
 
             if !googleKey.isEmpty && !wantsSystemVoice {
                 do {
                     try await self.speakWithGemini(text: trimmed, apiKey: googleKey, gen: gen)
+                    // Only charge for audio that genuinely reached the speaker.
                     CostMeter.shared.addTTSChars(trimmed.count)
                     return
                 } catch {
@@ -338,7 +363,7 @@ class TTSService: NSObject, ObservableObject {
                 print("🔊 [TTS] No Gemini key — using system TTS")
             }
 
-            await self.fallbackToSystemTTS(text: trimmed)
+            await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
         }
     }
 
@@ -435,14 +460,20 @@ class TTSService: NSObject, ObservableObject {
     /// Play raw PCM16 @ 24 kHz and wait for playback to finish.
     /// - Parameter gen: the speech generation that owns this utterance. Used to
     ///   make the teardown conditional — see AUDIT P0 (TTS-STALE) below.
-    private func playPCM(_ audioData: Data, gen: Int) async {
+    private func playPCM(_ audioData: Data, gen: Int) async throws {
         configureAudioSession()
         startPlaybackEngine()
         guard let playbackEngine, playbackEngine.isRunning,
               let playbackFormat = playbackFormat,
               let buffer = createPCMBuffer(from: audioData, format: playbackFormat) else {
+            // AUDIT P0: this used to `return`, which is indistinguishable from
+            // success to the caller. So a failed playback charged the meter,
+            // never latched the fallback, and the wearer got TOTAL SILENCE for
+            // every long answer from then on — no voice, no tone, nothing on
+            // screen, while the chip still read "Standby on". Throwing is what
+            // routes him to the Apple voice instead of into a void.
             print("❌ [TTS] Could not prepare audio for playback")
-            return
+            throw TTSError.noAudio
         }
 
         // AUDIT P0 (TTS-STALE): scheduling into a stopped or DETACHED node
@@ -452,7 +483,7 @@ class TTSService: NSObject, ObservableObject {
         // media-services reset leaves behind.
         guard let node = playerNode, node.engine != nil else {
             print("❌ [TTS] Player node is detached — skipping playback")
-            return
+            throw TTSError.noAudio
         }
         node.play()
 
@@ -598,11 +629,16 @@ class TTSService: NSObject, ObservableObject {
 extension TTSService: AVSpeechSynthesizerDelegate {
     // SB-DEADLOCK FIX: both callbacks arrive on the synthesizer's own queue and
     // used to read-resume-nil without a lock, racing stop() on the main thread.
+    // AUDIT P2: these fired for ANY synthesizer, including a stale one being
+    // torn down, so a late didCancel from the previous utterance unparked the
+    // CURRENT one and cut it off mid-sentence. Only the live synthesizer counts.
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        guard synthesizer === systemSynthesizer else { return }
         resumeSystemContinuation()
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        guard synthesizer === systemSynthesizer else { return }
         resumeSystemContinuation()
     }
 }
