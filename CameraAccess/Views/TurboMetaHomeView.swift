@@ -11,6 +11,7 @@ import AVFoundation
 import AVKit
 import Speech
 import MapKit
+import EventKit
 
 struct TurboMetaHomeView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
@@ -43,6 +44,7 @@ struct TurboMetaHomeView: View {
     @State private var showLiveTranslate = false
     @State private var showOpenClaw = false
     @State private var showMemory = false
+    @State private var showReminders = false
     @ObservedObject private var openClawService = OpenClawNodeService.shared
 
     /// POCKET LAW: arm the wake word, but never on top of a module that owns
@@ -52,6 +54,14 @@ struct TurboMetaHomeView: View {
     /// closes, and failing that, the next didBecomeActive catches it.
     /// One line under the Memory row so the store is never a black box:
     /// you can see it filling up without opening it.
+    private var remindersDetailLine: String {
+        let od = ChappyReminders.shared.overdue().count
+        let t = ChappyReminders.shared.today().count
+        if od > 0 { return "\(od) overdue · \(t) today" }
+        if t > 0 { return "\(t) today · say \"remind me to…\"" }
+        return "Say \"Chappy, remind me to…\" — or tap to add"
+    }
+
     private var memoryDetailLine: String {
         let n = memory.recent.count
         if n == 0 { return "Everything Chappy stores, in one place" }
@@ -293,6 +303,11 @@ struct TurboMetaHomeView: View {
                         VStack(spacing: 8) {
                             // PHASE 5 — the one spot. Sits first because it is
                             // the thing you come back to, not a setting.
+                            MoreRow(icon: "bell.badge.fill",
+                                    title: "Reminders",
+                                    detail: remindersDetailLine) {
+                                showReminders = true
+                            }
                             MoreRow(icon: "brain",
                                     title: "Memory",
                                     detail: memoryDetailLine) {
@@ -346,6 +361,32 @@ struct TurboMetaHomeView: View {
             .fullScreenCover(isPresented: $showMemory) {
                 MemoryView()
             }
+            .fullScreenCover(isPresented: $showReminders) {
+                RemindersView()
+            }
+        }
+        // BUILD 103 — THE CAMERA THAT NEVER WOKE UP.
+        // snapSilently() posts this when the glasses camera isn't already
+        // streaming, which is nearly always — the camera is off during normal
+        // use on purpose, for the batteries. Nothing anywhere was listening,
+        // so Snap and "take a photo" did precisely nothing and said nothing
+        // about it. (The scan equivalent was wired; this one was missed.)
+        .onReceive(NotificationCenter.default.publisher(for: .chappyWakeCameraForSnap)) { _ in
+            Task { @MainActor in
+                await streamViewModel.startSession()
+                // The glasses need a beat to produce a first frame.
+                try? await Task.sleep(nanoseconds: 1_800_000_000)
+                if let frame = streamViewModel.currentVideoFrame {
+                    ChappyStandby.shared.completeSilentSnap(frame)
+                } else {
+                    ChappyEarcon.shared.fail()
+                    TTSService.shared.speak("The camera didn't wake up - check the glasses are connected.")
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chappyOpenReminders)) { _ in
+            showLiveAI = false; showQuickVision = false; showLiveTranslate = false
+            showReminders = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .chappyOpenMemory)) { _ in
             showLiveAI = false; showQuickVision = false; showLiveTranslate = false
@@ -366,6 +407,23 @@ struct TurboMetaHomeView: View {
             // location recovered from the breadcrumb trail. The AI pass that
             // pulls the durable facts out runs later, on charge.
             ChappyMemory.shared.foldInConversationRecords()
+
+            // PHASE 5.5 — reminders. Permission, re-arm every notification
+            // (they are lost on reinstall and after a restore), start the
+            // 30-second tick that speaks them while Chappy is running, and
+            // give the morning brief if this is the first look of the day.
+            ChappyReminders.shared.requestPermission()
+            ChappyReminders.shared.startTicking()
+            // PHASE 5.5 — the diary. One permission covers iCloud, Outlook,
+            // Google and anything else already on the phone.
+            ChappyCalendar.shared.requestAccess()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                ChappyCalendar.shared.fileFinishedEvents()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                ChappyReminders.shared.rescheduleAll()
+                ChappyReminders.shared.morningBriefIfDue()
+            }
 
             // PHASE 5 — anything the glasses captured with Chappy closed.
             // Self-gating: does nothing unless charging, on WiFi, and at
@@ -2058,6 +2116,8 @@ struct MemoryDetailView: View {
     @State private var pinned = false
     @State private var confirmDelete = false
     @State private var showOriginal = false
+    @State private var askTravel = false
+    @State private var toMaps = false
     @State private var region = MKCoordinateRegion()
 
     private var hasCoords: Bool {
@@ -2149,19 +2209,34 @@ struct MemoryDetailView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 16))
                             .allowsHitTesting(false)
 
+                            // BUILD 103 — ASK, DON'T ASSUME.
+                            // Both of these hard-coded walking, so tapping
+                            // Google Maps on a memory 76 km away offered a
+                            // seventeen-hour walk to Brisbane. A memory card
+                            // has no prior route to infer a mode from, and the
+                            // standing rule on this project is that the mode
+                            // question gets asked rather than guessed.
                             HStack(spacing: 10) {
                                 Button {
-                                    NavEngine.shared.navigateBack(
-                                        to: coord, name: entry.title, driving: false)
-                                    dismiss()
+                                    toMaps = false; askTravel = true
                                 } label: {
-                                    actionLabel("Take me back", "figure.walk")
+                                    actionLabel("Take me back", "arrow.uturn.backward")
                                 }
                                 Button {
-                                    openInGoogleMaps()
+                                    toMaps = true; askTravel = true
                                 } label: {
                                     actionLabel("Google Maps", "map.fill")
                                 }
+                            }
+                            .confirmationDialog("How are you getting there?",
+                                                isPresented: $askTravel,
+                                                titleVisibility: .visible) {
+                                Button("Walking") { travel("walking") }
+                                Button("Scooter or bike") { travel("two-wheeler") }
+                                Button("Driving") { travel("driving") }
+                                Button("Cancel", role: .cancel) { }
+                            } message: {
+                                Text(distanceHint)
                             }
                         } else {
                             Text("No location was recorded for this one.")
@@ -2259,10 +2334,35 @@ struct MemoryDetailView: View {
         .foregroundColor(theme.accent)
     }
 
-    private func openInGoogleMaps() {
+    /// How far away it is, so the mode question answers itself at a glance.
+    /// "17 hr 15 min" was Google's way of telling him the app had guessed
+    /// wrong; a distance on the button would have said it first.
+    private var distanceHint: String {
+        guard hasCoords,
+              let la = ContextEngine.shared.snapshot.latitude,
+              let lo = ContextEngine.shared.snapshot.longitude
+        else { return entry.title }
+        let m = TripRecorder.meters(la, lo, entry.lat ?? 0, entry.lon ?? 0)
+        if m < 1000 { return "\(entry.title) — about \(Int(m.rounded())) metres away" }
+        return String(format: "%@ — about %.1f km away", entry.title, m / 1000)
+    }
+
+    private func travel(_ mode: String) {
+        if toMaps {
+            openInGoogleMaps(mode: mode)
+        } else {
+            // NavEngine only knows two modes; a scooter routes as driving and
+            // Google gets the two-wheeler hint on the handoff.
+            NavEngine.shared.navigateBack(to: coord, name: entry.title,
+                                          driving: mode != "walking")
+            dismiss()
+        }
+    }
+
+    private func openInGoogleMaps(mode: String) {
         let lat = entry.lat ?? 0, lon = entry.lon ?? 0
-        let app = URL(string: "comgooglemaps://?daddr=\(lat),\(lon)&directionsmode=walking")
-        let web = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lon)&travelmode=walking")
+        let app = URL(string: "comgooglemaps://?daddr=\(lat),\(lon)&directionsmode=\(mode)")
+        let web = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lon)&travelmode=\(mode)")
         if let a = app, UIApplication.shared.canOpenURL(a) {
             UIApplication.shared.open(a)
         } else if let w = web {
@@ -2371,5 +2471,388 @@ struct OriginalMediaView: View {
                 failed = true
             }
         }
+    }
+}
+
+
+// =====================================================================
+// MARK: - REMINDERS SCREEN (Phase 5.5)
+// =====================================================================
+//
+// Voice sets the simple case; this screen edits the complex one. That split
+// is the one honest thing Alexa gets right and it is worth copying: nobody
+// wants to say "every second Tuesday at nine except public holidays" out
+// loud, and nobody wants to type "remind me to call mum at six".
+
+struct RemindersView: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var reminders = ChappyReminders.shared
+    @StateObject private var memory = ChappyMemory.shared
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var showAdd = false
+    @State private var editing: ChappyMemory.Entry?
+    @State private var showDone = false
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                               startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        briefCard
+                        diarySection
+                        section("Overdue", reminders.overdue(), .red)
+                        section("Today", reminders.today().filter { $0.deliveredAt == nil }, theme.accent)
+                        section("Waiting on a place", reminders.placeReminders(), .cyan)
+                        section("Coming up", reminders.upcoming().filter {
+                            !Calendar.current.isDateInToday($0.effectiveFire ?? Date())
+                        }, theme.textSecondary)
+                        if showDone {
+                            section("Done", reminders.done(), theme.textSecondary)
+                        } else if !reminders.done().isEmpty {
+                            Button("Show \(reminders.done().count) completed") { showDone = true }
+                                .font(.footnote).foregroundColor(theme.accent)
+                                .padding(.horizontal, 16).padding(.top, 6)
+                        }
+                        if reminders.open.isEmpty { empty }
+                        Color.clear.frame(height: 60)
+                    }
+                    .padding(.top, 8)
+                }
+            }
+            .navigationTitle("Reminders")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") { dismiss() }.foregroundColor(theme.accent)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { showAdd = true } label: {
+                        Image(systemName: "plus.circle.fill").foregroundColor(theme.accent)
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showAdd) { ReminderEditor(entry: nil, theme: theme) }
+        .sheet(item: $editing) { e in ReminderEditor(entry: e, theme: theme) }
+        .onAppear { ChappyReminders.shared.requestPermission() }
+    }
+
+    /// ONE LIST. A thing you have to BE AT and a thing you have to DO are the
+    /// same question at 7am — splitting them across two apps is exactly how
+    /// one of them gets missed.
+    @ViewBuilder
+    private var diarySection: some View {
+        let events = ChappyCalendar.shared.today().filter {
+            ($0.endDate ?? Date()) > Date()
+        }
+        if !events.isEmpty {
+            Text("IN THE DIARY")
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(.purple)
+                .padding(.horizontal, 20).padding(.top, 8)
+            ForEach(events, id: \.eventIdentifier) { e in
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: e.isAllDay ? "calendar" : "clock.badge")
+                        .font(.system(size: 17)).foregroundColor(.purple)
+                        .frame(width: 34, height: 34)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(e.title ?? "Appointment")
+                            .font(.subheadline).foregroundColor(theme.textPrimary).lineLimit(2)
+                        HStack(spacing: 6) {
+                            Text(e.isAllDay ? "All day" : Self.time(e.startDate))
+                            if let l = e.location, !l.isEmpty {
+                                Text("·"); Text(l).lineLimit(1)
+                            }
+                            if let c = e.calendar?.title { Text("·"); Text(c).lineLimit(1) }
+                        }
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    private static func time(_ d: Date?) -> String {
+        guard let d else { return "" }
+        let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    private var briefCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "sun.horizon.fill").foregroundColor(theme.accent)
+                Text("Your day").font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button {
+                    TTSService.shared.speak(ChappyReminders.shared.briefText())
+                } label: {
+                    Image(systemName: "speaker.wave.2.fill").foregroundColor(theme.accent)
+                }
+            }
+            Text(ChappyReminders.shared.briefText())
+                .font(.caption).foregroundColor(theme.textSecondary)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+    }
+
+    @ViewBuilder
+    private func section(_ title: String, _ items: [ChappyMemory.Entry], _ tint: Color) -> some View {
+        if !items.isEmpty {
+            Text(title.uppercased())
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(tint)
+                .padding(.horizontal, 20).padding(.top, 8)
+            ForEach(items) { r in
+                ReminderRow(entry: r, theme: theme, tint: tint)
+                    .contentShape(Rectangle())
+                    .onTapGesture { editing = r }
+            }
+        }
+    }
+
+    private var empty: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "bell.slash").font(.system(size: 36))
+                .foregroundColor(theme.textSecondary.opacity(0.5))
+            Text("Nothing on the list").font(.subheadline).foregroundColor(theme.textPrimary)
+            Text("Say \"Chappy, remind me to check in for my flight at six tomorrow\" — or tap plus.")
+                .font(.caption).foregroundColor(theme.textSecondary)
+                .multilineTextAlignment(.center).padding(.horizontal, 40)
+        }
+        .frame(maxWidth: .infinity).padding(.top, 50)
+    }
+}
+
+struct ReminderRow: View {
+    let entry: ChappyMemory.Entry
+    let theme: ChappyTheme
+    let tint: Color
+
+    private var whenText: String {
+        if let p = entry.placeTrigger, !p.isEmpty { return "when you're at \(p)" }
+        guard let f = entry.effectiveFire else { return "no time set" }
+        let cal = Calendar.current, df = DateFormatter()
+        if entry.floatingTime != nil { df.dateFormat = "h:mm a" ; return df.string(from: f) + " local, wherever you are" }
+        if cal.isDateInToday(f) { df.dateFormat = "'today' h:mm a" }
+        else if cal.isDateInTomorrow(f) { df.dateFormat = "'tomorrow' h:mm a" }
+        else { df.dateFormat = "EEE d MMM, h:mm a" }
+        return df.string(from: f)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Button {
+                if entry.doneAt == nil { ChappyReminders.shared.complete(entry.id) }
+                else { ChappyReminders.shared.reopen(entry.id) }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            } label: {
+                Image(systemName: entry.doneAt == nil ? "circle" : "checkmark.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundColor(entry.doneAt == nil ? theme.textSecondary : theme.accent)
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.title)
+                    .font(.subheadline)
+                    .foregroundColor(theme.textPrimary)
+                    .strikethrough(entry.doneAt != nil)
+                    .lineLimit(3)
+                HStack(spacing: 6) {
+                    Image(systemName: entry.placeTrigger?.isEmpty == false ? "mappin" : "clock")
+                        .font(.system(size: 9))
+                    Text(whenText)
+                    if let rule = entry.repeatRule {
+                        Text("· \(ChappyReminders.describe(rule: rule))").lineLimit(1)
+                    }
+                    if entry.escalate == true {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9)).foregroundColor(.orange)
+                    }
+                }
+                .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+            if entry.doneAt == nil, entry.effectiveFire != nil {
+                Menu {
+                    Button("Snooze 10 minutes") { ChappyReminders.shared.snooze(entry.id, minutes: 10) }
+                    Button("Snooze 1 hour") { ChappyReminders.shared.snooze(entry.id, minutes: 60) }
+                    Button("Tomorrow morning") {
+                        let cal = Calendar.current
+                        let d = cal.date(byAdding: .day, value: 1, to: Date()) ?? Date()
+                        ChappyReminders.shared.snooze(entry.id,
+                            until: cal.date(bySettingHour: 8, minute: 0, second: 0, of: d))
+                    }
+                    Divider()
+                    Button("Delete", role: .destructive) { ChappyReminders.shared.delete(entry.id) }
+                } label: {
+                    Image(systemName: "ellipsis").font(.caption)
+                        .foregroundColor(theme.textSecondary).frame(width: 30, height: 34)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 14)
+            .stroke(tint.opacity(entry.deliveredAt == nil ? 0.0 : 0.0), lineWidth: 1))
+        .padding(.horizontal, 16)
+        .opacity(entry.doneAt == nil ? 1 : 0.5)
+    }
+}
+
+/// Create or edit. The complex cases live here on purpose.
+struct ReminderEditor: View {
+    let entry: ChappyMemory.Entry?
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title = ""
+    @State private var mode = 0            // 0 time · 1 floating · 2 place
+    @State private var date = Date().addingTimeInterval(3600)
+    @State private var floating = Date()
+    @State private var place = ""
+    @State private var repeatUnit = 0      // 0 none 1 day 2 week 3 month
+    @State private var repeatN = 1
+    @State private var afterCompletion = false
+    @State private var escalate = false
+    @State private var leaveBy = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    TextField("Remind me to…", text: $title, axis: .vertical)
+                }
+                Section("When") {
+                    Picker("", selection: $mode) {
+                        Text("Time").tag(0); Text("Every day at").tag(1); Text("Place").tag(2)
+                    }.pickerStyle(.segmented)
+
+                    if mode == 0 {
+                        DatePicker("Date and time", selection: $date)
+                    } else if mode == 1 {
+                        DatePicker("Local time", selection: $floating, displayedComponents: .hourAndMinute)
+                        Text("Fires at this time wherever you are — it follows you across time zones instead of drifting.")
+                            .font(.caption2).foregroundColor(.secondary)
+                    } else {
+                        TextField("Somewhere — \"supermarket\", \"home\", \"the hotel\"", text: $place)
+                        Toggle("Warn me in time to leave", isOn: $leaveBy)
+                        if leaveBy {
+                            Text("Uses real travel time from where you are, not a fixed countdown.")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                if mode != 2 {
+                    Section("Repeat") {
+                        Picker("Repeat", selection: $repeatUnit) {
+                            Text("Never").tag(0); Text("Daily").tag(1)
+                            Text("Weekly").tag(2); Text("Monthly").tag(3)
+                        }
+                        if repeatUnit > 0 {
+                            Stepper("Every \(repeatN)", value: $repeatN, in: 1...30)
+                            Toggle("Count from when I do it", isOn: $afterCompletion)
+                            Text(afterCompletion
+                                 ? "Like laundry — the next one is measured from when you actually tick it off."
+                                 : "Like rent — fixed schedule regardless of when you do it.")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                Section {
+                    Toggle("Must not be missed", isOn: $escalate)
+                    Text("Breaks through Focus and the notification summary.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                if entry != nil {
+                    Section {
+                        Button("Delete", role: .destructive) {
+                            if let e = entry { ChappyReminders.shared.delete(e.id) }
+                            dismiss()
+                        }
+                    }
+                }
+            }
+            .navigationTitle(entry == nil ? "New reminder" : "Edit")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                        .disabled(title.trimmingCharacters(in: .whitespaces).count < 2)
+                }
+            }
+        }
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        guard let e = entry else { return }
+        title = e.title
+        escalate = e.escalate ?? false
+        if let p = e.placeTrigger, !p.isEmpty { mode = 2; place = p; leaveBy = e.leadMinutes != nil }
+        else if let f = e.floatingTime, let hm = ChappyReminders.hhmm(f) {
+            mode = 1
+            floating = Calendar.current.date(bySettingHour: hm.0, minute: hm.1, second: 0, of: Date()) ?? Date()
+        } else if let d = e.dueAt { mode = 0; date = d }
+        if let rule = e.repeatRule {
+            afterCompletion = rule.hasSuffix("!")
+            let r = afterCompletion ? String(rule.dropLast()) : rule
+            repeatUnit = ["d": 1, "w": 2, "m": 3][String(r.prefix(1))] ?? 0
+            repeatN = Int(r.dropFirst()) ?? 1
+        }
+    }
+
+    private func save() {
+        let rule: String? = {
+            guard repeatUnit > 0 else { return nil }
+            let u = ["d", "w", "m"][repeatUnit - 1]
+            return "\(u)\(repeatN)\(afterCompletion ? "!" : "")"
+        }()
+        let hhmm: String? = {
+            guard mode == 1 else { return nil }
+            let c = Calendar.current.dateComponents([.hour, .minute], from: floating)
+            return String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
+        }()
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let e = entry {
+            var c = e
+            c.title = clean
+            c.dueAt = mode == 0 ? date : nil
+            c.floatingTime = hhmm
+            c.placeTrigger = mode == 2 ? place : nil
+            c.repeatRule = rule
+            c.leadMinutes = (mode == 2 && leaveBy) ? 5 : nil
+            c.escalate = escalate
+            c.snoozedTo = nil
+            c.deliveredAt = nil
+            ChappyMemory.shared.replaceReminderFields(c)
+            ChappyReminders.shared.rescheduleAll()
+        } else {
+            ChappyReminders.shared.add(title: clean,
+                                       at: mode == 0 ? date : nil,
+                                       floatingTime: hhmm,
+                                       place: mode == 2 ? place : nil,
+                                       repeatRule: rule,
+                                       leadMinutes: (mode == 2 && leaveBy) ? 5 : nil,
+                                       escalate: escalate,
+                                       source: "typed")
+        }
+        dismiss()
     }
 }

@@ -13,6 +13,7 @@ import MapKit
 import Speech
 import Photos
 import Network
+import UserNotifications
 
 // MARK: - CHAPPY EARCONS — the sound of being heard
 //
@@ -1030,7 +1031,36 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var wasSpeaking = false
     private var speechWatch: Timer?
 
-    private static let wakeWords = ["chappy", "chappie", "chapy", "chappy's"]
+    /// BUILD 103. On-device recognition writes his name down differently
+    /// depending on how fast he says it and how far the phone is from his
+    /// mouth, and a name it did not recognise is a command that silently
+    /// never happened — which reads as "intermittent" rather than "deaf".
+    ///
+    /// Everything here begins "chap", "shap" or "tchap", so none of it can
+    /// collide with an ordinary word. Deliberately NOT included: "happy" and
+    /// "chatty", which would fire on normal conversation and make it worse.
+    /// Names the recogniser has to get right or the command is wasted.
+    /// Australian chains he uses now, and the SE Asian ones he is about to.
+    static let brandHints: [String] = [
+        "McDonald's", "Hungry Jack's", "Burger King", "KFC", "Red Rooster",
+        "Subway", "Domino's", "Guzman y Gomez", "Zambrero", "Nando's",
+        "IGA", "Woolworths", "Coles", "Aldi", "Bunnings", "Chemist Warehouse",
+        "Officeworks", "BP", "Caltex", "Ampol", "7-Eleven",
+        "Grab", "Gojek", "Indomaret", "Alfamart", "Circle K",
+        "Ubud", "Canggu", "Seminyak", "Kuta", "Uluwatu", "Denpasar",
+        "warung", "kebab", "kebabs", "nasi goreng", "mie goreng",
+        "pharmacy", "chemist", "ATM", "petrol station", "supermarket",
+    ]
+
+    /// Bumped when the server recogniser errors. Two strikes and this session
+    /// stays on-device — no retry storm, no silent deafness on a bad line.
+    static var serverHearingFailures = 0
+
+    private static let wakeWords = [
+        "chappy", "chappie", "chapy", "chappy's", "chappi", "chapi",
+        "chappey", "chappe", "chapper", "chappa", "chap he", "chap e",
+        "shappy", "shappie", "tchappy", "chappys", "chaphy",
+    ]
 
     // MARK: Language intelligence (country-aware translation)
 
@@ -1641,6 +1671,14 @@ final class ChappyStandby: NSObject, ObservableObject {
                 try? AVAudioSession.sharedInstance()
                     .setActive(false, options: .notifyOthersOnDeactivation)
                 self.isListening = false
+                // THE SILENT FAILURE. The chip said "Standby on", the ear was
+                // dead, and there was no way to know until a command went
+                // unanswered. This is the single highest-value notification in
+                // the app, because it is the one that has actually cost days.
+                ChappyNotify.post(.system,
+                    title: "Chappy stopped listening",
+                    body: "The wake word needs the app open. Add the audio background mode to keep it live in your pocket.",
+                    critical: false, force: true)
             }
         }
 
@@ -2164,7 +2202,11 @@ final class ChappyStandby: NSObject, ObservableObject {
         expectingNavModeUntil = Date().addingTimeInterval(12)
         if !isListening { silentArm = true; start() }
         ChappyEarcon.shared.wake()
-        TTSService.shared.speak("Walking, driving, or scooter?")
+        // BUILD 104: this used to ask the mode WITHOUT naming the place, so a
+        // misheard destination was invisible until a route to the wrong shop
+        // appeared. Saying it back costs a second and catches every mishear at
+        // the only moment it is still cheap to fix.
+        TTSService.shared.speak("\(destination). Walking, driving, or scooter?")
     }
 
     /// Same trick for naming a spot you just saved.
@@ -2215,8 +2257,36 @@ final class ChappyStandby: NSObject, ObservableObject {
         guard let recognizer else { return false }
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        // ON-DEVICE = free, private, works with no signal.
-        if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
+
+        // BUILD 104 — HEARING, PROPERLY.
+        //
+        // On-device recognition is free, private and works on a plane, and it
+        // is noticeably WORSE at proper nouns than Apple's server model. That
+        // is exactly the class of word this app lives on: McDonald's, Hungry
+        // Jack's, IGA, Gojek, Uluwatu. "Take me to the closest McDonald's"
+        // coming back as a route to a shop called King IT is what that failure
+        // looks like from the outside.
+        //
+        // So: use the server model when there is a network, and fall back to
+        // on-device the moment it fails twice. Offline still works; it just
+        // hears brand names less well, which is the correct trade.
+        let forcedOffline = UserDefaults.standard.bool(forKey: "chappy_hearing_offline_only")
+        let useOnDevice = recognizer.supportsOnDeviceRecognition
+            && (forcedOffline || Self.serverHearingFailures >= 2)
+        req.requiresOnDeviceRecognition = useOnDevice
+
+        // A short command is a search query, not dictation. The hint changes
+        // which language model weights get used and it is free.
+        req.taskHint = .search
+
+        // CONTEXTUAL STRINGS — words to expect. This is the single cheapest
+        // accuracy win available: his own assistant's name, every place he has
+        // already saved, and the brands he actually says out loud.
+        var hints = Self.wakeWords
+        hints += TripRecorder.shared.spots.suffix(40).map { $0.name }
+        hints += Self.brandHints
+        req.contextualStrings = Array(hints.prefix(100))
+
         request = req
 
         let input = engine.inputNode
@@ -2249,6 +2319,8 @@ final class ChappyStandby: NSObject, ObservableObject {
         var thisTask: SFSpeechRecognitionTask?
         thisTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             if let result {
+                // A result proves the path works; forgive earlier blips.
+                if !useOnDevice { Self.serverHearingFailures = 0 }
                 let text = result.bestTranscription.formattedString.lowercased()
                 Task { @MainActor in
                     guard let self, self.task === thisTask else { return }
@@ -2256,6 +2328,12 @@ final class ChappyStandby: NSObject, ObservableObject {
                 }
             }
             if error != nil || (result?.isFinal ?? false) {
+                if error != nil && !useOnDevice {
+                    Self.serverHearingFailures += 1
+                    if Self.serverHearingFailures == 2 {
+                        print("👂 [Standby] Server hearing failed twice — on-device for the rest of this session")
+                    }
+                }
                 Task { @MainActor in
                     guard let self, self.task === thisTask else { return }
                     self.task = nil
@@ -2420,6 +2498,13 @@ final class ChappyStandby: NSObject, ObservableObject {
                         self.speak("Finding \(dest).")
                         let reply = await NavEngine.shared.navigate(to: dest, driving: drive)
                         self.speak(NavEngine.shared.spokenRouteSummary ?? reply)
+                        // BUILD 104: the direct path offered the map; THIS path
+                        // — the one you land on whenever you didn't say how you
+                        // were travelling, which is most of the time — did not.
+                        // So the hands-free "want the map? yes" never happened.
+                        if NavEngine.shared.isNavigating {
+                            self.offerGoogleMaps(driving: drive)
+                        }
                     }
                     resetRecognition()
                     return
@@ -2847,6 +2932,80 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak("\(today.count) today. \(list).")
             return
         }
+        // ---------- PHASE 5.5 — REMINDERS (free, offline, instant) ----------
+        if Self.looksLikeReminder(c), let p = Self.parseReminder(c) {
+            let r = ChappyReminders.shared.add(
+                title: p.title, at: p.date, floatingTime: p.floating,
+                place: p.place, repeatRule: p.rule, leadMinutes: p.lead,
+                escalate: p.escalate,
+                thumbnail: LiveAIManager.shared.streamViewModel?.currentVideoFrame?
+                    .jpegData(compressionQuality: 0.4))
+            ChappyEarcon.shared.done()
+            // A FIVE-WORD TAIL, not a readback. Confirmation fatigue is why
+            // people stop using reminders; silence is acceptance.
+            speak("\(r.title). \(p.confirmation)")
+            return
+        }
+        if c.contains("what's on today") || c.contains("whats on today")
+            || c.contains("what's due") || c.contains("whats due")
+            || c.contains("my reminders") || c.contains("what reminders")
+            || c.contains("what have i got on") || c.contains("what's on my list")
+            || c.contains("whats on my list") || c.contains("read my list")
+            || c.contains("anything due") || c.contains("what's coming up")
+            || c.contains("whats coming up") {
+            speak(ChappyReminders.shared.spokenList()); return
+        }
+        if c.contains("what's my day") || c.contains("whats my day")
+            || c.contains("morning brief") || c.contains("brief me")
+            || c.contains("how's my day") || c.contains("hows my day") {
+            speak(ChappyReminders.shared.briefText()); return
+        }
+        // Ticking one off by name — fuzzy, because you never say it the same
+        // way twice. Matches the closest open reminder.
+        if let what = after(c, ["mark done", "tick off", "i've done", "ive done",
+                                "that's done", "thats done", "done with",
+                                "finished with", "cross off", "completed"]) {
+            let target = ChappyReminders.shared.open.first {
+                $0.title.lowercased().contains(what) || what.contains($0.title.lowercased())
+            }
+            if let t = target {
+                ChappyReminders.shared.complete(t.id)
+                ChappyEarcon.shared.done()
+                speak("Done: \(t.title).")
+            } else {
+                ChappyEarcon.shared.fail()
+                speak("I don't have a reminder like that.")
+            }
+            return
+        }
+        // SEMANTIC SNOOZE — the same grammar as creating one. "Snooze until I
+        // get home" works; nobody else on the market can do that.
+        if c.hasPrefix("snooze") || c.contains("remind me again")
+            || c.contains("not now") || c.contains("later") && c.count < 22 {
+            guard let last = ChappyReminders.shared.due().first
+                    ?? ChappyReminders.shared.overdue().first else {
+                speak("Nothing to snooze."); return
+            }
+            if let place = after(c, ["until i'm at ", "until im at ", "when i get to ",
+                                     "until i get to ", "until i'm home", "until im home"]) {
+                ChappyReminders.shared.snooze(last.id, place: place.isEmpty ? "home" : place)
+                speak("I'll say it again there.")
+            } else if let mins = Self.snoozeMinutes(in: c) {
+                ChappyReminders.shared.snooze(last.id, minutes: mins)
+                speak("\(mins) minutes.")
+            } else {
+                ChappyReminders.shared.snooze(last.id, minutes: 10)
+                speak("Ten minutes.")
+            }
+            return
+        }
+        if c.contains("open reminders") || c.contains("show my reminders")
+            || c.contains("show reminders") || c.contains("open my list") {
+            NotificationCenter.default.post(name: .chappyOpenReminders, object: nil)
+            ChappyEarcon.shared.done()
+            speak("Here's your list."); return
+        }
+
         // ---------- PHASE 5 — MEMORY RECALL (free, offline, instant) ----------
         // Sits ABOVE the journal answers on purpose: "what do you remember
         // about the warung" is a memory question, and the journal only knows
@@ -3024,10 +3183,27 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             return
         }
-        if c.hasPrefix("translate") || c.contains("interpreter")
-            || c == "open translate" || c == "start translate" || c == "open the translator"
-            || c == "start translating" || c == "open interpreter"
+        // BUILD 103 — THE WORD "TRANSLATION".
+        //
+        // He says "open translation" because that is what a person says. The
+        // string "translation" does not CONTAIN the string "translate" — the
+        // eighth letter differs — so every one of these tests missed, the
+        // command fell through the whole offline ladder, and it went to Gemini
+        // Flash instead: one to four seconds, over the network, sometimes
+        // right. That is precisely the "it sort of works and it doesn't"
+        // he described, and it was one missing word.
+        //
+        // The exact-equality tests were the same mistake in a smaller way:
+        // "open translate" matched, "open translate please" did not.
+        if c.hasPrefix("translate") || c.hasPrefix("translation")
+            || c.contains("translation") || c.contains("translator")
+            || c.contains("interpreter") || c.contains("interpret for")
+            || c.contains("open translate") || c.contains("start translate")
+            || c.contains("start translating") || c.contains("open translating")
+            || c.contains("translate mode") || c.contains("translate app")
             || c.contains("help me talk to") || c.contains("talk to them")
+            || c.contains("speak to them") || c.contains("talk to him")
+            || c.contains("talk to her") || c.contains("talk to this guy")
             || (c.contains("translate") && (c.contains("mode") || c.contains("for me"))) {
             // ============ WHICH LANGUAGE, WITHOUT ASKING ============
             // "Open translate and just start" is the right instinct, and it
@@ -3570,6 +3746,20 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     // MARK: Helpers
 
+    /// "snooze for twenty minutes", "snooze an hour".
+    static func snoozeMinutes(in c: String) -> Int? {
+        if let r = c.range(of: #"(\d+)\s?(minute|minutes|min|mins|hour|hours|hr|hrs)"#,
+                           options: .regularExpression) {
+            let frag = String(c[r])
+            let n = Int(frag.components(separatedBy: CharacterSet.decimalDigits.inverted)
+                .filter { !$0.isEmpty }.first ?? "") ?? 10
+            return frag.contains("h") ? n * 60 : n
+        }
+        if c.contains("an hour") { return 60 }
+        if c.contains("half an hour") { return 30 }
+        return nil
+    }
+
     /// Text following any of these openers (nil if none present)
     private func after(_ text: String, _ openers: [String]) -> String? {
         for o in openers {
@@ -3612,7 +3802,39 @@ final class ChappyStandby: NSObject, ObservableObject {
                        "route me to ", "route to ", "how do i get to ", "how do we get to ",
                        "give me a map to ", "map to ", "a map to ", "show me the way to ",
                        "i need to get to ", "i want to go to ", "how far to "]
-        if !asksAbout { openers += ["closest ", "nearest "] }
+        // BUILD 104: the way he actually asks. "Find me the closest Hungry
+        // Jack's and navigate me to it" used to extract the destination "it".
+        if !asksAbout {
+            openers += ["closest ", "nearest ",
+                        "find me the closest ", "find me the nearest ",
+                        "find the closest ", "find the nearest ", "find me a ",
+                        "find me the best ", "find the best ", "find a ",
+                        "where's the closest ", "wheres the closest ",
+                        "where is the closest ", "where's the nearest ",
+                        "wheres the nearest ", "where is the nearest ",
+                        "is there a "]
+        }
+        // BUILD 104 — CHOP THE TAIL BEFORE PICKING THE OPENER.
+        // "Find me the closest Hungry Jack's and navigate me to it" contains
+        // TWO openers, and the last-one-wins rule picked the second, so the
+        // destination came out as the word "it". The trailing half is never
+        // the place name, so it goes first. Only stripped when there is
+        // something in front of it, so a bare "take me there" still routes.
+        var c = c
+        for tail in [" navigate me to it", " navigate me there", " navigate to it",
+                     " navigate there", " take me there", " take me to it",
+                     " take us there", " get me there", " go there",
+                     " route me there", " show me a map", " show me the map",
+                     " map it", " drive me there", " walk me there"] {
+            if let r = c.range(of: tail), r.lowerBound != c.startIndex {
+                c = String(c[c.startIndex..<r.lowerBound])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+                // "…and" is left dangling once its clause is gone.
+                if c.hasSuffix(" and") { c = String(c.dropLast(4)) }
+                if c.hasSuffix(" then") { c = String(c.dropLast(5)) }
+            }
+        }
+
         // Take the LAST opener match so lead-ins can't poison the destination
         var best: Range<String.Index>?
         for o in openers {
@@ -3628,6 +3850,17 @@ final class ChappyStandby: NSObject, ObservableObject {
         // Kuta Beach by taxi" searched Places for "kuta beach by taxi" and found
         // nothing. Strip them wherever they appear — they are never part of a
         // place name.
+        // Trailing clauses. "…and take me there" is not part of a shop name,
+        // and it is how a person naturally chains the two halves of the ask.
+        for tail in [" and take me there", " and navigate me to it", " and navigate there",
+                     " and take me to it", " and show me a map", " and show me the map",
+                     " and map it", " and route me there", " and get me there",
+                     " and go there", " then take me there", " and take us there"] {
+            if let r = d.lowercased().range(of: tail) {
+                d = String(d[d.startIndex..<r.lowerBound])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            }
+        }
         for junk in [" by car", " via car", " by scooter", " on the scooter", " by motorbike",
                      " by taxi", " by grab", " by bike", " in the car", " on foot",
                      " walking", " driving", " please", " thanks", " thank you", " now"] {
@@ -3642,6 +3875,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             d = String(d.dropFirst(prefix.count))
         }
         d = d.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        // Belt and braces: a pronoun means the tail-chopper missed something.
+        // Routing to a place called "it" is worse than not routing at all.
+        if ["it", "there", "that", "them", "here", "one"].contains(d.lowercased()) { return nil }
         return d.count > 1 ? d : nil
     }
 
@@ -3801,6 +4037,27 @@ final class ChappyHaptics {
     func voiceRevived() { taps([(0, heavy), (0.5, heavy)]) }
     func costNudge()    { taps([(0, light), (0.3, light)]) }
     func proximity()    { taps([(0, light), (0.2, light), (0.35, heavy)]) }
+
+    // PHASE 5.5 — REMINDER SIGNATURES.
+    //
+    // The point of a haptic is that you can tell WHAT happened without
+    // looking, without hearing, and with the phone in a pocket on a scooter.
+    // That only works if the patterns are actually distinguishable from each
+    // other and from the navigation cues above, so these are deliberately
+    // shaped differently: nav is short and directional, reminders RISE.
+    //
+    //   normal   light · light · heavy      a rising "something's due"
+    //   urgent   heavy · heavy · heavy, twice, with a gap you feel through denim
+    //   place    three quick lights         a flutter — "you've arrived at the thing"
+    //   done     success notification       the system's own tick
+    func reminderDue()   { taps([(0, light), (0.14, light), (0.30, heavy)]) }
+    func reminderUrgent() {
+        taps([(0, heavy), (0.16, heavy), (0.32, heavy),
+              (0.9, heavy), (0.16, heavy), (0.32, heavy)])
+    }
+    func reminderPlace() { taps([(0, light), (0.10, light), (0.20, light)]) }
+    func reminderDone()  { notify.notificationOccurred(.success) }
+    func reminderSnoozed() { taps([(0, light)]) }
 }
 
 // MARK: - Backup & Restore (Settings → Backup)
@@ -3950,8 +4207,15 @@ final class CostMeter {
             warned = [Self.dayKey(): done]
             UserDefaults.standard.set(warned, forKey: spokenKey)
             DispatchQueue.main.async {
-                Task { @MainActor in ChappyHaptics.shared.costNudge() }
-                TTSService.shared.speak("Quick heads up - you're around \(Int(threshold)) dollars for the day.")
+                Task { @MainActor in
+                    ChappyHaptics.shared.costNudge()
+                    // Spend matters most when the app is CLOSED, because that
+                    // is exactly when you are not watching it.
+                    ChappyNotify.announce(.money,
+                        spoken: "Quick heads up - you're around \(Int(threshold)) dollars for the day.",
+                        title: "AI spend today",
+                        body: String(format: "About $%.0f so far today.", threshold))
+                }
             }
         }
     }
@@ -4144,6 +4408,13 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         snapshot.timestamp = Date()
         // PHASE 4 STEP 3: every fix feeds the journal (it self-throttles)
         TripRecorder.shared.record(location: loc)
+        // PHASE 5.5: a place reminder needs no timer of its own — it rides
+        // the location fix the journal is already taking, so it costs nothing.
+        Task { @MainActor in
+            ChappyReminders.shared.checkPlaceTriggers()
+            await ChappyReminders.shared.checkLeaveBy()
+            await ChappyCalendar.shared.checkLeaveBy()
+        }
         // PHASE 4 STEP 5: and the navigator (speaks turns when close)
         Task { @MainActor in NavEngine.shared.updateLocation(loc) }
         if Date().timeIntervalSince(lastGeocode) > 120 {
@@ -4721,6 +4992,28 @@ final class NavEngine: NSObject, ObservableObject {
         }
     }
 
+    /// PHASE 5.5 — how long it would actually take to get there, for leave-by
+    /// warnings. Deliberately does not start navigation or touch any state;
+    /// it is a question, not a command.
+    func travelMinutes(to query: String, driving: Bool = true) async -> Int? {
+        let snap = ContextEngine.shared.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude, !query.isEmpty else { return nil }
+        var dest: CLLocationCoordinate2D?
+        let q = query.lowercased()
+        if let spot = TripRecorder.shared.spots.last(where: {
+            q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q) }) {
+            dest = CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon)
+        }
+        if dest == nil, let found = await placesSearch(query: query, lat: lat, lon: lon) {
+            dest = found.0
+        }
+        guard let d = dest else { return nil }
+        var routed = await googleRoute(fromLat: lat, fromLon: lon, to: d, driving: driving)
+        if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: d, driving: driving) }
+        guard let r = routed else { return nil }
+        return max(1, Int(r.durationSec / 60))
+    }
+
     func getHome() async -> String {
         if let home = TripRecorder.shared.spots.last(where: { ["home", "hotel", "my hotel", "the hotel"].contains($0.name.lowercased()) }) {
             return await navigate(to: home.name)
@@ -4747,6 +5040,7 @@ final class NavEngine: NSObject, ObservableObject {
             if dw < 150 {
                 watchTarget = nil
                 ChappyHaptics.shared.proximity()
+                ChappyNotify.post(.nav, title: "You're near it", body: w.name, opens: .chappyShowMap)
                 speakNav("\(w.name) is about \(Int(dw)) meters away.")
             }
         }
@@ -4763,6 +5057,12 @@ final class NavEngine: NSObject, ObservableObject {
             stepIndex += 1
             if stepIndex >= steps.count {
                 ChappyHaptics.shared.arrival()
+                // Arriving is the one nav event worth a banner — you get it
+                // with the phone in a pocket, or find it later on the lock
+                // screen if you missed the voice. Turns are NOT notified:
+                // a banner per corner is how you learn to ignore all of them.
+                ChappyNotify.post(.nav, title: "Arrived",
+                                  body: destinationName, opens: .chappyShowMap)
                 speakNav("You have arrived at \(destinationName).")
                 stop()
                 return
@@ -4968,6 +5268,7 @@ final class ChappyMemory: ObservableObject {
         case ask          // something you asked and the answer
         case spend        // money noted
         case day          // the day's own summary paragraph
+        case reminder     // a memory with a trigger on it
 
         var id: String { rawValue }
 
@@ -4983,6 +5284,7 @@ final class ChappyMemory: ObservableObject {
             case .ask:   return "Asked"
             case .spend: return "Spend"
             case .day:   return "Days"
+            case .reminder: return "Reminders"
             }
         }
 
@@ -4998,6 +5300,7 @@ final class ChappyMemory: ObservableObject {
             case .ask:   return "questionmark.circle.fill"
             case .spend: return "creditcard.fill"
             case .day:   return "book.closed.fill"
+            case .reminder: return "bell.fill"
             }
         }
     }
@@ -5036,6 +5339,47 @@ final class ChappyMemory: ObservableObject {
         var expires: Date?
         /// Which part of Chappy wrote this. Useful when a module misbehaves.
         var source: String = ""
+        // ===== REMINDER FIELDS (PHASE 5.5) =====
+        // All optional, so every memory written before reminders existed still
+        // decodes, and a memory becomes a reminder by gaining a trigger rather
+        // than by being copied into a second store.
+        /// The moment it should fire. Nil for a place-only reminder.
+        var dueAt: Date?
+        /// FLOATING TIME, "HH:mm". Set instead of dueAt when the reminder means
+        /// "8am wherever I am" rather than a fixed instant. This is the field
+        /// every other assistant is missing, and it is the one that breaks the
+        /// day you change country.
+        var floatingTime: String?
+        /// Compact repeat rule — "d3" every 3 days, "d3!" every 3 days AFTER
+        /// COMPLETION, "w1:mon,fri" weekly on those days, "m1" monthly.
+        var repeatRule: String?
+        /// A place name or keyword that fires it instead of a clock.
+        var placeTrigger: String?
+        /// Minutes of buffer on top of real travel time for a leave-by warning.
+        var leadMinutes: Int?
+        /// When it was ticked off. Nil means still open.
+        var doneAt: Date?
+        /// Snooze wins over dueAt while it is in the future.
+        var snoozedTo: Date?
+        /// Time-sensitive: pierces Focus and the notification summary.
+        var escalate: Bool?
+        /// When it actually reached him. Logged so a reminder that fired while
+        /// he was asleep is recoverable rather than silently lost.
+        var deliveredAt: Date?
+
+        /// Snooze beats the original time; a floating time resolves against
+        /// TODAY in whatever zone the phone is in right now.
+        var effectiveFire: Date? {
+            if let s = snoozedTo, s > Date() { return s }
+            if let hhmm = floatingTime, let p = ChappyReminders.hhmm(hhmm) {
+                let cal = Calendar.current
+                let today = cal.date(bySettingHour: p.0, minute: p.1, second: 0, of: Date())
+                if let t = today, t >= Date() || Calendar.current.isDateInToday(t) { return t }
+                return today
+            }
+            return snoozedTo ?? dueAt
+        }
+
         /// PHOTO LIBRARY LINK. The PhotoKit local identifier of the original,
         /// for anything imported from the glasses. Memory holds a thumbnail
         /// and a summary; the full-resolution file stays in the library and
@@ -5235,6 +5579,13 @@ final class ChappyMemory: ObservableObject {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         mutate(id: id) { $0.title = trimmed }
+    }
+
+    /// Overwrite a whole entry in place. Reminders change often — snoozed,
+    /// completed, rescheduled — and each of those is a whole-record edit
+    /// rather than a one-field patch.
+    func replaceReminderFields(_ e: Entry) {
+        mutate(id: e.id) { $0 = e }
     }
 
     func setPinned(id: UUID, _ pinned: Bool) {
@@ -5945,6 +6296,14 @@ final class ChappyIngest: ObservableObject {
         if failed > 0 { summary += ", \(failed) couldn't be read" }
         lastResult = summary
         print("📥 [Ingest] \(summary)")
+        // Overnight, on the charger, app in the background — the whole point
+        // of this feature is that you wake up to it already done.
+        if photos + videos > 0 {
+            ChappyNotify.post(.memory,
+                title: "Glasses captures filed",
+                body: summary + " — captioned and searchable.",
+                opens: .chappyOpenMemory)
+        }
         if manual {
             ChappyEarcon.shared.done()
             TTSService.shared.speak(photos + videos == 0
@@ -6427,6 +6786,12 @@ extension ChappyMemory {
         }
 
         print("🧠 [Records] \(filed) facts filed from \(pending.count) conversations")
+        if filed > 0 {
+            ChappyNotify.post(.memory,
+                title: "Read \(pending.count) old conversations",
+                body: "\(filed) thing\(filed == 1 ? "" : "s") worth keeping filed into memory.",
+                opens: .chappyOpenMemory)
+        }
         if manual {
             ChappyEarcon.shared.done()
             TTSService.shared.speak(filed == 0
@@ -6501,5 +6866,1326 @@ extension ChappyMemory {
             .filter { $0.count > 6 && $0.count < 160 }
             .prefix(3)
             .map { $0 }
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY REMINDERS (PHASE 5.5 — the vocal diary)
+// =====================================================================
+//
+// ONE STORE, TWO VIEWS.
+// A reminder is a memory with a trigger on it. A memory is a reminder with
+// no trigger. "Remember the tracking number" and "remind me to book the
+// ferry" write the same kind of record, which is why "what did I say about
+// the tracking number" and "what's due today" search one index instead of
+// two — and why "remind me about that thing I noted yesterday" can attach a
+// trigger to a memory that already exists rather than making a duplicate.
+//
+// Meta's glasses keep reminders and memories in separate stores that never
+// cross-reference. That is the single biggest thing to beat, and it is beaten
+// by doing nothing — the store was built this way already.
+//
+// TWO THINGS NOBODY ELSE DOES, BOTH OF WHICH MATTER TO A FULL-TIME TRAVELLER
+//
+//   1. FLOATING TIME. "Take the tablet at 8am" means 8am WHEREVER YOU ARE.
+//      "Ring the bank at 9am Brisbane" means a fixed instant. Every assistant
+//      on the market stores one absolute moment and quietly gets one of those
+//      two wrong the day you change country. Chappy stores which kind it is.
+//
+//   2. COMPLETION-ANCHORED REPEATS. "Every 3 days" from the schedule versus
+//      "3 days after I actually do it" are different things — laundry is the
+//      second, rent is the first. Todoist has this and no voice assistant
+//      does, because nobody worked out how to say it out loud. You say
+//      "every three days after I do it".
+//
+// DELIVERY IS NEGOTIATED, CAPTURE IS NOT.
+// Capture always works, offline, instantly. Delivery has a ladder: if Chappy
+// is running it speaks in your ear; either way a local notification fires so
+// a closed app still reaches you, and the Meta app can read that aloud
+// through the glasses. Every fire is logged, so a reminder that went off
+// while you were asleep is recoverable rather than lost — which is exactly
+// how Meta's glasses lose them today.
+
+import UserNotifications
+
+@MainActor
+final class ChappyReminders: NSObject, ObservableObject {
+    static let shared = ChappyReminders()
+
+    @Published private(set) var lastSpoken: String = ""
+    @Published var permissionDenied = false
+
+    private var tickTimer: Timer?
+    private var briefedOn: String {
+        get { UserDefaults.standard.string(forKey: "chappy_brief_day") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_brief_day") }
+    }
+
+    private override init() { super.init() }
+
+    // MARK: - Permission
+
+    func requestPermission() {
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge, .timeSensitive]) { ok, _ in
+                DispatchQueue.main.async {
+                    self.permissionDenied = !ok
+                    if ok { self.registerCategories() }
+                }
+                print(ok ? "🔔 [Reminders] Notifications allowed" : "⚠️ [Reminders] Notifications refused")
+            }
+    }
+
+    // MARK: - Notification actions
+    //
+    // THE POINT: you should never have to open the app to deal with a
+    // reminder. Long-press the banner on the lock screen and it's done,
+    // snoozed ten minutes, or pushed until you're home — from the same screen
+    // it appeared on. Siri gives you a fixed-interval snooze and nothing else;
+    // "when I'm home" is the one people actually want and nobody offers it.
+    func registerCategories() {
+        let done = UNNotificationAction(identifier: "CHAPPY_DONE",
+                                        title: "Done", options: [])
+        let s10 = UNNotificationAction(identifier: "CHAPPY_SNOOZE10",
+                                       title: "In 10 minutes", options: [])
+        let sHome = UNNotificationAction(identifier: "CHAPPY_SNOOZE_HOME",
+                                         title: "When I'm home", options: [])
+        let cat = UNNotificationCategory(identifier: "CHAPPY_REMINDER",
+                                         actions: [done, s10, sHome],
+                                         intentIdentifiers: [],
+                                         options: [])
+        // Everything that is NOT a reminder — arrivals, imports, spend,
+        // problems. No action buttons: tapping opens the right screen, and
+        // there is nothing to "complete" about an arrival.
+        let info = UNNotificationCategory(identifier: "CHAPPY_INFO",
+                                          actions: [], intentIdentifiers: [], options: [])
+        let center = UNUserNotificationCenter.current()
+        center.setNotificationCategories([cat, info])
+        center.delegate = self
+    }
+
+    /// QUIET HOURS. A reminder that buzzes at 3am is one you turn off
+    /// entirely, and then it never helps you again. Anything marked
+    /// must-not-miss still comes through — that is what the flag is for.
+    var inQuietHours: Bool {
+        guard UserDefaults.standard.object(forKey: "chappy_quiet_hours") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_quiet_hours") else { return false }
+        let h = Calendar.current.component(.hour, from: Date())
+        let from = UserDefaults.standard.object(forKey: "chappy_quiet_from") as? Int ?? 22
+        let to = UserDefaults.standard.object(forKey: "chappy_quiet_to") as? Int ?? 7
+        return from > to ? (h >= from || h < to) : (h >= from && h < to)
+    }
+
+    // MARK: - Reading the list
+
+    var all: [ChappyMemory.Entry] {
+        ChappyMemory.shared.recent.filter { $0.kind == .reminder }
+    }
+    var open: [ChappyMemory.Entry] {
+        all.filter { $0.doneAt == nil }
+    }
+    /// Due now-ish and not done. Snooze wins over the original time.
+    func due(at when: Date = Date()) -> [ChappyMemory.Entry] {
+        open.filter { r in
+            guard let fire = r.effectiveFire else { return false }
+            return fire <= when
+        }.sorted { ($0.effectiveFire ?? .distantPast) < ($1.effectiveFire ?? .distantPast) }
+    }
+    func overdue(graceMinutes: Int = 2) -> [ChappyMemory.Entry] {
+        let cutoff = Date().addingTimeInterval(-Double(graceMinutes) * 60)
+        return due(at: cutoff).filter { $0.deliveredAt == nil || ($0.deliveredAt ?? .distantPast) < ($0.effectiveFire ?? .distantPast) }
+    }
+    func upcoming(limit: Int = 50) -> [ChappyMemory.Entry] {
+        open.filter { ($0.effectiveFire ?? .distantFuture) > Date() }
+            .sorted { ($0.effectiveFire ?? .distantFuture) < ($1.effectiveFire ?? .distantFuture) }
+            .prefix(limit).map { $0 }
+    }
+    func today() -> [ChappyMemory.Entry] {
+        open.filter {
+            guard let f = $0.effectiveFire else { return false }
+            return Calendar.current.isDateInToday(f)
+        }.sorted { ($0.effectiveFire ?? .distantPast) < ($1.effectiveFire ?? .distantPast) }
+    }
+    func placeReminders() -> [ChappyMemory.Entry] {
+        open.filter { !($0.placeTrigger ?? "").isEmpty }
+    }
+    func done(limit: Int = 60) -> [ChappyMemory.Entry] {
+        all.filter { $0.doneAt != nil }
+            .sorted { ($0.doneAt ?? .distantPast) > ($1.doneAt ?? .distantPast) }
+            .prefix(limit).map { $0 }
+    }
+
+    // MARK: - Creating
+
+    /// The one way in. Returns the stored reminder so a caller can confirm it.
+    @discardableResult
+    func add(title: String,
+             at when: Date? = nil,
+             floatingTime: String? = nil,
+             place: String? = nil,
+             repeatRule: String? = nil,
+             leadMinutes: Int? = nil,
+             escalate: Bool = false,
+             thumbnail: Data? = nil,
+             source: String = "voice") -> ChappyMemory.Entry {
+
+        var e = ChappyMemory.shared.remember(.reminder,
+                                            title: title,
+                                            tags: ["reminder"],
+                                            thumbnail: thumbnail,
+                                            source: source)
+        e.dueAt = when
+        e.floatingTime = floatingTime
+        e.placeTrigger = place
+        e.repeatRule = repeatRule
+        e.leadMinutes = leadMinutes
+        e.escalate = escalate
+        ChappyMemory.shared.replaceReminderFields(e)
+        schedule(e)
+        return e
+    }
+
+    /// PROMOTION. "Remind me about that thing I noted yesterday" attaches a
+    /// trigger to a memory that already exists instead of writing a second
+    /// copy of it. Nobody else does this, because nobody else keeps
+    /// reminders and memories in one place.
+    @discardableResult
+    func promote(memoryID: UUID, to when: Date?, place: String? = nil) -> Bool {
+        guard var e = ChappyMemory.shared.recent.first(where: { $0.id == memoryID }) else { return false }
+        e.kind = .reminder
+        e.dueAt = when
+        e.placeTrigger = place
+        e.doneAt = nil
+        ChappyMemory.shared.replaceReminderFields(e)
+        schedule(e)
+        return true
+    }
+
+    // MARK: - Changing
+
+    func complete(_ id: UUID) {
+        guard var e = ChappyMemory.shared.recent.first(where: { $0.id == id }) else { return }
+        cancelNotification(for: e)
+        // COMPLETION-ANCHORED REPEATS: "every three days after I do it" counts
+        // from NOW, not from when it was scheduled. Laundry works this way and
+        // rent does not, and the difference is the whole point.
+        if let rule = e.repeatRule, let next = Self.nextFire(rule: rule,
+                                                            from: e.effectiveFire ?? Date(),
+                                                            completedAt: Date()) {
+            e.dueAt = next
+            e.snoozedTo = nil
+            e.deliveredAt = nil
+            e.doneAt = nil
+            ChappyMemory.shared.replaceReminderFields(e)
+            schedule(e)
+            print("🔁 [Reminders] '\(e.title)' repeats — next \(next)")
+            return
+        }
+        e.doneAt = Date()
+        e.snoozedTo = nil
+        ChappyMemory.shared.replaceReminderFields(e)
+    }
+
+    func reopen(_ id: UUID) {
+        guard var e = ChappyMemory.shared.recent.first(where: { $0.id == id }) else { return }
+        e.doneAt = nil
+        e.deliveredAt = nil
+        ChappyMemory.shared.replaceReminderFields(e)
+        schedule(e)
+    }
+
+    /// SEMANTIC SNOOZE. Ten minutes is the default, but "until I get home" and
+    /// "tomorrow morning" use the same grammar as creating one — because the
+    /// moment you have to think in minutes, you stop using it.
+    func snooze(_ id: UUID, minutes: Int? = nil, until: Date? = nil, place: String? = nil) {
+        guard var e = ChappyMemory.shared.recent.first(where: { $0.id == id }) else { return }
+        cancelNotification(for: e)
+        if let p = place {
+            e.placeTrigger = p
+            e.snoozedTo = nil
+            e.dueAt = nil
+        } else if let u = until {
+            e.snoozedTo = u
+        } else {
+            e.snoozedTo = Date().addingTimeInterval(Double(minutes ?? 10) * 60)
+        }
+        e.deliveredAt = nil
+        ChappyMemory.shared.replaceReminderFields(e)
+        schedule(e)
+    }
+
+    func reschedule(_ id: UUID, to when: Date?, place: String?, floating: String?) {
+        guard var e = ChappyMemory.shared.recent.first(where: { $0.id == id }) else { return }
+        cancelNotification(for: e)
+        e.dueAt = when
+        e.placeTrigger = place
+        e.floatingTime = floating
+        e.snoozedTo = nil
+        e.deliveredAt = nil
+        ChappyMemory.shared.replaceReminderFields(e)
+        schedule(e)
+    }
+
+    func delete(_ id: UUID) {
+        if let e = ChappyMemory.shared.recent.first(where: { $0.id == id }) { cancelNotification(for: e) }
+        ChappyMemory.shared.forget(id: id)
+    }
+
+    // MARK: - Notifications (the path that works with Chappy closed)
+
+    private func schedule(_ e: ChappyMemory.Entry) {
+        cancelNotification(for: e)
+        guard e.doneAt == nil else { return }
+
+        // FLOATING TIME. A floating reminder has no fixed instant — it is
+        // "8am wherever I am", so it is scheduled as a CALENDAR trigger on
+        // local hour and minute, and iOS re-evaluates it in the new zone the
+        // moment you land. An absolute one is scheduled on its interval.
+        let content = UNMutableNotificationContent()
+        content.title = "Chappy"
+        content.body = e.title
+        content.sound = .default
+        // A SUBTITLE THAT SAYS WHY IT FIRED. "Reminder" tells you nothing;
+        // "every 3 days, from when you do it" tells you whether to act now.
+        var sub: [String] = []
+        if let p = e.placeTrigger, !p.isEmpty { sub.append("You're at \(p)") }
+        if let rule = e.repeatRule { sub.append(Self.describe(rule: rule)) }
+        if e.floatingTime != nil { sub.append("local time, wherever you are") }
+        content.subtitle = sub.joined(separator: " · ")
+        content.categoryIdentifier = "CHAPPY_REMINDER"
+        // One thread, so ten reminders stack into one group instead of ten
+        // separate banners burying everything else on the lock screen.
+        content.threadIdentifier = "chappy-reminders"
+        if e.escalate == true {
+            content.interruptionLevel = .timeSensitive
+        } else if inQuietHours {
+            // Lands silently in the summary rather than waking anyone.
+            content.interruptionLevel = .passive
+            content.sound = nil
+        }
+        content.userInfo = ["chappyReminderID": e.id.uuidString,
+                            "chappyUrgent": e.escalate == true,
+                            "chappyPlace": e.placeTrigger ?? ""]
+
+        var trigger: UNNotificationTrigger?
+        if let hhmm = e.floatingTime, let parts = Self.hhmm(hhmm) {
+            var dc = DateComponents()
+            dc.hour = parts.0; dc.minute = parts.1
+            trigger = UNCalendarNotificationTrigger(dateMatching: dc, repeats: e.repeatRule != nil)
+        } else if let fire = e.effectiveFire, fire > Date() {
+            trigger = UNTimeIntervalNotificationTrigger(
+                timeInterval: max(1, fire.timeIntervalSinceNow), repeats: false)
+        }
+        // A place-only reminder has no clock; ContextEngine fires it instead.
+        guard let t = trigger else { return }
+
+        let req = UNNotificationRequest(identifier: e.id.uuidString, content: content, trigger: t)
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err { print("⚠️ [Reminders] Could not schedule: \(err.localizedDescription)") }
+        }
+    }
+
+    private func cancelNotification(for e: ChappyMemory.Entry) {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [e.id.uuidString])
+    }
+
+    /// Re-arm everything after a restore, a reinstall, or a timezone change.
+    func rescheduleAll() {
+        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        for e in open { schedule(e) }
+        print("🔔 [Reminders] \(open.count) reminders re-armed")
+    }
+
+    // MARK: - Speaking (the path that works when Chappy IS running)
+
+    func startTicking() {
+        tickTimer?.invalidate()
+        // 30s is close enough for a reminder and costs nothing — this is a
+        // date comparison, not a wake-up.
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        tick()
+    }
+
+    func stopTicking() { tickTimer?.invalidate(); tickTimer = nil }
+
+    private func tick() {
+        guard !TTSService.shared.isSpeaking else { return }
+        let ready = due().filter { $0.deliveredAt == nil }
+        guard let first = ready.first else { return }
+        // QUIET HOURS: still marked delivered and still on the list, just not
+        // spoken aloud at 3am. It surfaces in the morning brief instead.
+        if inQuietHours && first.escalate != true { return }
+        markDelivered(first)
+        if first.escalate == true { ChappyHaptics.shared.reminderUrgent() }
+        else { ChappyHaptics.shared.reminderDue() }
+        ChappyEarcon.shared.wake()
+        var line = first.title
+        if ready.count > 1 { line += ". And \(ready.count - 1) more." }
+        TTSService.shared.speak(line)
+        lastSpoken = first.title
+        // A spoken reminder is worth remembering that it happened. If it fired
+        // while you were asleep, you can still find it.
+        ChappyMemory.shared.remember(.note, title: "Reminder fired: \(first.title)",
+                                     tags: ["reminder-fired"], source: "reminders")
+    }
+
+    private func markDelivered(_ e: ChappyMemory.Entry) {
+        var c = e
+        c.deliveredAt = Date()
+        ChappyMemory.shared.replaceReminderFields(c)
+    }
+
+    // MARK: - The morning brief
+
+    /// One paragraph, once a day, the first time you pick the phone up.
+    /// Deliberately not an alarm — it happens when you're already there.
+    func morningBriefIfDue() {
+        let key = ChappyMemory.dayKey(Date())
+        guard briefedOn != key else { return }
+        guard UserDefaults.standard.object(forKey: "chappy_morning_brief") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_morning_brief") else { return }
+        let h = Calendar.current.component(.hour, from: Date())
+        guard h >= 5, h < 12 else { return }
+        briefedOn = key
+        let line = briefText()
+        guard !line.isEmpty else { return }
+        ChappyEarcon.shared.wake()
+        TTSService.shared.speak(line)
+    }
+
+    func briefText() -> String {
+        var parts: [String] = []
+        let name = UserDefaults.standard.string(forKey: "chappy_user_name") ?? ""
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+
+        let od = overdue()
+        let t = today().filter { $0.deliveredAt == nil }
+        if od.isEmpty && t.isEmpty {
+            parts.append(name.isEmpty ? "Morning. Nothing on today."
+                                      : "Morning \(name). Nothing on today.")
+        } else {
+            parts.append(name.isEmpty ? "Morning." : "Morning \(name).")
+            if !t.isEmpty {
+                let list = t.prefix(3).map { "\($0.title) at \(df.string(from: $0.effectiveFire ?? Date()))" }
+                parts.append("Today: \(list.joined(separator: ", ")).")
+                if t.count > 3 { parts.append("And \(t.count - 3) more.") }
+            }
+            // OVERDUE IS BATCHED AND MENTIONED ONCE. Never re-rung on a
+            // schedule — an assistant that nags is one you turn off.
+            if !od.isEmpty {
+                parts.append("\(od.count) overdue: \(od.prefix(2).map { $0.title }.joined(separator: ", ")).")
+            }
+        }
+        // THE CALENDAR, MERGED. One agenda — a thing you have to be at and a
+        // thing you have to do are the same question at 7am, and splitting
+        // them across two apps is the reason people miss one of them.
+        if let agenda = ChappyCalendar.shared.agendaLine() {
+            parts.append("In the diary: \(agenda)")
+        }
+        let s = ContextEngine.shared.snapshot
+        if let w = s.weather, let temp = s.temperatureC {
+            parts.append("\(Int(temp.rounded())) degrees, \(w).")
+        }
+        // VISA — the highest-stakes recurring fact in a full-time traveller's
+        // life, and the easiest to lose track of.
+        if let visa = visaLine() { parts.append(visa) }
+        return parts.joined(separator: " ")
+    }
+
+    // MARK: - Visa countdown
+
+    func setVisa(country: String, days: Int, entered: Date = Date()) {
+        UserDefaults.standard.set(country, forKey: "chappy_visa_country")
+        UserDefaults.standard.set(days, forKey: "chappy_visa_days")
+        UserDefaults.standard.set(entered.timeIntervalSince1970, forKey: "chappy_visa_entered")
+        let cal = Calendar.current
+        // Warnings with enough runway to extend or fly, not to panic.
+        for d in [14, 7, 3, 1] {
+            guard let expiry = cal.date(byAdding: .day, value: days, to: entered),
+                  let warn = cal.date(byAdding: .day, value: -d, to: expiry),
+                  warn > Date() else { continue }
+            add(title: "Visa for \(country) expires in \(d) day\(d == 1 ? "" : "s")",
+                at: warn, escalate: d <= 3, source: "visa")
+        }
+        ChappyMemory.shared.remember(.note,
+            title: "Entered \(country) on a \(days)-day visa",
+            tags: ["visa", country.lowercased()], source: "visa")
+    }
+
+    func visaLine() -> String? {
+        guard let country = UserDefaults.standard.string(forKey: "chappy_visa_country") else { return nil }
+        let days = UserDefaults.standard.integer(forKey: "chappy_visa_days")
+        let t = UserDefaults.standard.double(forKey: "chappy_visa_entered")
+        guard days > 0, t > 0 else { return nil }
+        let entered = Date(timeIntervalSince1970: t)
+        guard let expiry = Calendar.current.date(byAdding: .day, value: days, to: entered) else { return nil }
+        let left = Calendar.current.dateComponents([.day], from: Date(), to: expiry).day ?? 0
+        if left < 0 { return "Your \(country) visa expired \(-left) days ago." }
+        if left > 21 { return nil }   // don't nag from day one
+        return "\(left) day\(left == 1 ? "" : "s") left on your \(country) visa."
+    }
+
+    // MARK: - Place triggers  ·  called by ContextEngine on every fix
+
+    /// "Remind me to buy sunscreen next time I'm at a supermarket."
+    /// Google removed location reminders from Assistant and never brought them
+    /// back; Meta's glasses never had them. This is the same geofence logic
+    /// alert-when-near already uses.
+    func checkPlaceTriggers() {
+        let pending = placeReminders().filter { $0.deliveredAt == nil }
+        guard !pending.isEmpty else { return }
+        let s = ContextEngine.shared.snapshot
+        let here = [s.street, s.suburb, s.city].compactMap { $0 }
+            .joined(separator: " ")
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        for r in pending {
+            guard let want = r.placeTrigger?
+                .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current),
+                  !want.isEmpty else { continue }
+            // A saved spot by name, or the street/suburb you're standing in.
+            var hit = here.contains(want)
+            if !hit, let spot = TripRecorder.shared.spots.last(where: {
+                $0.name.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                locale: .current).contains(want) }),
+               let la = s.latitude, let lo = s.longitude {
+                hit = TripRecorder.meters(la, lo, spot.lat, spot.lon) < 150
+            }
+            guard hit else { continue }
+            markDelivered(r)
+            ChappyHaptics.shared.reminderPlace()
+            ChappyEarcon.shared.wake()
+            TTSService.shared.speak("You're at \(r.placeTrigger ?? "the place") - \(r.title)")
+        }
+    }
+
+    // MARK: - Leave-by
+    //
+    // A reminder with a place doesn't warn you at the time, it warns you when
+    // you have to LEAVE. Chappy already computes real routes, so this is the
+    // difference between a list and a secretary.
+
+    func checkLeaveBy() async {
+        let candidates = open.filter {
+            $0.leadMinutes != nil && $0.dueAt != nil && $0.deliveredAt == nil
+                && !($0.placeTrigger ?? "").isEmpty
+        }
+        for r in candidates {
+            guard let due = r.dueAt, let lead = r.leadMinutes else { continue }
+            // Only worth a lookup inside a sensible window.
+            let mins = due.timeIntervalSinceNow / 60
+            guard mins > 0, mins < Double(lead) + 45 else { continue }
+            guard let travel = await NavEngine.shared.travelMinutes(to: r.placeTrigger ?? "") else { continue }
+            let leaveAt = due.addingTimeInterval(-Double(travel + lead) * 60)
+            guard Date() >= leaveAt else { continue }
+            markDelivered(r)
+            ChappyHaptics.shared.reminderUrgent()
+            ChappyEarcon.shared.wake()
+            TTSService.shared.speak("Time to go - \(r.title). It's about \(travel) minutes from here.")
+        }
+    }
+
+    // MARK: - Spoken answers
+
+    func spokenList() -> String {
+        let t = today(), od = overdue(), up = upcoming(limit: 3)
+        if t.isEmpty && od.isEmpty && up.isEmpty { return "Nothing on the list." }
+        var parts: [String] = []
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        if !od.isEmpty {
+            parts.append("\(od.count) overdue: \(od.prefix(3).map { $0.title }.joined(separator: ", ")).")
+        }
+        if !t.isEmpty {
+            parts.append("Today: " + t.prefix(4).map {
+                "\($0.title) at \(df.string(from: $0.effectiveFire ?? Date()))" }.joined(separator: ", ") + ".")
+        } else if let n = up.first, let f = n.effectiveFire {
+            let day = DateFormatter(); day.dateFormat = "EEEE 'at' h:mm a"
+            parts.append("Next up: \(n.title), \(day.string(from: f)).")
+        }
+        if let agenda = ChappyCalendar.shared.agendaLine(limit: 3) {
+            parts.append("Diary: \(agenda)")
+        }
+        let places = placeReminders()
+        if !places.isEmpty {
+            parts.append("\(places.count) waiting on a place.")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    // MARK: - Recurrence
+    //
+    // "every 3 days"  → anchored to the SCHEDULE (rent, tablets)
+    // "every 3 days after I do it" → anchored to COMPLETION (laundry, haircut)
+    // The second one is the useful one and no voice assistant has it.
+
+    /// Rules are stored as compact strings so they survive a JSON round trip:
+    ///   "d3"          every 3 days
+    ///   "d3!"         every 3 days AFTER COMPLETION
+    ///   "w1:mon,fri"  every week on Monday and Friday
+    ///   "m1"          every month
+    nonisolated static func nextFire(rule: String, from scheduled: Date, completedAt: Date) -> Date? {
+        let anchorCompletion = rule.hasSuffix("!")
+        var r = anchorCompletion ? String(rule.dropLast()) : rule
+        let cal = Calendar.current
+        let base = anchorCompletion ? completedAt : scheduled
+
+        var weekdays: [Int] = []
+        if let colon = r.firstIndex(of: ":") {
+            let names = String(r[r.index(after: colon)...]).split(separator: ",").map(String.init)
+            let map = ["sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7]
+            weekdays = names.compactMap { map[String($0.prefix(3))] }.sorted()
+            r = String(r[r.startIndex..<colon])
+        }
+        guard let unit = r.first else { return nil }
+        let n = max(1, Int(r.dropFirst()) ?? 1)
+
+        // Named weekdays: walk forward to the next one in the set.
+        if !weekdays.isEmpty {
+            var d = cal.date(byAdding: .day, value: 1, to: base) ?? base
+            for _ in 0..<14 {
+                if weekdays.contains(cal.component(.weekday, from: d)) { return keepTime(of: scheduled, on: d) }
+                d = cal.date(byAdding: .day, value: 1, to: d) ?? d
+            }
+            return nil
+        }
+        switch unit {
+        case "d": return cal.date(byAdding: .day, value: n, to: base)
+        case "w": return cal.date(byAdding: .weekOfYear, value: n, to: base)
+        case "m": return cal.date(byAdding: .month, value: n, to: base)
+        case "y": return cal.date(byAdding: .year, value: n, to: base)
+        case "h": return cal.date(byAdding: .hour, value: n, to: base)
+        default:  return nil
+        }
+    }
+
+    nonisolated private static func keepTime(of source: Date, on day: Date) -> Date {
+        let cal = Calendar.current
+        let t = cal.dateComponents([.hour, .minute], from: source)
+        return cal.date(bySettingHour: t.hour ?? 9, minute: t.minute ?? 0, second: 0, of: day) ?? day
+    }
+
+    nonisolated static func hhmm(_ s: String) -> (Int, Int)? {
+        let p = s.split(separator: ":").compactMap { Int($0) }
+        guard p.count == 2, p[0] >= 0, p[0] < 24, p[1] >= 0, p[1] < 60 else { return nil }
+        return (p[0], p[1])
+    }
+
+    /// Plain English for a rule, for the card and for speaking it back.
+    // MARK: - Acting on a notification
+    //
+    // Both of these arrive off the main actor, so each hops back before it
+    // touches anything. A completion handler that is never called is an app
+    // iOS starts treating as unresponsive, so both always call theirs.
+
+    nonisolated static func describe(rule: String) -> String {
+        let anchored = rule.hasSuffix("!")
+        var r = anchored ? String(rule.dropLast()) : rule
+        var days = ""
+        if let colon = r.firstIndex(of: ":") {
+            days = " on " + String(r[r.index(after: colon)...]).replacingOccurrences(of: ",", with: ", ")
+            r = String(r[r.startIndex..<colon])
+        }
+        guard let u = r.first else { return "repeats" }
+        let n = max(1, Int(r.dropFirst()) ?? 1)
+        let unit = ["d": "day", "w": "week", "m": "month", "y": "year", "h": "hour"][String(u)] ?? "day"
+        let every = n == 1 ? "every \(unit)" : "every \(n) \(unit)s"
+        return every + days + (anchored ? ", from when you do it" : "")
+    }
+}
+
+
+extension ChappyReminders: UNUserNotificationCenterDelegate {
+
+    /// A reminder that arrives while you are already looking at the phone
+    /// should still show and still buzz — otherwise the one time you are
+    /// holding it is the one time it goes missing.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        let info = notification.request.content.userInfo
+        let urgent = (info["chappyUrgent"] as? Bool) ?? false
+        let place = (info["chappyPlace"] as? String) ?? ""
+        Task { @MainActor in
+            if urgent { ChappyHaptics.shared.reminderUrgent() }
+            else if !place.isEmpty { ChappyHaptics.shared.reminderPlace() }
+            else { ChappyHaptics.shared.reminderDue() }
+        }
+        completionHandler([.banner, .list, .sound])
+    }
+
+    /// Done, snoozed, or opened — all three without unlocking into the app.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void) {
+        let idString = response.notification.request.content.userInfo["chappyReminderID"] as? String
+        let action = response.actionIdentifier
+        Task { @MainActor in
+            defer { completionHandler() }
+            // An informational one carries the screen it belongs to, so a tap
+            // lands where the thing actually is rather than on the home screen.
+            if let opens = response.notification.request.content
+                .userInfo["chappyOpens"] as? String {
+                NotificationCenter.default.post(name: Notification.Name(opens), object: nil)
+                return
+            }
+            guard let s = idString, let id = UUID(uuidString: s) else {
+                NotificationCenter.default.post(name: .chappyOpenReminders, object: nil)
+                return
+            }
+            switch action {
+            case "CHAPPY_DONE":
+                ChappyReminders.shared.complete(id)
+                ChappyHaptics.shared.reminderDone()
+            case "CHAPPY_SNOOZE10":
+                ChappyReminders.shared.snooze(id, minutes: 10)
+                ChappyHaptics.shared.reminderSnoozed()
+            case "CHAPPY_SNOOZE_HOME":
+                ChappyReminders.shared.snooze(id, place: "home")
+                ChappyHaptics.shared.reminderSnoozed()
+            default:
+                // Tapped the banner itself — open the list, not the home screen.
+                NotificationCenter.default.post(name: .chappyOpenReminders, object: nil)
+            }
+        }
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY NOTIFY (Phase 5.5 — the pocket channel)
+// =====================================================================
+//
+// THE RULE THAT KEEPS THIS FROM BECOMING SPAM:
+//
+//   A notification is for something you would want to know when you are NOT
+//   looking, and could not have found out any other way.
+//
+// Chappy already has a mouth. Anything it tells you out loud while the ear is
+// armed does NOT need a banner as well — that is how an app trains you to
+// swipe everything away without reading it, and then the one that mattered
+// goes with the rest. So every post goes through `voiceCouldNotReach()`
+// first: if the app is in front of you, or the ear is armed and speaking,
+// the notification is skipped, because you already know.
+//
+// What that leaves is exactly the useful set: things that happen while the
+// app is closed, backgrounded, or has quietly died — which, on this project,
+// is most of the failures that cost days.
+//
+// Every category can be turned off on its own. Nothing here is important
+// enough to be un-silenceable except the ones you marked must-not-miss.
+
+enum ChappyNotify {
+
+    enum Channel: String, CaseIterable {
+        case nav        // arrived, route stopped, watchpoint hit
+        case money      // daily spend crossing a threshold
+        case memory     // glasses import done, old conversations read
+        case system     // the ear stopped, battery, glasses dropped
+        case claw       // a job finished on the home computer
+        case research   // a long answer came back
+
+        var label: String {
+            switch self {
+            case .nav: return "Navigation"
+            case .money: return "Spending"
+            case .memory: return "Memory & imports"
+            case .system: return "Problems and battery"
+            case .claw: return "Home computer"
+            case .research: return "Research answers"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .nav: return "Arrived, route ended unexpectedly, or a place you asked to be told about"
+            case .money: return "When the day's AI spend crosses two, five and ten dollars"
+            case .memory: return "Overnight glasses imports and old conversations finishing"
+            case .system: return "The wake word stopping, battery getting low, glasses dropping out — the silent failures"
+            case .claw: return "A job you sent to the home computer finishing"
+            case .research: return "A deep research answer arriving after you walked away"
+            }
+        }
+        var defaultOn: Bool { self == .money ? true : true }
+        var key: String { "chappy_notify_" + rawValue }
+    }
+
+    /// True when speaking would NOT have reached him — which is the only time
+    /// a banner earns its place.
+    @MainActor
+    static func voiceCouldNotReach() -> Bool {
+        // In the foreground he is looking at the screen; a banner is noise.
+        if UIApplication.shared.applicationState == .active { return false }
+        // Armed in a pocket with background audio: Chappy can speak, so it does.
+        if ChappyStandby.shared.isListening && ChappyStandby.backgroundAudioAllowed { return false }
+        return true
+    }
+
+    @MainActor
+    static func post(_ channel: Channel,
+                     title: String,
+                     body: String,
+                     critical: Bool = false,
+                     opens: Notification.Name? = nil,
+                     force: Bool = false) {
+        guard UserDefaults.standard.object(forKey: channel.key) == nil
+                || UserDefaults.standard.bool(forKey: channel.key) else { return }
+        if !force && !voiceCouldNotReach() { return }
+
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.threadIdentifier = "chappy-" + channel.rawValue
+        c.categoryIdentifier = "CHAPPY_INFO"
+        if critical {
+            c.interruptionLevel = .timeSensitive
+            c.sound = .default
+        } else if ChappyReminders.shared.inQuietHours {
+            c.interruptionLevel = .passive
+            c.sound = nil
+        } else {
+            c.sound = .default
+        }
+        if let o = opens { c.userInfo = ["chappyOpens": o.rawValue] }
+
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        print("🔔 [Notify] \(channel.rawValue): \(title) — \(body)")
+    }
+
+    /// Say it out loud AND post it if the voice could not have landed. One
+    /// call site instead of two, so a module can never accidentally do both.
+    @MainActor
+    static func announce(_ channel: Channel,
+                         spoken: String,
+                         title: String,
+                         body: String? = nil,
+                         critical: Bool = false,
+                         opens: Notification.Name? = nil) {
+        if voiceCouldNotReach() {
+            post(channel, title: title, body: body ?? spoken, critical: critical, opens: opens, force: true)
+        } else {
+            TTSService.shared.speak(spoken)
+        }
+    }
+}
+
+// =====================================================================
+// MARK: - SAYING IT OUT LOUD (Phase 5.5 capture)
+// =====================================================================
+//
+// The research finding that shaped this: every typed parser on the market
+// (Todoist, Fantastical) solves the "is Friday part of the title or the due
+// date" problem by making you use quotes. There is no spoken equivalent of a
+// quote mark. So the split has to be done by structure — find the time
+// phrase, cut it out, and whatever is left is the thing to be reminded of.
+//
+// And the second finding: never block capture on a clarification. If the time
+// is ambiguous, pick the sensible one, SAY which one you picked, and let him
+// correct it. A reminder that failed to be created because it wanted to ask a
+// question is worse than a reminder set an hour out.
+
+extension ChappyStandby {
+
+    struct ParsedReminder {
+        var title: String
+        var date: Date?
+        var floating: String?      // "HH:mm" — 8am wherever I am
+        var place: String?
+        var rule: String?          // "d3", "d3!", "w1:mon,fri"
+        var lead: Int?
+        var escalate = false
+        /// What to say back. Short by design — a five-word tail, never a
+        /// full readback. Confirmation fatigue is why people stop using these.
+        var confirmation: String = ""
+    }
+
+    /// Words that mean "this is the reminder text" and everything after the
+    /// time phrase belongs to it.
+    private static let reminderOpeners = [
+        "remind me to ", "remind me that ", "remind me ", "remind us to ", "remind us ",
+        "set a reminder to ", "set a reminder for ", "set a reminder ",
+        "don't let me forget to ", "dont let me forget to ", "don't let me forget ",
+        "dont let me forget ", "make sure i ", "make sure we ",
+        "nudge me to ", "nudge me ", "ping me to ", "ping me ", "tell me to ",
+    ]
+
+    static func looksLikeReminder(_ c: String) -> Bool {
+        reminderOpeners.contains { c.contains($0) }
+    }
+
+    // MARK: The parser
+
+    static func parseReminder(_ raw: String) -> ParsedReminder? {
+        var c = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let opener = reminderOpeners.first(where: { c.contains($0) }),
+              let r = c.range(of: opener) else { return nil }
+        c = String(c[r.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        guard c.count > 2 else { return nil }
+
+        var out = ParsedReminder(title: c)
+
+        // ---- IMPLIED PLACES ------------------------------------------------
+        // "when I get home" names no place after it — the place IS the phrase,
+        // and the task can sit on either side of it. "Ping me when I get home
+        // to water the plants" broke every parser I tested it against.
+        for (phrase, resolved) in [("when i get home", "home"), ("when i'm home", "home"),
+                                   ("when im home", "home"), ("when i'm back home", "home"),
+                                   ("when i get back home", "home"),
+                                   ("when i get to the hotel", "hotel"),
+                                   ("when i'm at the hotel", "hotel"),
+                                   ("when im at the hotel", "hotel"),
+                                   ("when i get back to the hotel", "hotel"),
+                                   ("when i get to the room", "hotel")] {
+            guard let r = c.range(of: phrase) else { continue }
+            var t = c.replacingCharacters(in: r, with: " ")
+                .replacingOccurrences(of: "  ", with: " ")
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            if t.hasPrefix("to ") { t = String(t.dropFirst(3)) }
+            out.place = resolved
+            out.title = t.isEmpty ? raw : t
+            out.lead = nil
+            out.confirmation = "When you're \(resolved == "home" ? "home" : "at the hotel"), got it."
+            return finish(out)
+        }
+
+        // ---- PLACE TRIGGERS ------------------------------------------------
+        // Google removed these from Assistant and never brought them back;
+        // Meta's glasses never had them. They are the ones people actually
+        // want, because most tasks are bound to a place, not a clock.
+        for opener in ["when i'm at ", "when im at ", "when i am at ",
+                       "next time i'm at ", "next time im at ", "next time i'm in ",
+                       "next time im in ", "when i get to ", "when i'm near ",
+                       "when im near ", "when we're at ", "when were at ",
+                       "when i'm back at ", "when im back at ", "when i get home",
+                       "when i'm home", "when im home", "at the "] {
+            guard let pr = c.range(of: opener) else { continue }
+            let place = String(c[pr.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            // "when I get home" has no tail — the place IS the phrase.
+            // "next time I'm at a supermarket to buy sunscreen" — the task can
+            // trail the place as easily as lead it.
+            var resolved = place
+            var trailingTask = ""
+            if let toR = place.range(of: " to ") {
+                resolved = String(place[place.startIndex..<toR.lowerBound])
+                trailingTask = String(place[toR.upperBound...])
+            }
+            resolved = resolved.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            if resolved.hasPrefix("a ") { resolved = String(resolved.dropFirst(2)) }
+            if resolved.hasPrefix("the ") { resolved = String(resolved.dropFirst(4)) }
+            guard resolved.count > 1 else { continue }
+            out.place = resolved
+            out.title = String(c[c.startIndex..<pr.lowerBound])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            if out.title.isEmpty { out.title = trailingTask }
+            if out.title.isEmpty { out.title = raw }
+            out.confirmation = "At the \(resolved), got it."
+            // A place reminder can still carry a lead time for leave-by.
+            out.lead = 5
+            return finish(out)
+        }
+
+        // ---- RECURRENCE ---------------------------------------------------
+        if let rule = repeatRule(in: c) {
+            out.rule = rule.0
+            out.title = strip(rule.1, from: out.title)
+        }
+
+        // ---- TIME ---------------------------------------------------------
+        // Floating first: "at 8 every morning wherever I am" and the plain
+        // daily shapes mean local-clock, not a fixed instant.
+        if out.rule != nil, let hhmm = plainClock(in: c) {
+            out.floating = hhmm
+            out.title = strip(hhmm.replacingOccurrences(of: ":", with: ""), from: out.title)
+            out.title = stripTimeWords(out.title)
+            out.confirmation = "\(spoken(hhmm)) \(ChappyReminders.describe(rule: out.rule ?? "d1")), got it."
+            return finish(out)
+        }
+
+        // Relative shapes the system detector handles badly.
+        if let quick = relative(in: c) {
+            out.date = quick.0
+            out.title = strip(quick.1, from: out.title)
+            out.confirmation = "\(shortWhen(quick.0)), got it."
+            return finish(out)
+        }
+
+        // The system detector. Good at "tomorrow at 6", "next Tuesday at 3",
+        // "on the 14th", and it hands back the exact substring it consumed —
+        // which is what lets the title be cut cleanly without quote marks.
+        if let det = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) {
+            let ns = c as NSString
+            let matches = det.matches(in: c, range: NSRange(location: 0, length: ns.length))
+            if let m = matches.last, let d = m.date {
+                var when = d
+                // AM/PM AMBIGUITY: never block on it. "at 6" with no meridiem
+                // that lands in the past almost always meant the evening.
+                if when < Date(), Calendar.current.isDateInToday(when),
+                   let bumped = Calendar.current.date(byAdding: .hour, value: 12, to: when),
+                   bumped > Date() {
+                    when = bumped
+                }
+                if when < Date() {
+                    when = Calendar.current.date(byAdding: .day, value: 1, to: when) ?? when
+                }
+                out.date = when
+                out.title = strip(ns.substring(with: m.range), from: out.title)
+                out.confirmation = "\(shortWhen(when)), got it."
+                return finish(out)
+            }
+        }
+
+        if out.rule != nil {
+            out.floating = "09:00"
+            out.confirmation = "\(ChappyReminders.describe(rule: out.rule ?? "d1")) at nine, got it."
+            return finish(out)
+        }
+
+        // No time and no place. Still a reminder — it just sits on the list
+        // until it's given one. Losing the capture would be worse.
+        out.confirmation = "On the list, no time set."
+        return finish(out)
+    }
+
+    private static func finish(_ p: ParsedReminder) -> ParsedReminder {
+        var o = p
+        o.title = stripTimeWords(o.title)
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if o.title.count < 2 { o.title = "Reminder" }
+        o.title = o.title.prefix(1).uppercased() + o.title.dropFirst()
+        // Escalate anything that reads like it must not be missed.
+        let urgent = ["flight", "check in", "check-in", "passport", "visa", "boarding",
+                      "ferry", "train", "bus", "medication", "tablet", "pill", "insulin"]
+        if urgent.contains(where: { o.title.lowercased().contains($0) }) { o.escalate = true }
+        return o
+    }
+
+    // MARK: Pieces
+
+    private static func strip(_ fragment: String, from title: String) -> String {
+        guard !fragment.isEmpty else { return title }
+        var t = title
+        if let r = t.lowercased().range(of: fragment.lowercased()) {
+            t = t.replacingCharacters(in: r, with: " ")
+        }
+        return t.replacingOccurrences(of: "  ", with: " ")
+    }
+
+    private static func stripTimeWords(_ s: String) -> String {
+        var t = " " + s + " "
+        for w in [" at ", " on ", " by ", " in ", " this ", " next ", " every ", " o'clock ",
+                  " oclock ", " am ", " pm ", " today ", " tomorrow ", " tonight ",
+                  " morning ", " afternoon ", " evening ", " the ", " a "] {
+            if t.hasSuffix(w) { t = String(t.dropLast(w.count - 1)) }
+        }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// "in 20 minutes", "in an hour", "tonight", "tomorrow morning".
+    private static func relative(in c: String) -> (Date, String)? {
+        let cal = Calendar.current
+        if let r = c.range(of: #"in (\d+|a|an) (minute|minutes|min|mins|hour|hours|hr|hrs|day|days|week|weeks)"#,
+                           options: .regularExpression) {
+            let frag = String(c[r])
+            let parts = frag.split(separator: " ").map(String.init)
+            let n = (parts.count > 1 ? (Int(parts[1]) ?? 1) : 1)
+            let unit = parts.last ?? "minutes"
+            var d: Date?
+            if unit.hasPrefix("min") { d = cal.date(byAdding: .minute, value: n, to: Date()) }
+            else if unit.hasPrefix("h") { d = cal.date(byAdding: .hour, value: n, to: Date()) }
+            else if unit.hasPrefix("d") { d = cal.date(byAdding: .day, value: n, to: Date()) }
+            else if unit.hasPrefix("w") { d = cal.date(byAdding: .weekOfYear, value: n, to: Date()) }
+            if let d { return (d, frag) }
+        }
+        // Named parts of the day, with the hours a person actually means.
+        let named: [(String, Int, Int)] = [
+            ("tomorrow morning", 1, 8), ("tomorrow afternoon", 1, 14),
+            ("tomorrow evening", 1, 19), ("tomorrow night", 1, 20),
+            ("tonight", 0, 19), ("this evening", 0, 19), ("this afternoon", 0, 14),
+            ("in the morning", 1, 8), ("first thing", 1, 7),
+        ]
+        for (phrase, dayOffset, hour) in named where c.contains(phrase) {
+            guard let day = cal.date(byAdding: .day, value: dayOffset, to: Date()),
+                  var d = cal.date(bySettingHour: hour, minute: 0, second: 0, of: day) else { continue }
+            if d < Date() { d = cal.date(byAdding: .day, value: 1, to: d) ?? d }
+            return (d, phrase)
+        }
+        return nil
+    }
+
+    /// "every day", "every 3 days", "every monday and friday", "every other
+    /// week", and the one nobody else has — "every 3 days AFTER I DO IT".
+    private static func repeatRule(in c: String) -> (String, String)? {
+        guard c.contains("every ") || c.contains("each ") || c.contains("daily")
+                || c.contains("weekly") || c.contains("monthly") else { return nil }
+
+        // Completion-anchored: laundry, haircut, oil change. Todoist writes
+        // this as "every!" and no voice assistant supports it at all.
+        let anchored = ["after i do it", "after i've done it", "after ive done it",
+                        "from when i do it", "after it's done", "after its done"]
+            .contains { c.contains($0) }
+        let bang = anchored ? "!" : ""
+
+        let dayNames = ["monday": "mon", "tuesday": "tue", "wednesday": "wed",
+                        "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun"]
+        let hits = dayNames.filter { c.contains($0.key) }
+        if !hits.isEmpty {
+            let ordered = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                .filter { hits.values.contains($0) }
+            return ("w1:" + ordered.joined(separator: ","), "every")
+        }
+        if c.contains("daily") || c.contains("every day") || c.contains("each day") {
+            return ("d1" + bang, "every day")
+        }
+        if c.contains("every other day") { return ("d2" + bang, "every other day") }
+        if c.contains("every other week") { return ("w2" + bang, "every other week") }
+        if c.contains("weekly") || c.contains("every week") { return ("w1" + bang, "every week") }
+        if c.contains("monthly") || c.contains("every month") { return ("m1" + bang, "every month") }
+        if c.contains("every year") || c.contains("yearly") { return ("y1" + bang, "every year") }
+        if let r = c.range(of: #"every (\d+) (day|days|week|weeks|month|months|hour|hours)"#,
+                           options: .regularExpression) {
+            let frag = String(c[r])
+            let parts = frag.split(separator: " ").map(String.init)
+            let n = Int(parts[1]) ?? 1
+            let u = String(parts[2].prefix(1))
+            return ("\(u)\(n)\(bang)", frag)
+        }
+        return nil
+    }
+
+    /// A bare clock time inside a recurring phrase — "every day at 8".
+    private static func plainClock(in c: String) -> String? {
+        guard let r = c.range(of: #"at (\d{1,2})(:(\d{2}))?\s?(am|pm)?"#, options: .regularExpression)
+        else { return nil }
+        let frag = String(c[r])
+        let nums = frag.components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .filter { !$0.isEmpty }.compactMap { Int($0) }
+        guard var h = nums.first else { return nil }
+        let m = nums.count > 1 ? nums[1] : 0
+        if frag.contains("pm"), h < 12 { h += 12 }
+        if frag.contains("am"), h == 12 { h = 0 }
+        // No meridiem and a small number: 7 means morning, 8 means morning.
+        if !frag.contains("am"), !frag.contains("pm"), h <= 5 { h += 12 }
+        guard h < 24, m < 60 else { return nil }
+        return String(format: "%02d:%02d", h, m)
+    }
+
+    private static func spoken(_ hhmm: String) -> String {
+        guard let p = ChappyReminders.hhmm(hhmm) else { return hhmm }
+        let ampm = p.0 < 12 ? "am" : "pm"
+        var h = p.0 % 12; if h == 0 { h = 12 }
+        return p.1 == 0 ? "\(h)\(ampm)" : String(format: "%d:%02d%@", h, p.1, ampm)
+    }
+
+    /// A five-word tail, never a full readback.
+    private static func shortWhen(_ d: Date) -> String {
+        let cal = Calendar.current
+        let f = DateFormatter()
+        if cal.isDateInToday(d) { f.dateFormat = "'today at' h:mm a" }
+        else if cal.isDateInTomorrow(d) { f.dateFormat = "'tomorrow at' h:mm a" }
+        else if let days = cal.dateComponents([.day], from: Date(), to: d).day, days < 7 {
+            f.dateFormat = "EEEE 'at' h:mm a"
+        } else { f.dateFormat = "d MMM 'at' h:mm a" }
+        return f.string(from: d)
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY CALENDAR (Phase 5.5 — one agenda, every account)
+// =====================================================================
+//
+// EventKit reads whatever calendars are already subscribed on the phone.
+// iCloud, Outlook, Google, a shared family calendar — all of them, through
+// ONE permission, with no OAuth, no per-provider work, no server, and
+// nothing running at home. If the account is in iOS Settings, Chappy sees it.
+//
+// That is why calendar comes before email: the same day of work covers three
+// providers instead of one, and it works on a plane.
+//
+// NOTHING IS COPIED. Events are read live and never duplicated into the
+// memory store — a calendar entry that gets moved would otherwise leave a
+// stale copy behind, and the whole promise of this store is that there is one
+// truth. What DOES get stored is a memory when an appointment has actually
+// happened, because "when did I meet the villa guy" is a question about the
+// past, and the past is what memory is for.
+//
+// REQUIRES: NSCalendarsFullAccessUsageDescription in Info.plist.
+
+import EventKit
+
+@MainActor
+final class ChappyCalendar: ObservableObject {
+    static let shared = ChappyCalendar()
+
+    private let store = EKEventStore()
+    @Published private(set) var authorised = false
+    @Published private(set) var lastError: String?
+
+    private init() {}
+
+    // MARK: Permission
+
+    func requestAccess() {
+        if #available(iOS 17.0, *) {
+            store.requestFullAccessToEvents { [weak self] ok, err in
+                Task { @MainActor in
+                    self?.authorised = ok
+                    self?.lastError = err?.localizedDescription
+                    if ok { print("📅 [Calendar] Access granted") }
+                }
+            }
+        } else {
+            store.requestAccess(to: .event) { [weak self] ok, err in
+                Task { @MainActor in
+                    self?.authorised = ok
+                    self?.lastError = err?.localizedDescription
+                }
+            }
+        }
+    }
+
+    // MARK: Which calendars count
+    //
+    // Everything is included until he switches one off. The common case is a
+    // work calendar he doesn't want read aloud on holiday, not a hunt through
+    // a checklist before the feature does anything.
+
+    var allCalendars: [EKCalendar] {
+        guard authorised else { return [] }
+        return store.calendars(for: .event)
+            .sorted { ($0.source?.title ?? "") + $0.title < ($1.source?.title ?? "") + $1.title }
+    }
+
+    private func isOn(_ cal: EKCalendar) -> Bool {
+        let key = "chappy_cal_" + cal.calendarIdentifier
+        return UserDefaults.standard.object(forKey: key) == nil
+            || UserDefaults.standard.bool(forKey: key)
+    }
+
+    func setOn(_ cal: EKCalendar, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "chappy_cal_" + cal.calendarIdentifier)
+    }
+
+    func isEnabled(_ cal: EKCalendar) -> Bool { isOn(cal) }
+
+    private var activeCalendars: [EKCalendar]? {
+        let on = allCalendars.filter(isOn)
+        return on.isEmpty ? nil : on
+    }
+
+    // MARK: Reading
+
+    func events(from: Date, to: Date) -> [EKEvent] {
+        guard authorised else { return [] }
+        let p = store.predicateForEvents(withStart: from, end: to, calendars: activeCalendars)
+        return store.events(matching: p)
+            .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+    }
+
+    func today() -> [EKEvent] {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: Date())
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? Date()
+        return events(from: start, to: end)
+    }
+
+    func upcoming(days: Int = 7) -> [EKEvent] {
+        let end = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
+        return events(from: Date(), to: end)
+    }
+
+    /// The next thing that hasn't started yet.
+    func next() -> EKEvent? {
+        upcoming(days: 3).first { ($0.startDate ?? .distantPast) > Date() }
+    }
+
+    // MARK: Speaking it
+
+    /// One line per event, short enough to be heard rather than read.
+    func agendaLine(limit: Int = 4) -> String? {
+        let t = today().filter { !($0.isAllDay) && ($0.endDate ?? Date()) > Date() }
+        let allDay = today().filter { $0.isAllDay }
+        guard !t.isEmpty || !allDay.isEmpty else { return nil }
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        var parts: [String] = []
+        if !allDay.isEmpty { parts.append(allDay.prefix(2).map { $0.title ?? "" }.joined(separator: ", ")) }
+        for e in t.prefix(limit) {
+            var s = "\(e.title ?? "Something") at \(df.string(from: e.startDate ?? Date()))"
+            if let loc = e.location, !loc.isEmpty { s += " at \(loc.split(separator: ",").first.map(String.init) ?? loc)" }
+            parts.append(s)
+        }
+        if t.count > limit { parts.append("and \(t.count - limit) more") }
+        return parts.joined(separator: ", ") + "."
+    }
+
+    // MARK: Leave-by, for anything with a place on it
+    //
+    // The single most useful thing a calendar can do that a calendar app does
+    // not: warn you relative to REAL travel time rather than clock time.
+    // Chappy already computes routes, so "leave in fifteen, it's a
+    // twenty-five minute ride" is a sentence it can honestly say.
+
+    private var warnedEventIDs: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "chappy_cal_warned") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue.suffix(60)), forKey: "chappy_cal_warned") }
+    }
+
+    func checkLeaveBy() async {
+        guard authorised else { return }
+        guard UserDefaults.standard.object(forKey: "chappy_cal_leaveby") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_cal_leaveby") else { return }
+        var warned = warnedEventIDs
+        for e in upcoming(days: 1) {
+            guard let start = e.startDate, !e.isAllDay,
+                  let where_ = e.location, !where_.isEmpty,
+                  let id = e.eventIdentifier, !warned.contains(id) else { continue }
+            let minsAway = start.timeIntervalSinceNow / 60
+            // Only worth a route lookup inside a sensible window.
+            guard minsAway > 0, minsAway < 120 else { continue }
+            guard let travel = await NavEngine.shared.travelMinutes(to: where_) else { continue }
+            // Five minutes of slack, because nobody leaves the instant they're told.
+            guard minsAway <= Double(travel + 5) else { continue }
+            warned.insert(id)
+            warnedEventIDs = warned
+            ChappyHaptics.shared.reminderUrgent()
+            ChappyNotify.announce(.nav,
+                spoken: "Time to leave for \(e.title ?? "your appointment"). It's about \(travel) minutes to \(where_).",
+                title: "Leave now — \(e.title ?? "appointment")",
+                body: "About \(travel) minutes to \(where_).",
+                critical: true)
+        }
+    }
+
+    // MARK: What happened, for memory
+    //
+    // Appointments become memories only once they are in the PAST. A future
+    // event lives in the calendar where it can be moved; a past one is a fact
+    // about your day and belongs in the record with everything else.
+
+    func fileFinishedEvents() {
+        guard authorised else { return }
+        var filed = Set(UserDefaults.standard.stringArray(forKey: "chappy_cal_filed") ?? [])
+        let cal = Calendar.current
+        let start = cal.date(byAdding: .day, value: -2, to: Date()) ?? Date()
+        for e in events(from: start, to: Date()) {
+            guard let id = e.eventIdentifier, !filed.contains(id),
+                  let ended = e.endDate, ended < Date(), !e.isAllDay else { continue }
+            filed.insert(id)
+            var body = ""
+            if let n = e.notes, !n.isEmpty { body = n }
+            ChappyMemory.shared.rememberAt(.note,
+                title: e.title ?? "Appointment",
+                body: body,
+                lat: nil, lon: nil,
+                city: e.location,
+                tags: ["appointment", "calendar"],
+                source: "calendar",
+                at: e.startDate ?? ended)
+        }
+        UserDefaults.standard.set(Array(filed.suffix(400)), forKey: "chappy_cal_filed")
     }
 }

@@ -1143,8 +1143,17 @@ class LiveTranslateViewModel: ObservableObject {
             .filter { $0.isLetter || $0.isWhitespace || $0.isNumber }
             .trimmingCharacters(in: .whitespaces)
         var tokens = cleaned.split(separator: " ").map(String.init)
+        // BUILD 103: "hey chappy, change to German" failed because the FIRST
+        // token had to be his name exactly. People lead with hey, ok, so, um.
+        while let f = tokens.first, ["hey", "ok", "okay", "so", "um", "uh", "yo"].contains(f) {
+            tokens.removeFirst()
+        }
         guard let first = tokens.first else { return nil }
-        guard first == "chappy" || first == "chappie" || first == "chappys" else { return nil }
+        // Same widened list as the wake word itself — a name the recogniser
+        // spelled differently is a command that silently never happened.
+        guard ["chappy", "chappie", "chappys", "chapy", "chappi", "chapi",
+               "chappey", "chappe", "chapper", "chappa", "shappy", "chaphy"].contains(first)
+        else { return nil }
         tokens.removeFirst()
         // Drop pure politeness so "Chappy, could you please be quiet" still lands.
         tokens.removeAll { ["please", "can", "you", "could", "would", "just", "now"].contains($0) }
@@ -1213,6 +1222,23 @@ class LiveTranslateViewModel: ObservableObject {
 
     @discardableResult
     private func handleSettingCommand(_ text: String) -> Bool {
+        // BUILD 103 — CLOSING IT, WITHOUT THE WAKE WORD.
+        // Nobody says "stop the translation" to the person standing in front
+        // of them through an interpreter, so these need no name in front. They
+        // had no handler at all before, which is why the only way out of a
+        // conversation was digging the phone out and finding the X.
+        let bare = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if ["stop translating", "stop translation", "stop the translation",
+            "stop translate", "close translate", "close translation",
+            "close the translation", "end translation", "end the translation",
+            "finish translating", "translation stop", "translate stop",
+            "were done here", "we're done here"].contains(where: { bare.contains($0) }) {
+            say("Closing translate.", isConfirmation: true)
+            stopRecording()
+            NotificationCenter.default.post(name: .chappyCloseModules, object: nil)
+            return true
+        }
+
         guard let tail = Self.commandTail(text) else { return false }
 
         // "Chappy, read this" — mid-conversation, hands full, someone holding a
@@ -1231,6 +1257,40 @@ class LiveTranslateViewModel: ObservableObject {
             return true
         }
         func has(_ p: String) -> Bool { Self.has(tail, p) }
+
+        // BUILD 103 — CHANGING LANGUAGE MID-CONVERSATION.
+        // "Chappy, change to German" was routed nowhere and simply got
+        // translated into Indonesian and spoken at the other person. The
+        // retarget path existed and Standby could reach it — but Standby is
+        // handed off while this screen owns the microphone, so from in here
+        // there was no way to get to it. This screen already transcribes
+        // everything you say; it just had to look.
+        if has("change to") || has("switch to") || has("change the language")
+            || has("make it") || has("now in") || has("put it in")
+            || has("swap to") || has("translate to") || has("change language") {
+            let joinedTail = tail.joined(separator: " ")
+            if let code = ChappyStandby.languageCode(spokenIn: joinedTail),
+               let lang = TranslateLanguage(rawValue: code) {
+                targetLanguage = lang
+                UserDefaults.standard.set(code, forKey: "translate_target_language")
+                UserDefaults.standard.set(code, forKey: "translate_last_used_language")
+                say("Now in \(lang.displayName).", isConfirmation: true)
+                return true
+            }
+            // Heard the shape of it but not the language. Say so rather than
+            // translating "change to German" at the poor bloke opposite.
+            say("Which language?", isConfirmation: true)
+            return true
+        }
+
+        // Closing, with the name in front of it.
+        if has("stop") || has("close") || has("exit") || has("finish")
+            || has("done") || has("thats it") || has("that's it") {
+            say("Closing translate.", isConfirmation: true)
+            stopRecording()
+            NotificationCenter.default.post(name: .chappyCloseModules, object: nil)
+            return true
+        }
 
         if has("polite") || has("formal") || has("respectful") {
             politeMode = true

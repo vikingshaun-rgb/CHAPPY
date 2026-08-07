@@ -844,7 +844,7 @@ struct LiveTranslateView: View {
             Text(turn.translated)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(theme.textSecondary)
-                .fixedSize()
+                .lineLimit(1)
             Button("Start fresh") {
                 confirmClear = true
             }
@@ -920,8 +920,10 @@ struct LiveTranslateView: View {
                     .tracking(0.4)
             }
             .foregroundColor(on ? .white : theme.textSecondary)
-            .padding(.horizontal, 15)
-            .frame(minHeight: 44)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 44)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(on ? theme.accent : Color.clear)
@@ -963,7 +965,17 @@ struct LiveTranslateView: View {
             // And because there is also a MIC control, both are prefixed and
             // carry distinct icons — a speaker for output, a microphone for
             // input — so "GLASSES" can never be ambiguous between them.
-            HStack(spacing: 3) {
+            // LAYOUT FIX (build 103). This row was ONE HStack of four segments
+            // with .fixedSize() on it. fixedSize tells SwiftUI "give me my ideal
+            // width and ignore the parent" — and four segments with full words
+            // in them are wider than an iPhone. The row won, the root view grew
+            // past the screen, and EVERYTHING got clipped: the close button, the
+            // header, and both edges of every message bubble.
+            //
+            // Two rows of two. The long labels get half a screen each, which is
+            // plenty, and nothing has to be abbreviated back into jargon.
+            VStack(spacing: 3) {
+              HStack(spacing: 3) {
                 toggleSegment(hearLabel,
                               icon: hearIcon,
                               on: viewModel.audioOutputEnabled) {
@@ -975,6 +987,8 @@ struct LiveTranslateView: View {
                               on: viewModel.usePhoneMic) {
                     viewModel.switchMicSource()
                 }
+              }
+              HStack(spacing: 3) {
 
                 // SCAN — the menu he's holding up. Sits with the other controls
                 // because it belongs to the conversation, not to a separate mode.
@@ -1002,10 +1016,11 @@ struct LiveTranslateView: View {
                               on: showPronunciation) {
                     showPronunciation.toggle()
                 }
+              }
             }
             .padding(3)
             .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(theme.cardFill))
-            .fixedSize()
+            .padding(.horizontal, 12)
 
             // One quiet line of plain English. The row above is three words of
             // jargon otherwise, and this screen gets used by someone standing
