@@ -350,6 +350,16 @@ struct SettingsView: View {
                             .foregroundColor(AppColors.textSecondary)
                             .frame(maxWidth: 140)
                     }
+                    NavigationLink {
+                        VoiceCheckView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "stethoscope")
+                                .foregroundColor(.red)
+                            Text("Voice check")
+                                .foregroundColor(AppColors.textPrimary)
+                        }
+                    }
                 } header: {
                     Text("Voice")
                 } footer: {
@@ -1551,5 +1561,67 @@ struct CostMeterView: View {
             today = CostMeter.shared.today()
             monthCost = CostMeter.shared.monthCostUSD()
         }
+    }
+}
+
+// MARK: - Voice check
+//
+// Built after a week of "the voice commands don't work" with no way to tell
+// WHICH of eight things was wrong. Every row is read live from the system at
+// the moment you open it — permissions, whether audio is genuinely arriving at
+// the microphone, where sound is going, whether the ear can survive
+// backgrounding. No self-reported flags: this layer has been burned repeatedly
+// by code that trusted its own bookkeeping over the truth.
+struct VoiceCheckView: View {
+    @State private var rows: [(String, String, Bool)] = []
+    @State private var tick = 0
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, r in
+                    HStack(alignment: .top) {
+                        Image(systemName: r.2 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundColor(r.2 ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(r.0).foregroundColor(AppColors.textPrimary)
+                            Text(r.1)
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("Live status")
+            } footer: {
+                Text("If tones are missing but everything here is green, check the Ring/Silent switch on the side of the phone — iOS silences all system sounds when it's set to silent, whatever the app does.")
+            }
+
+            Section {
+                Button {
+                    ChappyEarcon.shared.prepare()
+                    ChappyEarcon.shared.wake()
+                } label: {
+                    Label("Play the wake tone", systemImage: "speaker.wave.2.fill")
+                }
+                Button {
+                    TTSService.shared.speak("This is Chappy's voice. If you can hear this, speech output is working.")
+                } label: {
+                    Label("Test the voice", systemImage: "waveform")
+                }
+                Button {
+                    rows = ChappyStandby.diagnostics(); tick += 1
+                } label: {
+                    Label("Re-check", systemImage: "arrow.clockwise")
+                }
+            } header: {
+                Text("Try it")
+            } footer: {
+                Text("Hear the tone but not the voice: it's speech output. Hear the voice but not the tone: it's the silent switch. Neither: it's the output route.")
+            }
+        }
+        .navigationTitle("Voice check")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { rows = ChappyStandby.diagnostics() }
     }
 }
