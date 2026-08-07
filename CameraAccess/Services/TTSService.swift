@@ -107,6 +107,48 @@ class TTSService: NSObject, ObservableObject {
 
     // MARK: - Speaking-flag lifecycle (deadlock-proof)
 
+    // ==================================================================
+    // THE DEADLOCK. Confirmed from the build-80 crash report, not guessed.
+    //
+    //   Thread 0 (main):
+    //     __ulock_wait2
+    //     _os_unfair_lock_lock_slow
+    //     ObservableObjectPublisher.Inner.send()
+    //     Published.subscript.setter
+    //     CameraAccess ...
+    //   Termination: FRONTBOARD 0x8BADF00D
+    //     "Failed to terminate gracefully after 5.0s"
+    //
+    // The main thread is parked forever on Combine's internal lock inside a
+    // @Published setter. That happens when a @Published property is written
+    // from a background thread while the main thread is publishing, and
+    // `isSpeaking` is written by beginSpeaking()/endSpeaking()/stop(), all of
+    // which are called from wherever the caller happens to be: URLSession
+    // completion handlers, audio callbacks, Timer fires, async contexts.
+    //
+    // This is MY regression and I can date it exactly. In build 69 the archive
+    // failed with "call to main actor-isolated instance method
+    // 'beginSpeaking' in a synchronous nonisolated context", and I removed the
+    // @MainActor annotation to make it compile — with a comment claiming
+    // "callers are main-thread in practice". They are not. Silencing the
+    // compiler's thread-safety warning is what created the hang.
+    //
+    // Every write to the published flag now goes through here. Already on the
+    // main thread, write directly; otherwise hop ASYNC — never sync, which
+    // would be a second way to deadlock.
+    private func setSpeaking(_ value: Bool, since: Date?) {
+        if Thread.isMainThread {
+            isSpeaking = value
+            speakingSince = since
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.isSpeaking = value
+                self?.speakingSince = since
+            }
+        }
+    }
+
+
     /// Claim the speaking flag and return the generation token that owns it.
     /// NOT @MainActor: speak()/speakOffline call this synchronously from
     /// nonisolated context and need the token back immediately — annotating it
@@ -115,8 +157,7 @@ class TTSService: NSObject, ObservableObject {
     private func beginSpeaking(estimatedCharacters: Int) -> Int {
         speechGeneration &+= 1
         let gen = speechGeneration
-        isSpeaking = true
-        speakingSince = Date()
+        setSpeaking(true, since: Date())
 
         // Ceiling: no utterance Chappy produces runs longer than this. Even a
         // long Live-AI answer is well under it, so the watchdog can only ever
@@ -129,8 +170,7 @@ class TTSService: NSObject, ObservableObject {
             await MainActor.run {
                 guard self.speechGeneration == gen, self.isSpeaking else { return }
                 print("⏱️ [TTS] Watchdog: speech never reported completion after \(Int(ceiling))s — releasing the mic gate")
-                self.isSpeaking = false
-                self.speakingSince = nil
+                self.setSpeaking(false, since: nil)
                 // Unblock anything still parked on a continuation.
                 self.resumeSystemContinuation()
                 self.systemSynthesizer?.stopSpeaking(at: .immediate)
@@ -144,8 +184,7 @@ class TTSService: NSObject, ObservableObject {
     /// method itself stays nonisolated so those Tasks compile.
     private func endSpeaking(_ gen: Int) {
         guard speechGeneration == gen else { return }
-        isSpeaking = false
-        speakingSince = nil
+        setSpeaking(false, since: nil)
         speakingWatchdog?.cancel()
         speakingWatchdog = nil
     }
@@ -378,8 +417,7 @@ class TTSService: NSObject, ObservableObject {
         // no lock, so a delegate callback landing between them resumed the same
         // continuation twice — an immediate hard crash, not an exception.
         resumeSystemContinuation()
-        isSpeaking = false
-        speakingSince = nil
+        setSpeaking(false, since: nil)
         speakingWatchdog?.cancel()
         speakingWatchdog = nil
     }
