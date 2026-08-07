@@ -130,6 +130,101 @@ enum ChappyVoice {
     }
 }
 
+// MARK: - TIER 3 — Flash intent
+//
+// COST NOTE, because this is the tier that spends money. The local recogniser
+// has ALREADY produced the text by the time this runs, so this is a text
+// request, not an audio stream. Streaming audio to a live model costs roughly
+// 100x more and adds a second of connection setup — which would defeat the
+// whole point. One classification is a few hundred tokens: a fraction of a
+// cent, and only for sentences Tiers 1 and 2 didn't already handle for free.
+//
+// It is also strictly optional. No key, no signal, a slow network, a malformed
+// reply — every one of those returns nil and the caller carries on to the
+// normal answer path. Nothing in the offline command set depends on it.
+enum ChappyIntent {
+    struct Result {
+        let action: String
+        let parameter: String?
+        let mode: String?
+    }
+
+    /// The vocabulary the model is allowed to answer with. Kept deliberately
+    /// small: a classifier with nine options is reliable, one with forty is a
+    /// creative writing exercise.
+    private static let systemPrompt = """
+    You route spoken commands for a wearable assistant called Chappy. Reply with ONLY a JSON object, no prose, no markdown fences.
+    {"action": "...", "parameter": "...", "mode": "..."}
+    action must be exactly one of:
+      navigate  - wants directions somewhere. parameter = the destination in plain words. mode = walk|drive|scooter if stated.
+      translate - wants the interpreter. parameter = the language name if stated, else "".
+      look      - wants the camera to look at something and answer. parameter = what to look for, else "".
+      photo     - just take a picture.
+      remember  - save this place. parameter = the name if given, else "".
+      map       - show the map.
+      watch     - continuous narration of what they see.
+      live_ai   - wants a live conversation.
+      stop      - stop talking or stop navigating.
+      journal   - what have I done / where have I been today.
+      ask       - a general question that is NOT a command. Use this when unsure.
+    Rules: prefer "ask" when genuinely ambiguous. Never invent a destination that was not said. Strip filler words from parameter.
+    """
+
+    static func classify(_ text: String) async -> Result? {
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty, text.count > 2,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+
+        let body: [String: Any] = [
+            "systemInstruction": ["parts": [["text": systemPrompt]]],
+            "contents": [["role": "user", "parts": [["text": text]]]],
+            "generationConfig": [
+                "temperature": 0,
+                "maxOutputTokens": 120,
+                "responseMimeType": "application/json",
+            ],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Hard ceiling. A command router that makes the user wait is worse than
+        // one that occasionally gives up — Tier 4 is right behind it.
+        req.timeoutInterval = 4
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let raw = parts.first?["text"] as? String
+        else {
+            print("🧠 [Intent] no usable reply — falling through")
+            return nil
+        }
+
+        // Models sometimes wrap JSON in fences despite being told not to.
+        let cleaned = raw
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let d = cleaned.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let action = obj["action"] as? String
+        else {
+            print("🧠 [Intent] unparseable: \(cleaned.prefix(80))")
+            return nil
+        }
+        let param = (obj["parameter"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mode = (obj["mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Result(action: action.lowercased(),
+                      parameter: (param?.isEmpty ?? true) ? nil : param,
+                      mode: (mode?.isEmpty ?? true) ? nil : mode)
+    }
+}
+
 final class ChappyEarcon {
     static let shared = ChappyEarcon()
 
@@ -871,6 +966,24 @@ final class ChappyStandby: NSObject, ObservableObject {
         guard let hit = spokenLanguages.first(where: { text.contains($0.0) }) else { return nil }
         return supportedCodes.contains(hit.1) ? hit.1 : nil
     }
+    /// Map a spoken language NAME ("Thai", "German", "Brazilian Portuguese")
+    /// to our code. Tier 3 returns words, not codes.
+    static func languageCode(forName name: String) -> String? {
+        let n = name.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return nil }
+        if let hit = spokenLanguages.first(where: { n.contains($0.0) })?.1 { return hit }
+        let extras: [String: String] = [
+            "mandarin": "zh", "cantonese": "yue", "bahasa": "id", "indonesian": "id",
+            "tagalog": "fil", "filipino": "fil", "khmer": "km", "cambodian": "km",
+            "lao": "lo", "brazilian": "pt", "portuguese": "pt", "castilian": "es",
+            "spanish": "es", "greek": "el", "turkish": "tr", "arabic": "ar",
+            "hindi": "hi", "japanese": "ja", "korean": "ko", "vietnamese": "vi",
+            "thai": "th", "german": "de", "french": "fr", "italian": "it",
+            "russian": "ru", "english": "en",
+        ]
+        return extras.first(where: { n.contains($0.key) })?.value
+    }
+
     static func languageName(_ code: String) -> String {
         spokenLanguages.first(where: { $0.1 == code })?.0.capitalized ?? code.uppercased()
     }
@@ -1731,13 +1844,73 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
         }
         lastWordAt = Date()
-        // Debounce: 1.1s of quiet means the sentence is finished.
+        // RESPONSIVENESS. 1.1s was tuned to be safe against clipping a long
+        // sentence, but it is dead air on the short imperative commands that
+        // are 90% of real use — "chappy translate", "chappy map". Scale it:
+        // a short tail is almost certainly finished, a long one may still be
+        // going. Saves roughly half a second on the commands you use most.
         routeWork?.cancel()
         let snapshot = command
         let work = DispatchWorkItem { [weak self] in self?.finish(snapshot) }
         routeWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: work)
+        // ================= TIER 2: INSTANT FIRE =================
+        // Waiting for silence is the wrong model for a short imperative. Once
+        // the ear has heard "chappy stop" there is nothing left to wait FOR —
+        // no command in the grammar extends it — so any delay is pure dead air
+        // on the one command whose entire purpose is to interrupt.
+        //
+        // Three classes, by whether more words could still be coming:
+        //
+        //   TERMINAL    nothing can follow. Fire NOW, 0 ms.
+        //               stop · quiet · enough · battery · where am I
+        //   EXTENDABLE  a known command that MIGHT take a tail
+        //               ("translate" → "translate to Thai"). 250 ms grace:
+        //               long enough to catch the tail, short enough to feel
+        //               instant if it never comes.
+        //   OPEN        anything else. Scaled wait, as before.
+        //
+        // The distinction matters: firing "translate" instantly would break
+        // "translate to Thai" by acting before the language arrives. Guessing
+        // wrong in that direction is worse than 250 ms.
+        let cleanTail = snapshot.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if Self.terminalCommands.contains(cleanTail) {
+            routeWork = nil
+            print("⚡ [Standby] Instant fire: \(cleanTail)")
+            finish(cleanTail)
+            return
+        }
+        let debounce: Double
+        if Self.extendableCommands.contains(cleanTail) {
+            debounce = 0.25
+        } else {
+            let wordCount = snapshot.split(separator: " ").count
+            debounce = wordCount <= 3 ? 0.6 : (wordCount <= 6 ? 0.85 : 1.1)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
     }
+
+    /// Complete in themselves — no command in the grammar extends any of these,
+    /// so there is never a reason to wait.
+    static let terminalCommands: Set<String> = [
+        "stop", "cancel", "quiet", "enough", "shut up", "shush", "be quiet",
+        "stop talking", "that's enough", "thats enough", "never mind",
+        "battery", "battery check", "battery level",
+        "where am i", "what street", "where was i", "i'm lost", "im lost",
+        "emergency", "sos", "help", "help me",
+        "stop navigation", "cancel navigation", "stop navigating",
+        "open maps", "open google maps", "show the map", "show map",
+        "what can i say", "what can you do",
+        "spent today", "cost check", "usage today",
+        "quiet mode", "tour mode", "budget mode", "normal mode",
+    ]
+
+    /// Known commands that MAY take a tail. Short grace, then fire.
+    static let extendableCommands: Set<String> = [
+        "translate", "look", "snap", "photo", "take a photo", "take a picture",
+        "map", "remember", "watch", "keep watching", "navigate", "go",
+        "remember this spot", "let's talk", "lets talk", "take me home",
+        "get me home", "go home",
+    ]
 
     private func finish(_ raw: String) {
         // AUDIT FIX (HIGH — re-entry): a second command arriving while one is
@@ -2170,7 +2343,100 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
 
         // Everything else question-shaped → the cheap brain
+        // ================= TIER 3: FLASH INTENT =================
+        // Everything above is hand-written string matching, and fifty
+        // conditions can never cover how a person actually talks. "Take me to
+        // my gym", "I need a chemist", "put it in German", "what's the closest
+        // beach" — all reasonable, none matched, all previously falling through
+        // to a general question when they were really commands.
+        //
+        // Rather than write condition fifty-one, hand the sentence to a small
+        // model and ask what he MEANT. The local recogniser already produced
+        // the text for free, so this is a text call, not audio: about 300 ms
+        // and a fraction of a cent, and only for phrasings the free tiers
+        // didn't recognise. No signal means no Tier 3 — and that is fine,
+        // because Tiers 1 and 2 are entirely offline and still work.
+        if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
+            print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
+            if await runIntent(intent) { return }
+        }
+
         await quickAsk(c)
+    }
+
+    /// Execute a Flash-classified intent by routing it back through the SAME
+    /// handlers the string ladder uses — no second implementation to drift.
+    /// Returns false if we couldn't action it, so the caller can fall through
+    /// to a plain answer rather than pretending.
+    private func runIntent(_ intent: ChappyIntent.Result) async -> Bool {
+        let p = intent.parameter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch intent.action {
+        case "navigate":
+            guard !p.isEmpty else { promptForDestination(); return true }
+            if ["home", "hotel", "the hotel"].contains(p.lowercased()) {
+                speak("Heading home."); speak(await NavEngine.shared.getHome()); return true
+            }
+            let driving = ["drive", "car", "taxi", "scooter", "motorbike", "grab"]
+                .contains { (intent.mode ?? "").lowercased().contains($0) }
+            speak("Finding \(p).")
+            let reply = await NavEngine.shared.navigate(to: p, driving: driving)
+            speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            return true
+
+        case "translate":
+            // p is a language name or code, or empty for "local language".
+            let code = p.isEmpty ? nil : Self.languageCode(forName: p)
+            guard let target = code ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode) else {
+                speak("I don't have that language yet."); return true
+            }
+            UserDefaults.standard.set("en", forKey: "translate_source_language")
+            UserDefaults.standard.set(target, forKey: "translate_target_language")
+            UserDefaults.standard.set(true, forKey: "translate_autostart")
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
+            speak("Translating English and \(Self.languageName(target)).")
+            handOff()
+            NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
+            return true
+
+        case "look":
+            speak("Looking.")
+            QuickVisionManager.shared.triggerQuickVision(customPrompt: p.isEmpty ? nil : "Look and answer: \(p)")
+            return true
+
+        case "photo":
+            NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
+            speak("Photo taken."); return true
+
+        case "remember":
+            if p.isEmpty { rememberSpotByVoice() } else {
+                let s = TripRecorder.shared.rememberSpot(named: p)
+                ChappyEarcon.shared.done(); speak("Saved \(s.name).")
+            }
+            return true
+
+        case "map":
+            NotificationCenter.default.post(name: .chappyShowMap, object: nil)
+            speak("Map's up."); return true
+
+        case "watch":
+            speak("Watching."); handOff()
+            NotificationCenter.default.post(name: .continuousVisionTriggered, object: nil)
+            return true
+
+        case "live_ai":
+            speak("Opening Live AI."); handOff()
+            NotificationCenter.default.post(name: .liveAITriggered, object: nil)
+            return true
+
+        case "stop":
+            TTSService.shared.stop(); NavEngine.shared.stop(); return true
+
+        case "journal":
+            speak(TripRecorder.shared.todaySummary()); return true
+
+        default:
+            return false
+        }
     }
 
     // MARK: Tier 1 brain — one call, spoken, then back to sleep
