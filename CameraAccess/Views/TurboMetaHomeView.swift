@@ -353,7 +353,11 @@ struct TurboMetaHomeView: View {
             let nav = NavEngine.shared
             var url: URL?
             if let d = nav.destinationCoord {
-                let mode = nav.lastDriving ? "driving" : "walking"
+                // Two-wheeler directions where Google supports them (most of
+                // SE Asia); driving elsewhere. A scooter on car directions gets
+                // sent down roads it shouldn't be on.
+                let mode = nav.lastModeWasScooter ? "two-wheeler"
+                    : (nav.lastDriving ? "driving" : "walking")
                 let appURL = URL(string: "comgooglemaps://?daddr=\(d.latitude),\(d.longitude)&directionsmode=\(mode)")
                 url = (appURL.map { UIApplication.shared.canOpenURL($0) } == true)
                     ? appURL
