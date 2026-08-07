@@ -181,7 +181,12 @@ enum ChappyIntent {
             "contents": [["role": "user", "parts": [["text": text]]]],
             "generationConfig": [
                 "temperature": 0,
-                "maxOutputTokens": 120,
+                // AUDIT P0: 120 was not enough. Flash models reason before
+                // answering and that reasoning is charged against this budget,
+                // so the response was truncated before any JSON appeared and
+                // classify() returned nil for EVERY utterance — Tier 3 was
+                // dead on arrival AND cost 4s of dead air on every question.
+                "maxOutputTokens": 800,
                 "responseMimeType": "application/json",
             ],
         ]
@@ -1211,6 +1216,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         starting = false
         installAudioResilience()
         ChappyEarcon.shared.prepare() // render the tones before they're needed
+        Self.validateCommandSets()   // AUDIT P0: catches prefix-unsafe entries
         ChappyHaptics.shared.connected()
         // THE ON-DUTY MOMENT. Opening the app — by the Action Button or by
         // tapping it — should feel like Chappy coming on shift: one short line
@@ -1881,7 +1887,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
         let debounce: Double
         if Self.extendableCommands.contains(cleanTail) {
-            debounce = 0.25
+            debounce = 0.40
         } else {
             let wordCount = snapshot.split(separator: " ").count
             debounce = wordCount <= 3 ? 0.6 : (wordCount <= 6 ? 0.85 : 1.1)
@@ -1889,33 +1895,109 @@ final class ChappyStandby: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
     }
 
-    /// Complete in themselves — no command in the grammar extends any of these,
-    /// so there is never a reason to wait.
+    /// AUDIT P0 — THE MISTAKE THIS SET USED TO MAKE.
+    ///
+    /// `heard()` receives the recogniser's RUNNING transcript, not finished
+    /// sentences. "stop" is what "stop navigation" looks like a quarter of a
+    /// second before the word "navigation" arrives. So a set containing short
+    /// words fired on the FIRST HALF of longer commands:
+    ///
+    ///   "Chappy, stop navigation"        -> fired "stop", route never cancelled
+    ///   "Chappy, quiet mode"             -> fired "quiet", mode never set
+    ///   "Chappy, where am I on the map"  -> fired "where am i", map never opened
+    ///   "Chappy, help me talk to them"   -> fired "help", coach menu instead
+    ///   "Chappy, emergency room near me" -> FIRED A REAL SOS
+    ///
+    /// That last one is why this is a P0 and not a polish item: it would have
+    /// WhatsApped his emergency contact with a live map pin because he asked
+    /// where a hospital was. Two independent auditors found it separately.
+    ///
+    /// The fix is the inverse of the instinct: instant-fire the COMPLETE forms,
+    /// never the short prefixes. "stop navigation" is terminal — nothing
+    /// extends it. Bare "stop" is not, and gets the grace window instead. The
+    /// unit test in Self.validateCommandSets() enforces this and will trip on
+    /// the next person to add a short word here.
     static let terminalCommands: Set<String> = [
-        "stop", "cancel", "quiet", "enough", "shut up", "shush", "be quiet",
-        "stop talking", "that's enough", "thats enough", "never mind",
-        "battery", "battery check", "battery level",
-        "where am i", "what street", "where was i", "i'm lost", "im lost",
-        "emergency", "sos", "help", "help me",
-        "stop navigation", "cancel navigation", "stop navigating",
-        "open maps", "open google maps", "show the map", "show map",
+        // Interrupts that genuinely end there.
+        "shut up", "shush", "be quiet", "never mind",
+        "that's enough", "thats enough", "stop talking",
+        // Complete long forms of otherwise-ambiguous commands.
+        "stop navigation", "stop navigating", "cancel navigation",
+        "battery check", "battery level",
+        "quiet mode", "tour mode", "budget mode", "normal mode",
+        "open google maps", "show the map", "show map",
         "what can i say", "what can you do",
         "spent today", "cost check", "usage today",
-        "quiet mode", "tour mode", "budget mode", "normal mode",
+        "where was i", "what street", "i'm lost", "im lost",
     ]
 
-    /// Known commands that MAY take a tail. Short grace, then fire.
+    /// Prefixes that MUST NOT instant-fire, because a real command extends
+    /// them. Kept explicit so the reasoning survives the next edit.
+    static let neverInstant: Set<String> = [
+        "stop", "cancel", "quiet", "battery", "where am i",
+        "emergency", "sos", "help", "help me", "open maps", "enough",
+    ]
+
+    /// Guard rail: no terminal command may be a prefix of another known
+    /// command, and nothing in `neverInstant` may leak into the terminal set.
+    /// Called once at arm time; a violation is a programming error, not a
+    /// runtime condition, so it prints loudly rather than failing quietly.
+    static func validateCommandSets() {
+        for t in terminalCommands where neverInstant.contains(t) {
+            print("‼️ [Standby] '\(t)' is prefix-unsafe and must not be terminal")
+        }
+        for a in terminalCommands {
+            for b in terminalCommands.union(extendableCommands) where b != a && b.hasPrefix(a + " ") {
+                print("‼️ [Standby] terminal '\(a)' is a prefix of '\(b)' — would fire early")
+            }
+        }
+    }
+
+    /// Known commands that MAY take a tail. A short grace, then fire.
+    ///
+    /// AUDIT P1: the grace is 400ms, not 250ms. 250 was measured between
+    /// recogniser PARTIALS rather than actual silence, and a natural pause
+    /// before the tail — "Chappy, translate… to Thai" — expired it, firing the
+    /// bare command and then wiping the transcript so the tail was lost
+    /// entirely. 400ms still reads as instant and survives a real breath.
+    ///
+    /// Everything here is verified to have a handler in route(). "look",
+    /// "navigate" and "go" previously did NOT and fell through to the either/or
+    /// prompt, which then poisoned the next command for 45 seconds.
     static let extendableCommands: Set<String> = [
-        "translate", "look", "snap", "photo", "take a photo", "take a picture",
-        "map", "remember", "watch", "keep watching", "navigate", "go",
-        "remember this spot", "let's talk", "lets talk", "take me home",
-        "get me home", "go home",
+        "translate", "snap", "photo", "take a photo", "take a picture",
+        "map", "remember", "remember this spot", "watch", "keep watching",
+        "let's talk", "lets talk", "take me home", "get me home", "go home",
+        // The prefix-unsafe words from neverInstant land here instead: a grace
+        // is exactly what they need, so the tail can arrive.
+        "stop", "cancel", "quiet", "battery", "where am i",
+        "emergency", "sos", "help", "help me", "open maps", "enough",
     ]
 
     private func finish(_ raw: String) {
         // AUDIT FIX (HIGH — re-entry): a second command arriving while one is
         // still routing used to run BOTH concurrently — two paid calls, two
         // voices, and a `busy` flag that stopped meaning anything.
+        // AUDIT P1: "stop" is the command you use precisely BECAUSE something is
+        // in flight — so routing it through the busy guard meant it was the one
+        // command that could never do its job. He'd get a failure tone and
+        // "Still working on the last one" while Chappy kept talking over him.
+        // Interrupts jump the queue and kill the work that's blocking them.
+        let interrupts = ["stop", "shut up", "shush", "quiet", "enough",
+                          "be quiet", "stop talking", "that's enough",
+                          "thats enough", "never mind", "cancel"]
+        let cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if interrupts.contains(cleaned) {
+            TTSService.shared.stop()
+            routeTask?.cancel()
+            busy = false
+            awake = false; command = ""
+            routeWork?.cancel(); routeWork = nil
+            ChappyHaptics.shared.straightStep()
+            print("🤫 [Standby] Interrupt — killed in-flight work")
+            resetRecognition()
+            return
+        }
         guard !busy else {
             // AUDIT P1 (SB-BUSY): this dropped the command with no speech and no
             // haptic. Wearing glasses with the phone pocketed, "heard and
@@ -2303,6 +2385,22 @@ final class ChappyStandby: NSObject, ObservableObject {
         // THE UNSURE RULE (spec'd, previously unbuilt): a bare noun is
         // ambiguous — "Chappy, sushi" could be find-me-one or tell-me-about.
         // Ask ONE either/or instead of guessing or burning a paid call.
+        // ================= TIER 3: FLASH INTENT (moved up) =================
+        // AUDIT P1: this used to sit at the very END of route(), BELOW the
+        // three-word either/or gate — so exactly the short rephrasings it
+        // exists to rescue ("make it German", "find a chemist", "I need an
+        // ATM") were swallowed by "Make It German - find you one nearby, or
+        // tell you about it?" and never reached the classifier at all.
+        // AUDIT P2: Tier 3 can take up to 4s on bad signal, and it did so in
+        // total silence — indistinguishable from not being heard, so he repeats
+        // himself. A tone costs nothing and closes the loop.
+        ChappyEarcon.shared.tap()
+        if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
+            print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
+            CostMeter.shared.addTTSChars(c.count) // AUDIT P2: was invisible to "cost check"
+            if await runIntent(intent) { return }
+        }
+
         // AUDIT P1 (SB-LOOP2): the ANSWER branch used to sit BELOW the ask, so a
         // short reply — "find one", "tell me" — was itself ≤3 words and simply
         // re-triggered the question. "Chappy, petrol station" → "find you one
@@ -2356,12 +2454,19 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and a fraction of a cent, and only for phrasings the free tiers
         // didn't recognise. No signal means no Tier 3 — and that is fine,
         // because Tiers 1 and 2 are entirely offline and still work.
-        if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
-            print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
-            if await runIntent(intent) { return }
-        }
-
         await quickAsk(c)
+    }
+
+    /// Strip text written for the MODEL out of anything spoken to a HUMAN.
+    /// NavEngine returns one string to two audiences and the tail is an
+    /// instruction to the model; the wearer should never hear it.
+    static func stripModelDirectives(_ s: String) -> String {
+        var out = s
+        for marker in ["Also tell the user:", "Tell the user:", "Ask the user",
+                       "[route mode:", "say this mode"] {
+            if let r = out.range(of: marker) { out = String(out[out.startIndex..<r.lowerBound]) }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Execute a Flash-classified intent by routing it back through the SAME
@@ -2373,11 +2478,26 @@ final class ChappyStandby: NSObject, ObservableObject {
         switch intent.action {
         case "navigate":
             guard !p.isEmpty else { promptForDestination(); return true }
-            if ["home", "hotel", "the hotel"].contains(p.lowercased()) {
-                speak("Heading home."); speak(await NavEngine.shared.getHome()); return true
+            // AUDIT P2: three aliases was narrower than the ladder's list, so
+            // "our hotel" / "the room" were geocoded as literal place names and
+            // sent you to a random hotel instead of yours.
+            let homeWords = ["home", "hotel", "the hotel", "my hotel", "our hotel",
+                             "the room", "our room", "my room", "the hostel",
+                             "our place", "back home", "our hotel room"]
+            if homeWords.contains(p.lowercased()) {
+                // AUDIT P2: getHome()'s string is written for the MODEL and
+                // contains "Tell the user:". Standby speaks it verbatim.
+                speak("Heading home.")
+                let r = await NavEngine.shared.getHome()
+                speak(NavEngine.shared.spokenRouteSummary ?? Self.stripModelDirectives(r))
+                return true
             }
-            let driving = ["drive", "car", "taxi", "scooter", "motorbike", "grab"]
-                .contains { (intent.mode ?? "").lowercased().contains($0) }
+            // AUDIT P2: mode came ONLY from the classifier, so "we're getting a
+            // Grab to the airport" produced a walking route when Flash left
+            // mode empty. Trust the utterance as well as the classification.
+            let modeHay = ((intent.mode ?? "") + " " + c).lowercased()
+            let driving = ["drive", "driving", "car", "taxi", "grab", "scooter",
+                           "motorbike", "moto", "ride"].contains { modeHay.contains($0) }
             speak("Finding \(p).")
             let reply = await NavEngine.shared.navigate(to: p, driving: driving)
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
@@ -2385,7 +2505,12 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         case "translate":
             // p is a language name or code, or empty for "local language".
-            let code = p.isEmpty ? nil : Self.languageCode(forName: p)
+            // AUDIT P2: an unvalidated parameter produced "Translating English
+            // and EN" and then opened an English-to-English session. If he asks
+            // for English he means "put THEIR language into English" — which is
+            // the local language on the other side, not a null pair.
+            var code = p.isEmpty ? nil : Self.languageCode(forName: p)
+            if code == "en" { code = nil } // fall through to the local language
             guard let target = code ?? Self.languageCode(forCountry: ContextEngine.shared.snapshot.countryCode) else {
                 speak("I don't have that language yet."); return true
             }
@@ -2405,12 +2530,32 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         case "photo":
             NotificationCenter.default.post(name: .chappyCapturePhoto, object: nil)
-            speak("Photo taken."); return true
+            // AUDIT P1: this said "Photo taken." unconditionally, re-introducing
+            // a bug the ladder had already fixed. With the phone pocketed and
+            // the camera not streaming, nothing is captured and Chappy claims
+            // success — the wearer walks off believing he has the shot.
+            if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
+                ChappyEarcon.shared.done(); speak("Photo taken.")
+            } else {
+                ChappyEarcon.shared.fail()
+                speak("Camera isn't running - open Talk or Look first.")
+            }
+            return true
 
         case "remember":
             if p.isEmpty { rememberSpotByVoice() } else {
-                let s = TripRecorder.shared.rememberSpot(named: p)
-                ChappyEarcon.shared.done(); speak("Saved \(s.name).")
+                let spot = TripRecorder.shared.rememberSpot(named: p)
+                // AUDIT P1: the GPS check was dropped here. Indoors or straight
+                // off a plane the pin saves at 0,0 and "Saved" is a lie — you
+                // find out weeks later when the spot is in the ocean.
+                if spot.lat == 0 && spot.lon == 0 {
+                    ChappyEarcon.shared.fail()
+                    speak("Saved, but GPS hasn't locked yet.")
+                } else {
+                    ChappyEarcon.shared.done()
+                    ChappyHaptics.shared.straightStep()
+                    speak("Saved \(spot.name).")
+                }
             }
             return true
 
@@ -2429,7 +2574,17 @@ final class ChappyStandby: NSObject, ObservableObject {
             return true
 
         case "stop":
-            TTSService.shared.stop(); NavEngine.shared.stop(); return true
+            // AUDIT P1: this silently cancelled an ACTIVE ROUTE with no speech
+            // and no tone. A conversational "alright, that'll do" could end
+            // your navigation in Denpasar and you would not know until you
+            // looked. Stopping the voice is harmless; stopping a route is not,
+            // so they are no longer the same action.
+            TTSService.shared.stop()
+            ChappyHaptics.shared.straightStep()
+            if NavEngine.shared.isNavigating {
+                speak("Stop navigation too, or just quiet?")
+            }
+            return true
 
         case "journal":
             speak(TripRecorder.shared.todaySummary()); return true
