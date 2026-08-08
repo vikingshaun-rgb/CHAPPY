@@ -5230,8 +5230,24 @@ final class NavEngine: NSObject, ObservableObject {
             dest = found.0
             destName = found.1
         }
+        // BUILD 123 — NAVIGATION WITHOUT A KEY.
+        //
+        // Google Places was the only way a name became coordinates. No key,
+        // or a rejected one, and the whole chain died silently: no
+        // destination, no route, nothing to open in Maps — and the command
+        // fell through to the AI, which answered like a travel guide instead
+        // of taking you anywhere.
+        //
+        // Apple's own local search needs NO KEY AT ALL. It is a little worse
+        // in Asia, which is why Google stays first, but it means navigation
+        // can never again be brought down entirely by a key problem.
+        if dest == nil, let found = await appleSearch(query: query, lat: lat, lon: lon) {
+            dest = found.0
+            destName = found.1
+            print("🗺️ [Nav] Google Places unavailable — found '\(destName)' with Apple search")
+        }
         guard let destination = dest else {
-            return "Could not find '\(query)' nearby. Ask the user to try a different name."
+            return "Could not find '\(query)' nearby - say this to the user in one short sentence and suggest a different name. Do not give travel advice about the place."
         }
         var routed = await googleRoute(fromLat: lat, fromLon: lon, to: destination, driving: driving)
         if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: destination, driving: driving) }
@@ -5310,11 +5326,31 @@ final class NavEngine: NSObject, ObservableObject {
         if dest == nil, let found = await placesSearch(query: query, lat: lat, lon: lon) {
             dest = found.0
         }
+        if dest == nil, let found = await appleSearch(query: query, lat: lat, lon: lon) {
+            dest = found.0
+        }
         guard let d = dest else { return nil }
         var routed = await googleRoute(fromLat: lat, fromLon: lon, to: d, driving: driving)
         if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: d, driving: driving) }
         guard let r = routed else { return nil }
         return max(1, Int(r.durationSec / 60))
+    }
+
+    /// Keyless place lookup. MKLocalSearch uses Apple's own maps data and
+    /// needs no API key, no billing account and no configuration — so it is
+    /// the floor under the whole navigation stack.
+    private func appleSearch(query: String, lat: Double, lon: Double)
+        async -> (CLLocationCoordinate2D, String)? {
+        let req = MKLocalSearch.Request()
+        req.naturalLanguageQuery = query
+        req.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+            latitudinalMeters: 40000, longitudinalMeters: 40000)
+        guard let response = try? await MKLocalSearch(request: req).start(),
+              let item = response.mapItems.first else { return nil }
+        let coord = item.placemark.coordinate
+        let name = item.name ?? query
+        return (coord, name)
     }
 
     func getHome() async -> String {
