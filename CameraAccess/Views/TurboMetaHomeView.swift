@@ -13,6 +13,221 @@ import Speech
 import MapKit
 import EventKit
 
+// MARK: - BUILD 126: SNAP CONFIRMATION
+//
+// Snap took a photo and told you nothing. No flash, no shutter, no picture —
+// just a glasses light that came on and stayed on, so "it worked" and "it is
+// broken" looked and sounded identical. This is the missing half.
+//
+// Every camera worth using gives you three signals and they are not
+// decoration:
+//
+//   SOUND   fired at the instant of capture, never at the press. That timing
+//           is the whole point — hearing it is proof the picture exists.
+//   FLASH   a fast white frame. Peripheral vision catches it even when you
+//           are looking at the thing you photographed, not at the phone.
+//   THE PICTURE ITSELF, briefly. Apple parks it in the thumbnail well;
+//           Samsung pops it and lets it fade. Both let you confirm you got
+//           the shot without leaving what you were doing.
+//
+// It lives in its own window rather than in the home view, because a photo
+// taken by voice while Live AI or Translate is open would otherwise be
+// confirmed underneath a full-screen cover, where you could never see it.
+
+/// Drives the snap confirmation from anywhere in the app.
+@MainActor
+final class SnapFeedback: ObservableObject {
+    static let shared = SnapFeedback()
+
+    @Published var flashOn = false
+    @Published var shot: UIImage?
+    @Published var caption = ""
+    @Published var isWaking = false
+
+    /// How long the card stays. Long enough to look at, short enough that it
+    /// never becomes something you have to dismiss.
+    private static let holdSeconds: TimeInterval = 2.6
+    private var hideWork: DispatchWorkItem?
+
+    private init() {}
+
+    /// The glasses camera is asleep and is being woken. Shows the waiting
+    /// state so the delay reads as a delay.
+    func waking() {
+        SnapHUD.shared.install()
+        hideWork?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) {
+            isWaking = true
+            shot = nil
+            caption = ""
+        }
+        // Never leave the spinner up forever — the wake path gives up at about
+        // eight seconds and speaks, so this outlives it by a margin and then
+        // clears itself no matter what.
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeIn(duration: 0.25)) { self?.isWaking = false }
+        }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    /// A frame genuinely exists. Flash, then hold the picture, then go.
+    func captured(_ image: UIImage) {
+        SnapHUD.shared.install()
+        hideWork?.cancel()
+
+        isWaking = false
+        caption = ""
+        // The flash is deliberately faster in than out — a real shutter is
+        // abrupt at the start and lingers on the eye.
+        withAnimation(.linear(duration: 0.05)) { flashOn = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            withAnimation(.easeOut(duration: 0.28)) { self?.flashOn = false }
+        }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
+            shot = image
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeIn(duration: 0.3)) {
+                self?.shot = nil
+                self?.caption = ""
+            }
+        }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.holdSeconds, execute: work)
+    }
+
+    /// The AI caption lands a second or two after the shutter. If the card is
+    /// still up, show it — that is the difference between "a photo" and
+    /// "the handwritten warung sign".
+    func setCaption(_ text: String) {
+        guard shot != nil else { return }
+        withAnimation(.easeOut(duration: 0.2)) { caption = text }
+    }
+
+    /// Tapped — get out of the way immediately.
+    func dismiss() {
+        hideWork?.cancel()
+        withAnimation(.easeIn(duration: 0.2)) {
+            shot = nil
+            caption = ""
+            isWaking = false
+        }
+    }
+}
+
+/// A window that is invisible to touches except where the overlay actually
+/// draws. Without this the whole screen would stop responding while a
+/// confirmation was up.
+final class SnapPassthroughWindow: UIWindow {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard let hit = super.hitTest(point, with: event) else { return nil }
+        return hit === rootViewController?.view ? nil : hit
+    }
+}
+
+@MainActor
+final class SnapHUD {
+    static let shared = SnapHUD()
+    private var window: SnapPassthroughWindow?
+    private init() {}
+
+    /// Built on first use and kept. Safe to call on every snap.
+    func install() {
+        guard window == nil else { return }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
+                ?? scenes.first else { return }
+
+        let w = SnapPassthroughWindow(windowScene: scene)
+        // Above full-screen covers and sheets, below system alerts.
+        w.windowLevel = .alert - 1
+        w.backgroundColor = .clear
+        let host = UIHostingController(rootView: SnapOverlay())
+        host.view.backgroundColor = .clear
+        w.rootViewController = host
+        w.isHidden = false
+        window = w
+        print("📷 [Snap] Confirmation overlay installed")
+    }
+}
+
+struct SnapOverlay: View {
+    @ObservedObject private var feedback = SnapFeedback.shared
+
+    var body: some View {
+        ZStack {
+            // THE FLASH. Ignores touches entirely and covers everything
+            // including the status bar, the way a real shutter does.
+            Color.white
+                .opacity(feedback.flashOn ? 0.92 : 0)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    if let shot = feedback.shot {
+                        card(shot)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    } else if feedback.isWaking {
+                        wakingCard
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
+                }
+                .padding(.trailing, 16)
+                .padding(.bottom, 34)
+            }
+        }
+    }
+
+    private func card(_ image: UIImage) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 132, height: 132)
+                .clipped()
+            if !feedback.caption.isEmpty {
+                Text(feedback.caption)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .frame(width: 132, alignment: .leading)
+            }
+        }
+        .background(Color.black.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.5), lineWidth: 1.5)
+        )
+        .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
+        .onTapGesture { feedback.dismiss() }
+    }
+
+    private var wakingCard: some View {
+        HStack(spacing: 9) {
+            ProgressView().scaleEffect(0.75).tint(.white)
+            Text("Waking the camera")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(Color.black.opacity(0.6))
+        .clipShape(Capsule())
+        .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
+        .allowsHitTesting(false)
+    }
+}
+
 struct TurboMetaHomeView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @ObservedObject var wearablesViewModel: WearablesViewModel
@@ -411,8 +626,30 @@ struct TurboMetaHomeView: View {
                 if let frame {
                     ChappyStandby.shared.completeSilentSnap(frame)
                 } else {
+                    SnapFeedback.shared.dismiss()
                     ChappyEarcon.shared.fail()
                     TTSService.shared.speak("The camera didn't wake up - check the glasses are connected in the Meta app.")
+                }
+
+                // BUILD 126: PUT THE CAMERA BACK.
+                //
+                // This path only runs because the camera was ASLEEP — that is
+                // the whole reason the notification fired. It woke it and then
+                // never turned it off again, so one Snap left the glasses
+                // streaming indefinitely: the light stayed on, the battery
+                // drained, and nothing in the app looked wrong.
+                //
+                // Only stand it down if nobody else has since claimed it.
+                // Live AI and Continuous Vision both legitimately hold the
+                // camera, and stealing it back from them would be a far worse
+                // bug than the one being fixed.
+                if !LiveAIManager.shared.isRunning,
+                   !ContinuousVisionManager.shared.isRunning,
+                   !showLiveAI, !showQuickVision, !showLiveStream, !showRTMPStreaming {
+                    // A beat, so a capture still in flight isn't cut off.
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    await streamViewModel.stopSession()
+                    print("📷 [Snap] Camera returned to sleep")
                 }
             }
         }
@@ -2611,6 +2848,28 @@ struct RemindersView: View {
     @State private var diaryTick = 0
     @State private var selectedCategory: ChappyReminders.Category? = nil
 
+    // BUILD 127 — TWO WAYS IN.
+    //
+    // The categories already existed, but only as a FILTER: tap Work and
+    // everything else vanished. That tells you about one category and hides
+    // the shape of everything else, which is the opposite of what a header
+    // does. Now time and type are peers — Schedule answers "what's next",
+    // By type answers "what have I got on", and neither hides the other.
+    private enum Mode: String, CaseIterable {
+        case schedule, byType, timeline, done
+        var label: String {
+            switch self {
+            case .schedule: return "Schedule"
+            case .byType:   return "By type"
+            case .timeline: return "Timeline"
+            case .done:     return "Done"
+            }
+        }
+    }
+    @State private var mode: Mode = .schedule
+    @State private var timelineDay = Calendar.current.startOfDay(for: Date())
+    @State private var timelineEvents: [EKEvent] = []
+
     var body: some View {
         NavigationView {
             ZStack {
@@ -2619,22 +2878,27 @@ struct RemindersView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         briefCard
-                        categoryChips
-                        diarySection
-                        section("Overdue", inFilter(reminders.overdue()), .red)
-                        section("Today", inFilter(reminders.today().filter { $0.deliveredAt == nil }), theme.accent)
-                        section("Waiting on a place", inFilter(reminders.placeReminders()), .cyan)
-                        section("Coming up", reminders.upcoming().filter {
-                            !Calendar.current.isDateInToday($0.effectiveFire ?? Date())
-                        }, theme.textSecondary)
-                        if showDone {
-                            section("Done", reminders.done(), theme.textSecondary)
-                        } else if !reminders.done().isEmpty {
-                            Button("Show \(reminders.done().count) completed") { showDone = true }
-                                .font(.footnote).foregroundColor(theme.accent)
-                                .padding(.horizontal, 16).padding(.top, 6)
+                        modePicker
+                        switch mode {
+                        case .schedule:
+                            categoryChips
+                            diarySection
+                            section("Overdue", inFilter(reminders.overdue()), .red)
+                            section("Today", inFilter(reminders.today().filter { $0.deliveredAt == nil }), theme.accent)
+                            section("Waiting on a place", inFilter(reminders.placeReminders()), .cyan)
+                            section("Coming up", reminders.upcoming().filter {
+                                !Calendar.current.isDateInToday($0.effectiveFire ?? Date())
+                            }, theme.textSecondary)
+                            if reminders.open.isEmpty { empty }
+                        case .byType:
+                            byTypeSections
+                            if reminders.open.isEmpty { empty }
+                        case .timeline:
+                            weekStrip
+                            timelineSection
+                        case .done:
+                            doneSection
                         }
-                        if reminders.open.isEmpty { empty }
                         Color.clear.frame(height: 60)
                     }
                     .padding(.top, 8)
@@ -2660,6 +2924,294 @@ struct RemindersView: View {
             todaysEvents = ChappyCalendar.shared.today().filter {
                 ($0.endDate ?? Date()) > Date()
             }
+            loadTimelineEvents()
+        }
+    }
+
+    // BUILD 127: Schedule / By type / Done.
+    private var modePicker: some View {
+        HStack(spacing: 3) {
+            ForEach(Mode.allCases, id: \.rawValue) { m in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) { mode = m }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    Text(m.label)
+                        .font(.caption).fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8)
+                            .fill(mode == m ? theme.accent.opacity(0.18) : Color.clear))
+                        .foregroundColor(mode == m ? theme.accent : theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(RoundedRectangle(cornerRadius: 11).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+    }
+
+    /// BUILD 127 — THE HEADERS.
+    ///
+    /// Every open reminder, grouped by the category it already had, with a
+    /// count on each header so the shape of things is readable at a glance:
+    /// Money having one item in it that happens to be overdue is a fact you
+    /// can now see without tapping anything.
+    ///
+    /// Empty categories never appear. Inside each one, soonest first, and
+    /// anything with no date at all sinks to the bottom rather than floating
+    /// to the top pretending to be urgent.
+    @ViewBuilder
+    private var byTypeSections: some View {
+        let open = reminders.open.filter { $0.doneAt == nil }
+        let grouped = Dictionary(grouping: open) { ChappyReminders.category(of: $0) }
+        ForEach(ChappyReminders.Category.allCases, id: \.rawValue) { cat in
+            if let items = grouped[cat], !items.isEmpty {
+                let sorted = items.sorted {
+                    ($0.effectiveFire ?? .distantFuture) < ($1.effectiveFire ?? .distantFuture)
+                }
+                HStack(spacing: 7) {
+                    Image(systemName: cat.icon).font(.system(size: 11, weight: .bold))
+                    Text(cat.label.uppercased())
+                        .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    Spacer()
+                    Text("\(sorted.count)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.07)))
+                }
+                .foregroundColor(cat.tintColour)
+                .padding(.horizontal, 20).padding(.top, 10)
+
+                ForEach(sorted) { r in
+                    ReminderRow(entry: r, theme: theme, tint: cat.tintColour)
+                        .contentShape(Rectangle())
+                        .onTapGesture { editing = r }
+                }
+            }
+        }
+    }
+
+    // MARK: - BUILD 127: TIMELINE
+    //
+    // The one thing no list can show you: THE GAP BETWEEN WHEN SOMETHING IS
+    // DUE AND WHEN IT PINGS. A list says "2:00 PM". It does not say that the
+    // notification lands at one o'clock, in the middle of lunch. Every other
+    // reminder app has the same blind spot, and it is the reason a lead time
+    // set once is never quite what you expected.
+    //
+    // Calendar events share the timeline with reminders, because at 7am a
+    // thing you have to BE AT and a thing you have to DO are the same
+    // question, and splitting them across two screens is exactly how one of
+    // them gets missed.
+
+    private struct Slot: Identifiable {
+        let id: String
+        let at: Date
+        let title: String
+        let tint: Color
+        let sub: String
+        let isPing: Bool          // dashed — this is a notification, not a deadline
+        let isEvent: Bool
+    }
+
+    /// Seven days from today. A dot means there is something on that day, so
+    /// you can see next Thursday is empty without scrolling into it.
+    private var weekStrip: some View {
+        let cal = Calendar.current
+        let days = (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: cal.startOfDay(for: Date())) }
+        return HStack(spacing: 6) {
+            ForEach(days, id: \.timeIntervalSince1970) { d in
+                let on = cal.isDate(d, inSameDayAs: timelineDay)
+                let busy = reminders.open.contains {
+                    guard let f = $0.effectiveFire else { return false }
+                    return cal.isDate(f, inSameDayAs: d)
+                }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { timelineDay = d }
+                    loadTimelineEvents()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    VStack(spacing: 1) {
+                        Text(Self.weekdayLetters(d))
+                            .font(.system(size: 9, weight: .heavy)).tracking(0.5)
+                            .foregroundColor(on ? theme.accent : theme.textSecondary)
+                        Text("\(cal.component(.day, from: d))")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(on ? theme.accent : theme.textPrimary)
+                        Circle().fill(busy ? theme.accent : Color.clear)
+                            .frame(width: 4, height: 4).padding(.top, 1)
+                    }
+                    .frame(maxWidth: .infinity).padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 11)
+                        .fill(on ? theme.accent.opacity(0.16) : theme.cardFill))
+                    .overlay(RoundedRectangle(cornerRadius: 11)
+                        .stroke(on ? theme.accent : Color.clear, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private static func weekdayLetters(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "EEE"
+        return f.string(from: d).uppercased()
+    }
+
+    /// Everything happening on the chosen day, deadlines and notifications
+    /// alike, laid against the clock.
+    private var slots: [Slot] {
+        let cal = Calendar.current
+        var out: [Slot] = []
+
+        for r in reminders.open where r.doneAt == nil {
+            guard let fire = r.effectiveFire, cal.isDate(fire, inSameDayAs: timelineDay) else { continue }
+            let cat = ChappyReminders.category(of: r)
+            out.append(Slot(id: r.id.uuidString, at: fire, title: r.title,
+                            tint: r.escalate == true ? .orange : theme.accent,
+                            sub: "\(cat.label) · due", isPing: false, isEvent: false))
+            // The notification, as its own block. This is the whole point.
+            if let lead = r.leadMinutes, lead > 0 {
+                let at = fire.addingTimeInterval(-Double(lead) * 60)
+                if cal.isDate(at, inSameDayAs: timelineDay) {
+                    out.append(Slot(id: r.id.uuidString + "-ping", at: at,
+                                    title: "Ping — \(r.title)", tint: .orange,
+                                    sub: ChappyCalendar.leadLabel(lead) + " before it's due",
+                                    isPing: true, isEvent: false))
+                }
+            }
+        }
+
+        for e in timelineEvents where !e.isAllDay {
+            guard let s = e.startDate, cal.isDate(s, inSameDayAs: timelineDay) else { continue }
+            var sub = "Diary"
+            if let l = e.location, !l.isEmpty { sub += " · \(l)" }
+            out.append(Slot(id: e.eventIdentifier ?? UUID().uuidString, at: s,
+                            title: e.title ?? "Appointment", tint: .purple,
+                            sub: sub, isPing: false, isEvent: true))
+        }
+
+        return out.sorted { $0.at < $1.at }
+    }
+
+    @ViewBuilder
+    private var timelineSection: some View {
+        let cal = Calendar.current
+        let items = slots
+        let isToday = cal.isDateInToday(timelineDay)
+        // Only draw hours that are actually in play, plus a little air —
+        // a timeline that starts at midnight is mostly empty space.
+        let hours: [Int] = {
+            guard !items.isEmpty else { return Array(7...20) }
+            let lo = max(0, (items.map { cal.component(.hour, from: $0.at) }.min() ?? 7) - 1)
+            let hi = min(23, (items.map { cal.component(.hour, from: $0.at) }.max() ?? 20) + 1)
+            return Array(lo...hi)
+        }()
+        let nowHour = cal.component(.hour, from: Date())
+
+        if items.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "calendar.day.timeline.left")
+                    .font(.system(size: 32)).foregroundColor(theme.textSecondary.opacity(0.5))
+                Text(isToday ? "Nothing left today" : "Nothing on this day")
+                    .font(.subheadline).foregroundColor(theme.textPrimary)
+            }
+            .frame(maxWidth: .infinity).padding(.top, 46)
+        } else {
+            VStack(spacing: 0) {
+                ForEach(hours, id: \.self) { h in
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(Self.hourLabel(h))
+                            .font(.system(size: 10)).foregroundColor(theme.textSecondary)
+                            .frame(width: 46, alignment: .trailing)
+                            .padding(.top, 1)
+                        VStack(alignment: .leading, spacing: 6) {
+                            let inHour = items.filter { cal.component(.hour, from: $0.at) == h }
+                            if inHour.isEmpty {
+                                Color.clear.frame(height: 16)
+                            } else {
+                                ForEach(inHour) { s in slotCard(s) }
+                            }
+                            if isToday, h == nowHour {
+                                HStack(spacing: 5) {
+                                    Text("NOW").font(.system(size: 8, weight: .heavy)).foregroundColor(.red)
+                                    Rectangle().fill(Color.red.opacity(0.7)).frame(height: 1)
+                                }
+                                .padding(.vertical, 1)
+                            }
+                        }
+                        .padding(.leading, 12)
+                        .padding(.bottom, 8)
+                        .overlay(alignment: .topLeading) {
+                            Circle()
+                                .fill(items.contains { cal.component(.hour, from: $0.at) == h }
+                                      ? theme.accent : theme.textSecondary.opacity(0.3))
+                                .frame(width: 7, height: 7)
+                                .offset(x: -3.5, y: 2)
+                        }
+                        .background(alignment: .leading) {
+                            Rectangle().fill(theme.textSecondary.opacity(0.18)).frame(width: 1)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 4)
+        }
+    }
+
+    private func slotCard(_ s: Slot) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(s.title)
+                .font(.system(size: 12.5, weight: s.isPing ? .semibold : .regular))
+                .foregroundColor(s.isPing ? .orange : theme.textPrimary)
+                .lineLimit(2)
+            Text(s.sub).font(.system(size: 10)).foregroundColor(theme.textSecondary).lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 11).fill(s.tint.opacity(s.isPing ? 0.08 : 0.14))
+                Rectangle().fill(s.tint).frame(width: 3)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 11))
+        )
+        .overlay(
+            // Dashed means "this is a notification, not a deadline".
+            RoundedRectangle(cornerRadius: 11)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: s.isPing ? [4, 3] : []))
+                .foregroundColor(s.isPing ? .orange.opacity(0.55) : .clear)
+        )
+    }
+
+    private static func hourLabel(_ h: Int) -> String {
+        let ampm = h < 12 ? "AM" : "PM"
+        let twelve = h % 12 == 0 ? 12 : h % 12
+        return "\(twelve) \(ampm)"
+    }
+
+    private func loadTimelineEvents() {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: timelineDay)
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start
+        timelineEvents = ChappyCalendar.shared.events(from: start, to: end)
+    }
+
+    @ViewBuilder
+    private var doneSection: some View {
+        let items = reminders.done()
+        if items.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "checkmark.circle").font(.system(size: 36))
+                    .foregroundColor(theme.textSecondary.opacity(0.5))
+                Text("Nothing finished yet").font(.subheadline).foregroundColor(theme.textPrimary)
+            }
+            .frame(maxWidth: .infinity).padding(.top, 50)
+        } else {
+            section("Done", items, theme.textSecondary)
         }
     }
 
@@ -2826,10 +3378,113 @@ struct RemindersView: View {
     }
 }
 
+// MARK: - BUILD 127: reminder row
+//
+// The row said what a thing was called and when it was due. It did not say
+// what KIND of thing it was, when it would actually interrupt you, or give you
+// any way to act on it — and "pick up the visa photos" without a map link is a
+// reminder that reminds you of a job you still have to go and start.
+//
+// Four additions, each earning its place rather than appearing on everything:
+// a coloured edge for urgency, a type pill, the ping time spelled out, and
+// ONE action button — a map where there is somewhere to go, a search where
+// there is something to look up, nothing where neither applies.
+extension ChappyReminders.Category {
+    var tintColour: Color {
+        switch self {
+        case .work:    return .purple
+        case .travel:  return .cyan
+        case .money:   return .orange
+        case .places:  return .green
+        case .health:  return .pink
+        case .home:    return .blue
+        case .general: return .gray
+        }
+    }
+}
+
 struct ReminderRow: View {
     let entry: ChappyMemory.Entry
     let theme: ChappyTheme
     let tint: Color
+
+    private var category: ChappyReminders.Category { ChappyReminders.category(of: entry) }
+
+    /// Red when it has already passed, amber when it is flagged, otherwise the
+    /// theme accent. The edge is the fastest read on the whole screen.
+    private var edgeColour: Color {
+        if entry.doneAt != nil { return theme.textSecondary.opacity(0.4) }
+        if let f = entry.effectiveFire, f < Date() { return .red }
+        if entry.escalate == true { return .orange }
+        return theme.accent
+    }
+
+    /// When it will actually interrupt you, which is not the same as when it
+    /// is due — and was previously invisible everywhere in the app.
+    private var pingText: String? {
+        guard entry.doneAt == nil,
+              let lead = entry.leadMinutes, lead > 0,
+              let fire = entry.effectiveFire else { return nil }
+        let at = fire.addingTimeInterval(-Double(lead) * 60)
+        guard at > Date() else { return nil }
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        return "pings \(df.string(from: at))"
+    }
+
+    /// Somewhere to go: real coordinates, or a named place trigger.
+    private var hasSomewhereToGo: Bool {
+        (entry.lat != nil && entry.lon != nil) || (entry.placeTrigger?.isEmpty == false) || (entry.place?.isEmpty == false)
+    }
+
+    /// Straight-line kilometres, when both ends are known.
+    private var distanceKm: Double? {
+        guard let la = entry.lat, let lo = entry.lon else { return nil }
+        let snap = ContextEngine.shared.snapshot
+        guard let mla = snap.latitude, let mlo = snap.longitude else { return nil }
+        let here = CLLocation(latitude: mla, longitude: mlo)
+        return here.distance(from: CLLocation(latitude: la, longitude: lo)) / 1000.0
+    }
+
+    /// Reminders that are a QUESTION rather than an errand. Deliberately a
+    /// short, specific list — a magnifier on every row would be clutter, and
+    /// clutter is how a useful button stops being noticed.
+    private static let lookupWords = [
+        "check", "look up", "lookup", "find out", "how much", "what time",
+        "price", "cost", "allowance", "opening hours", "compare", "research",
+        "google", "book ", "rate", "exchange"
+    ]
+    private var isLookup: Bool {
+        guard !hasSomewhereToGo else { return false }
+        let t = entry.title.lowercased()
+        return Self.lookupWords.contains { t.contains($0) }
+    }
+
+    /// Distance decides the mode, the same rule navigation uses. Nobody walks
+    /// twelve kilometres to a job.
+    private func openMap() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let mode = (distanceKm ?? 99) > 1.0 ? "driving" : "walking"
+        var url: URL?
+        if let la = entry.lat, let lo = entry.lon {
+            url = URL(string: "comgooglemaps://?daddr=\(la),\(lo)&directionsmode=\(mode)")
+            if url == nil || !UIApplication.shared.canOpenURL(url!) {
+                url = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(la),\(lo)&travelmode=\(mode)")
+            }
+        } else {
+            let name = entry.placeTrigger ?? entry.place ?? entry.title
+            let q = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+            url = URL(string: "https://www.google.com/maps/search/?api=1&query=\(q)")
+        }
+        if let url { UIApplication.shared.open(url) }
+    }
+
+    private func openSearch() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let q = entry.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        if let url = URL(string: "https://www.google.com/search?q=\(q)") {
+            UIApplication.shared.open(url)
+        }
+    }
 
     private var whenText: String {
         if let p = entry.placeTrigger, !p.isEmpty { return "when you're at \(p)" }
@@ -2873,10 +3528,51 @@ struct ReminderRow: View {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 9)).foregroundColor(.orange)
                     }
+                    // BUILD 127: when it will actually interrupt you.
+                    if let ping = pingText {
+                        Text("· \(ping)")
+                            .foregroundColor(.orange)
+                            .lineLimit(1)
+                    }
+                    // BUILD 127: how far, when we know — so the map button's
+                    // driving-or-walking choice is visible before you tap it.
+                    if let km = distanceKm, km > 0.05 {
+                        Text(km < 1 ? "· \(Int(km * 1000)) m" : String(format: "· %.1f km", km))
+                            .lineLimit(1)
+                    }
                 }
                 .font(.caption2).foregroundColor(theme.textSecondary)
+
+                // BUILD 127: what KIND of thing this is, without reading it.
+                Text(category.label.uppercased())
+                    .font(.system(size: 8.5, weight: .heavy))
+                    .tracking(0.5)
+                    .foregroundColor(category.tintColour)
+                    .padding(.horizontal, 6).padding(.vertical, 2.5)
+                    .background(Capsule().fill(category.tintColour.opacity(0.16)))
+                    .padding(.top, 2)
             }
             Spacer(minLength: 0)
+
+            // BUILD 127: ONE action, only where there is one worth having.
+            if entry.doneAt == nil {
+                if hasSomewhereToGo {
+                    Button(action: openMap) {
+                        Image(systemName: "map.fill").font(.system(size: 13))
+                            .foregroundColor(theme.accent)
+                            .frame(width: 30, height: 30)
+                            .background(RoundedRectangle(cornerRadius: 9).fill(theme.accent.opacity(0.14)))
+                    }.buttonStyle(.plain)
+                } else if isLookup {
+                    Button(action: openSearch) {
+                        Image(systemName: "magnifyingglass").font(.system(size: 13))
+                            .foregroundColor(theme.accent)
+                            .frame(width: 30, height: 30)
+                            .background(RoundedRectangle(cornerRadius: 9).fill(theme.accent.opacity(0.14)))
+                    }.buttonStyle(.plain)
+                }
+            }
+
             if entry.doneAt == nil, entry.effectiveFire != nil {
                 Menu {
                     Button("Snooze 10 minutes") { ChappyReminders.shared.snooze(entry.id, minutes: 10) }
@@ -2896,9 +3592,15 @@ struct ReminderRow: View {
             }
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
-        .overlay(RoundedRectangle(cornerRadius: 14)
-            .stroke(tint.opacity(entry.deliveredAt == nil ? 0.0 : 0.0), lineWidth: 1))
+        .background(
+            // BUILD 127: the urgency edge. Fastest read on the screen — red
+            // means it has already passed, amber means it was flagged.
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 14).fill(theme.cardFill)
+                Rectangle().fill(edgeColour).frame(width: 3)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        )
         .padding(.horizontal, 16)
         .opacity(entry.doneAt == nil ? 1 : 0.5)
     }
@@ -2921,6 +3623,48 @@ struct ReminderEditor: View {
     @State private var escalate = false
     @State private var leaveBy = false
 
+    // BUILD 127 — WARN ME.
+    //
+    // `leadMinutes` existed on the model and was only ever set to 5, and only
+    // for leave-by. So every timed reminder in the app fired at the moment it
+    // was due and not a second earlier — which is useless for anything you
+    // have to DO something about. "Check in for the flight at 2pm" arriving at
+    // 2pm is a notification about a thing you are already late for.
+    //
+    // Discrete steps rather than a free scrub, because nobody wants 23 minutes
+    // — and the readout names the actual clock time it will land, so you can
+    // see the consequence while you are choosing it instead of finding out
+    // tomorrow.
+    private static let leadSteps: [Int] = [0, 5, 10, 15, 30, 60, 120, 240, 720, 1440]
+    @State private var leadIndex: Double = 0
+
+    private var leadMinutes: Int { Self.leadSteps[min(Int(leadIndex), Self.leadSteps.count - 1)] }
+
+    private var leadReadout: String {
+        let m = leadMinutes
+        guard m > 0 else { return "On time — no early warning" }
+        let base: Date? = mode == 0 ? date : (mode == 1 ? floating : nil)
+        let name = ChappyCalendar.leadLabel(m)
+        guard let base else { return "\(name) before" }
+        let at = base.addingTimeInterval(-Double(m) * 60)
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        return "\(name) before — pings \(df.string(from: at))"
+    }
+
+    /// The four times he actually uses. Typing a date is the slow path.
+    private var quickTimes: [(String, Date)] {
+        let cal = Calendar.current
+        let now = Date()
+        let tomorrow = cal.date(byAdding: .day, value: 1, to: now) ?? now
+        let nextWeek = cal.date(byAdding: .day, value: 7, to: now) ?? now
+        return [
+            ("In an hour", now.addingTimeInterval(3600)),
+            ("Tonight 7pm", cal.date(bySettingHour: 19, minute: 0, second: 0, of: now) ?? now),
+            ("Tomorrow 8am", cal.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow) ?? tomorrow),
+            ("Next week", cal.date(bySettingHour: 9, minute: 0, second: 0, of: nextWeek) ?? nextWeek)
+        ]
+    }
+
     var body: some View {
         NavigationView {
             Form {
@@ -2933,6 +3677,30 @@ struct ReminderEditor: View {
                     }.pickerStyle(.segmented)
 
                     if mode == 0 {
+                        // BUILD 127: presets first, picker underneath. Four
+                        // taps cover almost everything; the picker is there
+                        // for the fifth case, not for the first four.
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 7) {
+                                ForEach(quickTimes, id: \.0) { label, when in
+                                    let on = abs(date.timeIntervalSince(when)) < 60
+                                    Button {
+                                        date = when
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        Text(label)
+                                            .font(.caption).fontWeight(.medium)
+                                            .padding(.horizontal, 11).padding(.vertical, 6)
+                                            .background(Capsule().fill(on
+                                                ? theme.accent.opacity(0.22)
+                                                : Color.secondary.opacity(0.14)))
+                                            .foregroundColor(on ? theme.accent : .primary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
                         DatePicker("Date and time", selection: $date)
                     } else if mode == 1 {
                         DatePicker("Local time", selection: $floating, displayedComponents: .hourAndMinute)
@@ -2945,6 +3713,26 @@ struct ReminderEditor: View {
                             Text("Uses real travel time from where you are, not a fixed countdown.")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
+                    }
+                }
+                // BUILD 127 — the slider that makes lead times real.
+                if mode != 2 {
+                    Section("Warn me") {
+                        Slider(value: $leadIndex, in: 0...Double(Self.leadSteps.count - 1), step: 1)
+                            .tint(theme.accent)
+                        HStack(spacing: 0) {
+                            Text("On time").font(.caption2).foregroundColor(.secondary)
+                            Spacer()
+                            Text("15m").font(.caption2).foregroundColor(.secondary)
+                            Spacer()
+                            Text("1h").font(.caption2).foregroundColor(.secondary)
+                            Spacer()
+                            Text("1d").font(.caption2).foregroundColor(.secondary)
+                        }
+                        Text(leadReadout)
+                            .font(.footnote).fontWeight(.medium)
+                            .foregroundColor(leadMinutes > 0 ? theme.accent : .secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
                     }
                 }
                 if mode != 2 {
@@ -2996,6 +3784,15 @@ struct ReminderEditor: View {
         guard let e = entry else { return }
         title = e.title
         escalate = e.escalate ?? false
+        // BUILD 127: bring the existing lead back onto the slider, snapping to
+        // the nearest step so a value set by voice ("half an hour before")
+        // still lands somewhere sensible rather than resetting to zero.
+        if let lead = e.leadMinutes, lead > 0,
+           let idx = Self.leadSteps.enumerated().min(by: {
+               abs($0.element - lead) < abs($1.element - lead)
+           })?.offset {
+            leadIndex = Double(idx)
+        }
         if let p = e.placeTrigger, !p.isEmpty { mode = 2; place = p; leaveBy = e.leadMinutes != nil }
         else if let f = e.floatingTime, let hm = ChappyReminders.hhmm(f) {
             mode = 1
@@ -3029,7 +3826,9 @@ struct ReminderEditor: View {
             c.floatingTime = hhmm
             c.placeTrigger = mode == 2 ? place : nil
             c.repeatRule = rule
-            c.leadMinutes = (mode == 2 && leaveBy) ? 5 : nil
+            // BUILD 127: the slider now owns this for timed reminders; the
+            // leave-by toggle still owns it for place ones.
+            c.leadMinutes = mode == 2 ? (leaveBy ? 5 : nil) : (leadMinutes > 0 ? leadMinutes : nil)
             c.escalate = escalate
             c.snoozedTo = nil
             c.deliveredAt = nil
@@ -3041,7 +3840,8 @@ struct ReminderEditor: View {
                                        floatingTime: hhmm,
                                        place: mode == 2 ? place : nil,
                                        repeatRule: rule,
-                                       leadMinutes: (mode == 2 && leaveBy) ? 5 : nil,
+                                       leadMinutes: mode == 2 ? (leaveBy ? 5 : nil)
+                                                                : (leadMinutes > 0 ? leadMinutes : nil),
                                        escalate: escalate,
                                        source: "typed")
         }
