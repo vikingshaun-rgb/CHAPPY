@@ -172,6 +172,10 @@ class GeminiLiveService: NSObject {
     private var lifecycleTokens: [NSObjectProtocol] = []
     private var restartAttempt = 0
     private static let restartDelays: [TimeInterval] = [0.4, 1.0, 2.5]
+    /// Deferrals while waiting for the mic format to settle. Bounded so a
+    /// genuinely dead input can't leave a half-second retry running forever.
+    private var formatDeferrals = 0
+    private static let maxFormatDeferrals = 10
 
     init(apiKey: String, model: String? = nil) {
         self.apiKey = apiKey
@@ -180,6 +184,21 @@ class GeminiLiveService: NSObject {
         self.model = GeminiLiveService.liveModel
         super.init()
         setupAudioEngine()
+    }
+
+    /// BUILD 126: this class had no deinit at all. A new instance is built for
+    /// every chat session, and each one installed notification observers that
+    /// outlived it. Harmless while they only revived playback; actively
+    /// dangerous once build 125 taught them to reclaim the microphone, because
+    /// a stale instance would fight the live one for the input hardware — and
+    /// two engines tapping the same input is a crash, not a glitch.
+    deinit {
+        let nc = NotificationCenter.default
+        for token in lifecycleTokens { nc.removeObserver(token) }
+        if let token = engineWatchdogToken { nc.removeObserver(token) }
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        if let engine = audioEngine, engine.isRunning { engine.stop() }
+        print("🧹 [Gemini] Service torn down cleanly")
     }
 
     // MARK: - Audio Engine Setup
@@ -200,20 +219,27 @@ class GeminiLiveService: NSObject {
         guard !audioLifelinesInstalled else { return }
         audioLifelinesInstalled = true
         let nc = NotificationCenter.default
-        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+        // BUILD 126: every token is kept now. A GeminiLiveService is created
+        // fresh for each chat session, and these observers were never removed —
+        // so opening Live AI five times left five live instances all listening
+        // for route changes, each with its own AVAudioEngine, all racing to
+        // grab the same hardware input. Build 125 made that materially worse by
+        // adding three more observers that CLAIM THE MICROPHONE. Retain the
+        // tokens and tear them down in deinit.
+        lifecycleTokens.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             guard let self,
                   let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
             if let engine = self.playbackEngine, !engine.isRunning {
                 self.revivePlaybackEngine()
             }
-        }
-        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        lifecycleTokens.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             if let engine = self.playbackEngine, !engine.isRunning {
                 self.revivePlaybackEngine()
             }
-        }
+        })
         // BUILD 125: the interruption observer above revives PLAYBACK only, so
         // a call or a Siri press gave Chappy his voice back but never his ears.
         // "Silent and doesn't recognise my mic" was literally both halves of
@@ -633,6 +659,39 @@ class GeminiLiveService: NSObject {
 
             let inputNode = engine.inputNode
             let inputFormat = inputNode.outputFormat(forBus: 0)
+
+            // BUILD 126 (THE CRASH): while the audio route is settling — the
+            // instant the app opens, the instant it comes back from the lock
+            // screen, the moment the glasses connect — the input format reads
+            // back as 0 Hz for a beat. installTap with a zero sample rate or
+            // zero channel count raises "required condition is false:
+            // format.sampleRate == hwFormat.sampleRate", an Objective-C
+            // exception that goes straight past Swift's try/catch and kills
+            // the app outright.
+            //
+            // LiveTranslateService has had this guard since build 64. This file
+            // never did — and build 125 made it far more likely to bite by
+            // teaching chat to reclaim the microphone on foreground, on unlock
+            // and after an interruption, which are precisely the three moments
+            // the format is unsettled. Refuse, and come back in half a second.
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                formatDeferrals += 1
+                guard formatDeferrals <= Self.maxFormatDeferrals else {
+                    formatDeferrals = 0
+                    print("❌ [Gemini] Input format never settled — giving up rather than looping")
+                    onError?("Chappy can't get to the microphone. Close the chat and open it again.")
+                    return
+                }
+                print("⚠️ [Gemini] Input format not ready (\(inputFormat.sampleRate) Hz) — deferring \(formatDeferrals)/\(Self.maxFormatDeferrals)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self, self.wantsRecording, !self.isRecording else { return }
+                    self.startRecording()
+                }
+                return
+            }
+            formatDeferrals = 0
+            print("🎵 [Gemini] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
+
             if let recordTargetFormat {
                 recordConverter = AVAudioConverter(from: inputFormat, to: recordTargetFormat)
             } else {
