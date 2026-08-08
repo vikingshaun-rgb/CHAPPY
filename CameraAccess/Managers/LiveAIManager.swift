@@ -281,6 +281,11 @@ final class ChappyEarcon {
     private var thinkURL: URL?
     private var stillURL: URL?
     private var askURL: URL?
+    /// BUILD 126: the camera pair. A shutter is not a chime — every attempt to
+    /// make one out of sine partials sounds like a doorbell. These are
+    /// synthesised as filtered noise bursts instead.
+    private var shutterURL: URL?
+    private var camWakeURL: URL?
     private var thinkTimer: Timer?
     private var prepared = false
 
@@ -326,6 +331,38 @@ final class ChappyEarcon {
         // question and should sound like one; every other cue lands, this one
         // hangs. You will know it is waiting for an answer without being told.
         askURL  = render(name: "chappy-ask", notes: [(523.25, 0.22), (698.46, 0.60)], gain: 0.22)
+
+        // BUILD 126 — THE CAMERA PAIR.
+        //
+        // Snap had no sound of its own. It borrowed the tap and the done tone,
+        // which are the same two sounds Remember uses, so there was no way to
+        // tell a photo from a saved pin — or from nothing happening at all.
+        //
+        // Every camera app ever made solves this the same way, and it is worth
+        // saying why: the shutter sound is not decoration, it is PROOF. Apple
+        // fires it at the instant of capture, not when you press, precisely so
+        // that hearing it means the picture exists. Samsung does the same and
+        // adds a white flash. GoPro and Insta360 — the closest thing to
+        // glasses, because you often cannot see a screen — go further and use
+        // TWO different sounds, one for "starting" and one for "written",
+        // because their capture has a real delay in it.
+        //
+        // Chappy's capture has a delay of up to eight seconds while the glasses
+        // camera wakes. So it gets the GoPro treatment: a soft double-tick when
+        // the camera starts waking, and a real mechanical shutter clack only
+        // when a frame genuinely lands. Hearing the clack means you have a
+        // photo. Not hearing it means you don't.
+        camWakeURL = renderShutter(name: "chappy-cam-wake",
+                                   bursts: [(0.000, 0.014, 1500, 0.42),
+                                            (0.075, 0.014, 1500, 0.34)],
+                                   gain: 0.20)
+        // Mirror up, then mirror down 48 ms later — the shape of an SLR, which
+        // is the sound every phone on earth imitates because everyone already
+        // knows what it means.
+        shutterURL = renderShutter(name: "chappy-shutter",
+                                   bursts: [(0.000, 0.016, 2600, 1.00),
+                                            (0.048, 0.024, 1700, 0.72)],
+                                   gain: 0.42)
     }
 
     /// The thinking pulse. Safe to call twice; safe to stop when not running.
@@ -359,6 +396,85 @@ final class ChappyEarcon {
     /// close the loop when the screen gives you nothing: you pressed Remember,
     /// something happened, you did not have to look.
     func tap() { play(tapURL) }
+
+    /// BUILD 126. The camera is waking — this can take seconds on the glasses.
+    /// Says "started", never "done".
+    func cameraWaking() { prepare(); play(camWakeURL) }
+    /// BUILD 126. A frame has genuinely been captured. This is the proof
+    /// sound: it fires at the moment of capture and at no other time, so
+    /// hearing it always means a photo exists.
+    func shutter() { prepare(); play(shutterURL) }
+
+    /// BUILD 126: a shutter is broadband noise, not a tone — `render` above
+    /// stacks harmonic partials and cannot make one. This builds each click as
+    /// a burst of noise pushed through a simple resonant band-pass, which is
+    /// physically what a mirror slapping a stop actually is.
+    ///
+    /// Each burst is (start seconds, length seconds, centre frequency Hz,
+    /// relative loudness).
+    private func renderShutter(name: String,
+                               bursts: [(Double, Double, Double, Double)],
+                               gain: Double) -> URL? {
+        let sampleRate = 44100.0
+        let total = (bursts.map { $0.0 + $0.1 }.max() ?? 0.1) + 0.03
+        let count = Int(sampleRate * total)
+        guard count > 0 else { return nil }
+
+        // Deterministic noise. A fixed seed means the click is byte-identical
+        // every launch, so it never sounds subtly different from itself.
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        func noise() -> Double {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17
+            return Double(Int64(bitPattern: seed)) / Double(Int64.max)
+        }
+
+        var samples = [Double](repeating: 0, count: count)
+        for (start, length, centre, level) in bursts {
+            // Two-pole resonant band-pass, run over the burst only.
+            let w = 2 * Double.pi * centre / sampleRate
+            let q = 0.94                       // ring, but don't whistle
+            let a1 = 2 * q * cos(w), a2 = -q * q
+            var y1 = 0.0, y2 = 0.0
+            let first = Int(start * sampleRate)
+            let last = min(count - 1, Int((start + length) * sampleRate))
+            guard first < last else { continue }
+            for i in first...last {
+                let local = Double(i - first) / sampleRate
+                // Near-instant attack, sharp decay — a click, not a swell.
+                let env = exp(-local / (length * 0.28)) * min(1.0, local / 0.0004)
+                let x = noise() * env
+                let y = x + a1 * y1 + a2 * y2
+                y2 = y1; y1 = y
+                samples[i] += y * level * 0.25
+            }
+        }
+
+        var pcm: [Int16] = []
+        pcm.reserveCapacity(count)
+        for v in samples {
+            let out = max(-1.0, min(1.0, v * gain))
+            pcm.append(Int16(out * 32767))
+        }
+
+        var data = Data()
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        let byteCount = UInt32(pcm.count * 2)
+        data.append(contentsOf: Array("RIFF".utf8)); le32(36 + byteCount)
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); le32(16); le16(1); le16(1)
+        le32(UInt32(sampleRate)); le32(UInt32(sampleRate) * 2); le16(2); le16(16)
+        data.append(contentsOf: Array("data".utf8)); le32(byteCount)
+        pcm.withUnsafeBufferPointer { data.append(UnsafeBufferPointer(start: $0.baseAddress, count: $0.count)) }
+
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let url = dir.appendingPathComponent("\(name).wav")
+        do { try data.write(to: url, options: .atomic) } catch {
+            print("⚠️ [Earcon] Could not write \(name): \(error.localizedDescription)")
+            return nil
+        }
+        return url
+    }
 
     /// THE REASON YOU HAVE NEVER HEARD A TONE.
     ///
@@ -2078,28 +2194,84 @@ final class ChappyStandby: NSObject, ObservableObject {
     // Three modes, no overlap. Snap is a visual journal — you take it because
     // you want it later, not because you want to be told about it now.
     func snapSilently() {
-        ChappyEarcon.shared.tap()
         guard let vm = LiveAIManager.shared.streamViewModel,
               let frame = vm.currentVideoFrame else {
+            // BUILD 126: the camera is asleep and will take seconds to wake.
+            // Say so — with a sound that means "starting", never "done", and
+            // with something on screen so the wait is visibly a wait rather
+            // than a silence you have to interpret.
+            ChappyEarcon.shared.cameraWaking()
+            SnapFeedback.shared.waking()
             NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
             return
         }
+        // The camera is already awake — this is instant, so the shutter is the
+        // only sound needed. completeSilentSnap fires it.
         completeSilentSnap(frame)
     }
 
     func completeSilentSnap(_ frame: UIImage) {
+        // BUILD 126 — PROOF, NOT SILENCE.
+        //
+        // Everything below this line used to be invisible. A haptic, a soft
+        // tone identical to the one Remember plays, and a thumbnail filed into
+        // a list you would have to go looking for. There was no way to tell a
+        // photo from a failure from nothing at all — which is exactly what it
+        // felt like from the outside.
+        //
+        // Three signals now, in the order every camera on earth uses them:
+        // the shutter fires at the instant of capture (so hearing it is proof
+        // the picture exists), the screen flashes, and the photo itself slides
+        // in, holds, and leaves.
         ChappyHaptics.shared.shutter()
+        ChappyEarcon.shared.shutter()
+        SnapFeedback.shared.captured(frame)
+
         let thumb = frame.jpegData(compressionQuality: 0.4)
+
         // Store it immediately with a placeholder — the photo must never be lost
         // waiting on a network call that might not come back.
         let note = TripRecorder.shared.addVisualNote(caption: "Photo", thumbnail: thumb)
+
+        // BUILD 126: and into the memory store, which is where you actually go
+        // looking. It was only ever landing in visual notes, so a snapped photo
+        // was invisible to search, to Dreaming and to the AI.
+        let entry = ChappyMemory.shared.remember(.photo,
+                                                 title: "Photo",
+                                                 tags: ["snap"],
+                                                 thumbnail: thumb,
+                                                 source: "snap")
+
+        // BUILD 126: and into the camera roll, so it is backed up to iCloud and
+        // findable in the app you already use. Add-only permission — Chappy
+        // never gets read access to your library from this path.
+        Self.saveToCameraRoll(frame)
+
         Task { @MainActor in
             if let caption = await Self.describe(frame) {
                 TripRecorder.shared.updateCaption(id: note.id, to: caption)
+                ChappyMemory.shared.setTitle(id: entry.id, caption)
+                // If the card is still on screen, let him read what it is.
+                SnapFeedback.shared.setCaption(caption)
             }
         }
-        // A tone, not a sentence. The whole point is that it doesn't talk.
-        ChappyEarcon.shared.done()
+    }
+
+    /// BUILD 126. Add-only, so the wearer is never asked for full library
+    /// access just to keep a photo he took himself.
+    nonisolated private static func saveToCameraRoll(_ image: UIImage) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                print("📷 [Snap] No add-only photo permission — kept in Chappy only")
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            } completionHandler: { ok, err in
+                if ok { print("📷 [Snap] Saved to camera roll") }
+                else { print("📷 [Snap] Camera roll save failed: \(err?.localizedDescription ?? "unknown")") }
+            }
+        }
     }
 
     /// One line, cheap and quiet. Never spoken unless he asks for it.
@@ -5935,6 +6107,16 @@ final class ChappyMemory: ObservableObject {
     /// rather than a one-field patch.
     func replaceReminderFields(_ e: Entry) {
         mutate(id: e.id) { $0 = e }
+    }
+
+    /// BUILD 126: a snapped photo is filed the instant it exists, with the
+    /// placeholder title "Photo", because the picture must never be lost
+    /// waiting on a network call. The AI caption arrives a second or two later
+    /// and replaces it. Nothing else in the store needed a title edit before.
+    func setTitle(id: UUID, _ title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        mutate(id: id) { $0.title = t }
     }
 
     func setPinned(id: UUID, _ pinned: Bool) {
