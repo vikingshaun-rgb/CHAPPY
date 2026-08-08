@@ -1849,8 +1849,32 @@ final class ChappyStandby: NSObject, ObservableObject {
                 self.suppressTranscriptBefore = Date().addingTimeInterval(0.3)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self, self.isListening, !self.awake, !self.busy else { return }
-                    print("🧹 [Standby] Flushing the ear after Chappy's own voice")
-                    self.resetRecognition()
+                    // BUILD 119 — WHY YOU HAVE TO SAY IT TWICE.
+                    //
+                    // This tore down and rebuilt the whole recogniser after
+                    // EVERY answer Chappy gave. Rebuilding means removing the
+                    // tap, installing a new one and starting a new task — and
+                    // for those few hundred milliseconds the ear is DEAF. The
+                    // moment you are most likely to speak is the moment right
+                    // after Chappy stops, so your reply landed in the gap and
+                    // vanished. Then you said it again and it worked, which is
+                    // exactly the behaviour you described.
+                    //
+                    // The suppress window above already throws away anything
+                    // heard while Chappy was talking. The rebuild was only ever
+                    // belt-and-braces for an actual echo — so now it only
+                    // happens when there IS one: the transcript still carrying
+                    // Chappy's own words back. Otherwise the ear stays up and
+                    // hears your reply the first time.
+                    let spoken = TTSService.shared.lastSpokenLine
+                        .lowercased().split(separator: " ").filter { $0.count > 3 }
+                    let heard = self.lastHeard.lowercased()
+                    let echoing = spoken.count >= 2
+                        && spoken.prefix(6).filter { heard.contains($0) }.count >= 2
+                    if echoing {
+                        print("🧹 [Standby] Echo detected — flushing the ear")
+                        self.resetRecognition()
+                    }
                 }
             }
         }
@@ -1916,10 +1940,23 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// anything — the app is fully usable while it talks.
     func launchGreeting() {
         guard wakeStyle != "silent" else { return }
-        // Not on every foreground. Twice in five minutes is grating.
-        let gap = Date().timeIntervalSince(lastGreetingAt)
-        guard gap > 900 else { return }
-        lastGreetingAt = Date()
+        // BUILD 117 — WHY YOU NEVER HEARD IT.
+        //
+        // Two mistakes, both mine.
+        //
+        // ONE: it shared `lastGreetingAt` with the WAKE-WORD greeting. Say
+        // "Chappy" once and the launch greeting went silent for the next
+        // fifteen minutes — and you say "Chappy" constantly, so it was
+        // permanently suppressed by its own sibling. Its own clock now.
+        //
+        // TWO: fifteen minutes is far too long while testing, and the whole
+        // point is the FIRST open. It now always speaks on a cold launch,
+        // and after that respects a five-minute gap on foregrounding.
+        let key = "chappy_launch_greeting_at"
+        let last = Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: key))
+        if Self.greetedThisLaunch, Date().timeIntervalSince(last) < 300 { return }
+        Self.greetedThisLaunch = true
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: key)
 
         let h = Calendar.current.component(.hour, from: Date())
         let pool: [String]
@@ -1986,7 +2023,28 @@ final class ChappyStandby: NSObject, ObservableObject {
     private func acknowledgeWake(tail: String) {
         ChappyHaptics.shared.connected()
         guard wakeStyle != "silent" else { return }
-        ChappyEarcon.shared.wake()
+
+        // BUILD 118 — DON'T DING OVER HIM.
+        //
+        // The tone fired the instant the name was recognised. Say "Chappy,
+        // open the map" in one breath and the ding lands in the middle of your
+        // own sentence — it talks over you, and it comes back through the mic
+        // on top of the words you are still saying.
+        //
+        // Every good assistant handles this the same way: acknowledge with a
+        // SOUND only when you have stopped, and with a light or a screen when
+        // you have not. So the tone now waits a third of a second. If more
+        // speech arrives in that window you were mid-sentence, and it stays
+        // silent and simply listens — the haptic above has already told you it
+        // heard the name.
+        let mark = Date()
+        pendingWakeToneAt = mark
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.33) { [weak self] in
+            guard let self, self.pendingWakeToneAt == mark else { return }
+            // Still talking? Then the acknowledgement would be an interruption.
+            guard Date().timeIntervalSince(self.lastHeardAt) > 0.30 else { return }
+            ChappyEarcon.shared.wake()
+        }
 
         let bare = tail.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).isEmpty
         guard bare else { return }
@@ -2090,6 +2148,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// While this is in the future, a sentence with no wake word is still taken
     /// as a command — specifically as a destination.
     private var expectingDestinationUntil = Date.distantPast
+    /// The moment the recogniser last produced anything.
+    private var lastHeardAt = Date.distantPast
+    /// Cancels a queued wake tone if a newer wake supersedes it.
+    private var pendingWakeToneAt = Date.distantPast
 
 
     // ==================================================================
@@ -2389,7 +2451,18 @@ final class ChappyStandby: NSObject, ObservableObject {
     private func restartRenewTimer() {
         restartTimer?.invalidate()
         restartTimer = Timer.scheduledTimer(withTimeInterval: 50, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.renew() }
+            Task { @MainActor in
+                guard let self else { return }
+                // BUILD 119: never rebuild the recogniser while he is talking.
+                // The 50-second renewal is housekeeping; landing it in the
+                // middle of a sentence loses the sentence. Wait for a gap.
+                guard Date().timeIntervalSince(self.lastHeardAt) > 1.5,
+                      !TTSService.shared.isSpeaking, !self.awake, !self.busy else {
+                    print("👂 [Standby] Renewal deferred — mid-utterance")
+                    return
+                }
+                self.renew()
+            }
         }
     }
 
@@ -2497,6 +2570,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         // or in the decay window straight after, is his own voice coming back
         // through the speaker. Discard it without scanning for the wake word.
         guard Date() >= suppressTranscriptBefore else { return }
+        // When words last arrived. Used to tell "he has stopped" from "he is
+        // mid-sentence", which is the whole difference between an
+        // acknowledgement and an interruption.
+        lastHeardAt = Date()
         lastHeard = text
 
         // BARGE-IN LAW — with the self-interruption guard.
@@ -2648,7 +2725,18 @@ final class ChappyStandby: NSObject, ObservableObject {
                         // were travelling, which is most of the time — did not.
                         // So the hands-free "want the map? yes" never happened.
                         if NavEngine.shared.isNavigating {
-                            self.offerGoogleMaps(driving: drive)
+                            // BUILD 117: you already answered the mode question,
+                            // so asking a SECOND question before showing the map
+                            // is one question too many. On a vehicle it just
+                            // opens — that is what "drive" meant. Walking still
+                            // asks, because on foot the spoken directions are
+                            // usually enough and Maps is the interruption.
+                            if drive {
+                                self.speak("Opening Google Maps.")
+                                NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                            } else {
+                                self.offerGoogleMaps(driving: drive)
+                            }
                         }
                     }
                     resetRecognition()
@@ -2758,8 +2846,24 @@ final class ChappyStandby: NSObject, ObservableObject {
             // language. Words that commonly take a tail get longer.
             debounce = ["translate", "navigate", "go", "map to"].contains(cleanTail) ? 0.75 : 0.45
         } else {
+            // BUILD 118 — FASTER ONCE HE HAS ACTUALLY FINISHED.
+            //
+            // The old ladder waited longer the MORE he said, which is exactly
+            // backwards: a long sentence is usually a complete one, and a
+            // complete sentence should fire immediately. The long wait is for
+            // hesitation, and looksUnfinished already catches that above.
+            //
+            // So: a complete-looking command gets a short window regardless of
+            // length. Only genuinely ambiguous short fragments — where more
+            // words would change the meaning — get the longer one.
             let wordCount = snapshot.split(separator: " ").count
-            debounce = wordCount <= 3 ? 0.6 : (wordCount <= 6 ? 0.85 : 1.1)
+            if wordCount >= 4 {
+                debounce = 0.45          // said his piece; go
+            } else if wordCount == 1 {
+                debounce = 0.55          // one word could still be growing
+            } else {
+                debounce = 0.5
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
     }
@@ -2983,9 +3087,22 @@ final class ChappyStandby: NSObject, ObservableObject {
         // BUILD 90: he opened Live AI and could not get out of it by voice —
         // the only exit was a button on a screen he could not see. Anything
         // that reads as "shut this down" now closes whatever module is open.
+        // BUILD 122 — ONE WAY OUT, FROM ANYWHERE.
+        //
+        // Every module is a full-screen cover, and one notification closes all
+        // of them. What was missing was a word you would actually reach for
+        // without thinking — so "home", "take me back" and "I'm done" now land
+        // here too. There is no wrong way to say it, and it works the same
+        // from translate, Live AI, the map or a photo. That matters more than
+        // it sounds: with the phone in a pocket you cannot see which screen
+        // you are on, so the exit has to be the same word everywhere.
         if ["close", "close it", "exit", "go back", "done", "finish", "that's it",
             "thats it", "close live", "stop live", "close live ai", "end it",
-            "shut it down", "close translate", "close this"].contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
+            "shut it down", "close translate", "close this",
+            "home", "go home now", "back to home", "home screen", "take me back",
+            "i'm done", "im done", "all done", "we're done", "were done",
+            "get out", "back out", "cancel that", "never mind that",
+            "close it down", "shut this"].contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
             ChappyEarcon.shared.done()
             // NOT stop() — LiveAIManager has stopSession() (async) and
             // triggerStop() (the fire-and-forget wrapper the UI uses).
@@ -3077,6 +3194,20 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak("\(today.count) today. \(list).")
             return
         }
+        // BUILD 121 — RESTARTING A PAUSED TRANSLATE SESSION BY VOICE.
+        // With the translate mic stopped, Standby holds the ear again — so
+        // this is where "start" has to land. Sits above everything, because
+        // while that screen is open a bare "start" can only mean one thing.
+        if LiveTranslateIsOpen,
+           ["start", "go", "start again", "carry on", "resume", "keep going",
+            "start listening", "start translating", "unpause", "listen"]
+            .contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
+            ChappyEarcon.shared.done()
+            handOff()
+            NotificationCenter.default.post(name: .chappyResumeTranslate, object: nil)
+            return
+        }
+
         // ---------- PHASE 5.5 — REMINDERS (free, offline, instant) ----------
         if Self.looksLikeReminder(c), let p = Self.parseReminder(c) {
             let r = ChappyReminders.shared.add(
@@ -8870,4 +9001,10 @@ final class ChappyCalendar: ObservableObject {
         }
         UserDefaults.standard.set(Array(filed.suffix(400)), forKey: "chappy_cal_filed")
     }
+}
+
+extension Notification.Name {
+    /// BUILD 121: resume a paused Live Translate session by voice. Declared
+    /// here rather than beside the others so this build touches one fewer file.
+    static let chappyResumeTranslate = Notification.Name("chappyResumeTranslate")
 }
