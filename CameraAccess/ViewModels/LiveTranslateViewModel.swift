@@ -1461,6 +1461,18 @@ class LiveTranslateViewModel: ObservableObject {
             fromWearer = !last.fromWearer
         }
 
+        // BUILD 124: speaker identification leans on the TRANSLATION to decide
+        // who spoke — and from this build the interpreter is held silent on any
+        // turn carrying the app's name, so a command arrives with an empty
+        // translation and nothing to identify from. Left alone, the
+        // alternating-turns fallback above could hand the wearer's own command
+        // to the other side of the screen and it would never reach the command
+        // handler at all: silent, ignored, and looking exactly like a crash.
+        // Only the wearer ever says the app's name. Settle it here.
+        if LiveTranslateService.carriesCommandName(clean) {
+            fromWearer = true
+        }
+
         // VERBAL REPEAT: catch it before it becomes a bubble. The interpreter
         // has been told to stay silent on these, so nothing was spoken over it.
         if Self.isRepeatCommand(clean, spokenByWearer: fromWearer) {
