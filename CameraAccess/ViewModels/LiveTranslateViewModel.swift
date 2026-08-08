@@ -391,16 +391,6 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Init
 
     init() {
-        // BUILD 121: "Chappy, start" while paused. Standby holds the ear when
-        // the translate mic is stopped, so it posts and this listens — that is
-        // the whole round trip that lets you restart without touching anything.
-        NotificationCenter.default.addObserver(
-            forName: Notification.Name("chappyResumeTranslate"),
-            object: nil, queue: .main) { [weak self] _ in
-                guard let self, !self.isRecording else { return }
-                self.startRecording()
-                self.say("Listening.", isConfirmation: true)
-        }
         // Load settings from UserDefaults
         let savedSource = UserDefaults.standard.string(forKey: "translate_source_language") ?? "en"
         var loadedSource = TranslateLanguage(rawValue: savedSource) ?? .en
@@ -466,7 +456,23 @@ class LiveTranslateViewModel: ObservableObject {
         self.politeMode = UserDefaults.standard.object(forKey: "translate_polite") as? Bool ?? true
         self.phrases = SavedPhrase.load()
         installLifecycleObserver()
-    }
+    
+        // BUILD 122 FIX — this observer was registered at the TOP of init(),
+        // which touches `self` before every stored property exists. Swift
+        // refuses, and rightly. It belongs at the END, once the object is
+        // actually an object.
+        //
+        // "Chappy, start" while paused: Standby holds the ear when the
+        // translate mic is stopped, so it posts and this listens. That round
+        // trip is what lets you restart without touching the screen.
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("chappyResumeTranslate"),
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, !self.isRecording else { return }
+                self.startRecording()
+                self.say("Listening.", isConfirmation: true)
+        }
+}
 
     // MARK: - Connection
 
