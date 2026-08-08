@@ -142,6 +142,37 @@ class GeminiLiveService: NSObject {
     private var hasAudioBeenSent = false
     private var isSessionConfigured = false
 
+    // MARK: - BUILD 125: surviving the lock screen
+    //
+    // Chat worked the first time and then died the moment the phone locked,
+    // and stayed dead even after unlocking and reopening the app. Three causes,
+    // all here:
+    //
+    //   1. This class had NO background or foreground handling for its capture
+    //      engine at all. ChappyStandby next door has it; chat never did. When
+    //      the app went away the engine stopped and `isRecording` stayed true,
+    //      so every later startRecording() hit `guard !isRecording` and returned
+    //      immediately. Silent forever.
+    //
+    //   2. When the watchdog DID fire while backgrounded, its restart failed,
+    //      leaving `isRecording` false — and the watchdog's own guard is
+    //      `self.isRecording`, so it then ignored every future reconfiguration
+    //      for the life of the object. It disarmed itself.
+    //
+    //   3. A failed engine.start() left the mic tap installed, so the next
+    //      attempt double-installed and iOS raised an ObjC exception Swift
+    //      cannot catch. That one is a crash, not a silence. The identical bug
+    //      was found and fixed in LiveTranslateService long ago; this file
+    //      never got the fix.
+    //
+    // `wantsRecording` is INTENT, separate from `isRecording` which is fact.
+    // Recovery is driven by intent, so a failed restart can never disarm it.
+    private var wantsRecording = false
+    private var wasRecordingBeforeBackground = false
+    private var lifecycleTokens: [NSObjectProtocol] = []
+    private var restartAttempt = 0
+    private static let restartDelays: [TimeInterval] = [0.4, 1.0, 2.5]
+
     init(apiKey: String, model: String? = nil) {
         self.apiKey = apiKey
         // HARD PIN: ignore whatever the caller passes — builds 12-14 may still
@@ -183,7 +214,102 @@ class GeminiLiveService: NSObject {
                 self.revivePlaybackEngine()
             }
         }
-        print("🛟 [Gemini] Audio lifelines installed (interruption + route change)")
+        // BUILD 125: the interruption observer above revives PLAYBACK only, so
+        // a call or a Siri press gave Chappy his voice back but never his ears.
+        // "Silent and doesn't recognise my mic" was literally both halves of
+        // that. Capture gets the same treatment now.
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            switch type {
+            case .began:
+                guard self.wantsRecording else { return }
+                print("🎤 [Gemini] Interrupted — letting the mic go, will reclaim it")
+                self.teardownCapture()
+            case .ended:
+                guard self.wantsRecording, !self.isRecording else { return }
+                // iOS needs a beat after an interruption clears before it will
+                // hand the session back.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    self?.reclaimMic(why: "interruption ended")
+                }
+            @unknown default: break
+            }
+        }
+
+        // BUILD 125: the lock screen. With `audio` in UIBackgroundModes the app
+        // is allowed to keep running, but the engine can still be stopped under
+        // us and the session handed elsewhere. Let go cleanly on the way out
+        // and take it back on the way in, rather than pretending nothing
+        // happened and leaving a dead tap behind.
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.isRecording else { return }
+                print("🎤 [Gemini] Backgrounded — standing the mic down cleanly")
+                self.wasRecordingBeforeBackground = true
+                self.teardownCapture()
+            })
+
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.wasRecordingBeforeBackground else { return }
+                self.wasRecordingBeforeBackground = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    self?.reclaimMic(why: "returned to foreground")
+                }
+            })
+
+        // Belt and braces: didBecomeActive fires on unlock even when
+        // willEnterForeground didn't (Control Centre, notification shade). If
+        // we still WANT the mic and don't HAVE it, take it.
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.wantsRecording, !self.isRecording else { return }
+                self.reclaimMic(why: "became active")
+            })
+
+        print("🛟 [Gemini] Audio lifelines installed (interruption + route + lifecycle)")
+    }
+
+    /// BUILD 125: release capture without touching INTENT. Safe to call from
+    /// anywhere; leaves `wantsRecording` alone so recovery still knows the
+    /// wearer wanted the microphone open.
+    private func teardownCapture() {
+        if let token = engineWatchdogToken {
+            NotificationCenter.default.removeObserver(token)
+            engineWatchdogToken = nil
+        }
+        // Unconditional — see cause 3 above. A tap left on a stopped engine is
+        // an uncatchable exception on the next install.
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        if let engine = audioEngine, engine.isRunning { engine.stop() }
+        isRecording = false
+    }
+
+    /// BUILD 125: take the microphone back, with backoff. Driven by
+    /// `wantsRecording`, never by `isRecording` — that was the flag that
+    /// disarmed the old watchdog permanently.
+    private func reclaimMic(why: String) {
+        guard wantsRecording, isSessionConfigured, !isRecording else { return }
+        print("🎤 [Gemini] Reclaiming the mic (\(why)), attempt \(restartAttempt + 1)")
+        startRecording()
+        guard !isRecording else { restartAttempt = 0; return }
+
+        let attempt = restartAttempt
+        guard attempt < Self.restartDelays.count else {
+            restartAttempt = 0
+            print("❌ [Gemini] Could not reclaim the mic after \(Self.restartDelays.count) tries")
+            onError?("Chappy can't hear you — close and reopen the chat.")
+            return
+        }
+        restartAttempt += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.restartDelays[attempt]) { [weak self] in
+            self?.reclaimMic(why: why)
+        }
     }
 
     private func revivePlaybackEngine() {
@@ -455,6 +581,11 @@ class GeminiLiveService: NSObject {
     // MARK: - Audio Recording
 
     func startRecording() {
+        // BUILD 125: intent is recorded FIRST and independently. Everything
+        // that recovers the microphone keys off this, so a start that fails —
+        // backgrounded, session busy, engine refusing — leaves a system that
+        // still knows it is supposed to be listening.
+        wantsRecording = true
         guard !isRecording else { return }
 
         do {
@@ -482,8 +613,14 @@ class GeminiLiveService: NSObject {
                 break
             }
 
-            if let engine = audioEngine, engine.isRunning {
-                engine.stop()
+            // BUILD 125 (CRASH): removeTap used to be inside the isRunning
+            // test, so a failed engine.start() left the tap installed on a
+            // STOPPED engine and the next attempt installed a second one on the
+            // same bus — an Objective-C exception that goes straight through
+            // Swift's try/catch and takes the app down. LiveTranslateService
+            // was given this exact fix; this file never was. Always remove.
+            if let engine = audioEngine {
+                if engine.isRunning { engine.stop() }
                 engine.inputNode.removeTap(onBus: 0)
             }
 
@@ -510,12 +647,19 @@ class GeminiLiveService: NSObject {
             try engine.start()
 
             isRecording = true
+            restartAttempt = 0
             installRecordEngineWatchdog()
             print("✅ [Gemini] Recording started")
 
         } catch {
+            // BUILD 125: leave nothing behind. The tap installed a few lines
+            // above is still on the input node at this point, and it is the
+            // thing that turns the NEXT attempt into a crash.
+            audioEngine?.inputNode.removeTap(onBus: 0)
+            isRecording = false
             print("❌ [Gemini] Failed to start recording: \(error.localizedDescription)")
-            onError?("Failed to start recording: \(error.localizedDescription)")
+            // Not surfaced to the wearer: reclaimMic retries with backoff and
+            // only speaks up once it has genuinely given up.
         }
     }
 
@@ -531,29 +675,36 @@ class GeminiLiveService: NSObject {
             object: engine,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.isRecording, self.isSessionConfigured else { return }
+            // BUILD 125: guard on INTENT, not on isRecording. The old guard was
+            // `self.isRecording`, and the very first thing the body did was set
+            // it false — so if the restart below then failed, this observer
+            // could never fire again for the life of the object. It disarmed
+            // itself at exactly the moment it was needed most.
+            guard let self, self.wantsRecording, self.isSessionConfigured else { return }
             print("🔧 [Gemini] Audio engine reconfigured — rebuilding the mic tap")
-            self.isRecording = false
-            self.audioEngine?.inputNode.removeTap(onBus: 0)
-            self.audioEngine?.stop()
+            self.teardownCapture()
+            // Backoff rather than a single 0.3 s shot: a route change during a
+            // lock or a call needs longer than that before iOS will hand the
+            // input back, and one failed try used to be the end of it.
+            self.restartAttempt = 0
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                guard let self, self.isSessionConfigured else { return }
-                self.startRecording()
+                self?.reclaimMic(why: "engine reconfigured")
             }
         }
     }
 
     func stopRecording() {
+        // BUILD 125: intent is cleared FIRST and unconditionally, before the
+        // isRecording guard. Otherwise a stop pressed while capture happened to
+        // be down left `wantsRecording` true, and the lifecycle observers would
+        // dutifully reopen the microphone the wearer had just closed.
+        wantsRecording = false
+        wasRecordingBeforeBackground = false
+        restartAttempt = 0
         guard isRecording else { return }
 
         print("🛑 [Gemini] Stop recording")
-        if let token = engineWatchdogToken {
-            NotificationCenter.default.removeObserver(token)
-            engineWatchdogToken = nil
-        }
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine?.stop()
-        isRecording = false
+        teardownCapture()
         hasAudioBeenSent = false
     }
 

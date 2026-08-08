@@ -7,6 +7,122 @@
 import Foundation
 import AVFoundation
 import NaturalLanguage
+import CryptoKit
+
+/// BUILD 125 — ONE VOICE.
+///
+/// Build 109 split Chappy's mouth in two: short lines went to Apple's on-device
+/// voice because they were instant, long lines went to Gemini because it sounds
+/// human. The result was an assistant that changed sex every other sentence —
+/// "Saved" in one voice, the answer that followed in another. That is worse
+/// than either voice on its own, and it was my doing.
+///
+/// The fix is not to choose between them. It is to stop paying the network toll
+/// twice for the same sentence. Chappy's short lines are a small, finite,
+/// repeating set — "Route's off", "Map's up", "Saved", "Having a look". Render
+/// each one through Gemini ONCE, keep the audio on disk, and every time after
+/// it plays instantly, in the right voice, with no signal at all.
+///
+/// Raw PCM16 @ 24 kHz is what Gemini hands back and what the playback engine
+/// wants, so nothing is transcoded on either side of the cache.
+private final class VoiceCache {
+
+    static let shared = VoiceCache()
+
+    /// Total bytes to keep. PCM16 @ 24 kHz is ~48 KB per second, so 60 MB is
+    /// roughly twenty minutes of speech — far more than the repeating set ever
+    /// needs, and nothing next to a phone full of photos.
+    private static let budgetBytes = 60 * 1024 * 1024
+
+    private let dir: URL
+    private let io = DispatchQueue(label: "chappy.voice.cache", qos: .utility)
+
+    private init() {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        dir = base.appendingPathComponent("ChappyVoice", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    /// The voice is part of the key. Change voice in Settings and every line
+    /// re-renders in the new one rather than serving the old voice from disk —
+    /// which is exactly the flip-flop this whole class exists to end.
+    private func filename(text: String, voice: String) -> String {
+        let digest = SHA256.hash(data: Data("\(voice)|\(text)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined() + ".pcm"
+    }
+
+    func url(text: String, voice: String) -> URL {
+        dir.appendingPathComponent(filename(text: text, voice: voice))
+    }
+
+    func has(text: String, voice: String) -> Bool {
+        FileManager.default.fileExists(atPath: url(text: text, voice: voice).path)
+    }
+
+    /// Returns cached audio and stamps the file as used, so pruning can be LRU
+    /// rather than arbitrary.
+    func load(text: String, voice: String) -> Data? {
+        let u = url(text: text, voice: voice)
+        guard let data = try? Data(contentsOf: u), !data.isEmpty else { return nil }
+        io.async {
+            try? FileManager.default.setAttributes([.modificationDate: Date()],
+                                                   ofItemAtPath: u.path)
+        }
+        return data
+    }
+
+    func save(_ data: Data, text: String, voice: String) {
+        guard !data.isEmpty else { return }
+        let u = url(text: text, voice: voice)
+        io.async { [weak self] in
+            try? data.write(to: u, options: .atomic)
+            self?.pruneIfNeeded()
+        }
+    }
+
+    /// Oldest-used first, down to the budget. Runs on the io queue only.
+    private func pruneIfNeeded() {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return }
+
+        var total = 0
+        var entries: [(url: URL, size: Int, used: Date)] = []
+        for u in items {
+            let vals = try? u.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            let size = vals?.fileSize ?? 0
+            let used = vals?.contentModificationDate ?? .distantPast
+            total += size
+            entries.append((u, size, used))
+        }
+        guard total > Self.budgetBytes else { return }
+
+        for e in entries.sorted(by: { $0.used < $1.used }) {
+            try? fm.removeItem(at: e.url)
+            total -= e.size
+            if total <= Self.budgetBytes { break }
+        }
+        print("🔊 [VoiceCache] Pruned to \(total / 1024) KB")
+    }
+
+    /// Wipe everything — used when the wearer changes voice and wants the disk
+    /// back, and by Settings' "clear cached speech".
+    func clear() {
+        io.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let items = (try? fm.contentsOfDirectory(at: self.dir, includingPropertiesForKeys: nil)) ?? []
+            for u in items { try? fm.removeItem(at: u) }
+            print("🔊 [VoiceCache] Cleared")
+        }
+    }
+
+    var fileCount: Int {
+        ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []).count
+    }
+}
 
 /// SB-DEADLOCK FIX: a checked continuation resumed twice is an instant crash,
 /// and one never resumed is a permanent hang. Both were live in this file. This
@@ -51,6 +167,67 @@ class TTSService: NSObject, ObservableObject {
     /// Nice options: Kore (warm female), Puck (male), Aoede, Charon, Fenrir, Leda.
     private var voiceName: String {
         UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore"
+    }
+
+    /// BUILD 125: above this length a line is almost certainly a one-off AI
+    /// answer that will never be said twice, so caching it only burns disk.
+    /// Chappy's repeating vocabulary — confirmations, refusals, nav calls — is
+    /// comfortably under it.
+    fileprivate static let cacheableLimit = 200
+
+    /// BUILD 125: ONE Apple voice, chosen once and pinned.
+    ///
+    /// When Apple's voice does have to speak — no key, no cached copy, no
+    /// signal — it must at least always be the SAME Apple voice. Left to
+    /// itself, `AVSpeechSynthesisVoice(language:)` returns whatever the system
+    /// feels like that day, which is a second way for Chappy to change person
+    /// mid-conversation. Resolve it once, write the identifier down, and use
+    /// that identifier forever after.
+    private func pinnedSystemVoice(for language: String) -> AVSpeechSynthesisVoice? {
+        let key = "chappy_pinned_voice_\(language)"
+        if let saved = UserDefaults.standard.string(forKey: key),
+           let v = AVSpeechSynthesisVoice(identifier: saved) {
+            return v
+        }
+
+        let candidates = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.lowercased() == language.lowercased() }
+        guard !candidates.isEmpty else { return nil }
+
+        // Match the sex of the chosen Gemini voice where iOS will tell us, so
+        // the fallback is as close a relative as the device can offer.
+        var pool = candidates
+        if #available(iOS 17.0, *) {
+            let wanted: AVSpeechSynthesisVoiceGender = Self.femaleGeminiVoices.contains(voiceName) ? .female : .male
+            let matched = candidates.filter { $0.gender == wanted }
+            if !matched.isEmpty { pool = matched }
+        }
+
+        // Prefer the nicest available, then settle it deterministically so two
+        // launches never disagree.
+        let ranked = pool.sorted { a, b in
+            if a.quality.rawValue != b.quality.rawValue { return a.quality.rawValue > b.quality.rawValue }
+            return a.identifier < b.identifier
+        }
+        guard let chosen = ranked.first else { return nil }
+        UserDefaults.standard.set(chosen.identifier, forKey: key)
+        print("🔊 [TTS] Pinned fallback voice for \(language): \(chosen.name) (\(chosen.identifier))")
+        return chosen
+    }
+
+    /// Gemini's prebuilt voices, split so the Apple fallback can match.
+    private static let femaleGeminiVoices: Set<String> = [
+        "Kore", "Aoede", "Leda", "Zephyr", "Autonoe", "Callirrhoe",
+        "Despina", "Erinome", "Gacrux", "Laomedeia", "Pulcherrima", "Vindemiatrix"
+    ]
+
+    /// Forget the pinned choices — used when the wearer changes voice so the
+    /// fallback re-matches the new one.
+    static func repinSystemVoices() {
+        let d = UserDefaults.standard
+        for (k, _) in d.dictionaryRepresentation() where k.hasPrefix("chappy_pinned_voice_") {
+            d.removeObject(forKey: k)
+        }
     }
 
     // Playback engine (24 kHz PCM16 from Gemini)
@@ -107,6 +284,34 @@ class TTSService: NSObject, ObservableObject {
         super.init()
         setupPlaybackEngine()
         installPlaybackResilience()
+
+        // BUILD 125: warm the voice cache a few seconds after launch, off the
+        // critical path. Once the repeating vocabulary is on disk this is a
+        // no-op forever, so it costs one quiet burst on the first run and
+        // nothing after. Deliberately self-contained — no other file has to
+        // remember to call it.
+        Task.detached(priority: .background) { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            self?.warmCache()
+        }
+    }
+
+    /// BUILD 125: notice a voice change without Settings having to tell us.
+    /// The cache is keyed by voice so it can never serve the wrong one, but the
+    /// PINNED Apple fallback has to re-match, and the old voice's audio is dead
+    /// weight worth reclaiming.
+    private func noticeVoiceChange() {
+        let current = voiceName
+        let key = "chappy_tts_voice_last_seen"
+        let previous = UserDefaults.standard.string(forKey: key)
+        guard previous != current else { return }
+        UserDefaults.standard.set(current, forKey: key)
+        guard previous != nil else { return }   // first run, nothing to clear
+        print("🔊 [TTS] Voice changed \(previous ?? "?") → \(current) — resetting cache and fallback")
+        VoiceCache.shared.clear()
+        Self.repinSystemVoices()
+        Self.geminiVoiceGaveUp = false
+        warmCache()
     }
 
     // MARK: - Speaking-flag lifecycle (deadlock-proof)
@@ -333,8 +538,101 @@ class TTSService: NSObject, ObservableObject {
             // normal return, early return, thrown error, cancellation — where
             // the old `if !Task.isCancelled` guard released it on almost none.
             defer { Task { @MainActor in self.endSpeaking(gen) } }
+
+            // BUILD 125: "offline" used to mean "Apple's voice", because the
+            // only way to avoid the network was to avoid Gemini. With a disk
+            // cache it no longer does — a saved phrase you have heard before
+            // plays in Chappy's real voice with the radio off, which is the
+            // whole point of saved phrases. Still zero network either way.
+            let voice = self.voiceName
+            if voice != "System",
+               let cached = VoiceCache.shared.load(text: trimmed, voice: voice) {
+                do {
+                    try await self.playPCM(cached, gen: gen)
+                    return
+                } catch {
+                    if Task.isCancelled { return }
+                }
+            }
             await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
         }
+    }
+
+    // MARK: - BUILD 125: cache warm-up
+
+    /// The lines Chappy actually repeats. Rendering these once on wifi means
+    /// the wearer effectively never hears a cold one — every confirmation,
+    /// refusal and nav call comes off the disk instantly, in the real voice,
+    /// for the rest of the phone's life.
+    ///
+    /// Pulled from the literal `speak(...)` calls in LiveAIManager, so this is
+    /// the vocabulary as it actually exists rather than a guess at it.
+    private static let warmPhrases: [String] = [
+        "Got it.", "Done.", "Noted.", "Saved.", "No worries.", "I'm listening.",
+        "Route's off.", "Map's up.", "Right, heading home.", "Let me get you home.",
+        "Opening Live AI.", "Opening Google Maps.", "Memory's open.",
+        "Having a look.", "Let me look.", "Let me read it.", "Eyes open.",
+        "Reading that now.", "Reading through them now.", "Checking the label.",
+        "Where do you want to go?", "What should I log?", "Remember what?",
+        "Here's your list.", "Nothing to snooze.", "Nothing new to import.",
+        "Nothing photographed today.", "Nothing left to read through.",
+        "No GPS fix yet.", "Finding you another way.", "Quiet mode.",
+        "Tour mode.", "Budget mode on.", "Back to normal.",
+        "One thing at a time - still on the last.",
+        "I don't have a reminder like that.",
+        "I don't speak that one yet, sorry.",
+        "Just quiet, or stop the route as well?",
+        "That deserves a proper conversation - give me a moment."
+    ]
+
+    /// Render anything in the warm list that isn't cached yet. Serial, gentle,
+    /// and silent — it never plays a sound. Safe to call on every launch: once
+    /// the set is on disk this does nothing at all.
+    func warmCache() {
+        let voice = voiceName
+        guard voice != "System" else { return }
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty else { return }
+
+        let missing = Self.warmPhrases.filter { !VoiceCache.shared.has(text: $0, voice: voice) }
+        guard !missing.isEmpty else {
+            print("🔊 [TTS] Voice cache warm (\(VoiceCache.shared.fileCount) lines)")
+            return
+        }
+
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            print("🔊 [TTS] Warming the voice cache — \(missing.count) lines to render")
+            var made = 0
+            for phrase in missing {
+                // One at a time, with a breath between, so warming never
+                // competes with a line the wearer is actually waiting on.
+                if Self.geminiVoiceGaveUp { break }
+                do {
+                    let audio = try await self.requestGeminiAudio(
+                        text: phrase, model: self.ttsModels[0], apiKey: key)
+                    VoiceCache.shared.save(audio, text: phrase, voice: voice)
+                    CostMeter.shared.addTTSChars(phrase.count)
+                    made += 1
+                } catch {
+                    // A warm-up is a nicety. If it can't run, the normal path
+                    // still renders on demand — never surface this.
+                    print("🔊 [TTS] Warm-up stopped: \(error.localizedDescription)")
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+            print("🔊 [TTS] Voice cache warmed — \(made) new lines")
+        }
+    }
+
+    /// Called when the wearer picks a different voice in Settings: the old
+    /// voice's audio is dead weight, and the Apple fallback needs to re-match.
+    func voiceChanged() {
+        VoiceCache.shared.clear()
+        Self.repinSystemVoices()
+        Self.geminiVoiceGaveUp = false
+        warmCache()
     }
 
     /// - Parameters:
@@ -358,6 +656,7 @@ class TTSService: NSObject, ObservableObject {
         stop()
 
         lastSpokenLine = trimmed
+        noticeVoiceChange()
         let gen = beginSpeaking(estimatedCharacters: trimmed.count)
         currentTask = Task { [weak self] in
             guard let self else { return }
@@ -367,32 +666,43 @@ class TTSService: NSObject, ObservableObject {
             let googleKey = APIKeyManager.shared.getGoogleAPIKey() ?? ""
             let wantsSystemVoice = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
 
-            // RESPONSIVENESS FIX. Gemini TTS is a NETWORK ROUND TRIP — generate
-            // the audio, download it, then play it. On good wifi that's about a
-            // second; on one bar of Indonesian mobile data it is several. Every
-            // short acknowledgement was paying that toll: "Finding IGA",
-            // "Saved", "Standby on" — the exact lines whose entire value is
-            // being immediate. That is most of the "very slow" feeling.
+            // BUILD 125 — ONE VOICE, ALWAYS.
             //
-            // Apple's on-device voice starts in milliseconds, works with no
-            // signal, and costs nothing. For a short line it is simply the
-            // better tool; the network voice earns its latency only on longer
-            // content where the nicer delivery is actually noticeable.
+            // The old code here split by LENGTH: anything under 90 characters
+            // went to Apple's voice because Gemini is a network round trip and
+            // short acknowledgements have to be instant. It worked, and it made
+            // Chappy change sex every other sentence. Length is not a sane way
+            // to choose a voice.
             //
-            // VOICE CONSISTENCY. This also fixes Chappy changing sex mid-
-            // conversation — a male line, then a female one. That was the
-            // Gemini call failing intermittently and silently falling back to
-            // the system voice, so the voice tracked the network. Now short
-            // lines are ALWAYS the system voice and long ones are always
-            // Gemini-first, and once Gemini has failed we stop asking it for
-            // the rest of the run rather than flip-flopping every sentence.
-            let isShortAck = trimmed.count <= 90 && !forceNetworkVoice
-            if isShortAck || Self.geminiVoiceGaveUp {
-                await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
-                return
+            // Now there is exactly one voice, and speed comes from the disk
+            // instead. Short lines repeat — "Route's off", "Map's up", "Saved"
+            // — so the first time costs a round trip and every time after is a
+            // file read. Faster than what it replaced, in the right voice, and
+            // it works with no signal at all.
+            //
+            // Apple's voice is now a genuine last resort: no key, no cached
+            // copy, and no network. When it does speak it speaks as ONE pinned
+            // voice (see systemVoice) rather than whatever iOS picks that day.
+            let voice = self.voiceName
+
+            // 1. DISK. Instant, offline, right voice.
+            if !wantsSystemVoice, !forceNetworkVoice,
+               let cached = VoiceCache.shared.load(text: trimmed, voice: voice) {
+                do {
+                    try await self.playPCM(cached, gen: gen)
+                    return
+                } catch {
+                    if Task.isCancelled { return }
+                    // A cached file that won't play is a corrupt file. Drop it
+                    // and let the network re-render rather than going mute.
+                    try? FileManager.default.removeItem(
+                        at: VoiceCache.shared.url(text: trimmed, voice: voice))
+                    print("⚠️ [TTS] Cached line wouldn't play — re-rendering")
+                }
             }
 
-            if !googleKey.isEmpty && !wantsSystemVoice {
+            // 2. NETWORK. Renders, plays, and keeps the audio for next time.
+            if !googleKey.isEmpty, !wantsSystemVoice, !Self.geminiVoiceGaveUp {
                 do {
                     try await self.speakWithGemini(text: trimmed, apiKey: googleKey, gen: gen)
                     // Only charge for audio that genuinely reached the speaker.
@@ -401,12 +711,13 @@ class TTSService: NSObject, ObservableObject {
                 } catch {
                     if Task.isCancelled { return }
                     Self.geminiVoiceGaveUp = true
-                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — system voice for the rest of this run")
+                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — Apple voice until the cooldown clears")
                 }
-            } else {
+            } else if googleKey.isEmpty {
                 print("🔊 [TTS] No Gemini key — using system TTS")
             }
 
+            // 3. LAST RESORT.
             await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
         }
     }
@@ -436,6 +747,13 @@ class TTSService: NSObject, ObservableObject {
             do {
                 let audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
                 try Task.checkCancellation()
+                // BUILD 125: keep it BEFORE playing, so audio we paid for
+                // survives even if playback then fails. Long lines are almost
+                // always one-off AI answers — caching those would fill the disk
+                // with speech that is never heard twice.
+                if text.count <= Self.cacheableLimit {
+                    VoiceCache.shared.save(audio, text: text, voice: voiceName)
+                }
                 print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
                 try await playPCM(audio, gen: gen)
                 return
@@ -630,11 +948,17 @@ class TTSService: NSObject, ObservableObject {
                 language = v
             }
         }
-        utterance.voice = AVSpeechSynthesisVoice(language: language)
+        // BUILD 125: pinned, not picked. AVSpeechSynthesisVoice(language:)
+        // returns whichever voice the system fancies for that language, which
+        // can differ between launches and after an iOS update — a second way
+        // for Chappy to change person mid-conversation, on top of the one this
+        // build removes. Resolve it once, remember the identifier, reuse it.
+        utterance.voice = pinnedSystemVoice(for: language)
+            ?? AVSpeechSynthesisVoice(language: language)
             ?? AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
 
-        print("🔊 [TTS] System TTS speaking: \(text.prefix(30))…")
+        print("🔊 [TTS] System TTS speaking (\(utterance.voice?.name ?? "?")): \(text.prefix(30))…")
 
         // SB-DEADLOCK FIX: the delegate callback is not guaranteed. If iOS
         // reconfigures the audio session under us — which is exactly what

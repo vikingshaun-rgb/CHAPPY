@@ -77,6 +77,54 @@ class LiveTranslateService: NSObject {
     private var accumulatedOriginal = ""
     /// ECHO GATE: the microphone stays shut until this moment has passed.
     private var micGateUntil = Date.distantPast
+
+    // MARK: - BUILD 124: command mute
+    //
+    // The system prompt tells the interpreter to stay silent on anything
+    // carrying the name "Chappy". Prompts are advice, not a switch — and by
+    // the time the app sees a finished turn and recognises a command, the
+    // audio has already been spoken. So "Chappy, close" got translated aloud
+    // and THEN closed, and "Chappy, change to French" got announced in
+    // Indonesian to a stranger before the language changed.
+    //
+    // This is the switch. The incoming transcription arrives live, word by
+    // word, well before the model's reply. The moment the wearer's own name
+    // for the app appears in it, we stop the player dead and refuse every
+    // audio chunk for the rest of that turn — regardless of what the model
+    // decides to say. Belt on the prompt, braces on the speaker.
+    private var commandMuteThisTurn = false
+
+    /// Spelling variants the transcriber actually produces for "Chappy".
+    /// Kept deliberately generous: the cost of a false positive is one silent
+    /// turn the wearer repeats; the cost of a miss is a command spoken aloud
+    /// to the person opposite.
+    private static let commandNames = [
+        "chappy", "chappie", "chapy", "chappi", "chapi", "chappey",
+        "chappe", "chapper", "chappa", "shappy", "shappie", "tchappy",
+        "chaphy", "chap he", "chap e", "chappys", "chappy's"
+    ]
+
+    /// True when a stretch of heard speech carries the app's name.
+    static func carriesCommandName(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return commandNames.contains { t.contains($0) }
+    }
+
+    /// Kill the current spoken turn immediately and keep it dead until the
+    /// turn completes. Also releases the echo gate — the wearer is mid-command
+    /// and going deaf on him now is exactly the wrong move.
+    private func muteForCommand() {
+        guard !commandMuteThisTurn else { return }
+        commandMuteThisTurn = true
+        playerNode?.stop()
+        playerNode?.reset()
+        hasStartedPlaying = false
+        pendingPlaybackBuffers = 0
+        lastPlaybackChangeAt = Date()
+        micGateUntil = .distantPast
+        accumulatedText = ""
+        print("🤫 [Translate] Heard the app's name — this turn is a command, staying silent")
+    }
     /// Audio buffers handed to the player that have not finished playing yet.
     /// While this is above zero, Chappy is audibly speaking — whatever the clock
     /// says — and the microphone must stay shut.
@@ -529,23 +577,32 @@ class LiveTranslateService: NSObject {
         as DIGITS with thousands separators (say 250,000 - not two hundred and \
         fifty thousand), and keep the currency word. \
         \(scriptInstruction)\
-        CONTROL PHRASES: when the wearer says the name "Chappy" together with a \
-        repeat instruction - "Chappy repeat that", "Chappy say that again", \
-        "Chappy one more time" - that is an instruction to the app and NOT speech \
-        to translate: output NOTHING AT ALL and stay silent, the app handles it. \
+        CONTROL PHRASES - THE MOST IMPORTANT RULE OF ALL: \
+        the wearer's assistant is called "Chappy". ANY utterance that contains \
+        the name "Chappy" - however it is spelled or mis-heard: Chappy, Chappie, \
+        Chapy, Chappi, Chapi, Chappey, Shappy, Chap-he - is an instruction to the \
+        app and is NEVER speech to translate. The instant you hear that name, \
+        output NOTHING AT ALL for that entire utterance: no translation, no audio, \
+        no acknowledgement, no partial rendering of the words that came before or \
+        after it. Stay completely silent and let the app handle it. This applies \
+        no matter what follows the name and no matter whether you recognise the \
+        instruction: "Chappy close", "Chappy stop", "Chappy finish translation", \
+        "Chappy change to French", "Chappy switch to Indonesian", "Chappy repeat \
+        that", "Chappy say that again", "Chappy be polite", "Chappy casual", \
+        "Chappy quiet", "Chappy mute", "Chappy speak", "Chappy loud", "Chappy \
+        speaker off", "Chappy private", "Chappy pronunciation", "Chappy go home", \
+        and ANY other sentence carrying that name. There is no exception. If you \
+        are part-way through speaking when the name appears, stop immediately. \
+        Never translate a command. Never speak a command back. Never read a \
+        command aloud in either language. \
         A bare single word from the other speaker asking for a repeat - "ulangi", \
         "sekali lagi", "maaf", "apa" - is likewise handled by the app: stay silent. \
-        Likewise ANY short sentence that begins with or contains the name "Chappy" \
-        and an app instruction is a command, not speech: "Chappy be polite", \
-        "Chappy casual", "Chappy quiet", "Chappy silent", "Chappy mute", \
-        "Chappy speak", "Chappy loud", "Chappy loudspeaker", "Chappy speaker off", \
-        "Chappy private", "Chappy pronunciation". Stay completely silent on all \
-        of them - the app handles them. \
-        CRITICAL: any OTHER sentence containing repeat wording IS ordinary speech \
-        and must be translated normally. "Can you repeat that?", "sorry, could you \
-        say that again?" and "one more time please" are things the wearer is saying \
-        TO the person in front of them - translate those, never treat them as \
-        commands. Only the name "Chappy" makes it an instruction.
+        CRITICAL: any sentence WITHOUT that name is ordinary speech and must be \
+        translated normally, even if it sounds like an instruction. "Can you \
+        repeat that?", "sorry, could you say that again?", "one more time please", \
+        "please close the door" and "let's finish up" are things the wearer is \
+        saying TO the person in front of them - translate those, never treat them \
+        as commands. Only the name "Chappy" makes it an instruction.
         """
 
         var setup: [String: Any] = [
@@ -790,6 +847,8 @@ class LiveTranslateService: NSObject {
         // the cost meter stopped counting, and the microphone came back up and
         // kept streaming a private conversation to Google.
         shouldResumeRecordingAfterSetup = false
+        // BUILD 124: never carry a command mute across a stop/start.
+        commandMuteThisTurn = false
         guard isRecording else { return }
         print("🛑 [Translate] Stop recording")
         // ORDER MATTERS. removeTap while the engine is still running races the
@@ -1120,6 +1179,9 @@ class LiveTranslateService: NSObject {
                 print("✅ [Translate] Session established (Gemini Live)")
                 self.isConnected = true
                 self.accumulatedText = ""
+                // BUILD 124: a turn that never completed (renewal, drop,
+                // goAway) must not leave the interpreter permanently mute.
+                self.commandMuteThisTurn = false
                 self.onConnected?()
                 // Safe point to resume recording after a settings reconnect
                 // BUILD 56: a good handshake clears the recovery budget, so a
@@ -1142,11 +1204,20 @@ class LiveTranslateService: NSObject {
                    let text = inputT["text"] as? String, !text.isEmpty {
                     self.accumulatedOriginal += text
                     self.onOriginalDelta?(text)
+
+                    // BUILD 124: the earliest moment we can possibly know this
+                    // is a command. Check the WHOLE accumulated turn, not the
+                    // delta — "Chappy" often arrives split as "Chap" + "py".
+                    if !self.commandMuteThisTurn,
+                       Self.carriesCommandName(self.accumulatedOriginal) {
+                        self.muteForCommand()
+                    }
                 }
 
                 // Translated-speech transcription (text of what is being spoken)
                 if let transcription = serverContent["outputTranscription"] as? [String: Any],
-                   let text = transcription["text"] as? String, !text.isEmpty {
+                   let text = transcription["text"] as? String, !text.isEmpty,
+                   !self.commandMuteThisTurn {
                     self.accumulatedText += text
                     self.onTranslationDelta?(text)
                 }
@@ -1160,7 +1231,8 @@ class LiveTranslateService: NSObject {
                            let audioData = Data(base64Encoded: b64) {
                             self.handleAudioChunk(audioData)
                         }
-                        if let text = part["text"] as? String, !text.isEmpty {
+                        if let text = part["text"] as? String, !text.isEmpty,
+                           !self.commandMuteThisTurn {
                             self.accumulatedText += text
                             self.onTranslationDelta?(text)
                         }
@@ -1197,6 +1269,11 @@ class LiveTranslateService: NSObject {
                     }
                     self.accumulatedText = ""
                     self.accumulatedOriginal = ""
+                    // BUILD 124: the mute lasts exactly one turn. The next
+                    // thing the person opposite says must be translated
+                    // normally — a sticky mute would be far worse than the
+                    // bug it fixes.
+                    self.commandMuteThisTurn = false
                     self.onAudioDone?()
                 }
                 return
@@ -1231,6 +1308,10 @@ class LiveTranslateService: NSObject {
     // MARK: - Audio Playback (24 kHz PCM16 from Gemini)
 
     private func handleAudioChunk(_ audioData: Data) {
+        // BUILD 124: if the wearer's name turned up in this turn, nothing the
+        // model produced for it ever reaches the speaker. This runs before
+        // onAudioDelta so no downstream consumer records it either.
+        if commandMuteThisTurn { return }
         onAudioDelta?(audioData)
         guard audioOutputEnabled else { return }
 
