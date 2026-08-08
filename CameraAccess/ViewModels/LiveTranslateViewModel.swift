@@ -391,6 +391,16 @@ class LiveTranslateViewModel: ObservableObject {
     // MARK: - Init
 
     init() {
+        // BUILD 121: "Chappy, start" while paused. Standby holds the ear when
+        // the translate mic is stopped, so it posts and this listens — that is
+        // the whole round trip that lets you restart without touching anything.
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("chappyResumeTranslate"),
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, !self.isRecording else { return }
+                self.startRecording()
+                self.say("Listening.", isConfirmation: true)
+        }
         // Load settings from UserDefaults
         let savedSource = UserDefaults.standard.string(forKey: "translate_source_language") ?? "en"
         var loadedSource = TranslateLanguage(rawValue: savedSource) ?? .en
@@ -580,6 +590,9 @@ class LiveTranslateViewModel: ObservableObject {
     }
 
     func startRecording() {
+        // Give the microphone back to the translate session — two recognisers
+        // on one mic is how both of them end up deaf.
+        ChappyStandby.shared.handOff()
         // BUILD 56: asleep? Wake up first, then start listening the moment the
         // line is live. You just tap the mic; you never see the difference.
         if isAsleep || lostConnection {
@@ -674,6 +687,18 @@ class LiveTranslateViewModel: ObservableObject {
         translateService?.stopRecording()
         isRecording = false
         archiveConversationToMemory()
+        // BUILD 121 — THE HOLE IN VOICE CONTROL OF THIS SCREEN.
+        //
+        // You could STOP a session by voice, because the translate microphone
+        // was open and heard you. You could never START one, because the
+        // moment it stopped, NOTHING was listening — Standby hands the
+        // microphone over when this screen opens and never took it back. So
+        // the red button was the only way back in, which is exactly the
+        // "I shouldn't have to touch it" you described.
+        //
+        // Now: the instant recording stops, the wake word takes the mic back.
+        // Say "Chappy, start" and you are translating again without looking.
+        ChappyStandby.shared.resumeAfterHandOff()
         stopCostCheckpoint()
         // Bank only the minutes the microphone was actually open.
         if let start = sessionStartAt {
@@ -1228,6 +1253,13 @@ class LiveTranslateViewModel: ObservableObject {
         // had no handler at all before, which is why the only way out of a
         // conversation was digging the phone out and finding the X.
         let bare = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        // BUILD 121: pausing without leaving. "Stop listening" is not the same
+        // request as "close translate", and conflating them lost the transcript.
+        if ["stop listening", "pause", "hold on stop", "stop the mic",
+            "stop recording", "mute the mic"].contains(where: { bare.contains($0) }) {
+            if isRecording { say("Paused.", isConfirmation: true); stopRecording() }
+            return true
+        }
         if ["stop translating", "stop translation", "stop the translation",
             "stop translate", "close translate", "close translation",
             "close the translation", "end translation", "end the translation",
@@ -1265,10 +1297,20 @@ class LiveTranslateViewModel: ObservableObject {
         // handed off while this screen owns the microphone, so from in here
         // there was no way to get to it. This screen already transcribes
         // everything you say; it just had to look.
-        if has("change to") || has("switch to") || has("change the language")
-            || has("make it") || has("now in") || has("put it in")
-            || has("swap to") || has("translate to") || has("change language") {
-            let joinedTail = tail.joined(separator: " ")
+        // BUILD 120 — WHY "CHAPPY, CHANGE TO FRENCH" DID NOTHING.
+        //
+        // has() only matches when everything LEFT OVER after the phrase is a
+        // filler word. That is exactly right for "be polite" and exactly wrong
+        // here, because the leftover IS the payload — "change to french" left
+        // "french" behind, which is not filler, so the whole branch was
+        // skipped and your command got translated at the other person instead.
+        //
+        // Language changes match on the raw tail instead.
+        let joinedTail = tail.joined(separator: " ")
+        if ["change to", "switch to", "change the language", "make it", "now in",
+            "put it in", "swap to", "translate to", "change language",
+            "speak", "talk in", "go to"].contains(where: { joinedTail.contains($0) })
+            || ChappyStandby.languageCode(spokenIn: joinedTail) != nil {
             if let code = ChappyStandby.languageCode(spokenIn: joinedTail),
                let lang = TranslateLanguage(rawValue: code) {
                 targetLanguage = lang
