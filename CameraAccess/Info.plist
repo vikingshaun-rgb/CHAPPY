@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.smartview.glassai.proactive</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -86,6 +90,8 @@
 	<string>Chappy reads the photos and videos you capture with your glasses so it can caption them and file them in your memory.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
 	<string>Chappy reads and writes your Reminders lists so reminders live alongside your calendar and memory.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Chappy keeps your shopping and errand lists in Reminders so they sync across your devices and can be shared.</string>
 	<key>NSSiriUsageDescription</key>
 	<string>Chappy needs Needs siri to talk to chappy</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
@@ -104,6 +110,8 @@
 		<string>bluetooth-peripheral</string>
 		<string>external-accessory</string>
 		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
