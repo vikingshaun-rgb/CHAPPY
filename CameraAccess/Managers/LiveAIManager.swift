@@ -3115,6 +3115,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         "translate", "snap", "photo", "take a photo", "take a picture",
         "map", "remember", "remember this spot", "watch", "keep watching",
         "let's talk", "lets talk", "take me home", "get me home", "go home",
+        // BUILD 129: destination openers need the same grace "navigate"
+        // already gets. "take me to the IGA at Sunset Road" arrives as
+        // several recogniser partials and a short window routed half a
+        // place name.
+        "take me to", "take us to", "drive me to", "drive us to",
+        "walk me to", "walk us to", "get me to", "get us to",
+        "navigate to", "navigate me to", "directions to", "route to",
+        "closest", "nearest",
         // The prefix-unsafe words from neverInstant land here instead: a grace
         // is exactly what they need, so the tail can arrive.
         "stop", "cancel", "quiet", "battery", "where am i",
@@ -3234,6 +3242,11 @@ final class ChappyStandby: NSObject, ObservableObject {
     // MARK: The router
 
     private func route(_ c: String) async {
+        // BUILD 129: everything new lives behind one entry point. If the
+        // hook doesn't recognise a command it returns false and the router
+        // below runs exactly as it always has.
+        if await ChappyRouterHook.intercept(c) { return }
+
         // ---------- SAFETY FIRST — emergency outranks everything ----------
         // AUDIT FIX (P0): "Chappy, emergency" used to fall through to a 25s
         // network call. Standby is often the ONLY thing listening (screen

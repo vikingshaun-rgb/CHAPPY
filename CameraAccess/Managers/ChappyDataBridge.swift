@@ -1,20 +1,32 @@
 /*
- * ChappyDataBridge — the single seam between the new AI layer and your data
+ * ChappyDataBridge — the seam between the new AI layer and your existing data
  *
- * ⚠️ THIS IS THE ONLY FILE THAT NAMES ChappyReminders / ChappyCalendar /
- *    ChappyMemory. If any of the calls below don't match the real API in your
- *    build, the compiler points at a line IN THIS FILE and nowhere else. Fix
- *    it here once and ChappyConversation and ChappyProactive are both correct.
+ * ── THIS FILE WAS WRITTEN BLIND AND HAS NOW BEEN CORRECTED ─────────────
+ * The first version guessed at the reminders API. Having read the real
+ * LiveAIManager.swift, three of those guesses were wrong, and the real API is
+ * better than what I'd assumed:
  *
- * WHY THIS EXISTS. Two files need your reminders, your diary and your memory.
- * If each called those stores directly, one renamed method would mean hunting
- * through 900 lines across both. Funnelling every access through a handful of
- * small functions makes a rename a one-line fix in a known place — and it lets
- * the new AI layer drop into the project without me having seen those files.
+ *   WRONG:  ChappyReminders.Entry(text:category:) then .shared.add(entry)
+ *   RIGHT:  ChappyReminders.shared.add(title:at:place:leadMinutes:…) which
+ *           returns a ChappyMemory.Entry. Reminders ARE memories with a
+ *           .reminder kind — there is no separate Entry type.
  *
- * Every function is failure-tolerant: an empty or unavailable store returns an
- * empty string and the callers degrade gracefully. A brief with no calendar
- * line is still useful; a brief that invents a meeting is worse than none.
+ *   WRONG:  passing a Category when creating a reminder.
+ *   RIGHT:  Category is DERIVED, not chosen — ChappyReminders.category(of:)
+ *           infers it from provenance. Build 115's note in that file is
+ *           explicit that the app never asks, because "every task app on earth
+ *           loses people at the dropdown where you pick a list". So the
+ *           category argument is gone from this bridge entirely; the model no
+ *           longer picks one and cannot pick a wrong one.
+ *
+ *   WRONG:  scraping JSONL files off disk for the memory digest.
+ *   RIGHT:  ChappyMemory.shared.recent is already a published array of
+ *           Entry. Reading the store directly is both correct and cheaper.
+ *
+ * Two further capabilities came free, because the real add() already takes
+ * them: `place:` for a place trigger and `leadMinutes:` for a warn-me lead.
+ * Both are now plumbed through, so a voice reminder can carry the same
+ * trigger and lead that the Reminders screen sets by hand.
  */
 
 import Foundation
@@ -25,42 +37,49 @@ enum ChappyDataBridge {
     // MARK: - Reminders
 
     /// Today's reminders as one spoken-ready line.
-    /// ⚠️ VERIFY: ChappyReminders.shared.briefText()
     static func remindersBrief() -> String {
         ChappyReminders.shared.briefText()
     }
 
-    /// Create a reminder. Returns a spoken confirmation, or nil on failure.
-    /// ⚠️ VERIFY: ChappyReminders.Entry(text:category:), .remindAt, .shared.add(_:)
-    static func addReminder(text: String, at date: Date?, category: String) -> String? {
-        let cat = reminderCategory(named: category)
-        var entry = ChappyReminders.Entry(text: text, category: cat)
-        entry.remindAt = date
-        ChappyReminders.shared.add(entry)
+    /// Create a reminder. Returns a spoken confirmation.
+    ///
+    /// - Parameters:
+    ///   - text: the reminder title, in his own words.
+    ///   - date: absolute fire time, or nil for an untimed one.
+    ///   - place: optional place trigger — fires when he's there, using the
+    ///     existing checkPlaceTriggers machinery rather than a new geofence.
+    ///   - leadMinutes: warn-me lead. With a place set this also feeds
+    ///     checkLeaveBy, which warns when to LEAVE rather than when it's due.
+    @discardableResult
+    static func addReminder(text: String,
+                            at date: Date?,
+                            place: String? = nil,
+                            leadMinutes: Int? = nil) -> String {
+        let entry = ChappyReminders.shared.add(title: text,
+                                               at: date,
+                                               place: place,
+                                               leadMinutes: leadMinutes,
+                                               source: "chappy-ai")
 
-        guard let d = date else { return "Reminder saved: \(text)." }
+        // Speak back what was actually stored, not what was asked for — the
+        // category is inferred and he may want to know which bucket it landed
+        // in when it turns up later.
+        let cat = ChappyReminders.category(of: entry).label.lowercased()
+
+        if let p = place, !p.isEmpty, date == nil {
+            return "Saved under \(cat) — I'll remind you at \(p)."
+        }
+        guard let d = date else { return "Saved under \(cat): \(text)." }
+
         let f = DateFormatter()
         f.dateFormat = Calendar.current.isDateInToday(d) ? "h:mm a" : "h:mm a, EEE d MMM"
-        return "Reminder set for \(f.string(from: d)): \(text)."
-    }
-
-    /// ⚠️ VERIFY: the cases of ChappyReminders.Category
-    private static func reminderCategory(named s: String) -> ChappyReminders.Category {
-        switch s.lowercased() {
-        case "work":   return .work
-        case "travel": return .travel
-        case "money":  return .money
-        case "places": return .places
-        case "health": return .health
-        case "home":   return .home
-        default:       return .general
-        }
+        let lead = leadMinutes.map { " I'll warn you \($0) minutes before." } ?? ""
+        return "Set for \(f.string(from: d)) under \(cat).\(lead)"
     }
 
     // MARK: - Calendar
 
     /// Today's diary as one spoken-ready line, or "" if nothing is on.
-    /// ⚠️ VERIFY: ChappyCalendar.shared.agendaLine()
     static func agenda() -> String {
         ChappyCalendar.shared.agendaLine() ?? ""
     }
@@ -68,55 +87,37 @@ enum ChappyDataBridge {
     // MARK: - Memory
 
     /// A compact digest of what Chappy has logged recently, for the proactive
-    /// pass to reason over. Capped hard: memory grows without limit and an
-    /// uncapped digest would quietly inflate the token bill on every call.
+    /// pass and the `recall` tool to reason over.
     ///
-    /// This reads the ChappyMemory JSONL files directly rather than calling an
-    /// API, precisely so it cannot break when that API changes. If your memory
-    /// files live somewhere other than Documents, change the directory below.
+    /// Capped hard on both age and line count: memory grows without limit and
+    /// an uncapped digest would quietly inflate the token bill on all eight
+    /// passes a day.
     static func recentMemoryDigest(days: Int = 3, maxLines: Int = 40) -> String {
-        let fm = FileManager.default
-        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first
-        else { return "" }
-
-        var candidates: [URL] = []
-        for dir in [docs, docs.appendingPathComponent("memory")] {
-            let found = (try? fm.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: [.skipsHiddenFiles])) ?? []
-            candidates += found.filter { $0.pathExtension.lowercased() == "jsonl" }
-        }
-        guard !candidates.isEmpty else { return "" }
-
         let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
-        let recent = candidates
-            .compactMap { url -> (URL, Date)? in
-                let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate
-                guard let d, d > cutoff else { return nil }
-                return (url, d)
-            }
-            .sorted { $0.1 > $1.1 }
-            .prefix(days)
+        let df = DateFormatter()
+        df.dateFormat = "EEE h:mm a"
 
-        var lines: [String] = []
-        for (url, _) in recent {
-            guard let raw = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            for line in raw.split(separator: "\n") {
-                guard let data = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
-                let text = (obj["title"] as? String)
-                    ?? (obj["text"] as? String)
-                    ?? (obj["note"] as? String)
-                    ?? (obj["summary"] as? String)
-                guard let t = text, !t.isEmpty else { continue }
-                let kind = (obj["kind"] as? String).map { "[\($0)] " } ?? ""
-                lines.append(kind + t)
+        let lines = ChappyMemory.shared.recent
+            .filter { $0.at > cutoff }
+            .sorted { $0.at < $1.at }
+            .suffix(maxLines)
+            .map { e -> String in
+                var s = "[\(e.kind.rawValue)] \(df.string(from: e.at)) — \(e.title)"
+                if let p = e.place, !p.isEmpty { s += " (at \(p))" }
+                else if let c = e.city, !c.isEmpty { s += " (\(c))" }
+                if e.doneAt != nil { s += " ✓done" }
+                return s
             }
-        }
-        guard !lines.isEmpty else { return "" }
-        return lines.suffix(maxLines).joined(separator: "\n")
+
+        return lines.isEmpty ? "" : lines.joined(separator: "\n")
+    }
+
+    /// Anything with a time on it that will fire its own alert — handed to the
+    /// proactive pass so it never announces something twice.
+    static func selfAlertingReminders() -> [String] {
+        ChappyReminders.shared.open
+            .filter { $0.effectiveFire != nil && $0.deliveredAt == nil }
+            .prefix(12)
+            .map(\.title)
     }
 }
