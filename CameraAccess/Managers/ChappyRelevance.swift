@@ -65,7 +65,7 @@ final class ChappyRelevance: ObservableObject {
     /// Quiet hours, matching the proactive brief.
     private let quietStart = 22, quietEnd = 7
 
-    @Published var isEnabled: Bool {
+    @Published var isEnabled: Bool = false {
         didSet { d.set(isEnabled, forKey: Key.enabled) }
     }
     @Published private(set) var remarksToday = 0

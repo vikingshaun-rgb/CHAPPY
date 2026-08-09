@@ -116,7 +116,7 @@ final class ChappyPhotoIngest: ObservableObject {
 
     /// Cheap, synchronous wi-fi check. NWPathMonitor is the right tool but it
     /// is asynchronous; this snapshot is refreshed by the monitor below.
-    private static var onWiFi = true
+    nonisolated(unsafe) private static var onWiFi = true
     private static let monitor: NWPathMonitor = {
         let m = NWPathMonitor()
         m.pathUpdateHandler = { path in

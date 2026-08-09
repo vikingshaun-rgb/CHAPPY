@@ -375,9 +375,7 @@ final class ChappyConversation: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return "No reminder text given." }
             let when = parseWhen(args["when"] as? String ?? "")
-            let cat  = args["category"] as? String ?? "general"
-            return ChappyDataBridge.addReminder(text: text, at: when, category: cat)
-                ?? "Couldn't save that reminder."
+            return ChappyDataBridge.addReminder(text: text, at: when)
 
         case "list_reminders":
             let rem = ChappyDataBridge.remindersBrief()

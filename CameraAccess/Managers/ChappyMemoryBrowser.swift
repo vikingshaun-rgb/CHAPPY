@@ -147,7 +147,7 @@ struct ChappyMemoryBrowser: View {
                 }
             }
             .safeAreaInset(edge: .top, spacing: 0) { chips }
-            .sheet(item: $selected) { MemoryCard(entry: $0) }
+            .sheet(item: $selected) { BrowserMemoryCard(entry: $0) }
         }
     }
 
@@ -196,7 +196,7 @@ struct ChappyMemoryBrowser: View {
             ForEach(grouped, id: \.0) { day, items in
                 Section {
                     ForEach(items) { e in
-                        MemoryRow(entry: e).onTapGesture { selected = e }
+                        BrowserMemoryRow(entry: e).onTapGesture { selected = e }
                     }
                 } header: {
                     HStack {
@@ -312,7 +312,7 @@ struct ChappyMemoryBrowser: View {
 
 // MARK: - Row
 
-private struct MemoryRow: View {
+private struct BrowserMemoryRow: View {
     let entry: ChappyMemory.Entry
 
     var body: some View {
@@ -373,7 +373,7 @@ private struct MemoryRow: View {
 
 // MARK: - Detail card
 
-private struct MemoryCard: View {
+private struct BrowserMemoryCard: View {
     let entry: ChappyMemory.Entry
     @Environment(\.dismiss) private var dismiss
     @State private var pinned: Bool
