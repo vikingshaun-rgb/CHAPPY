@@ -7,22 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		558B41A82753DE62D1DDA703 /* ChappyRouterHook.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */; };
-		2D0C84D5142EA8FA3746CD02 /* ChappyNavMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB81EFB828618D74882D2907 /* ChappyNavMode.swift */; };
-		A42D3FF068527FE4F6EFDCC5 /* ChappyConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */; };
 		03E4006E9F4089719887A2CC /* ChappyProactive.swift in Sources */ = {isa = PBXBuildFile; fileRef = 053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */; };
-		565451425EAAF582C732D0DD /* ChappyLists.swift in Sources */ = {isa = PBXBuildFile; fileRef = 498DED13D7119C3AE95F4864 /* ChappyLists.swift */; };
-		53F8E88D7FE48BA073AE1516 /* ChappyTimers.swift in Sources */ = {isa = PBXBuildFile; fileRef = E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */; };
-		94FFAFB0D3ED2FB0F5B083C6 /* ChappyDataBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */; };
-		56CD99FD1815F5BC040117E7 /* ChappyMemoryKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */; };
-		7F705D33AD599F31BA69ABA5 /* ChappyPulse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */; };
-		79E1F7ACFA8907F31F4D30C1 /* ChappyPhotoIngest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */; };
-		EDE3E7D84058F8A7A3FD7B31 /* ChappyRelevance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */; };
-		92BCB49284B79ABB0DBA0BF9 /* ChappyMemoryBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */; };
 		05043536CDB06C0B88B3C4D9 /* TTSService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 069172850B30A2766C8BD4B5 /* TTSService.swift */; };
 		217BDD58A35C2D24403F74BF /* APIProviderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1111827A1CF7A278A6DC6934 /* APIProviderManager.swift */; };
 		26664DE8308E3F2981609421 /* QuickVisionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3E36CE337855A7F17F2AC8 /* QuickVisionService.swift */; };
 		2746170F50E225008AB717CE /* QuickVisionModeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A08DC107E5A57DDE6036C3 /* QuickVisionModeManager.swift */; };
+		2D0C84D5142EA8FA3746CD02 /* ChappyNavMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB81EFB828618D74882D2907 /* ChappyNavMode.swift */; };
 		2D194F19524B5A74AAA4F325 /* GeminiLiveService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63EB4C91D8E0C8AC944DF95A /* GeminiLiveService.swift */; };
 		3121D19C06DC68008799365A /* LiveAIIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0ECA1D14EBBE33F66EEF18 /* LiveAIIntent.swift */; };
 		4B69CCC32F050D4300D1D025 /* RTMPStreamingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B69CCC22F050D4300D1D025 /* RTMPStreamingView.swift */; };
@@ -82,18 +72,28 @@
 		4BB5DFEF2F06C05E00AF7BD0 /* LiveAIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BB5DFEE2F06C05E00AF7BD0 /* LiveAIModels.swift */; };
 		4BB5DFF12F06C06D00AF7BD0 /* LiveAIModeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BB5DFF02F06C06D00AF7BD0 /* LiveAIModeManager.swift */; };
 		4BB5DFF32F06C07A00AF7BD0 /* LiveAISettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BB5DFF22F06C07A00AF7BD0 /* LiveAISettingsView.swift */; };
+		53F8E88D7FE48BA073AE1516 /* ChappyTimers.swift in Sources */ = {isa = PBXBuildFile; fileRef = E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */; };
+		558B41A82753DE62D1DDA703 /* ChappyRouterHook.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */; };
+		565451425EAAF582C732D0DD /* ChappyLists.swift in Sources */ = {isa = PBXBuildFile; fileRef = 498DED13D7119C3AE95F4864 /* ChappyLists.swift */; };
+		56CD99FD1815F5BC040117E7 /* ChappyMemoryKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */; };
 		5F1DD829120116C2EB177411 /* QuickVisionSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 330AF93394A09D97C504F568 /* QuickVisionSettingsView.swift */; };
 		6FE225749B8E795D8D265971 /* QuickVisionStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7F490219E64EC144DAF8A8C /* QuickVisionStorage.swift */; };
 		759D8C3F84F44478678CA613 /* LiveAIManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC72379319F7F8AAF8019018 /* LiveAIManager.swift */; };
+		79E1F7ACFA8907F31F4D30C1 /* ChappyPhotoIngest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */; };
+		7F705D33AD599F31BA69ABA5 /* ChappyPulse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */; };
 		8AAC01AA9E2C673BDDD9C7C5 /* QuickVisionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 414A2AC7E8B825BC1B4DB93F /* QuickVisionModels.swift */; };
 		8FD96B7F2E6F0A9800F56AB1 /* TurboMetaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD96B792E6F0A9800F56AB1 /* TurboMetaApp.swift */; };
 		8FD96B8D2E6F0A9800F56AB1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8FD96B772E6F0A9800F56AB1 /* Assets.xcassets */; };
 		8FD96B952E6F0F7D00F56AB1 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = 8FD96B942E6F0F7D00F56AB1 /* MWDATCore */; };
 		8FD96B952E6F0F7D00F56AB2 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 8FD96B942E6F0F7D00F56AB2 /* MWDATCamera */; };
 		8FD96B952E6F0F7D00F56AB3 /* MWDATMockDevice in Frameworks */ = {isa = PBXBuildFile; productRef = 8FD96B942E6F0F7D00F56AB3 /* MWDATMockDevice */; };
+		92BCB49284B79ABB0DBA0BF9 /* ChappyMemoryBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */; };
+		94FFAFB0D3ED2FB0F5B083C6 /* ChappyDataBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */; };
+		A42D3FF068527FE4F6EFDCC5 /* ChappyConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */; };
 		A5C50340AFD334B459151AF1 /* QuickVisionIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568E19B82D2116C7FE3B1829 /* QuickVisionIntent.swift */; };
 		B3F7AF9C18583263BE4D96A1 /* LanguageManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0080AFEB87FC4CF85E53FE97 /* LanguageManager.swift */; };
 		D83E4BD577765733E71A0068 /* QuickVisionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B037E0156E90DE2314A9F47 /* QuickVisionView.swift */; };
+		EDE3E7D84058F8A7A3FD7B31 /* ChappyRelevance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */; };
 		LT0001000100010001 /* LiveTranslateModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = LT1001000100010001 /* LiveTranslateModels.swift */; };
 		LT0002000200020002 /* LiveTranslateService.swift in Sources */ = {isa = PBXBuildFile; fileRef = LT1002000200020002 /* LiveTranslateService.swift */; };
 		LT0003000300030003 /* LiveTranslateViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = LT1003000300030003 /* LiveTranslateViewModel.swift */; };
@@ -132,24 +132,16 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRouterHook.swift; path = Managers/ChappyRouterHook.swift; sourceTree = "<group>"; };
-		EB81EFB828618D74882D2907 /* ChappyNavMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyNavMode.swift; path = Managers/ChappyNavMode.swift; sourceTree = "<group>"; };
-		30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyConversation.swift; path = Managers/ChappyConversation.swift; sourceTree = "<group>"; };
-		053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyProactive.swift; path = Managers/ChappyProactive.swift; sourceTree = "<group>"; };
-		498DED13D7119C3AE95F4864 /* ChappyLists.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyLists.swift; path = Managers/ChappyLists.swift; sourceTree = "<group>"; };
-		E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyTimers.swift; path = Managers/ChappyTimers.swift; sourceTree = "<group>"; };
-		7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyDataBridge.swift; path = Managers/ChappyDataBridge.swift; sourceTree = "<group>"; };
-		EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryKeeper.swift; path = Managers/ChappyMemoryKeeper.swift; sourceTree = "<group>"; };
-		9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPulse.swift; path = Managers/ChappyPulse.swift; sourceTree = "<group>"; };
-		2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPhotoIngest.swift; path = Managers/ChappyPhotoIngest.swift; sourceTree = "<group>"; };
-		8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRelevance.swift; path = Managers/ChappyRelevance.swift; sourceTree = "<group>"; };
-		8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryBrowser.swift; path = Managers/ChappyMemoryBrowser.swift; sourceTree = "<group>"; };
 		0080AFEB87FC4CF85E53FE97 /* LanguageManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LanguageManager.swift; path = Managers/LanguageManager.swift; sourceTree = "<group>"; };
+		053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyProactive.swift; path = Managers/ChappyProactive.swift; sourceTree = "<group>"; };
 		069172850B30A2766C8BD4B5 /* TTSService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TTSService.swift; sourceTree = "<group>"; };
 		1111827A1CF7A278A6DC6934 /* APIProviderManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = APIProviderManager.swift; path = Managers/APIProviderManager.swift; sourceTree = "<group>"; };
+		2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPhotoIngest.swift; path = Managers/ChappyPhotoIngest.swift; sourceTree = "<group>"; };
+		30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyConversation.swift; path = Managers/ChappyConversation.swift; sourceTree = "<group>"; };
 		330AF93394A09D97C504F568 /* QuickVisionSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionSettingsView.swift; sourceTree = "<group>"; };
 		3A3A3A3A3A3A3A3A3A3A3A3A /* CameraAccess.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CameraAccess.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		414A2AC7E8B825BC1B4DB93F /* QuickVisionModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionModels.swift; sourceTree = "<group>"; };
+		498DED13D7119C3AE95F4864 /* ChappyLists.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyLists.swift; path = Managers/ChappyLists.swift; sourceTree = "<group>"; };
 		4B69CCC22F050D4300D1D025 /* RTMPStreamingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RTMPStreamingView.swift; sourceTree = "<group>"; };
 		4B69CCC42F050D5200D1D025 /* RTMPStreamingViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RTMPStreamingViewModel.swift; sourceTree = "<group>"; };
 		4B69CCC62F050D5D00D1D025 /* RTMPStreamingService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RTMPStreamingService.swift; sourceTree = "<group>"; };
@@ -209,15 +201,23 @@
 		568E19B82D2116C7FE3B1829 /* QuickVisionIntent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionIntent.swift; sourceTree = "<group>"; };
 		5C0ECA1D14EBBE33F66EEF18 /* LiveAIIntent.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LiveAIIntent.swift; sourceTree = "<group>"; };
 		63EB4C91D8E0C8AC944DF95A /* GeminiLiveService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GeminiLiveService.swift; sourceTree = "<group>"; };
+		67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRouterHook.swift; path = Managers/ChappyRouterHook.swift; sourceTree = "<group>"; };
 		6B037E0156E90DE2314A9F47 /* QuickVisionView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionView.swift; sourceTree = "<group>"; };
+		7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyDataBridge.swift; path = Managers/ChappyDataBridge.swift; sourceTree = "<group>"; };
+		8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRelevance.swift; path = Managers/ChappyRelevance.swift; sourceTree = "<group>"; };
+		8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryBrowser.swift; path = Managers/ChappyMemoryBrowser.swift; sourceTree = "<group>"; };
 		8FD96B772E6F0A9800F56AB1 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8FD96B782E6F0A9800F56AB1 /* TurboMeta.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = TurboMeta.entitlements; sourceTree = "<group>"; };
 		8FD96B792E6F0A9800F56AB1 /* TurboMetaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurboMetaApp.swift; sourceTree = "<group>"; };
 		8FD96B7B2E6F0A9800F56AB1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPulse.swift; path = Managers/ChappyPulse.swift; sourceTree = "<group>"; };
 		C7F490219E64EC144DAF8A8C /* QuickVisionStorage.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionStorage.swift; sourceTree = "<group>"; };
 		CA3E36CE337855A7F17F2AC8 /* QuickVisionService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuickVisionService.swift; sourceTree = "<group>"; };
 		DC72379319F7F8AAF8019018 /* LiveAIManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LiveAIManager.swift; path = Managers/LiveAIManager.swift; sourceTree = "<group>"; };
 		E699CC952E8150670052C240 /* CameraAccessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CameraAccessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyTimers.swift; path = Managers/ChappyTimers.swift; sourceTree = "<group>"; };
+		EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryKeeper.swift; path = Managers/ChappyMemoryKeeper.swift; sourceTree = "<group>"; };
+		EB81EFB828618D74882D2907 /* ChappyNavMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyNavMode.swift; path = Managers/ChappyNavMode.swift; sourceTree = "<group>"; };
 		LT1001000100010001 /* LiveTranslateModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTranslateModels.swift; sourceTree = "<group>"; };
 		LT1002000200020002 /* LiveTranslateService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTranslateService.swift; sourceTree = "<group>"; };
 		LT1003000300030003 /* LiveTranslateViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTranslateViewModel.swift; sourceTree = "<group>"; };
@@ -741,7 +741,7 @@
 				CODE_SIGN_ENTITLEMENTS = CameraAccess/TurboMeta.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 130;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = 6NX3NYV6DK;
 				ENABLE_PREVIEWS = YES;
@@ -771,7 +771,7 @@
 				CODE_SIGN_ENTITLEMENTS = CameraAccess/TurboMeta.entitlements;
 				CODE_SIGN_IDENTITY = "";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 130;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = 6NX3NYV6DK;
 				ENABLE_PREVIEWS = YES;
@@ -798,7 +798,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 130;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -826,7 +826,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 124;
+				CURRENT_PROJECT_VERSION = 130;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GENERATE_INFOPLIST_FILE = YES;
