@@ -7,6 +7,18 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		558B41A82753DE62D1DDA703 /* ChappyRouterHook.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */; };
+		2D0C84D5142EA8FA3746CD02 /* ChappyNavMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB81EFB828618D74882D2907 /* ChappyNavMode.swift */; };
+		A42D3FF068527FE4F6EFDCC5 /* ChappyConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */; };
+		03E4006E9F4089719887A2CC /* ChappyProactive.swift in Sources */ = {isa = PBXBuildFile; fileRef = 053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */; };
+		565451425EAAF582C732D0DD /* ChappyLists.swift in Sources */ = {isa = PBXBuildFile; fileRef = 498DED13D7119C3AE95F4864 /* ChappyLists.swift */; };
+		53F8E88D7FE48BA073AE1516 /* ChappyTimers.swift in Sources */ = {isa = PBXBuildFile; fileRef = E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */; };
+		94FFAFB0D3ED2FB0F5B083C6 /* ChappyDataBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */; };
+		56CD99FD1815F5BC040117E7 /* ChappyMemoryKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */; };
+		7F705D33AD599F31BA69ABA5 /* ChappyPulse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */; };
+		79E1F7ACFA8907F31F4D30C1 /* ChappyPhotoIngest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */; };
+		EDE3E7D84058F8A7A3FD7B31 /* ChappyRelevance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */; };
+		92BCB49284B79ABB0DBA0BF9 /* ChappyMemoryBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */; };
 		05043536CDB06C0B88B3C4D9 /* TTSService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 069172850B30A2766C8BD4B5 /* TTSService.swift */; };
 		217BDD58A35C2D24403F74BF /* APIProviderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1111827A1CF7A278A6DC6934 /* APIProviderManager.swift */; };
 		26664DE8308E3F2981609421 /* QuickVisionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3E36CE337855A7F17F2AC8 /* QuickVisionService.swift */; };
@@ -120,6 +132,18 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRouterHook.swift; path = Managers/ChappyRouterHook.swift; sourceTree = "<group>"; };
+		EB81EFB828618D74882D2907 /* ChappyNavMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyNavMode.swift; path = Managers/ChappyNavMode.swift; sourceTree = "<group>"; };
+		30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyConversation.swift; path = Managers/ChappyConversation.swift; sourceTree = "<group>"; };
+		053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyProactive.swift; path = Managers/ChappyProactive.swift; sourceTree = "<group>"; };
+		498DED13D7119C3AE95F4864 /* ChappyLists.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyLists.swift; path = Managers/ChappyLists.swift; sourceTree = "<group>"; };
+		E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyTimers.swift; path = Managers/ChappyTimers.swift; sourceTree = "<group>"; };
+		7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyDataBridge.swift; path = Managers/ChappyDataBridge.swift; sourceTree = "<group>"; };
+		EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryKeeper.swift; path = Managers/ChappyMemoryKeeper.swift; sourceTree = "<group>"; };
+		9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPulse.swift; path = Managers/ChappyPulse.swift; sourceTree = "<group>"; };
+		2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyPhotoIngest.swift; path = Managers/ChappyPhotoIngest.swift; sourceTree = "<group>"; };
+		8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyRelevance.swift; path = Managers/ChappyRelevance.swift; sourceTree = "<group>"; };
+		8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ChappyMemoryBrowser.swift; path = Managers/ChappyMemoryBrowser.swift; sourceTree = "<group>"; };
 		0080AFEB87FC4CF85E53FE97 /* LanguageManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = LanguageManager.swift; path = Managers/LanguageManager.swift; sourceTree = "<group>"; };
 		069172850B30A2766C8BD4B5 /* TTSService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TTSService.swift; sourceTree = "<group>"; };
 		1111827A1CF7A278A6DC6934 /* APIProviderManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = APIProviderManager.swift; path = Managers/APIProviderManager.swift; sourceTree = "<group>"; };
@@ -236,6 +260,18 @@
 				1111827A1CF7A278A6DC6934 /* APIProviderManager.swift */,
 				51A08DC107E5A57DDE6036C3 /* QuickVisionModeManager.swift */,
 				DC72379319F7F8AAF8019018 /* LiveAIManager.swift */,
+				67590E0834B03A7D7B316FEB /* ChappyRouterHook.swift */,
+				EB81EFB828618D74882D2907 /* ChappyNavMode.swift */,
+				30A4C2262C83187A60DE8B33 /* ChappyConversation.swift */,
+				053EADE1DBA73BD12495F8B3 /* ChappyProactive.swift */,
+				498DED13D7119C3AE95F4864 /* ChappyLists.swift */,
+				E97BF00300855DF93C54CDE8 /* ChappyTimers.swift */,
+				7B06EE6A713DC6895AE6D9BE /* ChappyDataBridge.swift */,
+				EB19FC3156FD3970A9722392 /* ChappyMemoryKeeper.swift */,
+				9FB8221FC00343E8D66C7149 /* ChappyPulse.swift */,
+				2371B59362E50ECF88A7E891 /* ChappyPhotoIngest.swift */,
+				8E6A337BF5D1623CFA2CBFD2 /* ChappyRelevance.swift */,
+				8F1917C4ABE2F3FFA834B21F /* ChappyMemoryBrowser.swift */,
 			);
 			name = Managers;
 			sourceTree = "<group>";
@@ -632,6 +668,18 @@
 				3121D19C06DC68008799365A /* LiveAIIntent.swift in Sources */,
 				4BB5DFF12F06C06D00AF7BD0 /* LiveAIModeManager.swift in Sources */,
 				759D8C3F84F44478678CA613 /* LiveAIManager.swift in Sources */,
+				558B41A82753DE62D1DDA703 /* ChappyRouterHook.swift in Sources */,
+				2D0C84D5142EA8FA3746CD02 /* ChappyNavMode.swift in Sources */,
+				A42D3FF068527FE4F6EFDCC5 /* ChappyConversation.swift in Sources */,
+				03E4006E9F4089719887A2CC /* ChappyProactive.swift in Sources */,
+				565451425EAAF582C732D0DD /* ChappyLists.swift in Sources */,
+				53F8E88D7FE48BA073AE1516 /* ChappyTimers.swift in Sources */,
+				94FFAFB0D3ED2FB0F5B083C6 /* ChappyDataBridge.swift in Sources */,
+				56CD99FD1815F5BC040117E7 /* ChappyMemoryKeeper.swift in Sources */,
+				7F705D33AD599F31BA69ABA5 /* ChappyPulse.swift in Sources */,
+				79E1F7ACFA8907F31F4D30C1 /* ChappyPhotoIngest.swift in Sources */,
+				EDE3E7D84058F8A7A3FD7B31 /* ChappyRelevance.swift in Sources */,
+				92BCB49284B79ABB0DBA0BF9 /* ChappyMemoryBrowser.swift in Sources */,
 				LT0001000100010001 /* LiveTranslateModels.swift in Sources */,
 				LT0002000200020002 /* LiveTranslateService.swift in Sources */,
 				LT0003000300030003 /* LiveTranslateViewModel.swift in Sources */,

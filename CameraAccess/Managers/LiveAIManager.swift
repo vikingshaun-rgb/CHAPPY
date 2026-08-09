@@ -4883,6 +4883,9 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
         }
         // PHASE 4 STEP 5: and the navigator (speaks turns when close)
         Task { @MainActor in NavEngine.shared.updateLocation(loc) }
+        // BUILD 130: memory volunteers on arrival. Rides the fixes that
+        // already exist rather than starting a second location manager.
+        Task { @MainActor in ChappyRelevance.shared.locationUpdated(loc) }
         if Date().timeIntervalSince(lastGeocode) > 120 {
             lastGeocode = Date()
             reverseGeocode(loc)

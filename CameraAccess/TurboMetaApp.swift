@@ -33,6 +33,9 @@ struct TurboMetaApp: App {
   @StateObject private var wearablesViewModel: WearablesViewModel
 
   init() {
+    // BGTaskScheduler REQUIRES registration before launch finishes.
+    ChappyProactive.shared.registerBackgroundTask()
+
     do {
       try Wearables.configure()
       print("✅ [Chappy] Wearables SDK configured successfully")
@@ -49,6 +52,13 @@ struct TurboMetaApp: App {
       // Main app view with access to the shared Wearables SDK instance
       // The Wearables.shared singleton provides the core DAT API
       MainAppView(wearables: Wearables.shared, viewModel: wearablesViewModel)
+        .onAppear {
+          ChappyProactive.shared.start()            // 8 scheduled check-ins
+          ChappyLists.shared.startAtLaunch()        // re-arm shop geofences
+          ChappyTimers.shared.restoreAfterLaunch()  // re-arm spoken timers
+          ChappyPulse.shared.start()                // ambient memory dial
+          ChappyPhotoIngest.shared.start()          // wi-fi monitor for ingest
+        }
         // Show error alerts for view model failures
         .alert("Error", isPresented: $wearablesViewModel.showError) {
           Button("OK") {

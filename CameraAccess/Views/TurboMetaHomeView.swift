@@ -597,7 +597,10 @@ struct TurboMetaHomeView: View {
                 OpenClawChatView(streamViewModel: streamViewModel)
             }
             .fullScreenCover(isPresented: $showMemory) {
-                MemoryView()
+                // BUILD 130: the new browser — map view, detail cards with
+                // navigate-back, and an ambient filter so Pulse frames don't
+                // bury the photos he actually chose to take.
+                ChappyMemoryBrowser()
             }
             .fullScreenCover(isPresented: $showReminders) {
                 RemindersView()
