@@ -338,6 +338,11 @@ final class ChappyProactive: NSObject, ObservableObject {
         // retries producing three notifications an hour later.
         doneSlots = doneSlots + [slot]
 
+        // Daily housekeeping rides along with whichever pass runs first —
+        // no extra schedule, no extra wake-ups.
+        await ChappyMemoryKeeper.shared.nudgeIfDue()      // consolidate the profile
+        await ChappyPhotoIngest.shared.ingestIfDue()      // glasses photos, if charging on wi-fi
+
         guard let brief = await composeBrief(slot: slot) else { return }
 
         lastBrief = brief.spoken
@@ -480,6 +485,8 @@ final class ChappyProactive: NSObject, ObservableObject {
             "system":     briefSystemPrompt(partOfDay: partOfDay),
             "messages":   [["role": "user", "content": """
                 CONTEXT: \(context)
+
+                \(ChappyMemoryKeeper.shared.profileBlock())
 
                 DIARY TODAY: \(agenda.isEmpty ? "nothing scheduled" : agenda)
 

@@ -507,12 +507,17 @@ final class ChappyConversation: ObservableObject {
         let agenda = ChappyDataBridge.agenda()
         if !agenda.isEmpty { ctx += " Diary today: \(agenda)" }
 
+        // Curated durable profile — bounded, so it stays cheap forever.
+        let profile = ChappyMemoryKeeper.shared.profileBlock()
+
         return """
         You are Chappy, Shaun's assistant, speaking into his Ray-Ban Meta glasses. \
         Audio only — he has no screen in front of him and cannot read anything you produce.
 
         CONTEXT
         \(ctx)
+
+        \(profile)
 
         HOW YOU SPEAK
         Everything you write is read aloud, so write only what a person would say out loud. \

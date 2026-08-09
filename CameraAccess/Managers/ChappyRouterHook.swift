@@ -86,6 +86,13 @@ enum ChappyRouterHook {
             return true
         }
 
+        // ── 5b. Ambient memory: dial, boost, browse, spend ──────────────
+        // All free and local — no model, no network.
+        if let spoken = handleMemoryCommand(c) {
+            TTSService.shared.speak(spoken)
+            return true
+        }
+
         // ── 6. Timers and lists, free and instant ───────────────────────
         // The commands he'll use most, none of which needs a model. Opening a
         // paid session to hear "ten minutes" would be daft, and slower, which
@@ -248,6 +255,80 @@ enum ChappyRouterHook {
         return c.split(separator: " ").count > 22
     }
 
+    // MARK: - Ambient memory commands (PHASE 5 STEP 2)
+
+    /// The dial, the boost, the browser and the spend readout. Returns a line
+    /// to speak, or nil to let the rest of the router have it.
+    private static func handleMemoryCommand(_ c: String) -> String? {
+
+        // Stop, first and unconditionally. If he wants it off it goes off,
+        // and it must not be possible for a phrasing miss to keep it running.
+        if ["stop remembering", "stop recording", "stop the camera",
+            "stop ambient", "turn off memory", "forget the camera"]
+            .contains(where: { c.contains($0) }) {
+            ChappyPulse.shared.stopEverything()
+            return nil                                   // stopEverything speaks
+        }
+
+        // "remember everything for the next hour" / "for 20 minutes"
+        if c.contains("remember everything") || c.contains("record everything")
+            || c.contains("capture everything") {
+            var mins = 60
+            if let n = c.components(separatedBy: CharacterSet.decimalDigits.inverted)
+                .filter({ !$0.isEmpty }).first.flatMap({ Int($0) }), n > 0, n <= 480 {
+                mins = c.contains("hour") ? n * 60 : n
+            } else if c.contains("hour") {
+                mins = 60
+            }
+            ChappyPulse.shared.boost(minutes: min(mins, 480))
+            return nil                                   // boost speaks
+        }
+
+        // Setting the dial by name.
+        for tier in ChappyPulse.Tier.allCases where tier != .off {
+            let name = tier.rawValue
+            if c.contains("memory \(name)") || c.contains("\(name) memory")
+                || c.contains("set memory to \(name)") || c.contains("go \(name)") {
+                ChappyPulse.shared.setTier(tier)
+                return nil                               // setTier speaks
+            }
+        }
+
+        // How is it doing, and what has it cost.
+        if ["memory status", "how's memory", "hows memory", "what's memory doing",
+            "whats memory doing", "how much has memory cost", "what have i spent on memory"]
+            .contains(where: { c.contains($0) }) {
+            return ChappyPulse.shared.statusLine() + " " + ChappyPhotoIngest.shared.statusLine()
+        }
+
+        // Open the browser. Speech can't scroll a list, so this is a handoff.
+        if ["show my memory", "open my memory", "show me my memories",
+            "open memory", "memory browser", "show my photos from"]
+            .contains(where: { c.contains($0) }) {
+            NotificationCenter.default.post(name: .chappyOpenMemory, object: nil)
+            return "Opening your memory."
+        }
+
+        // Stop volunteering places / start again.
+        if c.contains("stop telling me about places") || c.contains("stop suggesting places") {
+            ChappyRelevance.shared.isEnabled = false
+            return "I'll keep quiet about places."
+        }
+        if c.contains("tell me about places") || c.contains("remind me about places") {
+            ChappyRelevance.shared.isEnabled = true
+            return "I'll mention places you've been when you're near them."
+        }
+
+        // Catch the photos up now rather than waiting for tonight.
+        if c.contains("catch up on my photos") || c.contains("import my photos")
+            || c.contains("ingest my photos") {
+            Task { await ChappyPhotoIngest.shared.runNow() }
+            return "Going through your glasses photos now."
+        }
+
+        return nil
+    }
+
     // MARK: - Free timer and list handling
 
     /// Returns something to say if this was a timer or list command, nil to
@@ -368,3 +449,5 @@ enum ChappyRouterHook {
         return d.count > 1 ? d : nil
     }
 }
+
+
