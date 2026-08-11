@@ -285,6 +285,65 @@ struct TurboMetaHomeView: View {
             : cachedReminderLine
     }
 
+    /// BUILD 140 — the day at a glance, on the home screen. Events and timed
+    /// reminders merged, next three, soonest first. Tap opens the Diary.
+    private var todayGlanceCard: some View {
+        let df: DateFormatter = { let f = DateFormatter(); f.dateFormat = "h:mm a"; return f }()
+        let now = Date()
+        var rows: [(at: Date, icon: String, tint: Color, text: String)] = []
+        for e in ChappyCalendar.shared.today() where !e.isAllDay {
+            if let s = e.startDate, (e.endDate ?? s) > now {
+                rows.append((s, "calendar", .purple, "\(e.title ?? "Appointment") · \(df.string(from: s))"))
+            }
+        }
+        for r in ChappyReminders.shared.today() where r.deliveredAt == nil && r.doneAt == nil {
+            if let f = r.effectiveFire, f > now {
+                rows.append((f, "bell.fill", theme.accent, "\(r.title) · \(df.string(from: f))"))
+            }
+        }
+        let next = rows.sorted { $0.at < $1.at }.prefix(3)
+        let od = ChappyReminders.shared.overdue().count
+
+        return Button { showReminders = true } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("TODAY")
+                        .font(.caption2).fontWeight(.heavy).tracking(0.8)
+                        .foregroundColor(theme.accent)
+                    Spacer()
+                    if od > 0 {
+                        Text("\(od) overdue")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.red)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11)).foregroundColor(theme.textSecondary)
+                }
+                if next.isEmpty {
+                    Text("Nothing left on today.")
+                        .font(.subheadline).foregroundColor(theme.textSecondary)
+                } else {
+                    ForEach(Array(next.enumerated()), id: \.offset) { _, row in
+                        HStack(spacing: 8) {
+                            Image(systemName: row.icon)
+                                .font(.system(size: 11)).foregroundColor(row.tint)
+                                .frame(width: 16)
+                            Text(row.text)
+                                .font(.subheadline).foregroundColor(theme.textPrimary)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+            }
+            .padding(13)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 15).fill(theme.cardFill))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+    }
+
     private var memoryDetailLine: String {
         cachedMemoryLine.isEmpty
             ? "Everything Chappy stores, in one place"
@@ -537,12 +596,17 @@ struct TurboMetaHomeView: View {
                         .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
                         .id(journalTick) // refresh counts when Remember fires
 
+                        // BUILD 140 — THE GLANCE. The day, on the home screen,
+                        // before you've opened anything: next events, next
+                        // reminders, one line of counts. Tap = the full Diary.
+                        todayGlanceCard
+
                         // MORE
                         VStack(spacing: 8) {
                             // PHASE 5 — the one spot. Sits first because it is
                             // the thing you come back to, not a setting.
-                            MoreRow(icon: "bell.badge.fill",
-                                    title: "Reminders",
+                            MoreRow(icon: "book.closed.fill",
+                                    title: "Diary",
                                     detail: remindersDetailLine) {
                                 showReminders = true
                             }
@@ -689,6 +753,10 @@ struct TurboMetaHomeView: View {
             // BUILD 132 — one-shot cleanup: the duplicate "glowing phone
             // screen" pulse captions and model junk already in the store.
             ChappyMemory.shared.sweepPulseJunk()
+            // BUILD 138 — the Trail: all-day visit + breadcrumb monitoring.
+            // Asks once to upgrade location to Always; low-power by design
+            // (Apple's visit detection + significant changes, no raw GPS).
+            ChappyTrail.shared.start()
 
             // PHASE 5.5 — reminders. Permission, re-arm every notification
             // (they are lost on reinstall and after a restore), start the
@@ -1323,46 +1391,174 @@ struct ScaleButtonStyle: ButtonStyle {
 // On-demand map: appears ONLY when asked — voice-first always.
 // Route drawn on MapKit (display), routing data from Google (NavEngine).
 
-/// Today's trail — the Map button's view when not navigating: your live
-/// location plus every journal breadcrumb from today.
+/// BUILD 138 — THE TRAIL. The Map button's view when not navigating: the
+/// day drawn as a line, the places you stopped as cards, and a strip of the
+/// last week to swipe back through. Fed by ChappyTrail's all-day visit and
+/// breadcrumb monitoring, plus the journal crumbs that were always there.
 struct TodayMapSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var trail = ChappyTrail.shared
+    @State private var selectedDay = Calendar.current.startOfDay(for: Date())
+
+    private var isToday: Bool { Calendar.current.isDateInToday(selectedDay) }
+
+    private var dayCoords: [CLLocationCoordinate2D] {
+        var pts = trail.points(for: selectedDay)
+            .map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+        // Today also gets the fine-grained journal crumbs it always had.
+        if isToday {
+            pts += TripRecorder.shared.crumbs.map {
+                CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+            }
+        }
+        return pts
+    }
+
     var body: some View {
         NavigationView {
-            ZStack(alignment: .bottom) {
-                RouteMapView(
-                    coords: TripRecorder.shared.crumbs.map {
-                        CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
-                    },
-                    destination: nil,
-                    spots: TripRecorder.shared.spots)
-                    .ignoresSafeArea(edges: .bottom)
+            VStack(spacing: 0) {
+                dayStrip
+                ZStack(alignment: .bottom) {
+                    RouteMapView(
+                        coords: dayCoords,
+                        destination: nil,
+                        spots: isToday ? TripRecorder.shared.spots : [])
+                        .ignoresSafeArea(edges: [])
 
-                // The same escape hatch as the route map: one tap to the real
-                // thing, from wherever you happen to be looking.
-                Button {
-                    NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
-                } label: {
-                    Label("Open in Google Maps", systemImage: "map.fill")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.blue))
-                        .foregroundColor(.white)
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 28)
-            }
-                .navigationTitle(TripRecorder.shared.spots.isEmpty
-                                 ? "Today's Trail"
-                                 : "Today's Trail · \(TripRecorder.shared.spots.count) saved")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("Done") { dismiss() }
+                    Button {
+                        NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                    } label: {
+                        Label("Open in Google Maps", systemImage: "map.fill")
+                            .font(.subheadline).fontWeight(.semibold)
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                            .background(Capsule().fill(Color.blue))
+                            .foregroundColor(.white)
                     }
+                    .padding(.bottom, 12)
                 }
+                visitList
+            }
+            .navigationTitle(isToday ? "Today's Trail" : Self.dayTitle(selectedDay))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
         }
+    }
+
+    /// The last seven days, newest first.
+    private var dayStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(0..<7, id: \.self) { back in
+                    let day = Calendar.current.date(byAdding: .day, value: -back,
+                        to: Calendar.current.startOfDay(for: Date()))!
+                    let on = Calendar.current.isDate(day, inSameDayAs: selectedDay)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { selectedDay = day }
+                    } label: {
+                        Text(back == 0 ? "Today" : (back == 1 ? "Yesterday" : Self.shortDay(day)))
+                            .font(.caption).fontWeight(.semibold)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Capsule().fill(on ? Color.blue.opacity(0.25) : Color.white.opacity(0.06)))
+                            .foregroundColor(on ? .blue : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8)
+        }
+        .background(Color.black.opacity(0.25))
+    }
+
+    /// The stops of the day, in order — the timeline you can read.
+    private var visitList: some View {
+        let visits = trail.visits(for: selectedDay).sorted { $0.arrive < $1.arrive }
+        return Group {
+            if visits.isEmpty {
+                VStack(spacing: 5) {
+                    Text(isToday ? "No stops recorded yet today"
+                                 : "No stops recorded that day")
+                        .font(.subheadline).foregroundColor(.primary)
+                    Text("Chappy notices arrivals and departures on its own once location is set to Always. Moving draws the line; stopping makes a card.")
+                        .font(.caption2).foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 18)
+            } else {
+                ScrollView {
+                    VStack(spacing: 8) {
+                        ForEach(visits) { v in
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: "mappin.circle.fill")
+                                    .font(.system(size: 18)).foregroundColor(.blue)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(v.name ?? "Stopped here")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundColor(.primary)
+                                    Text(v.spokenWindow)
+                                        .font(.caption).foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                // Back to any stop — the memory's exact spot,
+                                // through the machinery that already exists.
+                                Button {
+                                    NavEngine.shared.navigateBack(
+                                        to: CLLocationCoordinate2D(latitude: v.lat, longitude: v.lon),
+                                        name: v.name ?? "that stop")
+                                    dismiss()
+                                } label: {
+                                    Image(systemName: "arrow.uturn.backward.circle")
+                                        .font(.system(size: 18)).foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))
+                            .padding(.horizontal, 12)
+                            // BUILD 138 — TAGS AND LINKS. Long-press a stop:
+                            // star it (becomes a saved place — findable in
+                            // Memory, usable by "take me back"), mark it as
+                            // Home ("take me home" now points here), or open
+                            // the place itself in Google Maps — reviews,
+                            // website, opening hours, the lot.
+                            .contextMenu {
+                                Button {
+                                    TripRecorder.shared.saveSpot(
+                                        named: v.name ?? "Starred place",
+                                        lat: v.lat, lon: v.lon)
+                                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                } label: { Label("Star — save this place", systemImage: "star.fill") }
+                                Button {
+                                    TripRecorder.shared.saveSpot(named: "Home", lat: v.lat, lon: v.lon)
+                                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                } label: { Label("Set as Home", systemImage: "house.fill") }
+                                Button {
+                                    let q = (v.name ?? "").addingPercentEncoding(
+                                        withAllowedCharacters: .urlQueryAllowed) ?? ""
+                                    let u = q.isEmpty
+                                        ? "https://www.google.com/maps/search/?api=1&query=\(v.lat),\(v.lon)"
+                                        : "https://www.google.com/maps/search/?api=1&query=\(q)&center=\(v.lat),\(v.lon)"
+                                    if let url = URL(string: u) { UIApplication.shared.open(url) }
+                                } label: { Label("Place info in Google Maps", systemImage: "safari") }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+                .frame(maxHeight: 230)
+            }
+        }
+    }
+
+    private static func shortDay(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "EEE d"; return f.string(from: d)
+    }
+    private static func dayTitle(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"; return f.string(from: d)
     }
 }
 
@@ -3091,6 +3287,7 @@ struct RemindersView: View {
                         switch mode {
                         case .schedule:
                             categoryChips
+                            suggestedSection
                             diarySection
                             section("Overdue", inFilter(reminders.overdue()), .red)
                             section("Today", inFilter(reminders.today().filter { $0.deliveredAt == nil }), theme.accent)
@@ -3117,7 +3314,7 @@ struct RemindersView: View {
                     .padding(.top, 8)
                 }
             }
-            .navigationTitle("Reminders")
+            .navigationTitle("Diary")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -3507,6 +3704,51 @@ struct RemindersView: View {
     private static func time(_ d: Date?) -> String {
         guard let d else { return "" }
         let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    // BUILD 140 — SUGGESTED. Chappy's proposals for the day: a get-ready
+    // nudge per appointment, a time for anything that has none. One tap
+    // accepts one; "Chappy, plan my day" accepts the lot by voice. They
+    // vanish as they're accepted because the store now covers them.
+    @State private var suggTick = 0
+
+    @ViewBuilder
+    private var suggestedSection: some View {
+        let sugg = reminders.suggestions()
+        if !sugg.isEmpty {
+            Text("SUGGESTED — TAP ✓ TO SET")
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(.orange)
+                .padding(.horizontal, 20).padding(.top, 8)
+                .id(suggTick)
+            ForEach(sugg) { s in
+                HStack(spacing: 10) {
+                    Image(systemName: "lightbulb.fill")
+                        .font(.system(size: 13)).foregroundColor(.orange)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(s.title) · \(Self.time(s.fire))")
+                            .font(.subheadline).foregroundColor(theme.textPrimary)
+                            .lineLimit(1)
+                        Text(s.reason)
+                            .font(.caption2).foregroundColor(theme.textSecondary)
+                    }
+                    Spacer()
+                    Button {
+                        _ = ChappyDataBridge.addReminder(text: s.title, at: s.fire)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        suggTick += 1
+                    } label: {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 22)).foregroundColor(.green)
+                    }
+                }
+                .padding(11)
+                .background(RoundedRectangle(cornerRadius: 13)
+                    .fill(Color.orange.opacity(0.08)))
+                .padding(.horizontal, 16)
+            }
+        }
     }
 
     // BUILD 134 — THE PINGS TAB.

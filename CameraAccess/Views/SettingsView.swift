@@ -600,6 +600,23 @@ struct SettingsView: View {
                             }
                         }
                     }
+                    // BUILD 138 — the Trail's one switch.
+                    Toggle(isOn: Binding(
+                        get: { ChappyTrail.shared.isEnabled },
+                        set: { ChappyTrail.shared.isEnabled = $0 }
+                    )) {
+                        HStack {
+                            Image(systemName: "point.bottomleft.forward.to.point.topright.scurvepath")
+                                .foregroundColor(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Daily trail")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Draws where you've been, day by day — visits and the path between them. Needs location on Always; stays on this phone; days expire after 90.")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
                 } header: {
                     Text("Chappy's memory")
                 } footer: {
@@ -1676,13 +1693,21 @@ struct ChappyVoiceSettingsView: View {
     @AppStorage("chappy_tts_voice") private var selectedVoice: String = "Kore"
     @ObservedObject private var tts = TTSService.shared
 
+    // BUILD 139: the deep end added — Google ships 30 voices and the picker
+    // only showed six. Algenib is the genuinely deep one.
     private let voices: [(name: String, description: String)] = [
         ("Kore", "Warm, friendly female - the Chappy default"),
         ("Aoede", "Bright, upbeat female"),
         ("Leda", "Calm, soothing female"),
+        ("Sulafat", "Warm, rich female"),
+        ("Gacrux", "Mature, seasoned female"),
         ("Puck", "Energetic male"),
         ("Charon", "Deep, steady male"),
         ("Fenrir", "Strong, confident male"),
+        ("Algenib", "Gravelly, DEEP male - the rumble"),
+        ("Iapetus", "Low, clear male"),
+        ("Orus", "Firm, grounded male"),
+        ("Sadaltager", "Knowledgeable male - the professor"),
         ("System", "Apple voice - instant and works offline")
     ]
 
