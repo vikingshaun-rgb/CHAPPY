@@ -40,7 +40,11 @@ class APIKeyManager {
                 "R0Rar3EGP9woBFb_xslTY00DuJR_GD5NGI75uT5O1jJKgQ-_3IK6wAA"].joined()
     }
     private var defaultGoogleKey: String {
-        return ["AIzaSy", "Aq4nkw3Quu6", "a5mLOVG4EUm4n_Ru5Rox9Y"].joined()
+        // BUILD 141: the key from the BILLED project ("Chappy", the one wired
+        // to the prepaid credit), locked to generativelanguage only. The old
+        // key belonged to an unbilled project — which is why the voice kept
+        // hitting free-tier quota walls and falling back to the robot.
+        return ["AIzaSy", "Bjkebh0-XPrD2", "OTscKWRAmg3853CipeeY"].joined()
     }
     // chappy-maps key — locked to Routes + Places + Geocoding only.
     // Separate from the Gemini key (which is generativelanguage-locked).
@@ -51,7 +55,7 @@ class APIKeyManager {
     // Bump this number whenever a baked key above changes. On the next launch
     // the new keys overwrite whatever is in the Keychain ONCE — after that,
     // keys the user types in Settings are left alone.
-    private let keySeedVersion = 8
+    private let keySeedVersion = 9   // BUILD 141: billed-project Gemini key
     private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
 
     private func seedDefaultKeys() {

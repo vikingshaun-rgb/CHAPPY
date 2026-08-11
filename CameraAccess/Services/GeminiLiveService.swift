@@ -674,7 +674,12 @@ class GeminiLiveService: NSObject {
             // teaching chat to reclaim the microphone on foreground, on unlock
             // and after an interruption, which are precisely the three moments
             // the format is unsettled. Refuse, and come back in half a second.
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            // BUILD 142: a VALID format isn't enough — installTap also dies,
+            // uncatchably, if the route shifts between this read and the
+            // install (the crash in the 11 Aug .ips). Treat "the audio world
+            // moved in the last beat" exactly like "format not ready": defer.
+            let settling = Date().timeIntervalSince(ChappyStandby.lastAudioUpheavalAt) < 0.7
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0, !settling else {
                 formatDeferrals += 1
                 guard formatDeferrals <= Self.maxFormatDeferrals else {
                     formatDeferrals = 0
@@ -682,7 +687,7 @@ class GeminiLiveService: NSObject {
                     onError?("Chappy can't get to the microphone. Close the chat and open it again.")
                     return
                 }
-                print("⚠️ [Gemini] Input format not ready (\(inputFormat.sampleRate) Hz) — deferring \(formatDeferrals)/\(Self.maxFormatDeferrals)")
+                print("⚠️ [Gemini] Input \(settling ? "route settling" : "format not ready (\(inputFormat.sampleRate) Hz)") — deferring \(formatDeferrals)/\(Self.maxFormatDeferrals)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self, self.wantsRecording, !self.isRecording else { return }
                     self.startRecording()

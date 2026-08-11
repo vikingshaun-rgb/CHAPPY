@@ -1475,6 +1475,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // engines and two greetings.
         guard !isListening, !starting else { return }
         starting = true
+        installUpheavalWatch()   // BUILD 142: tap installs wait out route changes
         // Never fight Live AI for the microphone — Live AI IS the deep layer.
         guard !LiveAIManager.shared.isRunning else {
             // AUDIT FIX (SB-C1): this returned without clearing `starting`, so
@@ -1935,6 +1936,31 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     /// AUDIT P0 (SB-LOOP): scoped to the CURRENT engine instance, so it has to be
     /// re-registered whenever the engine is replaced. Also filters out the
+    /// BUILD 142: the moment the audio world last MOVED — any route change,
+    /// any engine reconfiguration, anywhere in the process. Tap installs
+    /// check this and refuse to run until the dust settles, because
+    /// installing into moving hardware is the uncatchable crash in the .ips.
+    nonisolated(unsafe) static var lastAudioUpheavalAt = Date.distantPast
+    private static var upheavalWatchInstalled = false
+
+    private func installUpheavalWatch() {
+        guard !Self.upheavalWatchInstalled else { return }
+        Self.upheavalWatchInstalled = true
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+        nc.addObserver(forName: .AVAudioEngineConfigurationChange,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+    }
+
     /// changes we caused ourselves — without that, every rebuild triggers the
     /// next one, and every TTS playback engine start re-enters here too.
     private func reinstallConfigChangeObserver() {
@@ -2731,6 +2757,24 @@ final class ChappyStandby: NSObject, ObservableObject {
         request = req
 
         let input = engine.inputNode
+        // BUILD 142 — THE CRASH IN THE .IPS, KILLED AT THE SOURCE.
+        //
+        // installTap throws an UNCATCHABLE exception when the hardware format
+        // shifts between reading it and installing the tap — and the crash
+        // report shows exactly that: InstallTapOnNode dying on the main
+        // thread while the engine queue was mid IOUnitConfigurationChanged
+        // (Safari grabbing the route, app backgrounded). The format guard
+        // below can't close that race; NOT INSTALLING during upheaval can.
+        // A tap is never installed within a breath of a route change — wait
+        // for calm, then come back.
+        if Date().timeIntervalSince(Self.lastAudioUpheavalAt) < 0.7 {
+            print("👂 [Standby] Audio still settling — deferring the tap")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, self.isListening else { return }
+                _ = self.startRecognition()
+            }
+            return false
+        }
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             print("⚠️ [Standby] Mic format not ready")
@@ -3613,6 +3657,32 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak(facts.isEmpty ? "Here's your list. Nothing due." : "Here's your list. " + facts.joined(separator: " "))
             return
         }
+        // BUILD 140 — "PLAN MY DAY." Chappy reads the diary and sets the
+        // reminders you'd have set yourself: a get-ready nudge per
+        // appointment, a time for anything that has none. One sentence in,
+        // a planned day out — every one of them editable in the Diary after.
+        if c.contains("plan my day") || c.contains("suggest reminders")
+            || c.contains("set up my day") || c.contains("organise my day")
+            || c.contains("organize my day") {
+            let sugg = ChappyReminders.shared.suggestions()
+            guard !sugg.isEmpty else {
+                speak("The day's already covered — nothing worth adding."); return
+            }
+            let df = DateFormatter(); df.dateFormat = "h:mm a"
+            for s in sugg.prefix(3) { _ = ChappyDataBridge.addReminder(text: s.title, at: s.fire) }
+            let lines = sugg.prefix(3).map { "\($0.title) at \(df.string(from: $0.fire))" }
+                .joined(separator: ". ")
+            speak("Done. \(lines). They're in the diary — kill any you don't want.")
+            return
+        }
+        // BUILD 139 — VOICE SELF-TEST. "All the voices sound the same" means
+        // Gemini renders are failing; this one command says WHY, out loud.
+        if c.contains("test the voice") || c.contains("voice test")
+            || c.contains("test your voice") || c.contains("why do you sound like a robot")
+            || c.contains("fix your voice") {
+            TTSService.shared.runVoiceSelfTest()
+            return
+        }
         // BUILD 135 — NOTIFICATION SELF-TEST. "Why aren't notifications
         // showing?" now has an answer you can get by asking. Reads the REAL
         // authorization state and, if allowed, fires a test banner in 5s.
@@ -3702,7 +3772,19 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak(n == 0 ? "Nothing stored yet."
                          : "\(n) memories in the last month, all searchable."); return
         }
-        if c.contains("where was i") || c.contains("where have i been") || c.contains("what did i do today") {
+        if c.contains("where was i") || c.contains("where have i been")
+            || c.contains("what did i do today") || c.contains("where did i go") {
+            // BUILD 138: a named day goes to the Trail — "where was I on
+            // Tuesday" is a history question, and the Trail holds the history.
+            if let day = ChappyTrail.dayMentioned(in: c),
+               !Calendar.current.isDateInToday(day) {
+                speak(ChappyTrail.shared.spokenSummary(for: day)); return
+            }
+            // Today: the Trail's visit list beats the old crumb summary when
+            // it has something; otherwise fall back to what always worked.
+            if !ChappyTrail.shared.todayVisits.isEmpty {
+                speak(ChappyTrail.shared.spokenSummary(for: Date())); return
+            }
             speak(TripRecorder.shared.todaySummary()); return
         }
         if c.contains("trace my steps") || c.contains("retrace") || c.contains("way i came") {
@@ -5454,6 +5536,26 @@ final class TripRecorder {
         spots.append(spot)
         saveSpots()
         print("📍 [Trip] Remembered spot: \(name)")
+        return spot
+    }
+
+    /// BUILD 138: save a spot at EXPLICIT coordinates — starring a Trail
+    /// visit from earlier in the day, or marking one as Home, must pin the
+    /// place you WERE, not the place you're standing now.
+    @discardableResult
+    func saveSpot(named rawName: String, lat: Double, lon: Double) -> Spot {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var spot = Spot(name: name.isEmpty ? "Starred place" : name, t: Date(),
+                        lat: lat, lon: lon,
+                        street: nil, city: nil, country: nil)
+        let mem = ChappyMemory.shared.rememberAt(.place, title: spot.name,
+                                                 lat: lat, lon: lon,
+                                                 tags: ["spot", "favourite"],
+                                                 source: "trail")
+        spot.memID = mem.id
+        spots.append(spot)
+        saveSpots()
+        print("📍 [Trip] Starred: \(spot.name)")
         return spot
     }
 
@@ -10120,5 +10222,335 @@ final class ChappyReader {
         let words = text.split(whereSeparator: \.isWhitespace).count
         if words < 40 { return "It's short — want me to read it now? Say 'keep reading'." }
         return "About \(words) words. Say 'keep reading' to hear it, or ask for it later with 'read my last scan'."
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY TRAIL (Build 138 — the day, drawn)
+// =====================================================================
+//
+// Google's Timeline works because it never stops watching. iOS won't let a
+// third-party app run raw GPS all day — and the wearer's battery wouldn't
+// survive it — but Apple provides two low-power instruments built for
+// exactly this job:
+//
+//   VISITS   — iOS itself detects "arrived somewhere, left somewhere" and
+//              delivers it even in the background, near-free on battery.
+//              This is the skeleton of a day: home till 2:10, the shop for
+//              twenty minutes, home again.
+//   SIGNIFICANT CHANGES — a breadcrumb roughly every 500m while moving.
+//              Enough to draw the day's path as a line on a map.
+//
+// Everything is stored ON THIS PHONE as one small JSON file per day.
+// Nothing leaves the device; reverse-geocoding a visit's name uses Apple's
+// geocoder, the same one the Maps app uses. Days expire after 90 unless
+// the wearer changes the setting. One switch kills the whole thing.
+@MainActor
+final class ChappyTrail: NSObject, ObservableObject {
+
+    static let shared = ChappyTrail()
+
+    struct Point: Codable {
+        var at: Date
+        var lat: Double
+        var lon: Double
+    }
+
+    struct Visit: Codable, Identifiable {
+        var id: UUID = UUID()
+        var arrive: Date
+        var depart: Date?          // nil = still there
+        var lat: Double
+        var lon: Double
+        var name: String?          // reverse-geocoded, lazily
+
+        var spokenWindow: String {
+            let f = DateFormatter(); f.dateFormat = "h:mm a"
+            if let d = depart {
+                let mins = max(1, Int(d.timeIntervalSince(arrive) / 60))
+                return "\(f.string(from: arrive)) to \(f.string(from: d)), about \(mins) minutes"
+            }
+            return "since \(f.string(from: arrive))"
+        }
+    }
+
+    private struct Day: Codable {
+        var points: [Point] = []
+        var visits: [Visit] = []
+    }
+
+    @Published private(set) var todayPoints: [Point] = []
+    @Published private(set) var todayVisits: [Visit] = []
+
+    private let mgr = CLLocationManager()
+    private var delegateSet = false
+    private let d = UserDefaults.standard
+
+    var isEnabled: Bool {
+        get { d.object(forKey: "chappy_trail_enabled") as? Bool ?? true }
+        set {
+            d.set(newValue, forKey: "chappy_trail_enabled")
+            newValue ? start() : stopMonitoring()
+        }
+    }
+
+    // MARK: lifecycle
+
+    func start() {
+        guard isEnabled else { return }
+        if !delegateSet { mgr.delegate = self; delegateSet = true }
+        // The one thing the wearer has to grant: Always. When-in-use can't
+        // hear visits with the phone in a pocket, which is the entire point.
+        switch mgr.authorizationStatus {
+        case .notDetermined, .authorizedWhenInUse:
+            mgr.requestAlwaysAuthorization()
+        default: break
+        }
+        mgr.startMonitoringVisits()
+        mgr.startMonitoringSignificantLocationChanges()
+        loadToday()
+        if let l = mgr.location { add(point: l) }   // never an empty map
+        pruneOldDays()
+        print("👣 [Trail] monitoring — \(todayPoints.count) points, \(todayVisits.count) visits today")
+    }
+
+    private func stopMonitoring() {
+        mgr.stopMonitoringVisits()
+        mgr.stopMonitoringSignificantLocationChanges()
+        print("👣 [Trail] off")
+    }
+
+    // MARK: recording
+
+    fileprivate func add(point loc: CLLocation) {
+        rollIfNeeded()
+        // Dedup: a new crumb has to be genuinely elsewhere or meaningfully later.
+        if let last = todayPoints.last {
+            let d = CLLocation(latitude: last.lat, longitude: last.lon).distance(from: loc)
+            if d < 40, Date().timeIntervalSince(last.at) < 300 { return }
+        }
+        todayPoints.append(Point(at: Date(), lat: loc.coordinate.latitude, lon: loc.coordinate.longitude))
+        saveToday()
+    }
+
+    fileprivate func handle(visit: CLVisit) {
+        rollIfNeeded()
+        let arrive = visit.arrivalDate == .distantPast ? Date() : visit.arrivalDate
+        let coord = visit.coordinate
+        if visit.departureDate == .distantFuture {
+            // Arrival. Skip if an open visit already covers this spot.
+            if todayVisits.contains(where: { $0.depart == nil && close($0, to: coord) }) { return }
+            var v = Visit(arrive: arrive, depart: nil,
+                          lat: coord.latitude, lon: coord.longitude, name: nil)
+            todayVisits.append(v)
+            saveToday()
+            geocode(&v)
+        } else {
+            // Departure. Close the matching open visit, or file the whole stay.
+            if let i = todayVisits.firstIndex(where: { $0.depart == nil && close($0, to: coord) }) {
+                todayVisits[i].depart = visit.departureDate
+            } else {
+                var v = Visit(arrive: arrive, depart: visit.departureDate,
+                              lat: coord.latitude, lon: coord.longitude, name: nil)
+                todayVisits.append(v)
+                geocode(&v)
+            }
+            saveToday()
+        }
+        print("👣 [Trail] visit — now \(todayVisits.count) today")
+    }
+
+    private func close(_ v: Visit, to c: CLLocationCoordinate2D) -> Bool {
+        CLLocation(latitude: v.lat, longitude: v.lon)
+            .distance(from: CLLocation(latitude: c.latitude, longitude: c.longitude)) < 120
+    }
+
+    private func geocode(_ v: inout Visit) {
+        let id = v.id
+        let loc = CLLocation(latitude: v.lat, longitude: v.lon)
+        CLGeocoder().reverseGeocodeLocation(loc) { [weak self] marks, _ in
+            let name = marks?.first.flatMap { $0.name ?? $0.thoroughfare ?? $0.locality }
+            Task { @MainActor in
+                guard let self, let name else { return }
+                if let i = self.todayVisits.firstIndex(where: { $0.id == id }) {
+                    self.todayVisits[i].name = name
+                    self.saveToday()
+                }
+            }
+        }
+    }
+
+    // MARK: storage — one JSON per day
+
+    private var dirURL: URL {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ChappyTrail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base
+    }
+
+    private static func key(_ date: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: date)
+    }
+
+    private func url(_ date: Date) -> URL {
+        dirURL.appendingPathComponent(Self.key(date) + ".json")
+    }
+
+    private var loadedDayKey = ""
+
+    private func rollIfNeeded() {
+        let today = Self.key(Date())
+        guard loadedDayKey != today else { return }
+        if !loadedDayKey.isEmpty { saveToday() }
+        loadedDayKey = today
+        let day = read(Date())
+        todayPoints = day.points
+        todayVisits = day.visits
+    }
+
+    private func loadToday() { loadedDayKey = ""; rollIfNeeded() }
+
+    private func saveToday() {
+        let day = Day(points: todayPoints, visits: todayVisits)
+        if let data = try? JSONEncoder().encode(day) {
+            try? data.write(to: url(Date()), options: .atomic)
+        }
+    }
+
+    private func read(_ date: Date) -> Day {
+        guard let data = try? Data(contentsOf: url(date)),
+              let day = try? JSONDecoder().decode(Day.self, from: data) else { return Day() }
+        return day
+    }
+
+    /// Points for any day — today comes from memory, the past from disk.
+    func points(for date: Date) -> [Point] {
+        Calendar.current.isDateInToday(date) ? todayPoints : read(date).points
+    }
+
+    func visits(for date: Date) -> [Visit] {
+        Calendar.current.isDateInToday(date) ? todayVisits : read(date).visits
+    }
+
+    private func pruneOldDays() {
+        let keepDays = d.object(forKey: "chappy_trail_keep_days") as? Int ?? 90
+        let cutoff = Self.key(Calendar.current.date(byAdding: .day, value: -keepDays, to: Date()) ?? Date())
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil)) ?? [] {
+            if f.deletingPathExtension().lastPathComponent < cutoff { try? fm.removeItem(at: f) }
+        }
+    }
+
+    // MARK: voice
+
+    /// "Where was I on Tuesday?" — the day, spoken.
+    func spokenSummary(for date: Date) -> String {
+        let vs = visits(for: date)
+        let dayName: String = {
+            if Calendar.current.isDateInToday(date) { return "Today" }
+            if Calendar.current.isDateInYesterday(date) { return "Yesterday" }
+            let f = DateFormatter(); f.dateFormat = "EEEE"; return f.string(from: date)
+        }()
+        guard !vs.isEmpty else {
+            let pts = points(for: date)
+            if pts.isEmpty { return "\(dayName): no trail recorded. Tracking may not have been on yet." }
+            return "\(dayName): you were on the move but didn't stop anywhere long enough to count. \(pts.count) points on the trail — say 'show my trail' to see the line."
+        }
+        let stops = vs.prefix(5).map { v in
+            "\(v.name ?? "a stop"), \(v.spokenWindow)"
+        }.joined(separator: ". ")
+        let more = vs.count > 5 ? " And \(vs.count - 5) more stops." : ""
+        return "\(dayName): \(stops).\(more) Say 'show my trail' for the map."
+    }
+
+    /// The day a sentence refers to, if it names one.
+    static func dayMentioned(in c: String) -> Date? {
+        if c.contains("yesterday") {
+            return Calendar.current.date(byAdding: .day, value: -1, to: Date())
+        }
+        if c.contains("today") { return Date() }
+        let names = ["sunday": 1, "monday": 2, "tuesday": 3, "wednesday": 4,
+                     "thursday": 5, "friday": 6, "saturday": 7]
+        for (name, wd) in names where c.contains(name) {
+            // The most recent such weekday, never today.
+            for back in 1...7 {
+                if let d = Calendar.current.date(byAdding: .day, value: -back, to: Date()),
+                   Calendar.current.component(.weekday, from: d) == wd {
+                    return d
+                }
+            }
+        }
+        return nil
+    }
+}
+
+extension ChappyTrail: CLLocationManagerDelegate {
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let l = locations.last else { return }
+        Task { @MainActor in ChappyTrail.shared.add(point: l) }
+    }
+    nonisolated func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
+        Task { @MainActor in ChappyTrail.shared.handle(visit: visit) }
+    }
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("👣 [Trail] location error: \(error.localizedDescription)")
+    }
+}
+
+
+// =====================================================================
+// MARK: - SUGGESTED REMINDERS (Build 140)
+// =====================================================================
+//
+// Chappy reads the day and proposes the reminders you'd have set yourself:
+// a get-ready nudge before each appointment, and a time for anything on the
+// list that has none. Suggestions are CHEAP — pure local reads, no AI call —
+// and they never self-activate: a tap or a "plan my day" is always the
+// consent. Anything accepted becomes an ordinary reminder you can edit or
+// kill like any other.
+extension ChappyReminders {
+
+    struct Suggestion: Identifiable {
+        let id = UUID()
+        let title: String
+        let fire: Date
+        let reason: String
+    }
+
+    func suggestions() -> [Suggestion] {
+        var out: [Suggestion] = []
+        let now = Date()
+
+        // A get-ready nudge for each upcoming appointment that doesn't
+        // already have a reminder shadowing it.
+        for e in ChappyCalendar.shared.upcoming(days: 2) where !e.isAllDay {
+            guard let s = e.startDate, let t = e.title, !t.isEmpty else { continue }
+            let fire = s.addingTimeInterval(-45 * 60)
+            guard fire > now.addingTimeInterval(600) else { continue }
+            let stem = t.lowercased().prefix(12)
+            guard !open.contains(where: { $0.title.lowercased().contains(stem) }) else { continue }
+            let hasAddress = (e.location?.isEmpty == false)
+            out.append(Suggestion(
+                title: "Get ready for \(t)",
+                fire: fire,
+                reason: hasAddress
+                    ? "45 min before — and the leave-by warning covers the drive"
+                    : "45 min before it starts"))
+            if out.count >= 3 { break }
+        }
+
+        // A time for anything that has none — an untimed reminder is a wish.
+        if let six = Calendar.current.date(bySettingHour: 18, minute: 0, second: 0, of: now),
+           six > now {
+            for r in open where r.doneAt == nil && r.dueAt == nil
+                && r.floatingTime == nil && r.placeTrigger == nil && r.repeatRule == nil {
+                out.append(Suggestion(title: r.title, fire: six,
+                                      reason: "No time on it — six tonight?"))
+                if out.count >= 5 { break }
+            }
+        }
+        return out
     }
 }

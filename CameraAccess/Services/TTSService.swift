@@ -218,8 +218,51 @@ class TTSService: NSObject, ObservableObject {
     /// Gemini's prebuilt voices, split so the Apple fallback can match.
     private static let femaleGeminiVoices: Set<String> = [
         "Kore", "Aoede", "Leda", "Zephyr", "Autonoe", "Callirrhoe",
-        "Despina", "Erinome", "Gacrux", "Laomedeia", "Pulcherrima", "Vindemiatrix"
+        "Despina", "Erinome", "Gacrux", "Laomedeia", "Pulcherrima",
+        "Vindemiatrix", "Sulafat", "Achernar", "Sadachbia"
     ]
+
+    // BUILD 139 — THE VOICE SELF-TEST.
+    //
+    // "All the voices sound the same" is not a taste problem — it means every
+    // Gemini render is FAILING and every preview is the one Apple fallback.
+    // This makes one real render and says exactly why it failed, out loud,
+    // because the wearer can't read the Xcode console from a moving scooter.
+    func runVoiceSelfTest() {
+        Task { [weak self] in
+            guard let self else { return }
+            let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+            guard !key.isEmpty else {
+                self.speak("No Google key is set, so every voice falls back to this Apple one. Add the Gemini key in Settings.")
+                return
+            }
+            Self.geminiVoiceGaveUp = false   // the test must actually try
+            do {
+                let audio = try await self.requestGeminiAudio(
+                    text: "This is my real voice, and it's working.",
+                    model: self.ttsModels[0], apiKey: key)
+                VoiceCache.shared.save(audio, text: "This is my real voice, and it's working.", voice: self.voiceName)
+                let gen = self.beginSpeaking(estimatedCharacters: 40)
+                defer { Task { @MainActor in self.endSpeaking(gen) } }
+                try await self.playPCM(audio, gen: gen)
+                self.speak("That was the Gemini voice, working fine. If things sound robotic later it's a temporary network drop, not a setup problem.")
+            } catch {
+                let msg: String
+                let desc = error.localizedDescription
+                if desc.contains("429") {
+                    msg = "Google says the voice quota is used up — error four two nine. That's why everything sounds like this robot. The Gemini key is on the free tier for speech: turn on billing for it in Google A I Studio, or the quota resets each day."
+                } else if desc.contains("403") {
+                    msg = "Google refused the key — error four zero three. The key works for pictures but is blocked for speech. Check the key's API restrictions in Google A I Studio."
+                } else if desc.contains("404") {
+                    msg = "The speech model name was not found — error four zero four. Tell Claude: the T T S model needs renaming."
+                } else {
+                    msg = "The voice service failed: \(desc). If this keeps happening, tell Claude exactly this message."
+                }
+                self.speak(msg)
+                print("🔊 [TTS] Self-test failed: \(desc)")
+            }
+        }
+    }
 
     /// Forget the pinned choices — used when the wearer changes voice so the
     /// fallback re-matches the new one.
