@@ -780,6 +780,15 @@ struct TurboMetaHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: .chappyShowMap)) { _ in
             showMapSheet = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chappyMapsCleanup"))) { _ in
+            // BUILD 135: Google Maps was opened directly (Live AI paths) —
+            // do the same tidy-up the Standby handoff does: card gone,
+            // sheet gone, Chappy's own turns silenced.
+            let nav = NavEngine.shared
+            if nav.isNavigating { nav.stop(announce: false) }
+            showMapSheet = false
+            showNavMap = false
+        }
         .onReceive(NotificationCenter.default.publisher(for: .chappyOpenGoogleMaps)) { _ in
             let nav = NavEngine.shared
             // BUILD 133: a multi-stop run built by addStops carries its own
@@ -3031,16 +3040,29 @@ struct RemindersView: View {
     // does. Now time and type are peers — Schedule answers "what's next",
     // By type answers "what have I got on", and neither hides the other.
     private enum Mode: String, CaseIterable {
-        case schedule, byType, timeline, lists, done
+        case schedule, byType, timeline, pings, lists, done
         var label: String {
             switch self {
             case .schedule: return "Schedule"
             case .byType:   return "By type"
             case .timeline: return "Timeline"
+            case .pings:    return "Pings"
             case .lists:    return "Lists"
             case .done:     return "Done"
             }
         }
+    }
+
+    /// BUILD 134 — one row of the Pings tab: a moment Chappy will make noise.
+    private struct PingItem: Identifiable {
+        enum Source { case reminder(ChappyMemory.Entry), event(EKEvent), timer(ChappyTimers.Countdown) }
+        let id: String
+        let at: Date
+        let icon: String
+        let tint: Color
+        let title: String
+        let sub: String
+        let source: Source
     }
 
     /// BUILD 132: a tapped diary event, wrapped so .sheet(item:) can use it.
@@ -3083,6 +3105,8 @@ struct RemindersView: View {
                         case .timeline:
                             weekStrip
                             timelineSection
+                        case .pings:
+                            pingsSection
                         case .lists:
                             listsSection
                         case .done:
@@ -3483,6 +3507,163 @@ struct RemindersView: View {
     private static func time(_ d: Date?) -> String {
         guard let d else { return "" }
         let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    // BUILD 134 — THE PINGS TAB.
+    //
+    // The question this answers: "what is going to make noise, and when?"
+    // Every future ping for the next 7 days, shown at the moment it will
+    // FIRE — a heads-up set 30 minutes before a 3pm job appears at 2:30, not
+    // at 3. Reminders open their editor on tap (change it, delete it),
+    // calendar heads-ups open the event sheet (change the warn time, mute
+    // it), timers show what's left. What you see here is what you'll hear.
+
+    private func pingItems() -> [PingItem] {
+        var items: [PingItem] = []
+        let now = Date()
+        let horizon = now.addingTimeInterval(7 * 86400)
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+
+        // Reminders, at their effective fire time.
+        for r in reminders.open where r.doneAt == nil {
+            guard let f = r.effectiveFire, f > now, f < horizon else { continue }
+            var sub = "Reminder"
+            if r.snoozedTo != nil, r.snoozedTo! > now { sub = "Snoozed reminder" }
+            else if r.repeatRule != nil { sub = "Repeating reminder" }
+            items.append(PingItem(id: "r-\(r.id)", at: f, icon: "bell.fill",
+                                  tint: theme.accent, title: r.title, sub: sub,
+                                  source: .reminder(r)))
+        }
+        // Place-triggered reminders have no clock — shown once, at the top of
+        // the list via distantPast+1 so they're visible but not scheduled.
+        for r in reminders.placeReminders() {
+            items.append(PingItem(id: "p-\(r.id)", at: now.addingTimeInterval(-1),
+                                  icon: "mappin.circle.fill", tint: .cyan,
+                                  title: r.title,
+                                  sub: "Fires near: \(r.placeTrigger ?? "a place")",
+                                  source: .reminder(r)))
+        }
+        // Calendar heads-ups, at start minus lead. Important events ping twice.
+        let cal = ChappyCalendar.shared
+        for e in cal.upcoming(days: 7) where !e.isAllDay {
+            guard cal.effectiveBehaviour(for: e) == .ping, let s = e.startDate else { continue }
+            let lead = cal.leadMinutes(for: e)
+            let important = cal.level(for: e) == .important
+            var fires: [(Date, String)] = [(s.addingTimeInterval(-Double(lead) * 60),
+                                            ChappyCalendar.leadLabel(lead))]
+            if important {
+                fires.append((s.addingTimeInterval(-86400), "the day before"))
+            }
+            for (f, label) in fires where f > now && f < horizon {
+                items.append(PingItem(
+                    id: "e-\(ChappyCalendar.fingerprint(e))-\(Int(f.timeIntervalSince1970))",
+                    at: f,
+                    icon: important ? "flag.fill" : "clock.badge",
+                    tint: important ? .orange : .purple,
+                    title: "\(e.title ?? "Appointment") at \(df.string(from: s))",
+                    sub: "Heads-up, \(label)",
+                    source: .event(e)))
+            }
+        }
+        // Timers.
+        for t in ChappyTimers.shared.active where !t.isExpired {
+            items.append(PingItem(id: "t-\(t.id)", at: t.fireAt, icon: "timer",
+                                  tint: .mint, title: t.name,
+                                  sub: "Timer", source: .timer(t)))
+        }
+        return items.sorted { $0.at < $1.at }
+    }
+
+    @ViewBuilder
+    private var pingsSection: some View {
+        let items = pingItems()
+        if items.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "bell.slash")
+                    .font(.system(size: 32)).foregroundColor(theme.textSecondary.opacity(0.5))
+                Text("Nothing will ping in the next 7 days")
+                    .font(.subheadline).foregroundColor(theme.textPrimary)
+            }
+            .frame(maxWidth: .infinity).padding(.top, 46)
+        } else {
+            let grouped = Dictionary(grouping: items) { pingDayLabel($0.at) }
+            let order = items.map { pingDayLabel($0.at) }.reduce(into: [String]()) {
+                if !$0.contains($1) { $0.append($1) }
+            }
+            ForEach(order, id: \.self) { day in
+                Text(day.uppercased())
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(theme.textSecondary)
+                    .padding(.horizontal, 20).padding(.top, 10)
+                ForEach(grouped[day] ?? []) { item in pingRow(item) }
+            }
+            Text("Tap a ping to change or clear it. This list is exactly what will make noise.")
+                .font(.caption2).foregroundColor(theme.textSecondary)
+                .padding(.horizontal, 20).padding(.top, 6)
+        }
+    }
+
+    private func pingDayLabel(_ d: Date) -> String {
+        if d < Date() { return "Whenever you're near" }
+        if Calendar.current.isDateInToday(d) { return "Today" }
+        if Calendar.current.isDateInTomorrow(d) { return "Tomorrow" }
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMM"; return f.string(from: d)
+    }
+
+    private func pingRow(_ item: PingItem) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(spacing: 1) {
+                if item.at > Date() {
+                    Text(Self.time(item.at))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(item.tint)
+                }
+                Image(systemName: item.icon)
+                    .font(.system(size: 13)).foregroundColor(item.tint)
+            }
+            .frame(width: 62)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.subheadline).foregroundColor(theme.textPrimary).lineLimit(2)
+                Text(item.sub)
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11)).foregroundColor(theme.textSecondary.opacity(0.5))
+        }
+        .padding(11)
+        .background(RoundedRectangle(cornerRadius: 13).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            switch item.source {
+            case .reminder(let r): editing = r
+            case .event(let e):
+                eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+            case .timer: break
+            }
+        }
+        .contextMenu {
+            switch item.source {
+            case .reminder(let r):
+                Button { editing = r } label: { Label("Edit", systemImage: "pencil") }
+                Button(role: .destructive) {
+                    reminders.complete(r.id)
+                } label: { Label("Done — clear it", systemImage: "checkmark.circle") }
+            case .event(let e):
+                Button {
+                    eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+                } label: { Label("Change the warning", systemImage: "clock") }
+                Button {
+                    ChappyCalendar.shared.setLevel(.muted, for: e); diaryTick += 1
+                } label: { Label("Mute this one", systemImage: "bell.slash") }
+            case .timer(let t):
+                Button(role: .destructive) {
+                    _ = ChappyTimers.shared.cancel(matching: t.name)
+                } label: { Label("Cancel timer", systemImage: "xmark.circle") }
+            }
+        }
     }
 
     // BUILD 132 — THE LISTS TAB.
