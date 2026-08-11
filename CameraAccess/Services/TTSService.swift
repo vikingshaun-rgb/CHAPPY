@@ -657,6 +657,12 @@ class TTSService: NSObject, ObservableObject {
         guard !missing.isEmpty else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
+            // BUILD 135: the route summary is being rendered and SPOKEN right
+            // now, over the same network the route lookup just used. Starting
+            // the pre-render in the same instant caused the very failure it
+            // exists to prevent — a rate-limited render latching the robot
+            // voice. Wait for the summary to finish before warming the turns.
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
             print("🔊 [TTS] Pre-rendering \(missing.count) nav lines")
             for line in missing {
                 if Self.geminiVoiceGaveUp { break }
@@ -751,8 +757,27 @@ class TTSService: NSObject, ObservableObject {
                     return
                 } catch {
                     if Task.isCancelled { return }
-                    Self.geminiVoiceGaveUp = true
-                    print("⚠️ [TTS] Gemini TTS failed (\(error.localizedDescription)) — Apple voice until the cooldown clears")
+                    // BUILD 135 — WHY NAV WENT ROBOT.
+                    //
+                    // One failed render latched the Apple voice for thirty
+                    // minutes — and navigation is EXACTLY where one render
+                    // fails: the route lookup, the geocode and the TTS all
+                    // hit the network in the same two seconds, and a single
+                    // dropped socket or 429 was enough. So the latch now
+                    // costs TWO consecutive failures, with a breath between.
+                    // Transient blips retry and stay in the real voice;
+                    // genuine outages still fall back exactly as before.
+                    do {
+                        try await Task.sleep(nanoseconds: 800_000_000)
+                        if Task.isCancelled { return }
+                        try await self.speakWithGemini(text: trimmed, apiKey: googleKey, gen: gen)
+                        CostMeter.shared.addTTSChars(trimmed.count)
+                        return
+                    } catch {
+                        if Task.isCancelled { return }
+                        Self.geminiVoiceGaveUp = true
+                        print("⚠️ [TTS] Gemini TTS failed twice (\(error.localizedDescription)) — Apple voice until the cooldown clears")
+                    }
                 }
             } else if googleKey.isEmpty {
                 print("🔊 [TTS] No Gemini key — using system TTS")

@@ -1015,6 +1015,11 @@ class GeminiLiveService: NSObject {
             }
             if let u = url {
                 UIApplication.shared.open(u)
+                // BUILD 135: hand off CLEANLY from this path too — close
+                // Chappy's map card/sheet and stop its own turn-by-turn,
+                // same as the Standby path does. The card that "wouldn't
+                // disappear" came through here.
+                NotificationCenter.default.post(name: Notification.Name("chappyMapsCleanup"), object: nil)
                 return nav.destinationCoord != nil
                     ? "Google Maps is opening with the destination and turn-by-turn loaded."
                     : "Google Maps is opening on the phone."
@@ -1793,6 +1798,8 @@ class GeminiLiveService: NSObject {
                         }
                         if let u = url {
                             await UIApplication.shared.open(u)
+                            // BUILD 135: clean handoff from the nav bridge too.
+                            NotificationCenter.default.post(name: Notification.Name("chappyMapsCleanup"), object: nil)
                             self.sendAppReply("Google Maps is opening on the phone with the destination loaded. Confirm this briefly.")
                         } else {
                             self.sendAppReply("Navigation: no destination known yet. Ask the user where they want to go first.")
