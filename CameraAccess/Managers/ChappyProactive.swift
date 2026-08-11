@@ -342,6 +342,8 @@ final class ChappyProactive: NSObject, ObservableObject {
         // no extra schedule, no extra wake-ups.
         await ChappyMemoryKeeper.shared.nudgeIfDue()      // consolidate the profile
         await ChappyPhotoIngest.shared.ingestIfDue()      // glasses photos, if charging on wi-fi
+        await ChappyFlights.shared.checkIfDue()           // watched routes, ≤3/day
+        await ChappyFlights.shared.flightDayPass()        // BUILD 152: flight-day briefs
 
         guard let brief = await composeBrief(slot: slot) else { return }
 
