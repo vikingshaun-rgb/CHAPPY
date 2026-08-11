@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UIKit
+import Charts   // BUILD 149: trail week chart
 import AVFoundation
 import AVKit
 import Speech
@@ -43,6 +44,26 @@ final class SnapFeedback: ObservableObject {
     @Published var shot: UIImage?
     @Published var caption = ""
     @Published var isWaking = false
+    // BUILD 147 — TAP TO ENLARGE. The card opens full screen; tap closes.
+    @Published var enlarged: UIImage?
+    @Published var enlargedCaption = ""
+
+    func enlarge() {
+        guard let s = shot else { return }
+        hideWork?.cancel()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            enlarged = s
+            enlargedCaption = caption
+            shot = nil
+        }
+    }
+
+    func closeEnlarged() {
+        withAnimation(.easeIn(duration: 0.2)) {
+            enlarged = nil
+            enlargedCaption = ""
+        }
+    }
 
     /// How long the card stays. Long enough to look at, short enough that it
     /// never becomes something you have to dismiss.
@@ -156,6 +177,8 @@ final class SnapHUD {
 struct SnapOverlay: View {
     @ObservedObject private var feedback = SnapFeedback.shared
 
+    @State private var zoom: CGFloat = 1
+
     var body: some View {
         ZStack {
             // THE FLASH. Ignores touches entirely and covers everything
@@ -164,6 +187,29 @@ struct SnapOverlay: View {
                 .opacity(feedback.flashOn ? 0.92 : 0)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+
+            // BUILD 147 — THE VIEWER. Full screen, pinch to zoom, caption
+            // under, tap anywhere to close.
+            if let big = feedback.enlarged {
+                ZStack(alignment: .bottom) {
+                    Color.black.opacity(0.94).ignoresSafeArea()
+                    Image(uiImage: big)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .scaleEffect(zoom)
+                        .gesture(MagnificationGesture()
+                            .onChanged { zoom = max(1, min(4, $0)) }
+                            .onEnded { _ in withAnimation(.spring()) { zoom = 1 } })
+                    if !feedback.enlargedCaption.isEmpty {
+                        Text(feedback.enlargedCaption)
+                            .font(.footnote).foregroundColor(.white.opacity(0.9))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 24).padding(.bottom, 46)
+                    }
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                .onTapGesture { zoom = 1; feedback.closeEnlarged() }
+            }
 
             VStack {
                 Spacer()
@@ -209,7 +255,16 @@ struct SnapOverlay: View {
                 .stroke(Color.white.opacity(0.5), lineWidth: 1.5)
         )
         .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
-        .onTapGesture { feedback.dismiss() }
+        // BUILD 147: tap opens it big; the little ✕ dismisses.
+        .onTapGesture { feedback.enlarge() }
+        .overlay(alignment: .topTrailing) {
+            Button { feedback.dismiss() } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundColor(.white.opacity(0.8))
+                    .padding(4)
+            }
+        }
     }
 
     private var wakingCard: some View {
@@ -236,6 +291,9 @@ struct TurboMetaHomeView: View {
     @StateObject private var continuousVision = ContinuousVisionManager.shared
     @StateObject private var navEngine = NavEngine.shared
     @State private var showNavMap = false
+    @State private var pulseOn = false          // BUILD 149: listening rings
+    @State private var showCommands = false     // BUILD 149: what can I say
+    @State private var showFlights = false      // BUILD 150: the flight deck
     @State private var showEmergencyContact = false
     @State private var emergencyContactText = UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? ""
     let apiKey: String
@@ -285,6 +343,56 @@ struct TurboMetaHomeView: View {
             : cachedReminderLine
     }
 
+    /// BUILD 144 — the Reader on screen: point the glasses at text, tap the
+    /// verb. On-device recognition, free; scans land in Memory.
+    private var readerCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("READER")
+                    .font(.caption2).fontWeight(.heavy).tracking(0.8)
+                    .foregroundColor(.cyan)
+                Spacer()
+                Text("Look at a page, menu or sign first")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            HStack(spacing: 8) {
+                readerButton("Read", icon: "text.viewfinder") {
+                    TTSService.shared.speak("Reading that now.")
+                    ChappyReader.shared.begin(.read)
+                }
+                readerButton("Translate", icon: "character.book.closed") {
+                    TTSService.shared.speak("Having a look.")
+                    ChappyReader.shared.begin(.translate)
+                }
+                readerButton("Scan", icon: "doc.viewfinder") {
+                    TTSService.shared.speak("Scanning.")
+                    ChappyReader.shared.begin(.scan)
+                }
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+        .padding(.horizontal, 16)
+    }
+
+    private func readerButton(_ label: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 18))
+                Text(label).font(.caption).fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 11).fill(Color.cyan.opacity(0.12)))
+            .foregroundColor(.cyan)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // BUILD 145: the adaptive line — real travel time to the next located job.
+    @State private var leaveByLine: String?
+
     /// BUILD 140 — the day at a glance, on the home screen. Events and timed
     /// reminders merged, next three, soonest first. Tap opens the Diary.
     private var todayGlanceCard: some View {
@@ -315,9 +423,18 @@ struct TurboMetaHomeView: View {
                         Text("\(od) overdue")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundColor(.red)
+                            .contentTransition(.numericText())
                     }
                     Image(systemName: "chevron.right")
                         .font(.system(size: 11)).foregroundColor(theme.textSecondary)
+                }
+                if let lb = leaveByLine {
+                    HStack(spacing: 6) {
+                        Image(systemName: "car.fill")
+                            .font(.system(size: 10)).foregroundColor(.orange)
+                        Text(lb).font(.caption).fontWeight(.semibold)
+                            .foregroundColor(.orange).lineLimit(2)
+                    }
                 }
                 if next.isEmpty {
                     Text("Nothing left on today.")
@@ -338,7 +455,7 @@ struct TurboMetaHomeView: View {
             }
             .padding(13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 15).fill(theme.cardFill))
+            .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 16)
@@ -356,6 +473,29 @@ struct TurboMetaHomeView: View {
         if od > 0 { cachedReminderLine = "\(od) overdue · \(t) today" }
         else if t > 0 { cachedReminderLine = "\(t) today · say \"remind me to…\"" }
         else { cachedReminderLine = "Say \"Chappy, remind me to…\" — or tap to add" }
+
+        // BUILD 145 — THE LEAVE-BY LINE. For the next appointment that has an
+        // address, work out REAL travel time from where the phone is right
+        // now: "Leave by 2:20 for the 3pm — about 34 min away." Recomputed on
+        // every home refresh; one route lookup, only when there is something
+        // to say.
+        leaveByLine = nil
+        if let next = ChappyCalendar.shared.today().first(where: { e in
+            guard !e.isAllDay, let s = e.startDate, s > Date(),
+                  let loc = e.location, !loc.isEmpty else { return false }
+            return s.timeIntervalSinceNow < 6 * 3600
+        }), let start = next.startDate, let loc = next.location {
+            Task {
+                guard let mins = await NavEngine.shared.travelMinutes(to: loc) else { return }
+                let leave = start.addingTimeInterval(-Double(mins + 10) * 60)
+                let f = DateFormatter(); f.dateFormat = "h:mm a"
+                if leave > Date() {
+                    leaveByLine = "Leave by \(f.string(from: leave)) for \(next.title ?? "the next one") — about \(mins) min away"
+                } else {
+                    leaveByLine = "⚠︎ \(next.title ?? "Next job") is about \(mins) min away — time to move"
+                }
+            }
+        }
 
         let all = memory.recent.count
         if all == 0 {
@@ -396,10 +536,36 @@ struct TurboMetaHomeView: View {
                             // theme-matched by default, chosen in Settings →
                             // Appearance → Avatar. Pure code: GPU-composited,
                             // home-screen only, zero cost to the AI pipeline.
-                            ChappyAvatarView(theme: theme, live: liveAIManager.isRunning)
+                            // BUILD 149 — THE LISTENING PULSE. While a command
+                            // is being taken, rings radiate from the avatar —
+                            // visible proof Chappy is hearing you, Siri-style.
+                            ZStack {
+                                if standby.awake {
+                                    ForEach(0..<2, id: \.self) { i in
+                                        Circle()
+                                            .stroke(theme.accent.opacity(0.5), lineWidth: 2)
+                                            .frame(width: 96, height: 96)
+                                            .scaleEffect(pulseOn ? 1.55 : 1.0)
+                                            .opacity(pulseOn ? 0 : 0.7)
+                                            .animation(.easeOut(duration: 1.1)
+                                                .repeatForever(autoreverses: false)
+                                                .delay(Double(i) * 0.55), value: pulseOn)
+                                    }
+                                }
+                                ChappyAvatarView(theme: theme, live: liveAIManager.isRunning)
+                            }
+                            .onChange(of: standby.awake) { _, on in pulseOn = on }
+                            // BUILD 148 — THE WORDMARK. SF Rounded heavy with
+                            // the theme's own colour poured through the
+                            // letters. The name finally dresses like the app.
                             Text("Chappy")
-                                .font(.system(size: 30, weight: .bold, design: .rounded))
-                                .foregroundColor(theme.textPrimary)
+                                .font(.system(size: 34, weight: .heavy, design: .rounded))
+                                .tracking(0.5)
+                                .foregroundStyle(
+                                    LinearGradient(
+                                        colors: [theme.accent, theme.textPrimary],
+                                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                                .shadow(color: theme.accent.opacity(0.35), radius: 12, y: 2)
                             Text(liveAIManager.isRunning ? "Listening — just talk"
                                  : (continuousVision.isRunning ? "Watching — say chappy stop to end"
                                     : "Ready when you are"))
@@ -464,7 +630,7 @@ struct TurboMetaHomeView: View {
                                 }
                             }
                             .padding(14)
-                            .background(RoundedRectangle(cornerRadius: 18).fill(theme.cardFill))
+                            .background(RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial))
                             .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.green.opacity(0.5), lineWidth: 1))
                             .sheet(isPresented: $showNavMap) {
                                 NavMapSheet(navEngine: navEngine)
@@ -593,13 +759,18 @@ struct TurboMetaHomeView: View {
                             Spacer()
                         }
                         .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                         .id(journalTick) // refresh counts when Remember fires
 
                         // BUILD 140 — THE GLANCE. The day, on the home screen,
                         // before you've opened anything: next events, next
                         // reminders, one line of counts. Tap = the full Diary.
-                        todayGlanceCard
+                        todayGlanceCard.chappyScrollFX()
+
+                        // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
+                        // voice-only in 134 and nobody could find it. Three
+                        // buttons now: look at the thing, tap the verb.
+                        readerCard.chappyScrollFX()
 
                         // MORE
                         VStack(spacing: 8) {
@@ -609,6 +780,21 @@ struct TurboMetaHomeView: View {
                                     title: "Diary",
                                     detail: remindersDetailLine) {
                                 showReminders = true
+                            }
+                            // BUILD 149 — the feature index. Eighty phrasings
+                            // existed and nothing showed them. Now they're a
+                            // searchable screen; tap a row and Chappy says it.
+                            MoreRow(icon: "questionmark.bubble.fill",
+                                    title: "What can I say?",
+                                    detail: "Every voice command, searchable") {
+                                showCommands = true
+                            }
+                            MoreRow(icon: "airplane",
+                                    title: "Flights",
+                                    detail: ChappyFlights.shared.watches.isEmpty
+                                        ? "Watch routes, track your flight"
+                                        : "\(ChappyFlights.shared.watches.count) route\(ChappyFlights.shared.watches.count == 1 ? "" : "s") watched") {
+                                showFlights = true
                             }
                             MoreRow(icon: "brain",
                                     title: "Memory",
@@ -665,6 +851,12 @@ struct TurboMetaHomeView: View {
                 // navigate-back, and an ambient filter so Pulse frames don't
                 // bury the photos he actually chose to take.
                 ChappyMemoryBrowser()
+            }
+            .sheet(isPresented: $showCommands) {
+                WhatCanISayView(theme: theme)
+            }
+            .sheet(isPresented: $showFlights) {
+                FlightsView(theme: theme)
             }
             .fullScreenCover(isPresented: $showReminders) {
                 RemindersView()
@@ -1402,6 +1594,60 @@ struct TodayMapSheet: View {
 
     private var isToday: Bool { Calendar.current.isDateInToday(selectedDay) }
 
+    /// BUILD 149 — THE WEEK IN BARS. Kilometres moved per day from the
+    /// Trail's own points; the selected day glows. Swift Charts, ~20 lines.
+    private var weekChart: some View {
+        let cal = Calendar.current
+        let days: [(day: Date, km: Double)] = (0..<7).reversed().compactMap { back in
+            guard let d = cal.date(byAdding: .day, value: -back,
+                                   to: cal.startOfDay(for: Date())) else { return nil }
+            let pts = trail.points(for: d)
+            var meters = 0.0
+            for i in 1..<max(1, pts.count) {
+                meters += CLLocation(latitude: pts[i-1].lat, longitude: pts[i-1].lon)
+                    .distance(from: CLLocation(latitude: pts[i].lat, longitude: pts[i].lon))
+            }
+            return (d, meters / 1000)
+        }
+        return Chart(days, id: \.day) { item in
+            BarMark(x: .value("Day", Self.shortDay(item.day)),
+                    y: .value("km", item.km))
+            .foregroundStyle(cal.isDate(item.day, inSameDayAs: selectedDay)
+                             ? Color.blue : Color.blue.opacity(0.35))
+            .cornerRadius(3)
+        }
+        .chartYAxis(.hidden)
+        .frame(height: 54)
+        .padding(.horizontal, 16).padding(.vertical, 6)
+        .background(Color.black.opacity(0.2))
+    }
+
+    /// BUILD 146 — the day's memories, pinned where they happened.
+    private var dayPins: [RouteMapView.JournalPin] {
+        let tf = DateFormatter(); tf.dateFormat = "h:mm a"
+        return ChappyMemory.shared.recent
+            .filter { Calendar.current.isDate($0.at, inSameDayAs: selectedDay) }
+            .compactMap { e in
+                guard let la = e.lat, let lo = e.lon else { return nil }
+                let (glyph, tint): (String, UIColor) = {
+                    switch e.kind {
+                    case .photo: return ("📷", .systemIndigo)
+                    case .scan:  return ("📄", .systemCyan)
+                    case .spend: return ("💰", .systemOrange)
+                    case .place: return ("⭐", .systemYellow)
+                    case .talk:  return ("💬", .systemGreen)
+                    case .route: return ("🧭", .systemBlue)
+                    default:     return ("✎", .systemTeal)
+                    }
+                }()
+                return RouteMapView.JournalPin(
+                    coord: CLLocationCoordinate2D(latitude: la, longitude: lo),
+                    glyph: glyph, tint: tint,
+                    title: e.title,
+                    sub: tf.string(from: e.at))
+            }
+    }
+
     private var dayCoords: [CLLocationCoordinate2D] {
         var pts = trail.points(for: selectedDay)
             .map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
@@ -1418,11 +1664,13 @@ struct TodayMapSheet: View {
         NavigationView {
             VStack(spacing: 0) {
                 dayStrip
+                weekChart
                 ZStack(alignment: .bottom) {
                     RouteMapView(
                         coords: dayCoords,
                         destination: nil,
-                        spots: isToday ? TripRecorder.shared.spots : [])
+                        spots: isToday ? TripRecorder.shared.spots : [],
+                        journalPins: dayPins)
                         .ignoresSafeArea(edges: [])
 
                     Button {
@@ -1474,6 +1722,14 @@ struct TodayMapSheet: View {
     }
 
     /// The stops of the day, in order — the timeline you can read.
+    /// BUILD 146: memories ride along between the stops, so the list reads
+    /// as the day's story — arrived, photographed, spent, moved on.
+    private var dayMemories: [ChappyMemory.Entry] {
+        ChappyMemory.shared.recent
+            .filter { Calendar.current.isDate($0.at, inSameDayAs: selectedDay) && $0.source != "pulse" }
+            .sorted { $0.at < $1.at }
+    }
+
     private var visitList: some View {
         let visits = trail.visits(for: selectedDay).sorted { $0.arrive < $1.arrive }
         return Group {
@@ -1551,7 +1807,40 @@ struct TodayMapSheet: View {
                 }
                 .frame(maxHeight: 230)
             }
+            // BUILD 146 — THE MOMENTS. What happened between the stops.
+            let moments = dayMemories
+            if !moments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(moments.prefix(12)) { m in
+                            HStack(spacing: 6) {
+                                Text(Self.momentGlyph(m.kind))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(m.title).font(.caption2).fontWeight(.semibold)
+                                        .foregroundColor(.primary).lineLimit(1)
+                                    Text(Self.momentTime(m.at)).font(.system(size: 9))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                        }
+                    }
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+                }
+            }
         }
+    }
+
+    private static func momentGlyph(_ k: ChappyMemory.Kind) -> String {
+        switch k {
+        case .photo: return "📷"; case .scan: return "📄"; case .spend: return "💰"
+        case .place: return "⭐"; case .talk: return "💬"; case .route: return "🧭"
+        default: return "✎"
+        }
+    }
+    private static func momentTime(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
     }
 
     private static func shortDay(_ d: Date) -> String {
@@ -1611,6 +1900,23 @@ struct RouteMapView: UIViewRepresentable {
     /// can never see again is not a feature. Titled pins, so tapping one tells
     /// you what you called it.
     var spots: [TripRecorder.Spot] = []
+    /// BUILD 146 — JOURNAL PINS. The day's memories placed where they
+    /// happened: photo, scan, note, spend, each with its own glyph and
+    /// colour, tappable for title + time. This is what turns a line on a
+    /// map into the story of a day.
+    struct JournalPin {
+        let coord: CLLocationCoordinate2D
+        let glyph: String
+        let tint: UIColor
+        let title: String
+        let sub: String
+    }
+    var journalPins: [JournalPin] = []
+
+    final class JournalAnnotation: MKPointAnnotation {
+        var glyph = "✎"
+        var tint = UIColor.systemTeal
+    }
 
     func makeUIView(context: Context) -> MKMapView {
         let map = MKMapView()
@@ -1638,9 +1944,18 @@ struct RouteMapView: UIViewRepresentable {
             pin.subtitle = [s.street, s.city].compactMap { $0 }.joined(separator: ", ")
             map.addAnnotation(pin)
         }
-        // If there is no trail but there ARE spots, frame the spots rather than
-        // dropping the user on a blank world map.
-        if coords.isEmpty, !spots.isEmpty {
+        for pinData in journalPins {
+            let a = JournalAnnotation()
+            a.coordinate = pinData.coord
+            a.title = pinData.title
+            a.subtitle = pinData.sub
+            a.glyph = pinData.glyph
+            a.tint = pinData.tint
+            map.addAnnotation(a)
+        }
+        // If there is no trail but there ARE pins or spots, frame them rather
+        // than dropping the user on a blank world map.
+        if coords.isEmpty, !(spots.isEmpty && journalPins.isEmpty) {
             map.showAnnotations(map.annotations, animated: false)
         }
         return map
@@ -1654,17 +1969,109 @@ struct RouteMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let line = overlay as? MKPolyline {
                 let r = MKPolylineRenderer(polyline: line)
-                r.strokeColor = .systemGreen
+                // BUILD 146: the trail reads as a path, not a route — teal,
+                // rounded, slightly translucent so streets stay legible.
+                r.strokeColor = UIColor.systemTeal.withAlphaComponent(0.85)
                 r.lineWidth = 5
+                r.lineCap = .round
+                r.lineJoin = .round
                 return r
             }
             return MKOverlayRenderer(overlay: overlay)
+        }
+
+        // BUILD 146 — glyph markers with callouts, Apple-Journal style.
+        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            guard let j = annotation as? JournalAnnotation else { return nil }
+            let id = "journal-pin"
+            let v = (mapView.dequeueReusableAnnotationView(withIdentifier: id) as? MKMarkerAnnotationView)
+                ?? MKMarkerAnnotationView(annotation: j, reuseIdentifier: id)
+            v.annotation = j
+            v.glyphText = j.glyph
+            v.markerTintColor = j.tint
+            v.canShowCallout = true
+            v.displayPriority = .required
+            return v
         }
     }
 }
 
 
 // MARK: - Chappy Themes (the Face's wardrobe)
+
+// BUILD 149 — SCROLL FEEL. The App Store trick: cards breathe in as they
+// enter the screen. One modifier, sprinkled where lists live.
+extension View {
+    func chappyScrollFX() -> some View {
+        self.scrollTransition(.interactive) { content, phase in
+            content
+                .opacity(phase.isIdentity ? 1 : 0.55)
+                .scaleEffect(phase.isIdentity ? 1 : 0.95)
+        }
+    }
+}
+
+// BUILD 148 — THE AURORA BACKDROP. Every theme's flat gradient becomes a
+// living background: the base wash plus two big, heavily-blurred colour
+// blobs drawn from the theme's own palette, drifting on a slow cycle. No
+// image assets, all GPU, and each theme gets its own mood for free because
+// the blobs are derived, not designed.
+struct AuroraBackdrop: View {
+    let theme: ChappyTheme
+    @State private var drift = false
+
+    static var hourTint: Color {
+        switch Calendar.current.component(.hour, from: Date()) {
+        case 5..<9:   return .orange          // dawn
+        case 9..<17:  return .yellow          // day
+        case 17..<21: return .pink            // dusk
+        default:      return .indigo          // night
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                           startPoint: .top, endPoint: .bottom)
+            GeometryReader { geo in
+                let w = geo.size.width, h = geo.size.height
+                Circle()
+                    .fill(theme.accent.opacity(0.20))
+                    .frame(width: w * 0.9)
+                    .blur(radius: 70)
+                    .offset(x: drift ? -w * 0.25 : w * 0.30,
+                            y: drift ? -h * 0.05 : h * 0.12)
+                Circle()
+                    .fill(theme.bgTop.opacity(0.55))
+                    .frame(width: w * 0.8)
+                    .blur(radius: 80)
+                    .offset(x: drift ? w * 0.35 : -w * 0.2,
+                            y: drift ? h * 0.55 : h * 0.35)
+                Circle()
+                    .fill(theme.accent.opacity(0.10))
+                    .frame(width: w * 0.6)
+                    .blur(radius: 60)
+                    .offset(x: drift ? w * 0.05 : w * 0.45,
+                            y: drift ? h * 0.85 : h * 0.65)
+                // BUILD 149 — TIME OF DAY IN THE LIGHT. Dawn warms the
+                // aurora, night cools and deepens it — same theme, living
+                // atmosphere, the Material-You idea done the iOS way.
+                Circle()
+                    .fill(Self.hourTint.opacity(0.12))
+                    .frame(width: w * 1.1)
+                    .blur(radius: 90)
+                    .offset(x: drift ? -w * 0.1 : w * 0.2,
+                            y: drift ? h * 0.2 : -h * 0.1)
+            }
+        }
+        .ignoresSafeArea()
+        .onAppear {
+            withAnimation(.easeInOut(duration: 22).repeatForever(autoreverses: true)) {
+                drift = true
+            }
+        }
+    }
+}
 
 struct ChappyTheme {
     let name: String
@@ -2129,7 +2536,7 @@ struct StatusChip: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(Capsule().fill(theme.cardFill))
+        .background(Capsule().fill(.ultraThinMaterial))
     }
 }
 
@@ -2194,7 +2601,7 @@ struct QuickActionButton: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
         }
         .buttonStyle(.plain)
     }
@@ -2228,7 +2635,7 @@ struct MoreRow: View {
                     .foregroundColor(theme.textPrimary.opacity(0.3))
             }
             .padding(12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
         }
         .buttonStyle(.plain)
     }
@@ -2290,8 +2697,7 @@ struct MemoryView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
-                               startPoint: .top, endPoint: .bottom)
+                AuroraBackdrop(theme: theme)
                     .ignoresSafeArea()
 
                 VStack(spacing: 0) {
@@ -2386,7 +2792,7 @@ struct MemoryView: View {
             }
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
         .padding(.top, 10)
     }
@@ -2548,7 +2954,7 @@ struct MemoryView: View {
                         .font(.footnote)
                         .foregroundColor(theme.accent)
                         .padding(14)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                     }
                     .buttonStyle(.plain)
                     .padding(.horizontal, 16)
@@ -2632,7 +3038,7 @@ struct MemoryRow: View {
                     .font(.system(size: 17))
                     .foregroundColor(theme.accent.opacity(0.85))
                     .frame(width: 46, height: 46)
-                    .background(RoundedRectangle(cornerRadius: 9).fill(theme.cardFill))
+                    .background(RoundedRectangle(cornerRadius: 9).fill(.ultraThinMaterial))
             }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
@@ -2659,7 +3065,7 @@ struct MemoryRow: View {
                 .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.5))
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
     }
 }
@@ -2691,8 +3097,7 @@ struct MemoryDetailView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
-                               startPoint: .top, endPoint: .bottom)
+                AuroraBackdrop(theme: theme)
                     .ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -2724,7 +3129,7 @@ struct MemoryDetailView: View {
                                 .font(.title3)
                                 .foregroundColor(theme.textPrimary)
                                 .padding(12)
-                                .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+                                .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
                             HStack {
                                 Button("Save") {
                                     ChappyMemory.shared.relabel(id: entry.id, to: draftTitle)
@@ -2757,7 +3162,7 @@ struct MemoryDetailView: View {
                                     Text(t)
                                         .font(.caption2)
                                         .padding(.horizontal, 8).padding(.vertical, 4)
-                                        .background(Capsule().fill(theme.cardFill))
+                                        .background(Capsule().fill(.ultraThinMaterial))
                                         .foregroundColor(theme.textSecondary)
                                 }
                             }
@@ -2841,7 +3246,7 @@ struct MemoryDetailView: View {
                             .font(.footnote)
                             .foregroundColor(.red.opacity(0.85))
                             .padding(12)
-                            .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+                            .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
                         }
                         .buttonStyle(.plain)
                         .padding(.top, 6)
@@ -2898,7 +3303,7 @@ struct MemoryDetailView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 12)
-        .background(RoundedRectangle(cornerRadius: 12).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
         .foregroundColor(theme.accent)
     }
 
@@ -3065,6 +3470,312 @@ struct OriginalMediaView: View {
 // wants to say "every second Tuesday at nine except public holidays" out
 // loud, and nobody wants to type "remind me to call mum at six".
 
+// BUILD 150 — THE FLIGHT DECK. Watched routes with price history drawn as
+// sparklines, the tracked flight's travel-day card, and a search box that
+// speaks Amadeus. Booking hands off to the big sites with the route ready.
+struct FlightsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let theme: ChappyTheme
+    @ObservedObject private var flights = ChappyFlights.shared
+    @State private var destField = ""
+    @State private var monthField = ""
+    @State private var busy = false
+    @State private var note = ""
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        // SEARCH / WATCH BOX
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("WATCH A ROUTE")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(.cyan)
+                            TextField("Where to? e.g. Denpasar", text: $destField)
+                                .textFieldStyle(.roundedBorder)
+                            TextField("Month, e.g. September (optional)", text: $monthField)
+                                .textFieldStyle(.roundedBorder)
+                            Button {
+                                let d = destField.trimmingCharacters(in: .whitespaces)
+                                guard !d.isEmpty else { note = "Type a destination first."; return }
+                                busy = true; note = "Checking…"
+                                let m = ChappyFlights.monthKey(from: monthField.lowercased()) ?? ""
+                                Task { @MainActor in
+                                    note = await flights.addWatch(destName: d, month: m)
+                                    busy = false; destField = ""; monthField = ""
+                                }
+                            } label: {
+                                Label(busy ? "Checking…" : "Watch this route",
+                                      systemImage: "binoculars.fill")
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(RoundedRectangle(cornerRadius: 11).fill(Color.cyan.opacity(0.18)))
+                                    .foregroundColor(.cyan)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(busy)
+                            if !note.isEmpty {
+                                Text(note).font(.caption).foregroundColor(theme.textSecondary)
+                            }
+                            if !flights.isConfigured {
+                                Text("Deal watching needs the free Amadeus keys — Settings → Flights.")
+                                    .font(.caption2).foregroundColor(.orange)
+                            }
+                        }
+                        .padding(13)
+                        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+
+                        // WATCHED ROUTES
+                        ForEach(flights.watches) { w in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("\(w.originCode) → \(w.destName)")
+                                        .font(.subheadline).fontWeight(.bold)
+                                        .foregroundColor(theme.textPrimary)
+                                    Spacer()
+                                    if let p = w.lastPrice {
+                                        Text("$\(Int(p))")
+                                            .font(.title3).fontWeight(.heavy)
+                                            .foregroundColor(.cyan)
+                                            .contentTransition(.numericText())
+                                    }
+                                }
+                                if let b = w.bestDate {
+                                    Text("Cheapest: \(ChappyFlights.spokenDate(b))\(w.month.isEmpty ? "" : " · watching \(w.month)")")
+                                        .font(.caption2).foregroundColor(theme.textSecondary)
+                                }
+                                if w.history.count >= 2 {
+                                    Chart(Array(w.history.enumerated()), id: \.offset) { _, pt in
+                                        LineMark(x: .value("t", pt.at), y: .value("$", pt.price))
+                                            .foregroundStyle(Color.cyan)
+                                            .interpolationMethod(.catmullRom)
+                                        AreaMark(x: .value("t", pt.at), y: .value("$", pt.price))
+                                            .foregroundStyle(Color.cyan.opacity(0.12))
+                                            .interpolationMethod(.catmullRom)
+                                    }
+                                    .chartXAxis(.hidden).chartYAxis(.hidden)
+                                    .frame(height: 44)
+                                }
+                                HStack {
+                                    Button {
+                                        let q = "flights to \(w.destName)"
+                                            .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                                        if let u = URL(string: "https://www.google.com/travel/flights?q=\(q)") {
+                                            UIApplication.shared.open(u)
+                                        }
+                                    } label: {
+                                        Label("Book", systemImage: "arrow.up.right.square")
+                                            .font(.caption).fontWeight(.semibold)
+                                    }
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        flights.removeWatch(w.id)
+                                    } label: {
+                                        Image(systemName: "trash").font(.caption)
+                                    }
+                                }
+                                .foregroundColor(theme.textSecondary)
+                            }
+                            .padding(13)
+                            .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+                            .chappyScrollFX()
+                        }
+
+                        // BUILD 152 — FLIGHT DAY banner. Lights up when a
+                        // tracked flight owns today; shows what the last
+                        // check brought home: gate, terminal, delay.
+                        if let today = flights.todayFlight() {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Image(systemName: "airplane.circle.fill")
+                                        .font(.title2).foregroundColor(.orange)
+                                    Text("FLIGHT DAY — \(today.number)")
+                                        .font(.caption).fontWeight(.heavy).tracking(0.8)
+                                        .foregroundColor(.orange)
+                                    Spacer()
+                                }
+                                Text(Self.flightDate(today.date))
+                                    .font(.subheadline).fontWeight(.semibold)
+                                    .foregroundColor(theme.textPrimary)
+                                HStack(spacing: 10) {
+                                    if let g = today.lastGate {
+                                        Label("Gate \(g)", systemImage: "signpost.right")
+                                    }
+                                    if let t = today.depTerminal {
+                                        Label("Terminal \(t)", systemImage: "building.2")
+                                    }
+                                    if let d = today.lastDelay, d > 0 {
+                                        Label("+\(d) min", systemImage: "clock.badge.exclamationmark")
+                                            .foregroundColor(.red)
+                                    } else if today.lastStatus != nil {
+                                        Label("On time", systemImage: "checkmark.circle")
+                                            .foregroundColor(.green)
+                                    }
+                                }
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                Text("Briefs and gate-change alerts run automatically today. Say \u{201C}how's my flight\u{201D} any time, or \u{201C}take me to the airport\u{201D} for the right terminal.")
+                                    .font(.caption2).foregroundColor(theme.textSecondary)
+                            }
+                            .padding(13)
+                            .background(RoundedRectangle(cornerRadius: 15)
+                                .fill(.ultraThinMaterial)
+                                .overlay(RoundedRectangle(cornerRadius: 15)
+                                    .stroke(Color.orange.opacity(0.5), lineWidth: 1)))
+                            .chappyScrollFX()
+                        }
+
+                        // TRACKED FLIGHTS
+                        if !flights.tracked.isEmpty {
+                            Text("MY FLIGHTS")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(.cyan).padding(.top, 4)
+                            ForEach(flights.tracked.sorted { $0.date < $1.date }) { f in
+                                HStack {
+                                    Image(systemName: "airplane.departure")
+                                        .foregroundColor(.cyan)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(f.number).font(.subheadline).fontWeight(.bold)
+                                            .foregroundColor(theme.textPrimary)
+                                        Text(Self.flightDate(f.date))
+                                            .font(.caption2).foregroundColor(theme.textSecondary)
+                                    }
+                                    Spacer()
+                                    Button {
+                                        _ = flights.statusHandoff()
+                                    } label: {
+                                        Text("Status").font(.caption).fontWeight(.semibold)
+                                            .foregroundColor(.cyan)
+                                    }
+                                }
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+                            }
+                        }
+
+                        Text("Say: \u{201C}watch flights to Bali in September\u{201D} · \u{201C}any flight deals?\u{201D} · \u{201C}track flight QF52 on Thursday\u{201D} · \u{201C}how's my flight?\u{201D}")
+                            .font(.caption2).foregroundColor(theme.textSecondary)
+                            .padding(.top, 6)
+                    }
+                    .padding(16)
+                }
+            }
+            .navigationTitle("Flights")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+        }
+    }
+
+    private static func flightDate(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMMM, h:mm a"; return f.string(from: d)
+    }
+}
+
+// BUILD 149 — WHAT CAN I SAY? Every voice command Chappy understands, on
+// one searchable screen, grouped by what it does. Tap a row and Chappy
+// speaks the phrase back so you hear exactly how to say it.
+struct WhatCanISayView: View {
+    @Environment(\.dismiss) private var dismiss
+    let theme: ChappyTheme
+    @State private var search = ""
+
+    private static let groups: [(name: String, icon: String, items: [String])] = [
+        ("Talk & ask", "bubble.left.fill",
+         ["Chappy, what time is it", "What's the weather", "Convert 180 centimeters to inches",
+          "What's 15 percent of 80", "How many calories in half a chicken", "Plan my day"]),
+        ("Navigate", "location.fill",
+         ["Take me to Coles", "Navigate to Brisbane Airport and get me a coffee on the way",
+          "Get fuel on the way", "Open maps", "Close maps", "Stop navigation", "Take me home",
+          "Where am I", "Remember this spot, call it the blue warung"]),
+        ("Camera & Reader", "camera.fill",
+         ["Take a photo", "Record a clip", "What did I just see", "Read this", "Read the menu",
+          "Translate this", "Scan this", "Keep reading", "Read my last scan"]),
+        ("Mail & texts", "envelope.fill",
+         ["Check my email", "Any texts?", "Read the first one", "Reply saying on my way"]),
+        ("Diary & reminders", "book.closed.fill",
+         ["Remind me to pay rego Friday at 9", "Remind me to take the bins out when I get home",
+          "What's on today", "What's on next week", "Reminders", "Snooze that", "Done with that"]),
+        ("Lists & timers", "checklist",
+         ["Add milk to the shopping list", "What's on my list", "Got the milk",
+          "Set a timer for 10 minutes"]),
+        ("Memory & journal", "brain.head.profile",
+         ["Open memory", "What do you remember about the warung", "Where was I on Tuesday",
+          "Read my journal", "Show my trail", "Remember everything for the next hour",
+          "Stop remembering"]),
+        ("Flights", "airplane",
+         ["Watch flights to Bali in September", "Any flight deals?",
+          "Track flight QF52 on Thursday", "How's my flight",
+          "Take me to the airport"]),
+        ("Rides & food", "car.fill",
+         ["Get me a Grab to the airport", "How much is an Uber to Coles",
+          "Ride home", "Order food", "Order from Mama's Warung",
+          "Order the usual"]),
+        ("Protection", "shield.fill",
+         ["Is this a scam - he wants gift cards", "Scam check", "Is this a good deal",
+          "Can I eat this", "Emergency"]),
+        ("Modes & checks", "gearshape.fill",
+         ["Let's talk", "Translate", "Quiet mode", "Battery check", "Spent today",
+          "Test the voice", "Test notification"]),
+    ]
+
+    private var filtered: [(name: String, icon: String, items: [String])] {
+        guard !search.isEmpty else { return Self.groups }
+        let q = search.lowercased()
+        return Self.groups.compactMap { g in
+            let hits = g.items.filter { $0.lowercased().contains(q) }
+            return hits.isEmpty ? nil : (g.name, g.icon, hits)
+        }
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                List {
+                    ForEach(filtered, id: \.name) { group in
+                        Section {
+                            ForEach(group.items, id: \.self) { phrase in
+                                Button {
+                                    TTSService.shared.speak(phrase)
+                                } label: {
+                                    HStack {
+                                        Text("\u{201C}\(phrase)\u{201D}")
+                                            .font(.subheadline)
+                                            .foregroundColor(theme.textPrimary)
+                                        Spacer()
+                                        Image(systemName: "speaker.wave.2")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(theme.textSecondary)
+                                    }
+                                }
+                                .listRowBackground(Color.white.opacity(0.05))
+                            }
+                        } header: {
+                            Label(group.name, systemImage: group.icon)
+                                .font(.caption).fontWeight(.heavy)
+                                .foregroundColor(theme.accent)
+                        }
+                    }
+                }
+                .scrollContentBackground(.hidden)
+                .searchable(text: $search, prompt: "Search commands")
+            }
+            .navigationTitle("What can I say?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+        }
+    }
+}
+
 // BUILD 132 — ONE EVENT, ONE SHEET.
 //
 // Long-press menus are invisible; this is the discoverable version. Tap any
@@ -3079,16 +3790,16 @@ struct EventDetailSheet: View {
     @State private var level: ChappyCalendar.EventLevel = .normal
     @State private var lead: Int? = nil   // nil = calendar default
 
+    // BUILD 145: the full menu the wearer asked for.
     private static let leadChoices: [(label: String, minutes: Int?)] = [
-        ("Default", nil), ("15 min", 15), ("30 min", 30),
-        ("1 hour", 60), ("2 hours", 120), ("Day before", 1440),
+        ("Default", nil), ("10 min", 10), ("15 min", 15), ("30 min", 30),
+        ("45 min", 45), ("1 hour", 60), ("2 hours", 120), ("Day before", 1440),
     ]
 
     var body: some View {
         NavigationView {
             ZStack {
-                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
-                               startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                AuroraBackdrop(theme: theme).ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         // WHAT AND WHEN.
@@ -3116,7 +3827,7 @@ struct EventDetailSheet: View {
                         }
                         .padding(14)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
 
                         // HOW MUCH IT MATTERS.
                         VStack(alignment: .leading, spacing: 8) {
@@ -3161,6 +3872,18 @@ struct EventDetailSheet: View {
                             }
                         }
 
+                        // BUILD 145 — THIS EVENT IN THE MORNING BRIEF.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("IN THE MORNING BRIEF")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(theme.textSecondary)
+                            HStack(spacing: 8) {
+                                briefChip("Calendar default", value: nil)
+                                briefChip("Always spoken", value: true)
+                                briefChip("Never spoken", value: false)
+                            }
+                        }
+
                         Spacer(minLength: 20)
                     }
                     .padding(16)
@@ -3180,6 +3903,28 @@ struct EventDetailSheet: View {
             let calDefault = event.calendar.map { ChappyCalendar.shared.leadMinutes(for: $0) } ?? 30
             lead = own == calDefault ? nil : own
         }
+    }
+
+    @State private var briefChoice: Bool?? = Bool??.none   // .none = not yet loaded
+
+    private func briefChip(_ label: String, value: Bool?) -> some View {
+        let current: Bool? = briefChoice ?? ChappyCalendar.shared.briefOverride(for: event)
+        let on = current == value
+        return Button {
+            briefChoice = .some(value)
+            ChappyCalendar.shared.setBriefOverride(value, for: event)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            onChange()
+        } label: {
+            Text(label)
+                .font(.caption).fontWeight(.semibold)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 9)
+                    .fill(on ? theme.accent.opacity(0.22) : theme.cardFill))
+                .foregroundColor(on ? theme.accent : theme.textPrimary)
+        }
+        .buttonStyle(.plain)
     }
 
     private func levelButton(_ l: ChappyCalendar.EventLevel, _ icon: String,
@@ -3278,8 +4023,7 @@ struct RemindersView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
-                               startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                AuroraBackdrop(theme: theme).ignoresSafeArea()
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         briefCard
@@ -3361,7 +4105,7 @@ struct RemindersView: View {
             }
         }
         .padding(3)
-        .background(RoundedRectangle(cornerRadius: 11).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 11).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
     }
 
@@ -3428,6 +4172,9 @@ struct RemindersView: View {
         let sub: String
         let isPing: Bool          // dashed — this is a notification, not a deadline
         let isEvent: Bool
+        // BUILD 145: what a tap opens — the event sheet or the reminder editor.
+        var event: EKEvent? = nil
+        var rem: ChappyMemory.Entry? = nil
     }
 
     /// Seven days from today. A dot means there is something on that day, so
@@ -3485,7 +4232,7 @@ struct RemindersView: View {
             let cat = ChappyReminders.category(of: r)
             out.append(Slot(id: r.id.uuidString, at: fire, title: r.title,
                             tint: r.escalate == true ? .orange : theme.accent,
-                            sub: "\(cat.label) · due", isPing: false, isEvent: false))
+                            sub: "\(cat.label) · due", isPing: false, isEvent: false, rem: r))
             // The notification, as its own block. This is the whole point.
             if let lead = r.leadMinutes, lead > 0 {
                 let at = fire.addingTimeInterval(-Double(lead) * 60)
@@ -3504,7 +4251,7 @@ struct RemindersView: View {
             if let l = e.location, !l.isEmpty { sub += " · \(l)" }
             out.append(Slot(id: e.eventIdentifier ?? UUID().uuidString, at: s,
                             title: e.title ?? "Appointment", tint: .purple,
-                            sub: sub, isPing: false, isEvent: true))
+                            sub: sub, isPing: false, isEvent: true, event: e))
         }
 
         return out.sorted { $0.at < $1.at }
@@ -3598,6 +4345,16 @@ struct RemindersView: View {
                 .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: s.isPing ? [4, 3] : []))
                 .foregroundColor(s.isPing ? .orange.opacity(0.55) : .clear)
         )
+        // BUILD 145 — TAP ANYTHING, ANYWHERE. The Schedule tab's event sheet
+        // now opens from the Timeline too; reminders open their editor.
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if let e = s.event {
+                eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+            } else if let r = s.rem {
+                editing = r
+            }
+        }
     }
 
     private static func hourLabel(_ h: Int) -> String {
@@ -3673,7 +4430,7 @@ struct RemindersView: View {
                     Spacer(minLength: 0)
                 }
                 .padding(12)
-                .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                 .padding(.horizontal, 16)
                 // BUILD 132 — TAP THE THING. Long-press was invisible; nobody
                 // finds a contextMenu they weren't told about. A tap now opens
@@ -3704,6 +4461,68 @@ struct RemindersView: View {
     private static func time(_ d: Date?) -> String {
         guard let d else { return "" }
         let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    // BUILD 145 — LISTS BY HAND (the Keep model). Voice stays the fast door;
+    // this is the visible one. Name it, type items comma-separated, done —
+    // the geofenced "pings you near a shop" magic attaches automatically.
+    @State private var showNewList = false
+    @State private var newListName = ""
+    @State private var newListItems = ""
+
+    private var newListButton: some View {
+        Button { showNewList = true } label: {
+            HStack {
+                Image(systemName: "plus.circle.fill").foregroundColor(.mint)
+                Text("New list").font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("or say \u{201C}add milk to the shopping list\u{201D}")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+            .padding(.horizontal, 16)
+        }
+        .buttonStyle(.plain)
+        .sheet(isPresented: $showNewList) {
+            NavigationView {
+                Form {
+                    Section("List name") {
+                        TextField("Shopping", text: $newListName)
+                    }
+                    Section("Items — separate with commas") {
+                        TextField("milk, bread, batteries", text: $newListItems, axis: .vertical)
+                            .lineLimit(3...6)
+                    }
+                    Section {
+                        Button("Create") {
+                            let name = newListName.trimmingCharacters(in: .whitespaces)
+                            let items = newListItems.split(separator: ",")
+                                .map { $0.trimmingCharacters(in: .whitespaces) }
+                                .filter { !$0.isEmpty }
+                            guard !name.isEmpty, !items.isEmpty else { return }
+                            Task {
+                                _ = await ChappyLists.shared.addItems(items, toListNamed: name, placeHint: name)
+                                listItems.removeValue(forKey: name)
+                            }
+                            newListName = ""; newListItems = ""
+                            showNewList = false
+                        }
+                        .disabled(newListName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    } footer: {
+                        Text("The list pings you on its own when you're near a shop that has what's on it.")
+                    }
+                }
+                .navigationTitle("New list")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Cancel") { showNewList = false }
+                    }
+                }
+            }
+        }
     }
 
     // BUILD 140 — SUGGESTED. Chappy's proposals for the day: a get-ready
@@ -3747,6 +4566,7 @@ struct RemindersView: View {
                 .background(RoundedRectangle(cornerRadius: 13)
                     .fill(Color.orange.opacity(0.08)))
                 .padding(.horizontal, 16)
+                .chappyScrollFX()
             }
         }
     }
@@ -3837,7 +4657,7 @@ struct RemindersView: View {
                     .font(.caption2).fontWeight(.heavy).tracking(0.6)
                     .foregroundColor(theme.textSecondary)
                     .padding(.horizontal, 20).padding(.top, 10)
-                ForEach(grouped[day] ?? []) { item in pingRow(item) }
+                ForEach(grouped[day] ?? []) { item in pingRow(item).chappyScrollFX() }
             }
             Text("Tap a ping to change or clear it. This list is exactly what will make noise.")
                 .font(.caption2).foregroundColor(theme.textSecondary)
@@ -3875,7 +4695,7 @@ struct RemindersView: View {
                 .font(.system(size: 11)).foregroundColor(theme.textSecondary.opacity(0.5))
         }
         .padding(11)
-        .background(RoundedRectangle(cornerRadius: 13).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 13).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
         .contentShape(Rectangle())
         .onTapGesture {
@@ -3917,6 +4737,7 @@ struct RemindersView: View {
     @ViewBuilder
     private var listsSection: some View {
         let all = ChappyLists.shared.lists
+        newListButton
         if all.isEmpty {
             VStack(spacing: 10) {
                 Image(systemName: "checklist")
@@ -3958,13 +4779,27 @@ struct RemindersView: View {
                     if expandedList == l.id {
                         if let items = listItems[l.id], !items.isEmpty {
                             ForEach(items, id: \.self) { item in
-                                HStack(spacing: 8) {
-                                    Image(systemName: "circle")
-                                        .font(.system(size: 9)).foregroundColor(.mint)
-                                    Text(item).font(.caption).foregroundColor(theme.textPrimary)
-                                    Spacer()
+                                // BUILD 145 — TAP TO TICK. Voice still works
+                                // ("got the milk"); now a finger does too.
+                                Button {
+                                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                    Task {
+                                        _ = await ChappyLists.shared.complete([item])
+                                        let open = await ChappyLists.shared.openItems(listID: l.id)
+                                        listItems[l.id] = open.compactMap { $0.title }
+                                    }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "circle")
+                                            .font(.system(size: 9)).foregroundColor(.mint)
+                                        Text(item).font(.caption).foregroundColor(theme.textPrimary)
+                                        Spacer()
+                                        Text("tap to tick")
+                                            .font(.system(size: 8)).foregroundColor(theme.textSecondary.opacity(0.6))
+                                    }
+                                    .padding(.leading, 46)
                                 }
-                                .padding(.leading, 46)
+                                .buttonStyle(.plain)
                             }
                             Text("Say \u{201C}Chappy, got the milk\u{201D} to tick one off.")
                                 .font(.caption2).foregroundColor(theme.textSecondary)
@@ -3977,7 +4812,7 @@ struct RemindersView: View {
                     }
                 }
                 .padding(12)
-                .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                 .padding(.horizontal, 16)
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -4057,7 +4892,7 @@ struct RemindersView: View {
                 .font(.caption).foregroundColor(theme.textSecondary)
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
     }
 
@@ -4307,7 +5142,7 @@ struct ReminderRow: View {
             // BUILD 127: the urgency edge. Fastest read on the screen — red
             // means it has already passed, amber means it was flagged.
             ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 14).fill(theme.cardFill)
+                RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial)
                 Rectangle().fill(edgeColour).frame(width: 3)
             }
             .clipShape(RoundedRectangle(cornerRadius: 14))

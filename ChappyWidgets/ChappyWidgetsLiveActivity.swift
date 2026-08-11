@@ -2,79 +2,170 @@
 //  ChappyWidgetsLiveActivity.swift
 //  ChappyWidgets
 //
-//  Created by user951653 on 8/11/26.
+//  BUILD 154 — FLIGHT DAY on the lock screen and in the Dynamic Island:
+//  countdown to wheels-up, gate, terminal, delay, leave-by. Updated by
+//  the app's flight-day passes; nothing here talks to the network.
+//
+//  ⚠️ ChappyFlightAttributes exists in TWO places on purpose: here, and
+//  in CameraAccess/Managers/LiveAIManager.swift. ActivityKit matches
+//  them by TYPE NAME and Codable shape across the process boundary —
+//  the two copies must stay IDENTICAL, field for field.
 //
 
 import ActivityKit
 import WidgetKit
 import SwiftUI
 
-struct ChappyWidgetsAttributes: ActivityAttributes {
+struct ChappyFlightAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable {
-        // Dynamic stateful properties about your activity go here!
-        var emoji: String
+        var status: String       // scheduled / active / landed / cancelled
+        var gate: String?
+        var terminal: String?
+        var delayMin: Int
+        var departure: Date      // countdown target
+        var leaveBy: Date?       // when to walk out the door
     }
-
-    // Fixed non-changing properties about your activity go here!
-    var name: String
+    var number: String           // "QF52"
+    var airport: String          // "Brisbane Airport"
 }
 
 struct ChappyWidgetsLiveActivity: Widget {
     var body: some WidgetConfiguration {
-        ActivityConfiguration(for: ChappyWidgetsAttributes.self) { context in
-            // Lock screen/banner UI goes here
-            VStack {
-                Text("Hello \(context.state.emoji)")
+        ActivityConfiguration(for: ChappyFlightAttributes.self) { context in
+            // ── Lock screen banner ──
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: "airplane.departure")
+                        .foregroundStyle(.cyan)
+                    Text(context.attributes.number)
+                        .font(.headline).bold()
+                    Text(context.attributes.airport)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    statusChip(context.state)
+                }
+                HStack(alignment: .firstTextBaseline) {
+                    if context.state.status == "active" {
+                        Text("In the air").font(.title3).bold()
+                    } else if context.state.departure > Date() {
+                        Text(timerInterval: Date()...context.state.departure,
+                             countsDown: true)
+                            .font(.title2).bold().monospacedDigit()
+                        Text("to wheels-up").font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Departing").font(.title3).bold()
+                    }
+                    Spacer()
+                    if let g = context.state.gate {
+                        Label("Gate \(g)", systemImage: "signpost.right")
+                            .font(.caption).bold()
+                    }
+                    if let t = context.state.terminal {
+                        Label("T\(t)", systemImage: "building.2")
+                            .font(.caption)
+                    }
+                }
+                if let leave = context.state.leaveBy, leave > Date() {
+                    Label {
+                        Text("Leave by \(leave, style: .time)")
+                    } icon: {
+                        Image(systemName: "figure.walk.departure")
+                    }
+                    .font(.caption).foregroundStyle(.orange)
+                }
             }
-            .activityBackgroundTint(Color.cyan)
-            .activitySystemActionForegroundColor(Color.black)
+            .padding(14)
+            .activityBackgroundTint(Color.black.opacity(0.55))
+            .activitySystemActionForegroundColor(Color.cyan)
 
         } dynamicIsland: { context in
             DynamicIsland {
-                // Expanded UI goes here.  Compose the expanded UI through
-                // various regions, like leading/trailing/center/bottom
+                // ── Expanded ──
                 DynamicIslandExpandedRegion(.leading) {
-                    Text("Leading")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label(context.attributes.number, systemImage: "airplane.departure")
+                            .font(.headline)
+                        if let g = context.state.gate {
+                            Text("Gate \(g)").font(.caption).bold()
+                                .foregroundStyle(.cyan)
+                        }
+                    }
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text("Trailing")
+                    VStack(alignment: .trailing, spacing: 2) {
+                        if context.state.departure > Date() {
+                            Text(timerInterval: Date()...context.state.departure,
+                                 countsDown: true)
+                                .font(.headline).monospacedDigit()
+                                .frame(maxWidth: 64)
+                        }
+                        if context.state.delayMin > 0 {
+                            Text("+\(context.state.delayMin) min")
+                                .font(.caption).bold().foregroundStyle(.red)
+                        } else {
+                            Text("On time").font(.caption).foregroundStyle(.green)
+                        }
+                    }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    Text("Bottom \(context.state.emoji)")
-                    // more content
+                    HStack {
+                        if let t = context.state.terminal {
+                            Label("Terminal \(t)", systemImage: "building.2")
+                                .font(.caption)
+                        }
+                        Spacer()
+                        if let leave = context.state.leaveBy, leave > Date() {
+                            Label {
+                                Text("Leave \(leave, style: .time)")
+                            } icon: {
+                                Image(systemName: "figure.walk.departure")
+                            }
+                            .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
                 }
             } compactLeading: {
-                Text("L")
+                Image(systemName: "airplane.departure")
+                    .foregroundStyle(.cyan)
             } compactTrailing: {
-                Text("T \(context.state.emoji)")
+                if context.state.delayMin > 0 {
+                    Text("+\(context.state.delayMin)m")
+                        .font(.caption2).bold().foregroundStyle(.red)
+                } else if context.state.departure > Date() {
+                    Text(timerInterval: Date()...context.state.departure,
+                         countsDown: true)
+                        .font(.caption2).monospacedDigit()
+                        .frame(maxWidth: 44)
+                } else {
+                    Image(systemName: "airplane")
+                }
             } minimal: {
-                Text(context.state.emoji)
+                Image(systemName: "airplane.departure")
+                    .foregroundStyle(.cyan)
             }
-            .widgetURL(URL(string: "http://www.apple.com"))
-            .keylineTint(Color.red)
+            .keylineTint(Color.cyan)
         }
     }
-}
 
-extension ChappyWidgetsAttributes {
-    fileprivate static var preview: ChappyWidgetsAttributes {
-        ChappyWidgetsAttributes(name: "World")
+    @ViewBuilder
+    private func statusChip(_ s: ChappyFlightAttributes.ContentState) -> some View {
+        if s.status == "cancelled" {
+            Text("CANCELLED").font(.caption2).bold()
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.red))
+                .foregroundStyle(.white)
+        } else if s.delayMin > 0 {
+            Text("+\(s.delayMin) min").font(.caption2).bold()
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.red.opacity(0.85)))
+                .foregroundStyle(.white)
+        } else {
+            Text("On time").font(.caption2).bold()
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.green.opacity(0.85)))
+                .foregroundStyle(.white)
+        }
     }
-}
-
-extension ChappyWidgetsAttributes.ContentState {
-    fileprivate static var smiley: ChappyWidgetsAttributes.ContentState {
-        ChappyWidgetsAttributes.ContentState(emoji: "😀")
-     }
-     
-     fileprivate static var starEyes: ChappyWidgetsAttributes.ContentState {
-         ChappyWidgetsAttributes.ContentState(emoji: "🤩")
-     }
-}
-
-#Preview("Notification", as: .content, using: ChappyWidgetsAttributes.preview) {
-   ChappyWidgetsLiveActivity()
-} contentStates: {
-    ChappyWidgetsAttributes.ContentState.smiley
-    ChappyWidgetsAttributes.ContentState.starEyes
 }
