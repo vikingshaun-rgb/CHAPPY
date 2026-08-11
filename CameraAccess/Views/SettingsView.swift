@@ -12,6 +12,9 @@ struct SettingsView: View {
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @ObservedObject var languageManager = LanguageManager.shared
     @ObservedObject var providerManager = APIProviderManager.shared
+    // BUILD 137: the memory controls, visible at last.
+    @ObservedObject private var pulse = ChappyPulse.shared
+    @ObservedObject private var keeper = ChappyMemoryKeeper.shared
     let apiKey: String
 
     @State private var showAPIKeySettings = false
@@ -549,6 +552,58 @@ struct SettingsView: View {
                     Text(standbyAutoArm
                          ? "Say “Chappy” then your command. Turning Standby off by hand keeps it off until you next open the app."
                          : "You'll need to tap Standby on the home screen each time before voice commands work.")
+                        .font(AppTypography.caption)
+                }
+
+                // BUILD 137 — CHAPPY'S MEMORY, FINALLY ON A SCREEN.
+                // The Pulse dial and the Codex were voice-only: real controls
+                // with no visible state. Now the dial is a picker you can see,
+                // and the Codex is a list you can read and prune — because a
+                // profile you can't inspect is a profile you can't trust.
+                Section {
+                    Picker(selection: Binding(
+                        get: { pulse.tier },
+                        set: { pulse.setTier($0, speak: false) }
+                    )) {
+                        ForEach(ChappyPulse.Tier.allCases) { t in
+                            Text(t.label).tag(t)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "camera.metering.matrix")
+                                .foregroundColor(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Ambient memory (Pulse)")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(pulse.tier == .off
+                                     ? "Off — the camera only wakes when you ask"
+                                     : "\(pulse.captionsToday) moments today · $\(String(format: "%.4f", pulse.spentTodayUSD)) spent")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                    NavigationLink {
+                        CodexFactsList()
+                    } label: {
+                        HStack {
+                            Image(systemName: "brain.head.profile")
+                                .foregroundColor(.mint)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("What Chappy knows about you")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(keeper.facts.isEmpty
+                                     ? "Nothing yet — the Codex distils facts as you live"
+                                     : "\(keeper.facts.count) facts held — tap to read or remove them")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Chappy's memory")
+                } footer: {
+                    Text("Pulse quietly captions what the glasses see so days are remembered. Facts and captions stay on this phone; ambient moments expire after 45 days unless pinned.")
                         .font(AppTypography.caption)
                 }
 
@@ -2011,5 +2066,69 @@ struct CalendarRow: View {
             behaviour = ChappyCalendar.shared.behaviour(for: cal)
             lead = ChappyCalendar.shared.leadMinutes(for: cal)
         }
+    }
+}
+
+// BUILD 137 — THE CODEX, READABLE AND PRUNABLE.
+//
+// Every durable fact Chappy holds about the wearer, on one screen: what it
+// is, when it was first learned, when it was last confirmed true. Swipe to
+// remove one; the button at the bottom clears the lot. Nothing here is a
+// transcript — these are the distilled lines the Codex keeps ("scooter
+// rider", "no shellfish") and injects into prompts so Chappy acts like it
+// knows you.
+struct CodexFactsList: View {
+    @ObservedObject private var keeper = ChappyMemoryKeeper.shared
+    @State private var confirmWipe = false
+
+    var body: some View {
+        List {
+            if keeper.facts.isEmpty {
+                Section {
+                    Text("Nothing yet. The Codex reads the day's memories once a night and keeps only what stays true — where you live, how you get around, what you can't eat. Facts appear here as they're learned.")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            } else {
+                Section {
+                    ForEach(keeper.facts) { f in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(f.text)
+                                .foregroundColor(AppColors.textPrimary)
+                            Text("Learned \(Self.day(f.firstSeen)) · confirmed \(Self.day(f.lastConfirmed))")
+                                .font(AppTypography.caption)
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                    }
+                    .onDelete { idx in
+                        for i in idx { keeper.forget(keeper.facts[i].id) }
+                    }
+                } footer: {
+                    Text("Swipe left to remove a fact. Removed facts are gone — the Codex won't re-add one unless it's genuinely observed again.")
+                        .font(AppTypography.caption)
+                }
+                Section {
+                    Button(role: .destructive) {
+                        confirmWipe = true
+                    } label: {
+                        Text("Forget everything")
+                    }
+                    .confirmationDialog("Remove every fact the Codex holds?",
+                                        isPresented: $confirmWipe,
+                                        titleVisibility: .visible) {
+                        Button("Forget everything", role: .destructive) {
+                            keeper.forgetEverything()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    }
+                }
+            }
+        }
+        .navigationTitle("What Chappy knows")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private static func day(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "d MMM"; return f.string(from: d)
     }
 }

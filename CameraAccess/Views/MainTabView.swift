@@ -25,10 +25,13 @@ struct MainTabView: View {
                 }
                 .tag(0)
 
-            // Records
-            RecordsView()
+            // BUILD 137 — RECORDS RETIRED. Everything Records showed is folded
+            // into the one memory store at launch, so this tab now opens the
+            // Memory browser: one place, searchable, with the map — instead of
+            // a second, staler view of the same life.
+            ChappyMemoryBrowser()
                 .tabItem {
-                    Label("tab.records".localized, systemImage: "list.bullet.rectangle")
+                    Label("Memory", systemImage: "brain.head.profile")
                 }
                 .tag(1)
 
