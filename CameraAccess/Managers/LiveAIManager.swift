@@ -14,6 +14,7 @@ import Speech
 import Photos
 import Network
 import UserNotifications
+import Vision   // BUILD 134: on-device OCR for the Reader
 
 // MARK: - CHAPPY EARCONS — the sound of being heard
 //
@@ -1221,6 +1222,9 @@ final class ChappyStandby: NSObject, ObservableObject {
         "chappy", "chappie", "chapy", "chappy's", "chappi", "chapi",
         "chappey", "chappe", "chapper", "chappa", "chap he", "chap e",
         "shappy", "shappie", "tchappy", "chappys", "chaphy",
+        // BUILD 135: what iOS actually hears an Australian say. "Chatty" is
+        // the recogniser's favourite mishearing of the name.
+        "chatty", "chattie", "chappé", "japi", "chubby",
     ]
 
     // MARK: Language intelligence (country-aware translation)
@@ -1669,6 +1673,19 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// of disarming on the first stumble. One transient mic-format failure
     /// during a Bluetooth route change — which happens constantly with glasses
     /// and a pocketed phone — used to kill the ear for the rest of the session.
+    /// BUILD 135: an on-demand liveness check for the moments most likely to
+    /// kill the tap — right after camera work. If buffers have stopped, the
+    /// ear rebuilds NOW instead of waiting out the 10-second watchdog.
+    func pokeEar(after delay: TimeInterval = 1.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isListening else { return }
+            if Date().timeIntervalSince(self.lastBufferAt) > 2.0 {
+                print("👂 [Standby] Ear quiet after camera work — rebuilding now")
+                self.rebuildEar()
+            }
+        }
+    }
+
     /// - Parameters:
     ///   - freshEngine: replace the AVAudioEngine outright. Required after a
     ///     media-services reset, where the old instance is invalid by contract.
@@ -2109,6 +2126,14 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         ChappyEarcon.shared.wake()
         TTSService.shared.speak(line)
+        // BUILD 135 — TALK BACK LIKE A PERSON. The greeting is an opening,
+        // so the door it opens stays open: for a good stretch after it,
+        // anything you say routes with NO wake word — "find the closest
+        // hardware store" straight after "Good morning" just works, the way
+        // Meta's do it. The window is generous because the ear is deaf while
+        // the greeting itself is being spoken.
+        followUpOpenedAt = Date()
+        followUpUntil = Date().addingTimeInterval(25)
     }
 
     /// The one thing worth leading with. Ordered by how much it matters.
@@ -2222,6 +2247,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyEarcon.shared.cameraWaking()
             SnapFeedback.shared.waking()
             NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            // BUILD 135: the camera coming up is exactly when the mic tap
+            // gets torn down. Check the ear once the wake settles.
+            pokeEar(after: 4.0)
             return
         }
         // The camera is already awake — this is instant, so the shutter is the
@@ -2245,6 +2273,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         ChappyHaptics.shared.shutter()
         ChappyEarcon.shared.shutter()
         SnapFeedback.shared.captured(frame)
+
+        // BUILD 135 — THE EAR THAT DIED WITH THE SHUTTER. Waking the glasses
+        // camera reroutes audio, and the mic tap can go down with it. The
+        // liveness watchdog catches this eventually (10s), but "eventually"
+        // reads as deaf. Check the ear the moment the photo is taken, and
+        // again after the camera goes back to sleep.
+        pokeEar(after: 1.5)
+        pokeEar(after: 5.0)
 
         let thumb = frame.jpegData(compressionQuality: 0.4)
 
@@ -3087,7 +3123,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             // The tail arrives as a separate recogniser partial and any natural
             // pause expired the window, firing bare "translate" and losing the
             // language. Words that commonly take a tail get longer.
-            debounce = ["translate", "navigate", "go", "map to"].contains(cleanTail) ? 0.75 : 0.45
+            // BUILD 135: widened again — the recogniser delivers partials in
+            // bursts, and a burst gap mid-sentence was firing half a thought.
+            debounce = ["translate", "navigate", "go", "map to"].contains(cleanTail) ? 0.9 : 0.6
         } else {
             // BUILD 118 — FASTER ONCE HE HAS ACTUALLY FINISHED.
             //
@@ -3099,13 +3137,19 @@ final class ChappyStandby: NSObject, ObservableObject {
             // So: a complete-looking command gets a short window regardless of
             // length. Only genuinely ambiguous short fragments — where more
             // words would change the meaning — get the longer one.
+            // BUILD 135 — THE CUT-OFF, FOUND. "Find the closest hardware
+            // store" is four words in ("find the closest hardware") when the
+            // recogniser takes a breath between partial bursts — and 0.45s
+            // fired right there, routing "hardware" and shelving "store".
+            // A quarter-second more of patience costs nothing a human can
+            // feel mid-conversation and stops whole sentences being clipped.
             let wordCount = snapshot.split(separator: " ").count
             if wordCount >= 4 {
-                debounce = 0.45          // said his piece; go
+                debounce = 0.7           // said his piece — but let the burst land
             } else if wordCount == 1 {
-                debounce = 0.55          // one word could still be growing
+                debounce = 0.8           // one word could still be growing
             } else {
-                debounce = 0.5
+                debounce = 0.7
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
@@ -3378,6 +3422,30 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.hasSuffix("that's enough") || c == "enough" || c.contains("back to standby") {
             TTSService.shared.stop(); ChappyHaptics.shared.straightStep(); return
         }
+        // BUILD 136: "close maps" — kill Chappy's route and clear its map UI.
+        // Honesty note: iOS does not let one app quit another, so Google Maps
+        // itself stays wherever it is — but Chappy's navigation ends and the
+        // slate is clean the moment you come back.
+        if c.contains("close maps") || c.contains("close the maps")
+            || c.contains("close google maps") || c.contains("exit maps")
+            || c.contains("shut maps") {
+            NavEngine.shared.stop(announce: false)
+            NotificationCenter.default.post(name: Notification.Name("chappyMapsCleanup"), object: nil)
+            speak("Route's off. Swipe back to me whenever you're ready.")
+            return
+        }
+
+        // ---------- BUILD 136: POCKET ANSWERS, FIRST IN LINE ----------
+        // "What time is it" was answering in fifteen seconds because a
+        // hundred ladder branches and a paid fall-through all got a look
+        // before the free tier did. Pocket only ever answers the questions
+        // it is CERTAIN about — time, date, conversions, arithmetic, the
+        // weather snapshot — so it is safe to run before everything else,
+        // and those questions now come back Meta-fast, offline, for free.
+        if let pocket = ChappyPocket.answer(c) {
+            speak(pocket)
+            return
+        }
 
         // ---------- TIER 3 — the computer (unambiguous openers, checked early
         // so job wording like "send the photos" can't be hijacked) ----------
@@ -3531,11 +3599,55 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             return
         }
-        if c.contains("open reminders") || c.contains("show my reminders")
-            || c.contains("show reminders") || c.contains("open my list") {
+        // BUILD 135: bare "reminders" used to fall through to the either/or
+        // prompt ("find you one nearby, or tell you about it?") — the single
+        // most obvious word for the feature didn't open the feature.
+        if c == "reminders" || c == "reminder" || c == "my reminders"
+            || c.contains("open reminders") || c.contains("show my reminders")
+            || c.contains("show reminders") || c.contains("open my list")
+            || c.contains("what are my reminders") || c.contains("check my reminders") {
             NotificationCenter.default.post(name: .chappyOpenReminders, object: nil)
             ChappyEarcon.shared.done()
-            speak("Here's your list."); return
+            // Say something USEFUL while the screen opens — the brief head.
+            let facts = Self.greetingFacts(max: 2)
+            speak(facts.isEmpty ? "Here's your list. Nothing due." : "Here's your list. " + facts.joined(separator: " "))
+            return
+        }
+        // BUILD 135 — NOTIFICATION SELF-TEST. "Why aren't notifications
+        // showing?" now has an answer you can get by asking. Reads the REAL
+        // authorization state and, if allowed, fires a test banner in 5s.
+        if c.contains("test notification") || c.contains("notification test")
+            || c.contains("check notifications") || c.contains("test my notifications") {
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                DispatchQueue.main.async {
+                    switch settings.authorizationStatus {
+                    case .denied:
+                        TTSService.shared.speak("Notifications are switched OFF for Chappy in iPhone Settings. Open Settings, find Chappy, tap Notifications, and turn Allow Notifications on. That's why nothing has been popping up.")
+                    case .notDetermined:
+                        TTSService.shared.speak("iOS hasn't been asked yet — asking now. Tap Allow.")
+                        UNUserNotificationCenter.current()
+                            .requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+                    default:
+                        var extras: [String] = []
+                        if settings.alertSetting != .enabled { extras.append("banners are off") }
+                        if settings.soundSetting != .enabled { extras.append("sound is off") }
+                        let content = UNMutableNotificationContent()
+                        content.title = "Chappy test"
+                        content.body = "Notifications are working."
+                        content.sound = .default
+                        content.userInfo = ["chappy_timer": true]
+                        let req = UNNotificationRequest(
+                            identifier: "chappy-test-\(Int(Date().timeIntervalSince1970))",
+                            content: content,
+                            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false))
+                        UNUserNotificationCenter.current().add(req)
+                        TTSService.shared.speak(extras.isEmpty
+                            ? "Allowed. Test banner in five seconds — watch the top of the screen."
+                            : "Allowed, but \(extras.joined(separator: " and ")) in iPhone Settings. Test banner in five seconds anyway.")
+                    }
+                }
+            }
+            return
         }
 
         // ---------- PHASE 5 — MEMORY RECALL (free, offline, instant) ----------
@@ -3727,6 +3839,41 @@ final class ChappyStandby: NSObject, ObservableObject {
         //
         // The exact-equality tests were the same mistake in a smaller way:
         // "open translate" matched, "open translate please" did not.
+
+        // BUILD 134 — THE READER claims its forms BEFORE the translate-session
+        // opener below can. "Translate this sign" means the text in front of
+        // the camera, not a live conversation — UNLESS a target language is
+        // named ("translate this to Thai"), which stays a session request.
+        let namesALanguage = ["indonesian", "thai", "vietnamese", "japanese",
+                              "chinese", "mandarin", "french", "german", "spanish",
+                              "korean", "italian", "hindi", "balinese", "malay"]
+            .contains { c.contains($0) }
+        if !namesALanguage,
+           c.contains("scan this") || c.contains("scan that") || c.contains("scan the ")
+            || c.contains("save this document") || c.contains("scan and save")
+            || c.contains("scan it") {
+            speak("Scanning.")
+            ChappyReader.shared.begin(.scan)
+            return
+        }
+        if !namesALanguage,
+           c.hasPrefix("translate this") || c.hasPrefix("translate that")
+            || c.hasPrefix("translate the ") || c.contains("translate what it says") {
+            speak("Having a look.")
+            ChappyReader.shared.begin(.translate)
+            return
+        }
+        if c.contains("keep reading") || c.contains("continue reading")
+            || c.contains("next page") || c.contains("read the rest") {
+            ChappyReader.shared.continueReading()
+            return
+        }
+        if c.contains("read my last scan") || c.contains("read the last scan")
+            || c.contains("read that scan") || c.contains("last scan") {
+            ChappyReader.shared.readLastScan()
+            return
+        }
+
         if c.hasPrefix("translate") || c.hasPrefix("translation")
             || c.contains("translation") || c.contains("translator")
             || c.contains("interpreter") || c.contains("interpret for")
@@ -3887,12 +4034,13 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT FIX: "read the menu" and "what does this sign say" — both in
         // the spec — used to fall through to a BLIND paid call that would
         // invent an answer. Matches the in-session bridge's breadth now.
+        // BUILD 134: routed through the Reader — free on-device OCR first,
+        // the paid eyes only when OCR finds nothing legible.
         if (c.hasPrefix("read th") || c.hasPrefix("read it") || c.contains("read this sign") || c.contains("read that sign") || c.contains("read the menu")) || c.contains("read it") || c.contains("read me")
             || c.contains("what does this say") || c.contains("what does that say")
             || (c.contains("what does") && c.contains("say")) {
             speak("Reading that now.")
-            QuickVisionManager.shared.triggerQuickVision(customPrompt:
-                "Read ALL visible text in this image aloud, verbatim and in order. If it is in another language, read it then translate it. No commentary.")
+            ChappyReader.shared.begin(.read)
             return
         }
         if c.contains("can i eat") || c.contains("can she eat") || c.contains("can we eat")
@@ -9769,5 +9917,208 @@ enum ChappyPocket {
         return rounded == rounded.rounded()
             ? String(Int(rounded))
             : String(format: "%.1f", rounded)
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY READER (Build 134 — read, translate, scan)
+// =====================================================================
+//
+// THE INSIGHT THIS IS BUILT ON: reading text is FREE now. Apple's Vision
+// framework does document-grade OCR on-device — menus, labels, signs,
+// contracts — with no network and no API bill. The old path sent a photo to
+// a paid model to do what the phone could do for nothing.
+//
+// So the Reader is a ladder of its own:
+//   1. Grab ONE frame from the glasses (same wake-grab-sleep dance as Pulse).
+//   2. OCR on-device. Free, instant, works with no signal.
+//   3a. READ       → speak it, chunked, "keep reading" for the rest.
+//   3b. TRANSLATE  → one tiny TEXT-ONLY call (the image never leaves the
+//                    phone), then speak the English.
+//   3c. SCAN       → file text + photo into memory as a .scan, then read it.
+//                    "Read my last scan" brings it back any time.
+//   4. Only if OCR finds nothing legible (handwriting, terrible light) does
+//      it fall back to the paid eyes — QuickVision — exactly as before.
+@MainActor
+final class ChappyReader {
+
+    static let shared = ChappyReader()
+    private init() {}
+
+    enum Mode { case read, translate, scan }
+
+    /// What "keep reading" continues from.
+    private var remainder = ""
+    private var lastMode: Mode = .read
+
+    // MARK: - Entry points
+
+    func begin(_ mode: Mode) {
+        lastMode = mode
+        Task { await run(mode) }
+    }
+
+    func continueReading() {
+        guard !remainder.isEmpty else {
+            TTSService.shared.speak("That was the lot.")
+            return
+        }
+        speakChunked(remainder)
+    }
+
+    /// "Read my last scan."
+    func readLastScan() {
+        let scans = ChappyMemory.shared.recent
+            .filter { $0.kind == .scan && !$0.body.isEmpty }
+            .sorted { $0.at > $1.at }
+        guard let last = scans.first else {
+            TTSService.shared.speak("No scans saved yet. Say 'scan this' while looking at a page.")
+            return
+        }
+        speakChunked(last.body)
+    }
+
+    // MARK: - The run
+
+    private func run(_ mode: Mode) async {
+        guard let frame = await grabFrame() else {
+            TTSService.shared.speak("The camera didn't come up. Try that again.")
+            return
+        }
+        let text = await ocr(frame)
+
+        // Nothing legible → the paid eyes, which also handle handwriting.
+        guard text.count >= 12 else {
+            QuickVisionManager.shared.triggerQuickVision(customPrompt:
+                "Read ALL visible text in this image aloud, verbatim and in order. If it is in another language, read it then translate it. No commentary.")
+            return
+        }
+
+        switch mode {
+        case .read:
+            speakChunked(text)
+
+        case .scan:
+            let title = String(text.split(separator: "\n").first ?? "Scanned document").prefix(60)
+            _ = ChappyMemory.shared.remember(
+                .scan,
+                title: String(title),
+                body: text,
+                tags: ["scan"],
+                thumbnail: frame.jpegData(compressionQuality: 0.5),
+                source: "reader")
+            TTSService.shared.speak("Saved. \(spokenLength(of: text))")
+            remainder = text
+
+        case .translate:
+            TTSService.shared.speak("One moment.")
+            if let english = await translate(text) {
+                speakChunked(english)
+            } else {
+                // No signal or no key — read it as-is rather than doing nothing.
+                TTSService.shared.speak("Couldn't reach the translator. Reading it as it is.")
+                speakChunked(text)
+            }
+        }
+    }
+
+    // MARK: - Camera (Pulse's wake-grab-sleep dance, one frame)
+
+    private func grabFrame() async -> UIImage? {
+        let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
+        if !wasStreaming {
+            NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            for _ in 0..<20 {                                    // up to ~5s
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
+            }
+            // Let exposure settle — the first frames off a cold camera are
+            // dark, and dark frames read as "no text".
+            try? await Task.sleep(nanoseconds: 900_000_000)
+        }
+        let frame = LiveAIManager.shared.streamViewModel?.currentVideoFrame
+        if !wasStreaming {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if !ContinuousVisionManager.shared.isRunning, GeminiLiveService.activeInstance == nil {
+                await LiveAIManager.shared.streamViewModel?.stopSession()
+            }
+        }
+        return frame
+    }
+
+    // MARK: - OCR (free, on-device)
+
+    private func ocr(_ image: UIImage) async -> String {
+        guard let cg = image.cgImage else { return "" }
+        return await withCheckedContinuation { cont in
+            let request = VNRecognizeTextRequest { req, _ in
+                let lines = (req.results as? [VNRecognizedTextObservation] ?? [])
+                    .compactMap { $0.topCandidates(1).first?.string }
+                cont.resume(returning: lines.joined(separator: "\n"))
+            }
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let handler = VNImageRequestHandler(cgImage: cg,
+                                                    orientation: .up, options: [:])
+                do { try handler.perform([request]) }
+                catch { cont.resume(returning: "") }
+            }
+        }
+    }
+
+    // MARK: - Translation (text-only — the photo never leaves the phone)
+
+    private func translate(_ text: String) async -> String? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=\(key)")
+        else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "contents": [["role": "user", "parts": [[
+                "text": "Translate this into natural English. Reply with ONLY the translation, nothing else. If it is already English, reply with the text unchanged.\n\n\(String(text.prefix(4000)))"
+            ]]]],
+            "generationConfig": ["temperature": 0.1, "maxOutputTokens": 1200]
+        ] as [String: Any])
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let t = parts.first?["text"] as? String
+        else { return nil }
+        let clean = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.isEmpty ? nil : clean
+    }
+
+    // MARK: - Speaking, chunked
+
+    /// A page at a time. Long documents are split at sentence boundaries so
+    /// each chunk sounds finished; "keep reading" continues where it stopped.
+    private func speakChunked(_ text: String) {
+        let limit = 1100
+        let flat = text.replacingOccurrences(of: "\n", with: ". ")
+            .replacingOccurrences(of: "..", with: ".")
+        guard flat.count > limit else {
+            remainder = ""
+            TTSService.shared.speak(flat)
+            return
+        }
+        // Cut at the last sentence end before the limit.
+        var cut = flat.index(flat.startIndex, offsetBy: limit)
+        if let dot = flat[..<cut].lastIndex(of: ".") { cut = flat.index(after: dot) }
+        remainder = String(flat[cut...]).trimmingCharacters(in: .whitespaces)
+        TTSService.shared.speak(String(flat[..<cut]) + " Say 'keep reading' for the rest.")
+    }
+
+    private func spokenLength(of text: String) -> String {
+        let words = text.split(whereSeparator: \.isWhitespace).count
+        if words < 40 { return "It's short — want me to read it now? Say 'keep reading'." }
+        return "About \(words) words. Say 'keep reading' to hear it, or ask for it later with 'read my last scan'."
     }
 }
