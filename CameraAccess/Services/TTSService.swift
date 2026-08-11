@@ -635,6 +635,47 @@ class TTSService: NSObject, ObservableObject {
         warmCache()
     }
 
+    /// BUILD 132 — ONE VOICE ON THE ROAD.
+    ///
+    /// Nav lines are unique ("Turn left onto Ann Street") so the warm list can
+    /// never hold them — every turn was a live network render, and the first
+    /// render that failed in traffic latched the Apple fallback for half an
+    /// hour. The wearer heard the robot voice precisely when Chappy was doing
+    /// its most impressive thing.
+    ///
+    /// So: the moment a route is computed, render EVERY step of it into the
+    /// cache in the background. By the time the wearer reaches turn one, the
+    /// whole route speaks from disk — instant, offline-proof, in the ONE voice.
+    func prerender(_ lines: [String]) {
+        let voice = voiceName
+        guard voice != "System" else { return }
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty else { return }
+        let missing = lines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !VoiceCache.shared.has(text: $0, voice: voice) }
+        guard !missing.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            print("🔊 [TTS] Pre-rendering \(missing.count) nav lines")
+            for line in missing {
+                if Self.geminiVoiceGaveUp { break }
+                do {
+                    let audio = try await self.requestGeminiAudio(
+                        text: line, model: self.ttsModels[0], apiKey: key)
+                    VoiceCache.shared.save(audio, text: line, voice: voice)
+                    CostMeter.shared.addTTSChars(line.count)
+                } catch {
+                    // A pre-render is a nicety; the normal path still renders
+                    // on demand. Never latch the fallback over one of these.
+                    print("🔊 [TTS] Pre-render stopped: \(error.localizedDescription)")
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 350_000_000)
+            }
+        }
+    }
+
     /// - Parameters:
     ///   - languageCode: AUDIT P1. The short-line fast path bypassed the
     ///     Gemini call, and with it the language handling — a short Indonesian
