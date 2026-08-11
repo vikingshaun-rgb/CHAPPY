@@ -2070,7 +2070,18 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and after that respects a five-minute gap on foregrounding.
         let key = "chappy_launch_greeting_at"
         let last = Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: key))
-        if Self.greetedThisLaunch, Date().timeIntervalSince(last) < 300 { return }
+        // BUILD 132 — THE "RANDOM HELLO", FOUND.
+        //
+        // The old rule respawned the greeting on any foregrounding more than
+        // five minutes after the last one. Come back from Google Maps, unlock
+        // the phone, close a sheet — if five quiet minutes had passed, Chappy
+        // piped up out of nowhere. It wasn't random; it was a timer nobody
+        // could see, which is worse.
+        //
+        // New rule: ONE greeting per app launch, plus one more if the day has
+        // rolled over since the last greeting (the phone that stays open all
+        // week still deserves its good morning). Nothing else speaks unasked.
+        if Self.greetedThisLaunch, Calendar.current.isDateInToday(last) { return }
         Self.greetedThisLaunch = true
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: key)
 
@@ -2089,45 +2100,53 @@ final class ChappyStandby: NSObject, ObservableObject {
         var line = pool[idx % pool.count]
         if !userName.isEmpty { line += " \(userName)." } else { line += "." }
 
-        // THE USEFUL HALF. One fact, whichever is most worth knowing right
-        // now — and nothing at all if there genuinely isn't one. A greeting
-        // that invents something to say is worse than a short one.
-        if let fact = Self.greetingFact() { line += " \(fact)" }
+        // THE USEFUL HALF. BUILD 133: up to TWO facts now — overdue first,
+        // then the next thing in the diary — clipped, in priority order, and
+        // nothing at all if the day is genuinely empty. With barge-in live,
+        // a long brief costs nothing: say "Chappy" and it stops mid-word.
+        let facts = Self.greetingFacts(max: 2)
+        if !facts.isEmpty { line += " " + facts.joined(separator: " ") }
 
         ChappyEarcon.shared.wake()
         TTSService.shared.speak(line)
     }
 
     /// The one thing worth leading with. Ordered by how much it matters.
-    static func greetingFact() -> String? {
+    /// BUILD 133: the launch brief, up to `max` short facts in priority order.
+    /// Clear and precise on purpose — each fact is one clipped sentence, and
+    /// an empty day is still allowed to be quiet.
+    static func greetingFacts(max: Int = 2) -> [String] {
         let df = DateFormatter(); df.dateFormat = "h:mm"
+        var facts: [String] = []
 
         // Overdue beats everything.
         let od = ChappyReminders.shared.overdue()
-        if od.count == 1 { return "\(od[0].title) is overdue." }
-        if od.count > 1 { return "\(od.count) things overdue." }
+        if od.count == 1 { facts.append("\(od[0].title) is overdue.") }
+        else if od.count > 1 { facts.append("\(od.count) things overdue.") }
 
         // Then what's next in the diary, because that is what you can act on.
         if let e = ChappyCalendar.shared.next(), let start = e.startDate,
            Calendar.current.isDateInToday(start) {
             let jobs = ChappyCalendar.shared.today().filter { !$0.isAllDay }.count
             if jobs > 1 {
-                return "\(jobs) on today, first at \(df.string(from: start))."
+                facts.append("\(jobs) on today, first at \(df.string(from: start)).")
+            } else {
+                facts.append("\(e.title ?? "Something") at \(df.string(from: start)).")
             }
-            return "\(e.title ?? "Something") at \(df.string(from: start))."
         }
 
         // Then reminders due today.
         let t = ChappyReminders.shared.today().filter { $0.deliveredAt == nil }
-        if t.count == 1 { return "One thing on: \(t[0].title)." }
-        if t.count > 1 { return "\(t.count) things on today." }
+        if t.count == 1 { facts.append("One thing on: \(t[0].title).") }
+        else if t.count > 1 { facts.append("\(t.count) things on today.") }
 
         // Then the visa, if it is close enough to matter.
-        if let v = ChappyReminders.shared.visaLine() { return v }
+        if let v = ChappyReminders.shared.visaLine() { facts.append(v) }
 
-        // Otherwise say nothing extra. An empty day is allowed to be quiet.
-        return nil
+        return Array(facts.prefix(max))
     }
+
+    static func greetingFact() -> String? { greetingFacts(max: 1).first }
 
     /// Answer the wake word. Tone first and always — it has to land inside
     /// ~200 ms or the user talks over it — then decide about words.
@@ -2775,8 +2794,41 @@ final class ChappyStandby: NSObject, ObservableObject {
                 awake = false; command = ""
                 routeWork?.cancel()
                 print("🤫 [Standby] Killed mid-sentence by voice")
+                return
             }
-            return // never route while he's mid-answer
+            // BUILD 133 — BARGE-IN, NOT JUST A MUTE BUTTON.
+            //
+            // Saying the NAME mid-sentence now cuts Chappy off and takes the
+            // command in the same breath: "Chappy, take me home" lands while
+            // the morning brief is still talking, kills it, and routes.
+            //
+            // The echo guard is the whole trick. The mic reliably hears the
+            // speaker, so if the line being SPOKEN contains "chappy" (the
+            // greeting does: "Chappy here"), the bare name doesn't count —
+            // only the name plus a tail that Chappy is NOT currently saying
+            // counts as the wearer. If the spoken line doesn't contain the
+            // name, the name alone is enough.
+            if let r = Self.wakeWords
+                .compactMap({ text.range(of: $0, options: .backwards) })
+                .max(by: { $0.upperBound < $1.upperBound }) {
+                let spokenLower = TTSService.shared.lastSpokenLine.lowercased()
+                let tail = String(text[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+                let nameSafe = !spokenLower.contains("chappy")
+                let tailIsHis = !tail.isEmpty && !spokenLower.contains(tail)
+                if nameSafe || tailIsHis {
+                    TTSService.shared.stop()
+                    ChappyHaptics.shared.straightStep()
+                    print("🎙️ [Standby] Barge-in — the name heard mid-sentence")
+                    // No return: the gate has lifted, and THIS utterance
+                    // already carries the wake word (and maybe the command).
+                    // Let it route right now rather than making him repeat it.
+                } else {
+                    return
+                }
+            } else {
+                return // never route while he's mid-answer
+            }
         }
 
         if !awake {
@@ -2847,18 +2899,37 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if handlePromptEtiquette(text) { return }
 
                 // BUILD 90: answering "Want turn by turn in Google Maps?"
+                // BUILD 132: armed after EVERY spoken route summary too, so
+                // bare "open maps" works without the wake word. Three changes:
+                // the window only closes on a real answer (a stray recognised
+                // word no longer eats it), "no" is explicit rather than
+                // "anything that isn't yes", and the window is long enough to
+                // outlast the summary itself — the ear is deaf while Chappy
+                // talks, so a short window used to expire before the wearer
+                // ever got a turn.
                 if Date() < expectingMapsAnswerUntil, text.count > 1 {
-                    expectingMapsAnswerUntil = .distantPast
                     let yes = ["yes", "yeah", "yep", "sure", "please", "ok", "okay",
-                               "go on", "do it", "open"].contains { text.contains($0) }
+                               "go on", "do it", "open maps", "open the maps",
+                               "open google maps", "open it", "maps"]
+                        .contains { text.contains($0) }
+                    let no = ["no", "nah", "nope", "no thanks", "don't", "dont",
+                              "never mind", "nevermind", "leave it"]
+                        .contains { text == $0 || text.hasSuffix(" " + $0) || text.hasPrefix($0 + " ") }
                     if yes {
+                        expectingMapsAnswerUntil = .distantPast
                         ChappyEarcon.shared.done()
                         NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
-                    } else {
-                        TTSService.shared.speak("No worries.")
+                        resetRecognition()
+                        return
                     }
-                    resetRecognition()
-                    return
+                    if no {
+                        expectingMapsAnswerUntil = .distantPast
+                        TTSService.shared.speak("No worries.")
+                        resetRecognition()
+                        return
+                    }
+                    // Neither — he said something else. Leave the window armed
+                    // and let the words route normally.
                 }
                 // BUILD 87: answering "Which language?" — no wake word needed.
                 if Date() < expectingLanguageUntil, text.count > 1 {
@@ -3780,11 +3851,27 @@ final class ChappyStandby: NSObject, ObservableObject {
             let driving = !(c.contains("foot") || c.contains("walking"))
             speak("Finding you another way.")
             let reply = await NavEngine.shared.navigate(to: last, driving: driving)
-            speak(NavEngine.shared.spokenRouteSummary ?? reply); return
+            speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+            return
         }
         if c.contains("open google maps") || c.contains("open maps") {
             NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
             speak("Opening Google Maps."); return
+        }
+
+        // BUILD 133 — STOPS ON THE WAY, as a follow-up. A route is on and he
+        // says "get me a coffee on the way and get fuel": resolve each ask to
+        // a place partway along the trip and hand the whole run to Maps.
+        if NavEngine.shared.destinationCoord != nil,
+           c.contains("on the way") || c.contains("along the way")
+            || c.hasPrefix("add a stop") || c.contains("stop for") {
+            let wants = Self.parseStopQueries(from: c)
+            guard !wants.isEmpty else { speak("Stop for what?"); return }
+            speak("Let me find that.")
+            let msg = await NavEngine.shared.addStops(wants)
+            speak(msg)
+            return
         }
 
         // ---------- TIER 1 — one cheap call ----------
@@ -3892,7 +3979,9 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if wantsNav {
                     speak("Finding \(pending).")
                     let reply = await NavEngine.shared.navigate(to: pending, driving: false)
-                    speak(NavEngine.shared.spokenRouteSummary ?? reply); return
+                    speak(NavEngine.shared.spokenRouteSummary ?? reply)
+                    if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+                    return
                 }
                 await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
                 return
@@ -3924,6 +4013,17 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and a fraction of a cent, and only for phrasings the free tiers
         // didn't recognise. No signal means no Tier 3 — and that is fine,
         // because Tiers 1 and 2 are entirely offline and still work.
+
+        // BUILD 133 ============ TIER 2.75: POCKET ANSWERS ============
+        // The questions a companion should never bill you for: the time, the
+        // date, a unit conversion, a bit of arithmetic, the weather already
+        // in the snapshot, "how are you". Answered locally in ~200ms, free,
+        // and they work with no signal at all. Anything Pocket can't answer
+        // falls through to the paid brain exactly as before.
+        if let pocket = ChappyPocket.answer(c) {
+            speak(pocket)
+            return
+        }
         await quickAsk(c)
     }
 
@@ -4011,11 +4111,64 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var LiveTranslateIsOpen: Bool { Self.LiveTranslateIsOpen }
 
     func offerGoogleMaps(driving: Bool) {
-        expectingMapsAnswerUntil = Date().addingTimeInterval(10)
+        // BUILD 132: 10s used to start counting BEFORE the question was even
+        // spoken, and the ear ignores everything while Chappy talks — so the
+        // real answering gap was a second or two. 30s leaves genuine room.
+        expectingMapsAnswerUntil = Date().addingTimeInterval(30)
         if !isListening { silentArm = true; start() }
         TTSService.shared.speak(driving
             ? "Want turn by turn in Google Maps?"
             : "Want me to open it in Google Maps?")
+    }
+
+    /// BUILD 132: armed after every SPOKEN route summary ("...Say 'open Google
+    /// Maps' for the full map"), so the wearer can answer the summary's own
+    /// invitation with a bare "open maps" — no wake word, no rush. The summary
+    /// takes ten-plus seconds to say and the ear is deaf while Chappy talks;
+    /// the window is sized to survive that and still leave time to think.
+    func armMapsAnswerWindow() {
+        expectingMapsAnswerUntil = Date().addingTimeInterval(30)
+        if !isListening { silentArm = true; start() }
+    }
+
+    /// BUILD 133: "get me a coffee on the way and get fuel" → ["cafe",
+    /// "petrol station"]. Aussie road vocabulary first, generic fallback after
+    /// — an unknown ask is passed through as its own words rather than
+    /// dropped, because Places search copes fine with "bunnings".
+    static func parseStopQueries(from c: String) -> [String] {
+        var s = c
+        for junk in ["on the way", "along the way", "add a stop for", "add a stop",
+                     "stop for", "can you", "could you", "please", "for me", "me a ", "me some "] {
+            s = s.replacingOccurrences(of: junk, with: " ")
+        }
+        var out: [String] = []
+        for chunk in s.components(separatedBy: " and ") {
+            let w = chunk.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard !w.isEmpty else { continue }
+            if w.contains("coffee") || w.contains("cafe") { out.append("cafe") }
+            else if w.contains("fuel") || w.contains("petrol") || w.contains("servo")
+                || w.contains("gas station") { out.append("petrol station") }
+            else if w.contains("maccas") || w.contains("mcdonald") { out.append("mcdonalds") }
+            else if w.contains("food") || w.contains("something to eat") || w.contains("hungry")
+                || w.contains("lunch") || w.contains("breakfast") { out.append("food") }
+            else if w.contains("atm") || w.contains("cash") { out.append("atm") }
+            else if w.contains("chemist") || w.contains("pharmacy") { out.append("pharmacy") }
+            else if w.contains("water") || w.contains("drink") || w.contains("snack") {
+                out.append("convenience store")
+            }
+            else if w.contains("groceries") || w.contains("supermarket")
+                || w.contains("woolies") || w.contains("coles") { out.append("supermarket") }
+            else {
+                // Strip leading verbs and pass the rest through as-is.
+                var g = w
+                for v in ["get ", "grab ", "pick up ", "find ", "i want ", "i need ", "a ", "some "] {
+                    if g.hasPrefix(v) { g = String(g.dropFirst(v.count)) }
+                }
+                let noise = ["it", "there", "that", "one", "way", "stop"]
+                if !g.isEmpty, g.count > 2, !noise.contains(g) { out.append(g) }
+            }
+        }
+        return out
     }
 
     /// Strip text written for the MODEL out of anything spoken to a HUMAN.
@@ -4051,6 +4204,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 speak("Right, heading home.")
                 let r = await NavEngine.shared.getHome()
                 speak(NavEngine.shared.spokenRouteSummary ?? Self.stripModelDirectives(r))
+                if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
                 return true
             }
             // AUDIT P2: mode came ONLY from the classifier, so "we're getting a
@@ -4062,6 +4216,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             speak("Finding \(p).")
             let reply = await NavEngine.shared.navigate(to: p, driving: driving)
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
             return true
 
         case "translate":
@@ -5401,6 +5556,26 @@ final class NavEngine: NSObject, ObservableObject {
 
     /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
     func navigate(to query: String, driving: Bool = false) async -> String {
+        // BUILD 133 — "TAKE ME TO BRISBANE AIRPORT AND GET ME A COFFEE ON THE
+        // WAY AND GET FUEL." One breath, three asks. The tail after the first
+        // "and then"/"and get" is STOPS, not part of the place name — without
+        // this cut the whole sentence went to the geocoder, which found
+        // nothing, and the command died. The tail is parsed into stop queries
+        // and added once the route exists.
+        var query = query
+        var stopTail = ""
+        var cutAt: String.Index?
+        for cut in [" and then ", " then get ", " and get ", " and grab ",
+                    " and pick up ", " on the way"] {
+            if let r = query.range(of: cut, options: .caseInsensitive),
+               cutAt == nil || r.lowerBound < cutAt! {
+                cutAt = r.lowerBound   // EARLIEST cut wins, whatever its phrasing
+            }
+        }
+        if let at = cutAt {
+            stopTail = String(query[at...])
+            query = String(query[..<at]).trimmingCharacters(in: .whitespaces)
+        }
         lastQuery = query
         lastDriving = driving
         let snap = ContextEngine.shared.snapshot
@@ -5460,6 +5635,20 @@ final class NavEngine: NSObject, ObservableObject {
         // VERBATIM, so the wearer heard Chappy say the words "Also tell the
         // user:" out loud. Two audiences, two strings.
         spokenRouteSummary = "\(destName). About \(distText), roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(steps[0].instruction). Say 'open Google Maps' for the full map."
+        // BUILD 132 — ONE VOICE ON THE ROAD: render every line this route can
+        // ever speak into the voice cache NOW, while there's still signal.
+        // Each turn then plays from disk in the real voice, instantly, even
+        // if the network dies mid-drive.
+        prerenderRouteVoice()
+        // BUILD 133: stops asked for in the same breath as the destination.
+        if !stopTail.isEmpty {
+            let wants = ChappyStandby.parseStopQueries(from: stopTail.lowercased())
+            if !wants.isEmpty {
+                let added = await addStops(wants)
+                spokenRouteSummary = "\(destName). About \(distText), roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(added)"
+                return "Route to \(destName) found with stops. \(added) Tell the user briefly."
+            }
+        }
         return "Route to \(destName) found: about \(distText), roughly \(mins) minutes \(driving ? "driving" : "walking"). First step: \(steps[0].instruction). Also tell the user: say 'open Google Maps' anytime for the full map with turn-by-turn on screen."
     }
 
@@ -5495,8 +5684,59 @@ final class NavEngine: NSObject, ObservableObject {
             let mins = max(1, Int(route.durationSec / 60))
             let line = "Back to \(name). Roughly \(mins) minutes \(driving ? "by vehicle" : "on foot"). \(route.steps[0].instruction)"
             spokenRouteSummary = line
+            prerenderRouteVoice()
             TTSService.shared.speak(line)
         }
+    }
+
+    /// BUILD 133 — STOPS ON THE WAY.
+    ///
+    /// "Get me a coffee on the way and get fuel." Each ask is resolved to a
+    /// real place biased PARTWAY ALONG the trip — a third in for the first
+    /// stop, two-thirds for the next — so the coffee isn't behind you and the
+    /// fuel isn't at the destination. Then the whole run, stops included, is
+    /// handed to Google Maps, which is genuinely better at multi-stop driving
+    /// than Chappy's own turn-by-turn will ever be. Chappy's job is done the
+    /// moment the trip is BUILT.
+    var pendingHandoffURL: URL?
+
+    func addStops(_ queries: [String]) async -> String {
+        guard let dest = destinationCoord else {
+            return "No route on yet. Where are we headed first?"
+        }
+        let snap = ContextEngine.shared.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else { return "No GPS fix yet." }
+        var found: [(CLLocationCoordinate2D, String)] = []
+        var frac = 0.33
+        for q in queries.prefix(3) {
+            let midLat = lat + (dest.latitude - lat) * frac
+            let midLon = lon + (dest.longitude - lon) * frac
+            var hit = await placesSearch(query: q, lat: midLat, lon: midLon)
+            if hit == nil { hit = await appleSearch(query: q, lat: midLat, lon: midLon) }
+            if let hit { found.append(hit) }
+            frac = min(0.7, frac + 0.25)
+        }
+        guard !found.isEmpty else { return "Couldn't find that along the route." }
+        let travel = lastDriving || lastModeWasScooter ? "driving" : "walking"
+        let wp = found.map { "\($0.0.latitude),\($0.0.longitude)" }
+            .joined(separator: "%7C")
+        pendingHandoffURL = URL(string:
+            "https://www.google.com/maps/dir/?api=1&destination=\(dest.latitude),\(dest.longitude)&waypoints=\(wp)&travelmode=\(travel)")
+        NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+        let names = found.map { $0.1 }.joined(separator: ", then ")
+        return "Added \(names). Google Maps has the full run."
+    }
+
+    /// BUILD 132: everything the current route could say, cached ahead of time
+    /// so nav never falls back to the robot voice mid-drive.
+    private func prerenderRouteVoice() {
+        var lines = steps.map { $0.instruction }
+        if let summary = spokenRouteSummary { lines.append(summary) }
+        if !destinationName.isEmpty {
+            lines.append("You have arrived at \(destinationName).")
+        }
+        lines.append("You've come off the route. Give me a second.")
+        TTSService.shared.prerender(lines)
     }
 
     /// PHASE 5.5 — how long it would actually take to get there, for leave-by
@@ -6192,6 +6432,68 @@ final class ChappyMemory: ObservableObject {
                 entries.removeAll { $0.id == id }
                 self.rewrite(day: url, entries: entries)
                 return
+            }
+        }
+    }
+
+    /// BUILD 132 — THE CLEAN-UP THE STORE ALREADY NEEDED.
+    ///
+    /// Builds 130-131 filed ambient pulse captions with two blind spots: dedup
+    /// only looked one frame back, and model junk ("Word Count & Style
+    /// Check:**") was never filtered. Both are fixed at the source in
+    /// ChappyPulse — this sweep deals with what already leaked in. It walks
+    /// every day file once, drops pulse junk, and collapses pulse entries with
+    /// identical titles down to the newest one. Pinned entries are untouchable,
+    /// deliberate memories (snap, voice, photo ingest) are not pulse and are
+    /// never considered. Runs once; a flag remembers it's been done.
+    func sweepPulseJunk() {
+        let flagKey = "chappy_pulse_sweep_132"
+        guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
+        UserDefaults.standard.set(true, forKey: flagKey)
+        io.async { [weak self] in
+            guard let self else { return }
+            let junkBits = ["word count", "style check", "**", "here is", "here's a"]
+            var newestByTitle: [String: (id: UUID, at: Date)] = [:]
+            var removedIDs: [UUID] = []
+
+            // Pass one, newest file first: learn which entry OWNS each title.
+            let files = self.dayFiles().sorted { $0.lastPathComponent > $1.lastPathComponent }
+            for url in files {
+                for e in self.readDay(url) where !e.pinned {
+                    guard e.source == "pulse" || e.tags.contains("pulse") else { continue }
+                    let norm = e.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    if newestByTitle[norm] == nil || e.at > newestByTitle[norm]!.at {
+                        newestByTitle[norm] = (e.id, e.at)
+                    }
+                }
+            }
+            // Pass two: rewrite each day without the junk and the also-rans.
+            for url in files {
+                let entries = self.readDay(url)
+                let kept = entries.filter { e in
+                    guard !e.pinned,
+                          e.source == "pulse" || e.tags.contains("pulse") else { return true }
+                    let norm = e.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    let isJunk = norm.isEmpty || norm.hasSuffix(":")
+                        || junkBits.contains { norm.contains($0) }
+                    let isDupe = newestByTitle[norm].map { $0.id != e.id } ?? false
+                    if isJunk || isDupe {
+                        removedIDs.append(e.id)
+                        if e.hasPhoto {
+                            try? FileManager.default.removeItem(at: self.thumbURL(e.id))
+                        }
+                        return false
+                    }
+                    return true
+                }
+                if kept.count != entries.count {
+                    self.rewrite(day: url, entries: kept)
+                }
+            }
+            guard !removedIDs.isEmpty else { return }
+            print("🧹 [Memory] Pulse sweep removed \(removedIDs.count) junk/duplicate entries")
+            DispatchQueue.main.async {
+                for id in removedIDs { self.setRecent(remove: id) }
             }
         }
     }
@@ -8095,13 +8397,27 @@ final class ChappyReminders: NSObject, ObservableObject {
         let name = UserDefaults.standard.string(forKey: "chappy_user_name") ?? ""
         let df = DateFormatter(); df.dateFormat = "h:mm a"
 
+        // BUILD 132 — THE BRIEF THAT COULD NOT TELL THE TIME.
+        //
+        // It said "Morning. Nothing on today." at 2pm, directly above a 3pm
+        // job it was not counting — because the greeting was hardcoded and
+        // the brief only counted REMINDERS, never the calendar. Now the
+        // greeting matches the clock and calendar jobs count as "on today".
+        let hour = Calendar.current.component(.hour, from: Date())
+        let dayPart = hour < 12 ? "Morning" : (hour < 17 ? "Afternoon" : "Evening")
+        let greet = name.isEmpty ? "\(dayPart)." : "\(dayPart) \(name)."
+        let jobs = ChappyCalendar.shared.today().filter {
+            !$0.isAllDay && (($0.endDate ?? .distantPast) > Date())
+        }
+
         let od = overdue()
         let t = today().filter { $0.deliveredAt == nil }
-        if od.isEmpty && t.isEmpty {
-            parts.append(name.isEmpty ? "Morning. Nothing on today."
-                                      : "Morning \(name). Nothing on today.")
+        if od.isEmpty && t.isEmpty && jobs.isEmpty {
+            parts.append("\(greet) \(hour >= 17 ? "Nothing left today." : "Nothing on today.")")
         } else {
-            parts.append(name.isEmpty ? "Morning." : "Morning \(name).")
+            parts.append(greet)
+            // Calendar jobs themselves are spoken by agendaLine() below —
+            // here they only stop the head from claiming an empty day.
             if !t.isEmpty {
                 let list = t.prefix(3).map { "\($0.title) at \(df.string(from: $0.effectiveFire ?? Date()))" }
                 parts.append("Today: \(list.joined(separator: ", ")).")
@@ -9033,6 +9349,36 @@ final class ChappyCalendar: ObservableObject {
         eventLevels = v
     }
 
+    // BUILD 132 — PER-EVENT WARN TIME.
+    //
+    // The per-calendar lead was the right default and the wrong ceiling: a
+    // 3pm job you need an hour's drive for and a 3pm haircut round the corner
+    // could share a calendar. Any single event can now carry its own lead,
+    // set by tapping it in Reminders. Same fingerprint trick as levels, same
+    // rule: nothing is written back to EventKit.
+    private var eventLeads: [String: Int] {
+        get { (UserDefaults.standard.dictionary(forKey: "chappy_event_leads") as? [String: Int]) ?? [:] }
+        set {
+            var v = newValue
+            if v.count > 400 { v = Dictionary(uniqueKeysWithValues: Array(v).suffix(400)) }
+            UserDefaults.standard.set(v, forKey: "chappy_event_leads")
+        }
+    }
+
+    /// The lead for THIS event: its own override first, its calendar second.
+    func leadMinutes(for e: EKEvent) -> Int {
+        if let m = eventLeads[Self.fingerprint(e)], m > 0 { return m }
+        return e.calendar.map { leadMinutes(for: $0) } ?? 30
+    }
+
+    /// nil = back to the calendar default.
+    func setLead(_ m: Int?, for e: EKEvent) {
+        var v = eventLeads
+        let key = Self.fingerprint(e)
+        if let m, m > 0 { v[key] = m } else { v.removeValue(forKey: key) }
+        eventLeads = v
+    }
+
     /// THE RESOLVER. Event override first, calendar behaviour second. One
     /// function, so every path — heads-up, leave-by, both briefs — agrees.
     func effectiveBehaviour(for e: EKEvent) -> Behaviour {
@@ -9061,12 +9407,15 @@ final class ChappyCalendar: ObservableObject {
                   effectiveBehaviour(for: e) == .ping else { continue }
             let important = level(for: e) == .important
             let mins = start.timeIntervalSinceNow / 60
-            // An important event warns TWICE: the day before, so you can act,
-            // and an hour before, so you don't forget you acted.
-            let leads: [Double] = important
-                ? [1440, 60]
-                : [Double(e.calendar.map { leadMinutes(for: $0) } ?? 30)]
             let fp = Self.fingerprint(e)
+            // BUILD 132: a per-event lead, when set, replaces the hour-before
+            // slot on important events and the whole lead on normal ones.
+            let custom = eventLeads[fp].map(Double.init)
+            // An important event warns TWICE: the day before, so you can act,
+            // and closer in, so you don't forget you acted.
+            let leads: [Double] = important
+                ? [1440, custom ?? 60]
+                : [custom ?? Double(e.calendar.map { leadMinutes(for: $0) } ?? 30)]
             var fired = false
             for lead in leads {
                 let key = "\(fp)#\(Int(lead))"
@@ -9241,4 +9590,184 @@ extension Notification.Name {
     /// BUILD 121: resume a paused Live Translate session by voice. Declared
     /// here rather than beside the others so this build touches one fewer file.
     static let chappyResumeTranslate = Notification.Name("chappyResumeTranslate")
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY POCKET (Build 133 — the free answers)
+// =====================================================================
+//
+// THE RULE: if a question can be answered from the phone itself — the clock,
+// the calendar, arithmetic, a unit table, the weather snapshot Chappy already
+// holds — it must never cost a network call or a cent. These are also the
+// questions where SPEED is the feature: a companion that takes three seconds
+// to tell you the time doesn't feel like a companion.
+//
+// Pocket sits at Tier 2.75: after every real command has had its chance, just
+// before the paid brain. It answers or it stays silent — it never guesses,
+// because a wrong free answer is worse than a slow paid one.
+enum ChappyPocket {
+
+    static func answer(_ raw: String) -> String? {
+        let t = raw.lowercased()
+            .replacingOccurrences(of: "please", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+
+        if let s = timeOrDate(t) { return s }
+        if let s = smallTalk(t) { return s }
+        if let s = weather(t) { return s }
+        if let s = conversion(t) { return s }
+        if let s = percentage(t) { return s }
+        if let s = arithmetic(t) { return s }
+        return nil
+    }
+
+    // MARK: time & date
+
+    private static func timeOrDate(_ t: String) -> String? {
+        if t.contains("what time") || t.hasSuffix("the time") || t == "time" {
+            let df = DateFormatter(); df.dateFormat = "h:mm"
+            let h = Calendar.current.component(.hour, from: Date())
+            let part = h < 12 ? "in the morning" : (h < 18 ? "in the afternoon" : "at night")
+            return "It's \(df.string(from: Date())) \(part)."
+        }
+        if t.contains("what's the date") || t.contains("what is the date")
+            || t.contains("what date") || t.contains("what day") || t.contains("today's date") {
+            let df = DateFormatter(); df.dateFormat = "EEEE, d MMMM"
+            return "It's \(df.string(from: Date()))."
+        }
+        return nil
+    }
+
+    // MARK: small talk — a companion answers like one, for free
+
+    private static func smallTalk(_ t: String) -> String? {
+        if t.contains("how are you") || t.contains("how's it going")
+            || t.contains("how are things") || t.contains("how you doing") {
+            return ChappyVoice.line("pocket_howru", [
+                "Good. Eyes open, ears on. You?",
+                "All running. What are we up to?",
+                "Can't complain — nobody listens to an app anyway. What's next?",
+            ])
+        }
+        if t.contains("who are you") || t.contains("what's your name") || t.contains("what are you") {
+            return "Chappy. I live in your glasses — navigation, memory, reminders, translation, and a decent set of eyes."
+        }
+        if t.contains("thank you") || t == "thanks" || t.hasSuffix(" thanks") {
+            return ChappyVoice.line("pocket_thanks", ["No worries.", "Anytime.", "That's the job."])
+        }
+        return nil
+    }
+
+    // MARK: weather — only from the snapshot already on the phone
+
+    private static func weather(_ t: String) -> String? {
+        guard t.contains("weather") || t.contains("how hot") || t.contains("how cold")
+            || t.contains("temperature") else { return nil }
+        let s = ContextEngine.shared.snapshot
+        guard let w = s.weather, let temp = s.temperatureC else { return nil } // no data → paid brain may know
+        return "\(Int(temp.rounded())) degrees and \(w)."
+    }
+
+    // MARK: conversions
+
+    /// metres-per-unit (or the special temperature pair) for everything the
+    /// wearer has ever plausibly asked on the road.
+    private struct Unit {
+        let names: [String]; let toBase: Double; let spoken: String
+        let kind: String   // length, mass, volume, temp
+    }
+    private static let units: [Unit] = [
+        Unit(names: ["centimeters", "centimetres", "centimeter", "centimetre", "cm"], toBase: 0.01, spoken: "centimeters", kind: "length"),
+        Unit(names: ["millimeters", "millimetres", "mm"], toBase: 0.001, spoken: "millimeters", kind: "length"),
+        Unit(names: ["meters", "metres", "meter", "metre"], toBase: 1, spoken: "meters", kind: "length"),
+        Unit(names: ["kilometers", "kilometres", "kilometer", "kilometre", "km", "kays", "clicks"], toBase: 1000, spoken: "kilometers", kind: "length"),
+        Unit(names: ["inches", "inch"], toBase: 0.0254, spoken: "inches", kind: "length"),
+        Unit(names: ["feet", "foot"], toBase: 0.3048, spoken: "feet", kind: "length"),
+        Unit(names: ["yards", "yard"], toBase: 0.9144, spoken: "yards", kind: "length"),
+        Unit(names: ["miles", "mile"], toBase: 1609.344, spoken: "miles", kind: "length"),
+        Unit(names: ["kilograms", "kilogram", "kilos", "kilo", "kg"], toBase: 1, spoken: "kilos", kind: "mass"),
+        Unit(names: ["grams", "gram"], toBase: 0.001, spoken: "grams", kind: "mass"),
+        Unit(names: ["pounds", "pound", "lbs"], toBase: 0.453592, spoken: "pounds", kind: "mass"),
+        Unit(names: ["ounces", "ounce"], toBase: 0.0283495, spoken: "ounces", kind: "mass"),
+        Unit(names: ["stone"], toBase: 6.35029, spoken: "stone", kind: "mass"),
+        Unit(names: ["liters", "litres", "liter", "litre"], toBase: 1, spoken: "liters", kind: "volume"),
+        Unit(names: ["milliliters", "millilitres", "ml", "mils"], toBase: 0.001, spoken: "milliliters", kind: "volume"),
+        Unit(names: ["gallons", "gallon"], toBase: 3.78541, spoken: "gallons", kind: "volume"),
+        Unit(names: ["cups", "cup"], toBase: 0.25, spoken: "cups", kind: "volume"),
+    ]
+
+    private static func findUnit(_ s: String) -> Unit? {
+        // Longest names first, so "kilometers" never half-matches "meters".
+        let all = units.flatMap { u in u.names.map { (name: $0, unit: u) } }
+            .sorted { $0.name.count > $1.name.count }
+        return all.first { s == $0.name }?.unit
+    }
+
+    private static func conversion(_ t: String) -> String? {
+        // Temperature is its own arithmetic.
+        if let m = t.firstMatch(of: #/(-?\d+(?:\.\d+)?)\s*(?:degrees\s*)?(celsius|fahrenheit|c|f)\b.*?(?:to|in|into)\s*(?:degrees\s*)?(celsius|fahrenheit|c|f)\b/#) {
+            guard let v = Double(m.1) else { return nil }
+            let from = String(m.2).hasPrefix("f") ? "f" : "c"
+            let to = String(m.3).hasPrefix("f") ? "f" : "c"
+            guard from != to else { return nil }
+            let out = from == "c" ? v * 9 / 5 + 32 : (v - 32) * 5 / 9
+            return "\(clean(v)) \(from == "c" ? "Celsius" : "Fahrenheit") is \(clean(out)) \(to == "c" ? "Celsius" : "Fahrenheit")."
+        }
+        // "180 centimeters to inches" / "convert 5 miles into km" /
+        // "how many inches in 180 centimeters"
+        var value: Double?; var fromRaw = ""; var toRaw = ""
+        if let m = t.firstMatch(of: #/(-?\d+(?:\.\d+)?)\s*([a-z]+)\s+(?:to|in|into)\s+([a-z]+)/#) {
+            value = Double(m.1); fromRaw = String(m.2); toRaw = String(m.3)
+        } else if let m = t.firstMatch(of: #/how many\s+([a-z]+)\s+(?:in|is)\s+(-?\d+(?:\.\d+)?)\s*([a-z]+)/#) {
+            value = Double(m.2); fromRaw = String(m.3); toRaw = String(m.1)
+        }
+        guard let v = value,
+              let from = findUnit(fromRaw), let to = findUnit(toRaw),
+              from.kind == to.kind, from.spoken != to.spoken else { return nil }
+        let out = v * from.toBase / to.toBase
+        return "\(clean(v)) \(from.spoken) is \(clean(out)) \(to.spoken)."
+    }
+
+    // MARK: percentages & arithmetic
+
+    private static func percentage(_ t: String) -> String? {
+        guard let m = t.firstMatch(of: #/(\d+(?:\.\d+)?)\s*(?:%|percent|per cent)\s*(?:of)\s*(-?\d+(?:\.\d+)?)/#) else { return nil }
+        guard let p = Double(m.1), let n = Double(m.2) else { return nil }
+        return "\(clean(p)) percent of \(clean(n)) is \(clean(n * p / 100))."
+    }
+
+    private static func arithmetic(_ t: String) -> String? {
+        // Spoken operators first, so "12 times 8" parses like "12 * 8".
+        var s = t
+        for (word, op) in [("multiplied by", "*"), ("divided by", "/"), ("times", "*"),
+                           ("plus", "+"), ("minus", "-"), (" x ", " * ")] {
+            s = s.replacingOccurrences(of: word, with: op)
+        }
+        guard let m = s.firstMatch(of: #/(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)/#) else { return nil }
+        // Only answer when the sentence is question-shaped maths, not any
+        // sentence with two numbers in it.
+        guard t.contains("what") || t.contains("how much") || t.contains("calculate")
+            || t.contains("times") || t.contains("plus") || t.contains("minus")
+            || t.contains("divided") || t.contains("multiplied") else { return nil }
+        guard let a = Double(m.1), let b = Double(m.3) else { return nil }
+        let out: Double
+        switch m.2 {
+        case "+": out = a + b
+        case "-": out = a - b
+        case "*": out = a * b
+        default:
+            guard b != 0 else { return "Can't divide by zero — nobody can." }
+            out = a / b
+        }
+        return "\(clean(out))."
+    }
+
+    /// "70.86614" → "70.9", "12.0" → "12" — numbers as a person says them.
+    private static func clean(_ v: Double) -> String {
+        let rounded = (v * 10).rounded() / 10
+        return rounded == rounded.rounded()
+            ? String(Int(rounded))
+            : String(format: "%.1f", rounded)
+    }
 }
