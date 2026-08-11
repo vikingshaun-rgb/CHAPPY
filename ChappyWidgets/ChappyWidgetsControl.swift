@@ -2,76 +2,30 @@
 //  ChappyWidgetsControl.swift
 //  ChappyWidgets
 //
-//  Created by user951653 on 8/11/26.
+//  BUILD 154 — one honest control: a Control Center / lock screen
+//  button that opens Chappy. (The template's fake timer is gone.)
 //
 
 import AppIntents
 import SwiftUI
 import WidgetKit
 
+struct OpenChappyIntent: AppIntent {
+    static let title: LocalizedStringResource = "Open Chappy"
+    static let openAppWhenRun: Bool = true
+    func perform() async throws -> some IntentResult { .result() }
+}
+
 struct ChappyWidgetsControl: ControlWidget {
     static let kind: String = "com.shaun.chappy.ChappyWidgets"
 
     var body: some ControlWidgetConfiguration {
-        AppIntentControlConfiguration(
-            kind: Self.kind,
-            provider: Provider()
-        ) { value in
-            ControlWidgetToggle(
-                "Start Timer",
-                isOn: value.isRunning,
-                action: StartTimerIntent(value.name)
-            ) { isRunning in
-                Label(isRunning ? "On" : "Off", systemImage: "timer")
+        StaticControlConfiguration(kind: Self.kind) {
+            ControlWidgetButton(action: OpenChappyIntent()) {
+                Label("Chappy", systemImage: "sparkles")
             }
         }
-        .displayName("Timer")
-        .description("A an example control that runs a timer.")
-    }
-}
-
-extension ChappyWidgetsControl {
-    struct Value {
-        var isRunning: Bool
-        var name: String
-    }
-
-    struct Provider: AppIntentControlValueProvider {
-        func previewValue(configuration: TimerConfiguration) -> Value {
-            ChappyWidgetsControl.Value(isRunning: false, name: configuration.timerName)
-        }
-
-        func currentValue(configuration: TimerConfiguration) async throws -> Value {
-            let isRunning = true // Check if the timer is running
-            return ChappyWidgetsControl.Value(isRunning: isRunning, name: configuration.timerName)
-        }
-    }
-}
-
-struct TimerConfiguration: ControlConfigurationIntent {
-    static let title: LocalizedStringResource = "Timer Name Configuration"
-
-    @Parameter(title: "Timer Name", default: "Timer")
-    var timerName: String
-}
-
-struct StartTimerIntent: SetValueIntent {
-    static let title: LocalizedStringResource = "Start a timer"
-
-    @Parameter(title: "Timer Name")
-    var name: String
-
-    @Parameter(title: "Timer is running")
-    var value: Bool
-
-    init() {}
-
-    init(_ name: String) {
-        self.name = name
-    }
-
-    func perform() async throws -> some IntentResult {
-        // Start the timer…
-        return .result()
+        .displayName("Chappy")
+        .description("Opens Chappy.")
     }
 }
