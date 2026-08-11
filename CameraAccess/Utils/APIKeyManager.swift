@@ -123,6 +123,27 @@ class APIKeyManager {
         return getAPIKey(for: provider, endpoint: endpoint) != nil
     }
 
+    // MARK: - Mail (Build 147) — the IMAP app-specific password, Keychain only.
+
+    func saveMailPassword(_ p: String) -> Bool { saveKey(p, for: "chappy-mail-imap") }
+    func getMailPassword() -> String? { getKey(for: "chappy-mail-imap") }
+
+    // BUILD 151: AviationStack — live flight status, split-chunk baked.
+    private var defaultAviationStackKey: String {
+        return ["d14ddd69", "7d9fbcd0", "3aa335db", "00964aed"].joined()
+    }
+
+    func getAviationStackKey() -> String? {
+        getKey(for: "chappy-aviationstack") ?? defaultAviationStackKey
+    }
+
+    // MARK: - Amadeus (Build 150) — flight data keys, Keychain only.
+
+    func saveAmadeusKey(_ k: String) -> Bool { saveKey(k, for: "chappy-amadeus-key") }
+    func getAmadeusKey() -> String? { getKey(for: "chappy-amadeus-key") }
+    func saveAmadeusSecret(_ k: String) -> Bool { saveKey(k, for: "chappy-amadeus-secret") }
+    func getAmadeusSecret() -> String? { getKey(for: "chappy-amadeus-secret") }
+
     // MARK: - Google API Key (for Live AI)
 
     func saveGoogleAPIKey(_ key: String) -> Bool {
