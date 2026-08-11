@@ -1475,6 +1475,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // engines and two greetings.
         guard !isListening, !starting else { return }
         starting = true
+        installUpheavalWatch()   // BUILD 142: tap installs wait out route changes
         // Never fight Live AI for the microphone — Live AI IS the deep layer.
         guard !LiveAIManager.shared.isRunning else {
             // AUDIT FIX (SB-C1): this returned without clearing `starting`, so
@@ -1935,6 +1936,31 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     /// AUDIT P0 (SB-LOOP): scoped to the CURRENT engine instance, so it has to be
     /// re-registered whenever the engine is replaced. Also filters out the
+    /// BUILD 142: the moment the audio world last MOVED — any route change,
+    /// any engine reconfiguration, anywhere in the process. Tap installs
+    /// check this and refuse to run until the dust settles, because
+    /// installing into moving hardware is the uncatchable crash in the .ips.
+    nonisolated(unsafe) static var lastAudioUpheavalAt = Date.distantPast
+    private static var upheavalWatchInstalled = false
+
+    private func installUpheavalWatch() {
+        guard !Self.upheavalWatchInstalled else { return }
+        Self.upheavalWatchInstalled = true
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+        nc.addObserver(forName: .AVAudioEngineConfigurationChange,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                       object: nil, queue: nil) { _ in
+            ChappyStandby.lastAudioUpheavalAt = Date()
+        }
+    }
+
     /// changes we caused ourselves — without that, every rebuild triggers the
     /// next one, and every TTS playback engine start re-enters here too.
     private func reinstallConfigChangeObserver() {
@@ -2731,6 +2757,24 @@ final class ChappyStandby: NSObject, ObservableObject {
         request = req
 
         let input = engine.inputNode
+        // BUILD 142 — THE CRASH IN THE .IPS, KILLED AT THE SOURCE.
+        //
+        // installTap throws an UNCATCHABLE exception when the hardware format
+        // shifts between reading it and installing the tap — and the crash
+        // report shows exactly that: InstallTapOnNode dying on the main
+        // thread while the engine queue was mid IOUnitConfigurationChanged
+        // (Safari grabbing the route, app backgrounded). The format guard
+        // below can't close that race; NOT INSTALLING during upheaval can.
+        // A tap is never installed within a breath of a route change — wait
+        // for calm, then come back.
+        if Date().timeIntervalSince(Self.lastAudioUpheavalAt) < 0.7 {
+            print("👂 [Standby] Audio still settling — deferring the tap")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, self.isListening else { return }
+                _ = self.startRecognition()
+            }
+            return false
+        }
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             print("⚠️ [Standby] Mic format not ready")
