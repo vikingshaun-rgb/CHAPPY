@@ -1142,7 +1142,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var restartTimer: Timer?
 
     // Wake-word state
-    private var awake = false
+    /// BUILD 149: published so the avatar can visibly REACT while a command
+    /// is being taken — the listening pulse. Rendering only; nothing reads
+    /// it for logic outside this class.
+    @Published private(set) var awake = false
     private var command = ""
     private var lastWordAt = Date()
     private var routeWork: DispatchWorkItem?
@@ -2426,7 +2429,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         let now = Date()
         return now < expectingLanguageUntil || now < expectingNavModeUntil
             || now < expectingSpotNameUntil || now < expectingDestinationUntil
-            || now < expectingMapsAnswerUntil
+            || now < expectingMapsAnswerUntil || now < expectingScamUntil
     }
 
     func closeAllPrompts() {
@@ -2435,8 +2438,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         expectingSpotNameUntil = .distantPast
         expectingDestinationUntil = .distantPast
         expectingMapsAnswerUntil = .distantPast
+        expectingScamUntil = .distantPast
         pendingNavDestination = nil
     }
+
+    /// BUILD 146: while open, the next full sentence is a scam description.
+    var expectingScamUntil = Date.distantPast
 
     private static let cancelWords: Set<String> = [
         "never mind", "nevermind", "cancel", "cancel that", "forget it",
@@ -2466,7 +2473,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         //    saved spot called "never mind".
         if Self.cancelWords.contains(t) || Self.cancelWords.contains(where: { t.hasSuffix(" " + $0) }) {
             closeAllPrompts()
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             TTSService.shared.speak(ChappyVoice.line("cancelled", [
                 "No worries.", "Alright, forget it.", "Sure, dropped.",
             ]))
@@ -2513,6 +2520,16 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// that test, "fish and chips" and "black and white" become two commands,
     /// which is far worse than missing a compound.
     static func splitCompound(_ text: String) -> [String] {
+        // BUILD 144: up to THREE actions in one breath — "take me to Coles
+        // and get fuel on the way and pull up my list". Same safety rule as
+        // ever: a piece only counts as its own command if it LOOKS like one,
+        // so "fish and chips" stays one thing. Recursion depth is bounded by
+        // the cap, so a rambling sentence can't fan out into five actions.
+        split(text, remaining: 3)
+    }
+
+    private static func split(_ text: String, remaining: Int) -> [String] {
+        guard remaining > 1 else { return [text] }
         let seps = [" and then ", " then ", " and also ", " and "]
         for sep in seps {
             guard let r = text.range(of: sep) else { continue }
@@ -2522,7 +2539,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
             guard a.count > 2, b.count > 2,
                   looksLikeCommand(a), looksLikeCommand(b) else { continue }
-            return [a, b]
+            return [a] + split(b, remaining: remaining - 1)
         }
         return [text]
     }
@@ -2532,7 +2549,9 @@ final class ChappyStandby: NSObject, ObservableObject {
         let verbs = ["navigate", "take", "get", "go", "walk", "drive", "find",
                      "remember", "save", "pin", "mark", "translate", "snap",
                      "photo", "look", "watch", "show", "open", "map", "log",
-                     "note", "stop", "call", "head", "bring"]
+                     "note", "stop", "call", "head", "bring",
+                     // BUILD 144: the asks that arrive third in a chain.
+                     "pull", "read", "tell", "check", "add", "set", "plan", "scan"]
         guard let first = t.split(separator: " ").first.map(String.init) else { return false }
         return verbs.contains(first)
     }
@@ -2641,7 +2660,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         UserDefaults.standard.set(code, forKey: "translate_last_used_language")
         UserDefaults.standard.set(true, forKey: "translate_autostart")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "translate_autostart_at")
-        ChappyEarcon.shared.done()
+        // BUILD 144 earcon diet: the spoken line IS the confirmation
         TTSService.shared.speak("Translating English and \(Self.languageName(code)).")
         handOff()
         NotificationCenter.default.post(name: .chappyOpenTranslate, object: nil)
@@ -2947,8 +2966,11 @@ final class ChappyStandby: NSObject, ObservableObject {
                         || Self.fillerWords.contains(where: { t == $0 || t.hasSuffix(" " + $0) }) {
                         if Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
                             followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
-                            // "Go on" — you can keep talking without the name.
-                            ChappyEarcon.shared.stillListening()
+                            // BUILD 144 — EARCON DIET: the door stays open
+                            // SILENTLY. The chirp here fired on every "um",
+                            // which is exactly the lift-chime effect the
+                            // wearer asked to be rid of. Sound now means a
+                            // task starting or finishing, nothing else.
                         }
                         return
                     }
@@ -2978,6 +3000,22 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // before any prompt gets to claim what you said.
                 if handlePromptEtiquette(text) { return }
 
+                // BUILD 146: answering "Tell me what's happening" (scam check).
+                if Date() < expectingScamUntil, text.split(separator: " ").count >= 3 {
+                    expectingScamUntil = .distantPast
+                    let described = text
+                    Task { @MainActor in
+                        if let v = ChappyScamGuard.verdict(for: described) {
+                            TTSService.shared.speak(v)
+                        } else {
+                            // No rule tripped — the cheap brain judges it,
+                            // with the wearer's own context attached.
+                            await self.quickAsk("SCAM CHECK - judge this situation for scam red flags in two short spoken sentences, be direct about risk: \(described)")
+                        }
+                    }
+                    resetRecognition()
+                    return
+                }
                 // BUILD 90: answering "Want turn by turn in Google Maps?"
                 // BUILD 132: armed after EVERY spoken route summary too, so
                 // bare "open maps" works without the wake word. Three changes:
@@ -3074,7 +3112,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                         if cleaned.hasPrefix(lead) { cleaned = String(cleaned.dropFirst(lead.count)) }
                     }
                     if TripRecorder.shared.renameLastSpot(to: cleaned) {
-                        ChappyEarcon.shared.done()
+                        // BUILD 144 earcon diet: the spoken line IS the confirmation
                         ChappyHaptics.shared.straightStep()
                         TTSService.shared.speak("Saved as \(cleaned).")
                     } else {
@@ -3181,19 +3219,19 @@ final class ChappyStandby: NSObject, ObservableObject {
             // So: a complete-looking command gets a short window regardless of
             // length. Only genuinely ambiguous short fragments — where more
             // words would change the meaning — get the longer one.
-            // BUILD 135 — THE CUT-OFF, FOUND. "Find the closest hardware
-            // store" is four words in ("find the closest hardware") when the
-            // recogniser takes a breath between partial bursts — and 0.45s
-            // fired right there, routing "hardware" and shelving "store".
-            // A quarter-second more of patience costs nothing a human can
-            // feel mid-conversation and stops whole sentences being clipped.
+            // BUILD 144 — TURN-TAKING LIKE A PERSON. The spec, in the wearer's
+            // own words: "wait till I finish speaking — 1 to 2 seconds of
+            // silence — THEN respond quickly." So sentence-shaped speech now
+            // waits 1.2s of true quiet before firing, and every new word
+            // resets the clock (routeWork is cancelled on each partial). The
+            // trade is deliberate: ~half a second more patience buys never
+            // being talked over, and the reply itself got fast in 143.
+            // Terminals ("stop") stay instant; short imperatives stay snappy.
             let wordCount = snapshot.split(separator: " ").count
-            if wordCount >= 4 {
-                debounce = 0.7           // said his piece — but let the burst land
-            } else if wordCount == 1 {
-                debounce = 0.8           // one word could still be growing
+            if wordCount <= 2 {
+                debounce = 0.9           // short command — keep it snappy
             } else {
-                debounce = 0.7
+                debounce = 1.2           // a sentence — let him finish it
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
@@ -3549,7 +3587,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 ChappyEarcon.shared.fail()
                 speak("Saved it, though GPS hasn't settled - it may be a little off.")
             } else {
-                ChappyEarcon.shared.done()
+                // BUILD 144 earcon diet: the spoken line IS the confirmation
                 speak("Saved \(spot.name).")
             }
             return
@@ -3584,7 +3622,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 escalate: p.escalate,
                 thumbnail: LiveAIManager.shared.streamViewModel?.currentVideoFrame?
                     .jpegData(compressionQuality: 0.4))
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             // A FIVE-WORD TAIL, not a readback. Confirmation fatigue is why
             // people stop using reminders; silence is acceptance.
             speak("\(r.title). \(p.confirmation)")
@@ -3614,7 +3652,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             if let t = target {
                 ChappyReminders.shared.complete(t.id)
-                ChappyEarcon.shared.done()
+                // BUILD 144 earcon diet: the spoken line IS the confirmation
                 speak("Done: \(t.title).")
             } else {
                 ChappyEarcon.shared.fail()
@@ -3651,7 +3689,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("show reminders") || c.contains("open my list")
             || c.contains("what are my reminders") || c.contains("check my reminders") {
             NotificationCenter.default.post(name: .chappyOpenReminders, object: nil)
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             // Say something USEFUL while the screen opens — the brief head.
             let facts = Self.greetingFacts(max: 2)
             speak(facts.isEmpty ? "Here's your list. Nothing due." : "Here's your list. " + facts.joined(separator: " "))
@@ -3673,6 +3711,177 @@ final class ChappyStandby: NSObject, ObservableObject {
             let lines = sugg.prefix(3).map { "\($0.title) at \(df.string(from: $0.fire))" }
                 .joined(separator: ". ")
             speak("Done. \(lines). They're in the diary — kill any you don't want.")
+            return
+        }
+        // BUILD 150 — FLIGHTS. Deal watching and travel-day tracking.
+        if c.contains("watch flights to") || c.contains("watch flight prices")
+            || c.contains("track flights to") {
+            var dest = c
+            for cut in ["watch flights to", "track flights to", "watch flight prices to"] {
+                if let r = dest.range(of: cut) { dest = String(dest[r.upperBound...]); break }
+            }
+            let month = ChappyFlights.monthKey(from: dest)
+                ?? ChappyFlights.monthKey(from: "in " + String(Calendar.current.component(.month, from: Date())))
+            for (name, _) in [("january",1),("february",2),("march",3),("april",4),("may",5),("june",6),
+                              ("july",7),("august",8),("september",9),("october",10),("november",11),("december",12)] {
+                dest = dest.replacingOccurrences(of: " in \(name)", with: "")
+                dest = dest.replacingOccurrences(of: name, with: "")
+            }
+            dest = dest.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard !dest.isEmpty else { speak("Watch flights to where?"); return }
+            speak("Setting that up.")
+            let m = month ?? "any"
+            Task { @MainActor in
+                TTSService.shared.speak(await ChappyFlights.shared.addWatch(destName: dest, month: m == "any" ? "" : m))
+            }
+            return
+        }
+        if c.contains("flight deals") || c.contains("any deals on flights")
+            || c.contains("cheapest flights") || c.contains("how are my flights looking") {
+            speak(ChappyFlights.shared.spokenDeals()); return
+        }
+        if c.contains("track flight ") || c.contains("track my flight ") {
+            guard let num = ChappyFlights.flightNumber(in: c) else {
+                speak("Which flight? Give me the number, like Q F five two."); return
+            }
+            let day = ChappyTrail.dayMentioned(in: c) ?? Date()
+            speak(ChappyFlights.shared.track(number: num, date: day))
+            return
+        }
+        if c.contains("how's my flight") || c.contains("hows my flight")
+            || c.contains("flight status") || c.contains("is my flight on time") {
+            speak(ChappyFlights.shared.statusHandoff()); return
+        }
+        // BUILD 153 — RIDE & FOOD. The Google-Maps pattern: Chappy prices
+        // and ETAs the trip itself, then hands to Grab/Uber with the
+        // drop-off pre-filled. One tap, one thumbprint, done.
+        if ChappyRide.shared.consumeConfirm(c) { return }
+        if c.contains("get me a grab") || c.contains("book a grab") || c.contains("grab to ")
+            || c.contains("get me an uber") || c.contains("book an uber") || c.contains("uber to ")
+            || c.contains("get me a ride") || c.contains("book a ride")
+            || c.contains("get me a gojek") || c.contains("book a gojek")
+            || c.contains("grab home") || c.contains("uber home") || c.contains("ride home")
+            || c.contains("how much is a grab") || c.contains("how much is an uber")
+            || c.contains("how much is a ride") {
+            // "make it a Gojek" in the moment: a named provider wins from here on.
+            if c.contains("gojek") { UserDefaults.standard.set("gojek", forKey: "chappy_ride_provider") }
+            else if c.contains("uber") { UserDefaults.standard.set("uber", forKey: "chappy_ride_provider") }
+            else if c.contains("grab") { UserDefaults.standard.set("grab", forKey: "chappy_ride_provider") }
+            var dest = ""
+            if let r = c.range(of: " to ", options: .backwards) { dest = String(c[r.upperBound...]) }
+            if dest.isEmpty, c.contains("home") { dest = "home" }
+            // Flight day: a bare "get me a Grab" means the airport, right terminal.
+            if dest.isEmpty, let ap = ChappyFlights.shared.airportNavQuery() { dest = ap }
+            guard !dest.isEmpty else {
+                speak("Where to? Say: get me a \(ChappyRide.shared.provider.display) to the airport.")
+                return
+            }
+            speak("Pricing it.")
+            Task { @MainActor in
+                TTSService.shared.speak(await ChappyRide.shared.quote(to: dest))
+            }
+            return
+        }
+        if c.contains("order food") || c.contains("get food") || c.contains("food delivery")
+            || c.contains("uber eats") || c.contains("grab food") || c.contains("go food")
+            || c.contains("order from ") || c.contains("i'm hungry") || c.contains("im hungry")
+            || c.contains("order the usual") || c.contains("order dinner") || c.contains("order lunch") {
+            speak(ChappyRide.shared.foodHandoff(from: c))
+            return
+        }
+        // BUILD 153 — "SPENT 200" / "I spent 45 on lunch". Fares and food
+        // land in memory as spend entries; the ride arrival prompt promises
+        // this, so it has to be real. ("Spent today" stays the cost check.)
+        if (c.hasPrefix("spent ") || c.contains("i spent ") || c.contains("i just spent ")),
+           !c.contains("spent today"), !c.contains("have i spent") {
+            let amount = c.split(separator: " ")
+                .compactMap { Double($0.filter { "0123456789.".contains($0) }) }
+                .first
+            guard let amt = amount, amt > 0 else {
+                speak("Spent how much? Say: spent 30 on lunch."); return
+            }
+            var what = ""
+            if let r = c.range(of: " on ") {
+                what = String(c[r.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?"))
+            }
+            let amtText = amt == amt.rounded() ? String(Int(amt)) : String(format: "%.2f", amt)
+            _ = ChappyMemory.shared.remember(.spend,
+                title: what.isEmpty ? "Spent \(amtText)" : "\(amtText) on \(what)",
+                tags: ["spend"], source: "voice")
+            speak("Logged - \(amtText)\(what.isEmpty ? "" : " on \(what)").")
+            return
+        }
+        // BUILD 147 — CLIP. Video, summarised: "record a clip" rolls ~20s of
+        // frames and files the story of what happened.
+        if c.contains("record a clip") || c.contains("record this") || c.contains("take a video")
+            || c.contains("record a video") || c.contains("watch this and remember") {
+            speak("Rolling - about twenty seconds.")
+            ChappyClip.shared.record()
+            return
+        }
+        if c.contains("what did i just see") || c.contains("what just happened") {
+            speak("Quick look back.")
+            ChappyClip.shared.record(seconds: 8)
+            return
+        }
+        // BUILD 147 — MAIL AND MESSAGES. One inbox, two kinds of message:
+        // email, and SMS arriving through the TelTel gateway.
+        if c.contains("check my email") || c.contains("check my mail") || c.contains("check my inbox")
+            || c.contains("any new email") || c.contains("any emails") || c.contains("any new mail") {
+            speak("Having a look.")
+            Task { @MainActor in TTSService.shared.speak(await ChappyMail.shared.check()) }
+            return
+        }
+        if c.contains("any texts") || c.contains("check my texts") || c.contains("any messages")
+            || c.contains("any new texts") || c.contains("check my messages") {
+            speak("Checking.")
+            Task { @MainActor in
+                _ = await ChappyMail.shared.check()
+                let texts = ChappyMail.shared.unread.filter { $0.isText }
+                if texts.isEmpty { TTSService.shared.speak("No new texts.") }
+                else { TTSService.shared.speak(ChappyMail.shared.read(index: 0, textsOnly: true)) }
+            }
+            return
+        }
+        if c.contains("read the first text") || c.contains("read my texts") {
+            speak(ChappyMail.shared.read(index: 0, textsOnly: true)); return
+        }
+        if c.contains("read the first one") || c.contains("read the first message")
+            || c.contains("read message one") {
+            speak(ChappyMail.shared.read(index: 0, textsOnly: false)); return
+        }
+        if c.contains("read the second one") || c.contains("read message two") {
+            speak(ChappyMail.shared.read(index: 1, textsOnly: false)); return
+        }
+        if c.contains("read the third one") || c.contains("read message three") {
+            speak(ChappyMail.shared.read(index: 2, textsOnly: false)); return
+        }
+        if c.hasPrefix("reply") && (c.contains("saying") || c.contains("that ")) {
+            var body = c
+            for cut in ["reply to that saying", "reply saying", "reply that", "reply with"] {
+                if let r = body.range(of: cut) { body = String(body[r.upperBound...]); break }
+            }
+            body = body.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard !body.isEmpty else { speak("Reply saying what?"); return }
+            speak(ChappyMail.shared.replyToLast(saying: body))
+            return
+        }
+        // BUILD 146 — SCAM GUARD. "Is this a scam" with the story in the same
+        // breath answers instantly; bare "scam check" opens the ear for it.
+        if c.contains("scam") || c.contains("is this a con") || c.contains("being conned")
+            || c.contains("rip off or") || c.contains("does this sound dodgy") {
+            let tail = c.replacingOccurrences(of: "scam check", with: "")
+                .replacingOccurrences(of: "is this a scam", with: "")
+                .replacingOccurrences(of: "is that a scam", with: "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            if tail.split(separator: " ").count >= 4 {
+                if let v = ChappyScamGuard.verdict(for: tail) { speak(v); return }
+                await quickAsk("SCAM CHECK - judge this situation for scam red flags in two short spoken sentences, be direct about risk: \(tail)")
+                return
+            }
+            expectingScamUntil = Date().addingTimeInterval(30)
+            if !isListening { silentArm = true; start() }
+            speak("Tell me what's happening - who's asking for what?")
             return
         }
         // BUILD 139 — VOICE SELF-TEST. "All the voices sound the same" means
@@ -3737,7 +3946,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 speak("Remember what?"); return
             }
             if let answer = ChappyMemory.shared.spokenRecall(subject) {
-                ChappyEarcon.shared.done()
+                // BUILD 144 earcon diet: the spoken line IS the confirmation
                 speak(answer)
             } else {
                 ChappyEarcon.shared.fail()
@@ -3750,7 +3959,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("open the memory") || c.contains("memory browser")
             || c.contains("show my memory") {
             NotificationCenter.default.post(name: .chappyOpenMemory, object: nil)
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             speak("Memory's open."); return
         }
         if c.contains("import from the glasses") || c.contains("import my photos")
@@ -3771,6 +3980,60 @@ final class ChappyStandby: NSObject, ObservableObject {
             let n = ChappyMemory.shared.recent.count
             speak(n == 0 ? "Nothing stored yet."
                          : "\(n) memories in the last month, all searchable."); return
+        }
+        // BUILD 146 — THE JOURNAL, SPOKEN. "Read my journal" / "tell me about
+        // my day" narrates the day as a story: the stops from the Trail, the
+        // moments from Memory, woven in time order. Free — it reads what the
+        // phone already knows.
+        if c.contains("read my journal") || c.contains("tell me about my day")
+            || c.contains("my day story") || c.contains("story of my day")
+            || c.contains("journal for") {
+            let day = ChappyTrail.dayMentioned(in: c) ?? Date()
+            let visits = ChappyTrail.shared.visits(for: day).sorted { $0.arrive < $1.arrive }
+            let mems = ChappyMemory.shared.recent
+                .filter { Calendar.current.isDate($0.at, inSameDayAs: day) && $0.source != "pulse" }
+                .sorted { $0.at < $1.at }
+            guard !visits.isEmpty || !mems.isEmpty else {
+                speak("Nothing in the journal for that day yet."); return
+            }
+            let tf = DateFormatter(); tf.dateFormat = "h:mm a"
+            var beats: [(Date, String)] = []
+            for v in visits {
+                beats.append((v.arrive, "\(v.name ?? "a stop"), \(v.spokenWindow)"))
+            }
+            for m in mems.prefix(6) {
+                let verb: String
+                switch m.kind {
+                case .photo: verb = "photographed"
+                case .scan: verb = "scanned"
+                case .spend: verb = "spent on"
+                case .place: verb = "starred"
+                default: verb = "noted"
+                }
+                beats.append((m.at, "\(tf.string(from: m.at)), \(verb) \(m.title)"))
+            }
+            let story = beats.sorted { $0.0 < $1.0 }.prefix(9).map { $0.1 }.joined(separator: ". ")
+            speak("Your day: \(story).")
+            return
+        }
+        // BUILD 144 — THE WEEK, SPOKEN. "What's on next week / this week /
+        // the week ahead" reads the diary forward, grouped by day.
+        if (c.contains("next week") || c.contains("this week") || c.contains("week ahead")),
+           c.contains("what") || c.contains("diary") || c.contains("calendar")
+            || c.contains("on ") || c.contains("coming") {
+            let events = ChappyCalendar.shared.upcoming(days: 7).filter { !$0.isAllDay }
+            guard !events.isEmpty else { speak("Nothing in the diary for the week ahead."); return }
+            let df = DateFormatter(); df.dateFormat = "EEEE"
+            let tf = DateFormatter(); tf.dateFormat = "h:mm a"
+            let lines = events.prefix(6).compactMap { e -> String? in
+                guard let s = e.startDate else { return nil }
+                let day = Calendar.current.isDateInToday(s) ? "Today"
+                    : (Calendar.current.isDateInTomorrow(s) ? "Tomorrow" : df.string(from: s))
+                return "\(day), \(e.title ?? "something") at \(tf.string(from: s))"
+            }
+            let more = events.count > 6 ? " And \(events.count - 6) more." : ""
+            speak("The week ahead: \(lines.joined(separator: ". ")).\(more)")
+            return
         }
         if c.contains("where was i") || c.contains("where have i been")
             || c.contains("what did i do today") || c.contains("where did i go") {
@@ -3899,7 +4162,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             UserDefaults.standard.set(newCode, forKey: "translate_target_language")
             UserDefaults.standard.set(newCode, forKey: "translate_last_used_language")
             NotificationCenter.default.post(name: .chappyRetargetTranslate, object: newCode)
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             speak("Switching to \(Self.languageName(newCode)).")
             if !LiveTranslateIsOpen {
                 UserDefaults.standard.set(true, forKey: "translate_autostart")
@@ -4054,16 +4317,24 @@ final class ChappyStandby: NSObject, ObservableObject {
                 let reply = await NavEngine.shared.getHome()
                 speak(reply); return
             }
+            // BUILD 152 — FLIGHT DAY: a bare "the airport" means HIS airport,
+            // right terminal, when a flight is tracked today.
+            var target = dest
+            if ["airport", "the airport", "airport please", "the airport please"]
+                .contains(target.lowercased()),
+               let better = ChappyFlights.shared.airportNavQuery() {
+                target = better
+            }
             // BUILD 87: if he didn't say HOW, ask — walking and driving routes
             // to the same place are completely different journeys, and guessing
             // walking for an airport run is how you get a 140-minute route.
             // Only asked when genuinely unknown: "walk me to" already said it.
             let modeStated = driving
                 || ["walk", "on foot", "walking", "stroll"].contains { c.contains($0) }
-            guard modeStated else { askForNavMode(destination: dest); return }
-            speak("Finding \(dest).")
+            guard modeStated else { askForNavMode(destination: target); return }
+            speak("Finding \(target).")
             ChappyEarcon.shared.startThinking()
-            let reply = await NavEngine.shared.navigate(to: dest, driving: driving)
+            let reply = await NavEngine.shared.navigate(to: target, driving: driving)
             ChappyEarcon.shared.stopThinking()
             // Human ears get the human string; the model-directed one is for
             // Live AI only. See AUDIT FIX (SPOKEN-LEAK) in NavEngine.navigate.
@@ -4498,7 +4769,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                     ChappyEarcon.shared.fail()
                     speak("Saved it, though GPS hasn't settled - it may be a little off.")
                 } else {
-                    ChappyEarcon.shared.done()
+                    // BUILD 144 earcon diet: the spoken line IS the confirmation
                     ChappyHaptics.shared.straightStep()
                     speak("Saved \(spot.name).")
                 }
@@ -5993,25 +6264,34 @@ final class NavEngine: NSObject, ObservableObject {
     /// warnings. Deliberately does not start navigation or touch any state;
     /// it is a question, not a command.
     func travelMinutes(to query: String, driving: Bool = true) async -> Int? {
+        (await travelEstimate(to: query, driving: driving))?.mins
+    }
+
+    /// BUILD 153 — the fuller answer ChappyRide needs: minutes AND
+    /// kilometres AND the resolved point, still without touching nav state.
+    func travelEstimate(to query: String, driving: Bool = true)
+        async -> (mins: Int, km: Double, coord: CLLocationCoordinate2D, name: String)? {
         let snap = ContextEngine.shared.snapshot
         guard let lat = snap.latitude, let lon = snap.longitude, !query.isEmpty else { return nil }
         var dest: CLLocationCoordinate2D?
+        var name = query
         let q = query.lowercased()
         if let spot = TripRecorder.shared.spots.last(where: {
             q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q) }) {
             dest = CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon)
+            name = spot.name
         }
         if dest == nil, let found = await placesSearch(query: query, lat: lat, lon: lon) {
-            dest = found.0
+            dest = found.0; name = found.1
         }
         if dest == nil, let found = await appleSearch(query: query, lat: lat, lon: lon) {
-            dest = found.0
+            dest = found.0; name = found.1
         }
         guard let d = dest else { return nil }
         var routed = await googleRoute(fromLat: lat, fromLon: lon, to: d, driving: driving)
         if routed == nil { routed = await mapKitRoute(fromLat: lat, fromLon: lon, to: d, driving: driving) }
         guard let r = routed else { return nil }
-        return max(1, Int(r.durationSec / 60))
+        return (max(1, Int(r.durationSec / 60)), r.distanceMeters / 1000.0, d, name)
     }
 
     /// Keyless place lookup. MKLocalSearch uses Apple's own maps data and
@@ -7495,7 +7775,7 @@ final class ChappyIngest: ObservableObject {
                 opens: .chappyOpenMemory)
         }
         if manual {
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             TTSService.shared.speak(photos + videos == 0
                 ? "Nothing new to import."
                 : "Imported \(photos + videos) from the glasses.")
@@ -7989,7 +8269,7 @@ extension ChappyMemory {
             }
         }
         if manual {
-            ChappyEarcon.shared.done()
+            // BUILD 144 earcon diet: the spoken line IS the confirmation
             TTSService.shared.speak(filed == 0
                 ? "Read them through - nothing worth keeping in those."
                 : "Filed \(filed) thing\(filed == 1 ? "" : "s") from \(pending.count) old conversations.")
@@ -8692,6 +8972,15 @@ final class ChappyReminders: NSObject, ObservableObject {
         // VISA — the highest-stakes recurring fact in a full-time traveller's
         // life, and the easiest to lose track of.
         if let visa = visaLine() { parts.append(visa) }
+        // BUILD 147: what the last mail check found, never a fresh fetch.
+        if ChappyMail.shared.isConfigured, !ChappyMail.shared.unread.isEmpty {
+            let texts = ChappyMail.shared.unread.filter { $0.isText }.count
+            let mails = ChappyMail.shared.unread.count - texts
+            var bits: [String] = []
+            if texts > 0 { bits.append("\(texts) text\(texts == 1 ? "" : "s")") }
+            if mails > 0 { bits.append("\(mails) email\(mails == 1 ? "" : "s")") }
+            parts.append("Unread: \(bits.joined(separator: " and ")).")
+        }
         return parts.joined(separator: " ")
     }
 
@@ -9737,7 +10026,30 @@ final class ChappyCalendar: ObservableObject {
     /// One line per event, short enough to be heard rather than read.
     /// Only Ping and Brief calendars are ever read aloud. "Just show it" means
     /// exactly that — visible in the diary, never spoken at you.
+    // BUILD 145 — PER-EVENT "IN THE BRIEF". One job can join the morning
+    // read-out without its whole calendar coming along, and vice versa.
+    // Same fingerprint trick as levels and leads; nil = calendar decides.
+    private var eventBriefs: [String: Bool] {
+        get { (UserDefaults.standard.dictionary(forKey: "chappy_event_briefs") as? [String: Bool]) ?? [:] }
+        set {
+            var v = newValue
+            if v.count > 400 { v = Dictionary(uniqueKeysWithValues: Array(v).suffix(400)) }
+            UserDefaults.standard.set(v, forKey: "chappy_event_briefs")
+        }
+    }
+
+    func briefOverride(for e: EKEvent) -> Bool? { eventBriefs[Self.fingerprint(e)] }
+
+    func setBriefOverride(_ on: Bool?, for e: EKEvent) {
+        var v = eventBriefs
+        let key = Self.fingerprint(e)
+        if let on { v[key] = on } else { v.removeValue(forKey: key) }
+        eventBriefs = v
+    }
+
     private func spokenWorthy(_ e: EKEvent) -> Bool {
+        // BUILD 145: the per-event switch outranks everything below it.
+        if let override = briefOverride(for: e) { return override }
         if level(for: e) == .important { return true }   // always, whatever the calendar says
         if level(for: e) == .muted { return false }
         let b = effectiveBehaviour(for: e)
@@ -10095,6 +10407,14 @@ final class ChappyReader {
             QuickVisionManager.shared.triggerQuickVision(customPrompt:
                 "Read ALL visible text in this image aloud, verbatim and in order. If it is in another language, read it then translate it. No commentary.")
             return
+        }
+
+        // BUILD 146 — THE EYES FEED THE GUARD. Everything read or scanned is
+        // swept for scam red flags, free. A dodgy invoice announces itself.
+        let flags = ChappyScamGuard.redFlags(in: text)
+        if let first = flags.first {
+            TTSService.shared.speak("Before I read it - heads up: \(first.warning)")
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
         }
 
         switch mode {
@@ -10552,5 +10872,1352 @@ extension ChappyReminders {
             }
         }
         return out
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY SCAM GUARD (Build 146 — Phase 5 Step 5)
+// =====================================================================
+//
+// A traveller's most expensive minutes are the ones where something feels
+// slightly off and there's nobody to ask. Chappy is somebody to ask.
+//
+// The guard is a LADDER, cheapest first:
+//   1. RULES — the twelve shapes nearly every scam wears, matched locally,
+//      free, instant, offline. Gift cards. Wire-only. Fake urgency.
+//      Authority threats. Too-good prices. Overpayment "refunds".
+//   2. THE BRAIN — a described situation that trips no rule goes to the
+//      cheap model WITH the wearer's Codex context, because "is this normal
+//      here" depends on where here is.
+//   3. THE EYES — everything the Reader scans is swept for red flags
+//      automatically. A dodgy invoice announces itself.
+//
+// The guard NEVER auto-blocks anything — it says what it sees and why, and
+// the human decides. An assistant that cries wolf gets switched off, so
+// rule matches are specific, not vibes.
+enum ChappyScamGuard {
+
+    struct Flag { let warning: String }
+
+    private static let rules: [(patterns: [String], warning: String)] = [
+        (["gift card", "itunes card", "google play card", "steam card"],
+         "Nobody legitimate takes payment in gift cards. Not the tax office, not a bank, not a supplier. That's a scam, full stop."),
+        (["wire transfer only", "western union", "moneygram", "wire the money", "transfer only no"],
+         "Untraceable-transfer-only is the classic scam payment. A real business takes a card."),
+        (["pay outside", "off the platform", "outside the app", "avoid the fees", "deal directly"],
+         "Being pulled off the platform kills your buyer protection — that's usually the whole point of asking."),
+        (["arrest", "warrant", "police will", "tax office says", "deported", "suspend your account today"],
+         "Authority plus urgency is the oldest con there is. Real agencies write letters; they don't threaten you into paying on the phone."),
+        (["overpaid", "send back the difference", "refund the extra", "accidentally sent too much"],
+         "The overpayment refund trick — their payment will bounce after you've sent real money back."),
+        (["crypto", "double your", "guaranteed return", "investment opportunity", "trading platform"],
+         "Guaranteed returns don't exist. Anyone promising them wants your principal, not your prosperity."),
+        (["verification code", "read me the code", "code i sent you", "one time code"],
+         "NEVER read anyone a verification code. That code is the key to one of your accounts — that's why they want it."),
+        (["customs fee", "release the package", "small fee to deliver", "parcel is held"],
+         "Held-parcel fees are a phishing staple. Check with the courier directly, never through the link or number they gave."),
+        (["romance", "stuck overseas", "needs money to fly", "hospital bills abroad", "never met in person"],
+         "Money to someone you've never met in person is gone the moment it's sent, whatever the story."),
+        (["act now", "today only", "last chance", "right now or", "expires in minutes"],
+         "Manufactured urgency exists to stop you thinking. Anything real survives a day's thought."),
+        (["too cheap", "half the price of every", "way below market"],
+         "A price wildly below every other seller usually isn't a bargain — it's bait."),
+        (["deposit to hold", "booking fee upfront", "send deposit sight unseen"],
+         "Deposits for something you haven't seen, to someone you can't verify, rarely come back."),
+    ]
+
+    /// Free, local, instant. Returns every matched warning, strongest first.
+    static func redFlags(in text: String) -> [Flag] {
+        let t = text.lowercased()
+        return rules.compactMap { rule in
+            rule.patterns.contains(where: { t.contains($0) }) ? Flag(warning: rule.warning) : nil
+        }
+    }
+
+    /// The spoken verdict for a described situation.
+    static func verdict(for text: String) -> String? {
+        let flags = redFlags(in: text)
+        guard !flags.isEmpty else { return nil }
+        if flags.count == 1 { return "Red flag. \(flags[0].warning)" }
+        return "Two red flags at once. \(flags[0].warning) And: \(flags[1].warning) I'd walk away."
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY CLIP (Build 147 — video, summarised)
+// =====================================================================
+//
+// Snap's bigger sibling. The glasses feed ~1 frame a second, which is
+// exactly what a summariser wants: "record a clip" captures a sequence,
+// sends the frames in ONE cheap call, and files a .video memory — a
+// narrative of what happened, first frame as the thumbnail, pinned on the
+// Journal Map. A 20-second clip costs about a tenth of a cent.
+@MainActor
+final class ChappyClip {
+
+    static let shared = ChappyClip()
+    private init() {}
+
+    private(set) var isRecording = false
+
+    func record(seconds: Int = 20) {
+        guard !isRecording else {
+            TTSService.shared.speak("Already rolling."); return
+        }
+        isRecording = true
+        Task { await run(seconds: seconds) }
+    }
+
+    private func run(seconds: Int) async {
+        defer { isRecording = false }
+
+        // Wake the camera — Pulse's dance.
+        let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
+        if !wasStreaming {
+            NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
+            }
+            try? await Task.sleep(nanoseconds: 800_000_000)
+        }
+
+        var frames: [UIImage] = []
+        let interval = max(1, seconds / 14)          // ≤14 frames whatever the length
+        for i in 0..<(seconds / interval) {
+            if i > 0 { try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000) }
+            if let f = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
+                frames.append(f)
+            }
+        }
+
+        if !wasStreaming {
+            if GeminiLiveService.activeInstance == nil, !ContinuousVisionManager.shared.isRunning {
+                await LiveAIManager.shared.streamViewModel?.stopSession()
+            }
+        }
+
+        guard frames.count >= 3 else {
+            TTSService.shared.speak("The camera never settled — no clip this time.")
+            return
+        }
+        ChappyEarcon.shared.done()
+
+        guard let summary = await summarise(frames) else {
+            // The moment still gets kept, just untitled — never lose footage
+            // to a network burp.
+            _ = ChappyMemory.shared.remember(.video, title: "Clip, \(frames.count) frames",
+                                             tags: ["clip"],
+                                             thumbnail: frames[0].jpegData(compressionQuality: 0.5),
+                                             source: "clip")
+            TTSService.shared.speak("Clip saved. Couldn't reach the summariser — it's kept untitled.")
+            return
+        }
+        let title = String(summary.split(separator: ".").first.map(String.init) ?? summary).prefix(70)
+        _ = ChappyMemory.shared.remember(.video, title: String(title),
+                                         body: summary,
+                                         tags: ["clip"],
+                                         thumbnail: frames[0].jpegData(compressionQuality: 0.5),
+                                         source: "clip")
+        TTSService.shared.speak(summary)
+    }
+
+    private func summarise(_ frames: [UIImage]) async -> String? {
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=\(key)")
+        else { return nil }
+        var parts: [[String: Any]] = [[
+            "text": "These are sequential frames from a short first-person video clip, in order. Narrate what happened across them as 2-3 vivid spoken sentences - what the place is, what changed, anything notable or readable. No preamble."
+        ]]
+        for f in frames {
+            let side: CGFloat = 384
+            let scale = side / max(f.size.width, f.size.height)
+            let sz = CGSize(width: f.size.width * scale, height: f.size.height * scale)
+            let small = UIGraphicsImageRenderer(size: sz).image { _ in
+                f.draw(in: CGRect(origin: .zero, size: sz))
+            }
+            guard let jpeg = small.jpegData(compressionQuality: 0.45) else { continue }
+            parts.append(["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "contents": [["role": "user", "parts": parts]],
+            "generationConfig": ["temperature": 0.3, "maxOutputTokens": 160]
+        ] as [String: Any])
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let ps = content["parts"] as? [[String: Any]],
+              let t = ps.first?["text"] as? String
+        else { return nil }
+        let clean = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "*", with: "")
+        return clean.isEmpty ? nil : clean
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY MAIL (Build 147 — mail and messages, one manager)
+// =====================================================================
+//
+// THE TELTEL INSIGHT: iOS will never let an app read SMS or WhatsApp — but
+// the wearer's SMS arrive as EMAILS through his TelTel gateway, into an
+// inbox Chappy CAN read with his blessing and an app-specific password.
+// So one IMAP client is both an email manager and a text-message manager:
+// a message from *@teltel.com.au IS a text, and replying to it sends a
+// real SMS back out through the gateway.
+//
+// The client speaks just enough IMAP: LOGIN, SELECT, UID SEARCH UNSEEN,
+// UID FETCH with BODY.PEEK (peek, so reading a summary never marks mail
+// read behind the wearer's back). TLS from the first byte (port 993).
+// Replies open the Mail composer pre-filled — one human tap to send,
+// same consent pattern as WhatsApp and SOS.
+@MainActor
+final class ChappyMail: ObservableObject {
+
+    static let shared = ChappyMail()
+    private init() {}
+
+    struct Message: Identifiable {
+        let id: Int              // IMAP UID
+        let from: String         // display or address
+        let fromAddress: String
+        let subject: String
+        let preview: String
+        var isText: Bool { fromAddress.lowercased().contains("teltel") }
+    }
+
+    @Published private(set) var unread: [Message] = []
+    @Published private(set) var lastChecked: Date?
+    @Published private(set) var lastError: String?
+
+    private(set) var lastRead: Message?
+
+    private enum Key {
+        static let address = "chappy_mail_address"
+        static let host = "chappy_mail_host"
+    }
+
+    var address: String { UserDefaults.standard.string(forKey: Key.address) ?? "" }
+    var host: String { UserDefaults.standard.string(forKey: Key.host) ?? "imap.mail.me.com" }
+    var isConfigured: Bool {
+        !address.isEmpty && APIKeyManager.shared.getMailPassword() != nil
+    }
+
+    func configure(address: String, host: String, password: String) {
+        UserDefaults.standard.set(address, forKey: Key.address)
+        UserDefaults.standard.set(host, forKey: Key.host)
+        _ = APIKeyManager.shared.saveMailPassword(password)
+    }
+
+    // MARK: the check
+
+    /// Fetch unseen mail and return the SPOKEN summary.
+    func check() async -> String {
+        guard isConfigured, let pass = APIKeyManager.shared.getMailPassword() else {
+            return "Mail isn't set up yet. Settings, Mail and Messages - it takes one app-specific password."
+        }
+        let imap = MiniIMAP()
+        do {
+            try await imap.connect(host: host)
+            _ = try await imap.command("LOGIN \(quoted(address)) \(quoted(pass))")
+            _ = try await imap.command("SELECT INBOX")
+            let search = try await imap.command("UID SEARCH UNSEEN")
+            let uids = Self.uids(from: search).suffix(8)
+            var out: [Message] = []
+            for uid in uids {
+                let r = try await imap.command(
+                    "UID FETCH \(uid) (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.400>)")
+                out.append(Self.parse(uid: uid, fetch: r))
+            }
+            imap.close()
+            unread = out.reversed()      // newest first
+            lastChecked = Date()
+            lastError = nil
+            return spokenSummary()
+        } catch {
+            imap.close()
+            lastError = error.localizedDescription
+            return "Couldn't reach the mailbox: \(error.localizedDescription)"
+        }
+    }
+
+    func spokenSummary() -> String {
+        guard !unread.isEmpty else { return "Inbox is clear - nothing unread." }
+        let texts = unread.filter { $0.isText }
+        let mails = unread.filter { !$0.isText }
+        var parts: [String] = []
+        if !texts.isEmpty {
+            parts.append("\(texts.count) text\(texts.count == 1 ? "" : "s") - from \(texts.prefix(2).map { Self.smsSender($0) }.joined(separator: ", "))")
+        }
+        if !mails.isEmpty {
+            parts.append("\(mails.count) email\(mails.count == 1 ? "" : "s") - \(mails.prefix(3).map { "\($0.from): \($0.subject)" }.joined(separator: ". "))")
+        }
+        return parts.joined(separator: ". ") + ". Say 'read the first one' to hear it."
+    }
+
+    /// "Read the first one" / "read message two" / "read the first text".
+    func read(index: Int, textsOnly: Bool) -> String {
+        let pool = textsOnly ? unread.filter { $0.isText } : unread
+        guard pool.indices.contains(index) else {
+            return textsOnly ? "No text like that." : "No message like that."
+        }
+        let m = pool[index]
+        lastRead = m
+        if m.isText {
+            return "Text from \(Self.smsSender(m)): \(m.preview.isEmpty ? m.subject : m.preview)"
+        }
+        return "From \(m.from). \(m.subject). \(m.preview)"
+    }
+
+    /// Reply — opens Mail pre-filled; ONE human tap sends. A reply to a
+    /// TelTel message goes back out as a real SMS.
+    func replyToLast(saying body: String) -> String {
+        guard let m = lastRead else { return "Read a message first, then tell me the reply." }
+        let to = m.fromAddress.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? m.fromAddress
+        let subj = ("Re: " + m.subject).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let b = body.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        guard let u = URL(string: "mailto:\(to)?subject=\(subj)&body=\(b)") else {
+            return "Couldn't build that reply."
+        }
+        UIApplication.shared.open(u)
+        return m.isText
+            ? "Reply's ready on screen - one tap sends the text."
+            : "Reply's ready on screen - one tap sends it."
+    }
+
+    // MARK: parsing (deliberately forgiving)
+
+    private func quoted(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
+              .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    static func uids(from response: String) -> [Int] {
+        for line in response.components(separatedBy: "\r\n") where line.hasPrefix("* SEARCH") {
+            return line.dropFirst(8).split(separator: " ").compactMap { Int($0) }
+        }
+        return []
+    }
+
+    static func parse(uid: Int, fetch: String) -> Message {
+        var from = "someone", fromAddr = "", subject = "(no subject)"
+        var bodyLines: [String] = []
+        var inHeaders = false
+        for raw in fetch.components(separatedBy: "\r\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let lower = line.lowercased()
+            if lower.hasPrefix("from:") {
+                inHeaders = true
+                let v = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                if let lt = v.firstIndex(of: "<"), let gt = v.firstIndex(of: ">") {
+                    fromAddr = String(v[v.index(after: lt)..<gt])
+                    let name = String(v[v.startIndex..<lt])
+                        .trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+                    from = name.isEmpty ? fromAddr : name
+                } else {
+                    fromAddr = v; from = v
+                }
+            } else if lower.hasPrefix("subject:") {
+                subject = String(line.dropFirst(8)).trimmingCharacters(in: .whitespaces)
+            } else if inHeaders, !line.isEmpty, !line.hasPrefix("*"),
+                      !lower.hasPrefix("from:"), !lower.hasPrefix("subject:"),
+                      line != ")", !line.hasPrefix("a") || !line.contains(" OK") {
+                // Everything after the headers that isn't IMAP plumbing is body.
+                if !line.contains("BODY[") && !line.hasPrefix("{") {
+                    bodyLines.append(line)
+                }
+            }
+        }
+        var preview = bodyLines.joined(separator: " ")
+            .replacingOccurrences(of: "=\r\n", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if preview.count > 260 { preview = String(preview.prefix(260)) }
+        return Message(id: uid, from: from, fromAddress: fromAddr,
+                       subject: subject, preview: preview)
+    }
+
+    /// "0412 345 678" out of "0412345678@teltel.com.au" — spoken like a person.
+    static func smsSender(_ m: Message) -> String {
+        let local = m.fromAddress.split(separator: "@").first.map(String.init) ?? m.from
+        if local.allSatisfy({ $0.isNumber || $0 == "+" }), local.count >= 8 {
+            return local.enumerated().map { i, c in
+                (i > 0 && i % 4 == 0) ? " \(c)" : "\(c)"
+            }.joined()
+        }
+        return m.from
+    }
+}
+
+/// Just enough IMAP, over TLS from the first byte.
+final class MiniIMAP {
+
+    private var conn: NWConnection?
+    private var tagN = 0
+
+    enum MailError: LocalizedError {
+        case connect, closed, bad(String)
+        var errorDescription: String? {
+            switch self {
+            case .connect: return "couldn't connect"
+            case .closed: return "connection closed"
+            case .bad(let s): return s
+            }
+        }
+    }
+
+    func connect(host: String) async throws {
+        let c = NWConnection(host: NWEndpoint.Host(host),
+                             port: NWEndpoint.Port(integerLiteral: 993),
+                             using: .tls)
+        conn = c
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            var done = false
+            c.stateUpdateHandler = { state in
+                guard !done else { return }
+                switch state {
+                case .ready: done = true; cont.resume()
+                case .failed(let e): done = true; cont.resume(throwing: e)
+                case .cancelled: done = true; cont.resume(throwing: MailError.closed)
+                default: break
+                }
+            }
+            c.start(queue: .global(qos: .userInitiated))
+        }
+        _ = try await readUntil("\r\n")   // the server greeting
+    }
+
+    func command(_ body: String) async throws -> String {
+        tagN += 1
+        let tag = "a\(tagN)"
+        try await send("\(tag) \(body)\r\n")
+        let resp = try await readUntil("\r\n\(tag) ")
+        if resp.contains("\r\n\(tag) NO") || resp.contains("\r\n\(tag) BAD") {
+            // Speakable: the word after NO/BAD onwards, trimmed.
+            let tail = resp.components(separatedBy: "\r\n\(tag) ").last ?? "refused"
+            throw MailError.bad(String(tail.prefix(120)))
+        }
+        return resp
+    }
+
+    private func send(_ s: String) async throws {
+        guard let conn else { throw MailError.closed }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            conn.send(content: Data(s.utf8), completion: .contentProcessed { e in
+                if let e { cont.resume(throwing: e) } else { cont.resume() }
+            })
+        }
+    }
+
+    /// Read until the marker appears, then one more line-end. Bounded so a
+    /// hostile or confused server can't balloon memory.
+    private func readUntil(_ marker: String) async throws -> String {
+        guard let conn else { throw MailError.closed }
+        var buf = Data()
+        for _ in 0..<200 {
+            if let text = String(data: buf, encoding: .utf8) ?? String(data: buf, encoding: .isoLatin1),
+               let r = text.range(of: marker) {
+                // finish the marker's line
+                if text[r.upperBound...].contains("\r\n") || marker == "\r\n" {
+                    return text
+                }
+            }
+            if buf.count > 512 * 1024 { throw MailError.bad("response too large") }
+            let chunk: Data = try await withCheckedThrowingContinuation { cont in
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 32768) { data, _, done, err in
+                    if let err { cont.resume(throwing: err) }
+                    else if let data, !data.isEmpty { cont.resume(returning: data) }
+                    else if done { cont.resume(throwing: MailError.closed) }
+                    else { cont.resume(returning: Data()) }
+                }
+            }
+            buf.append(chunk)
+        }
+        throw MailError.bad("response never completed")
+    }
+
+    func close() {
+        conn?.cancel()
+        conn = nil
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY FLIGHTS (Build 150 — deal watch + my flight)
+// =====================================================================
+//
+// Two halves, one engine:
+//
+//   DEAL WATCH — powered by Amadeus, the airline industry's own data rail,
+//   whose free developer tier covers exactly what a personal deal watcher
+//   needs: real offers for a route, and cheapest-date search. Watched
+//   routes are re-checked on the proactive engine's existing daily passes
+//   (capped at 3 checks a day), every price is logged so routes grow a
+//   history, and a real drop pings the wearer. No key configured = the
+//   feature says so politely and sits quiet; keys go in Settings whenever.
+//
+//   MY FLIGHT — "track flight QF52 on Thursday" builds the travel-day
+//   scaffolding automatically: check-in reminder at T-24h, airport
+//   departure reminder, and the flight as a diary presence. Live status
+//   hands off to a search with the flight number pre-filled — the honest
+//   free option until a status API earns its keep.
+@MainActor
+final class ChappyFlights: ObservableObject {
+
+    static let shared = ChappyFlights()
+    private init() { load(); armFlightDayWatch() }
+
+    // MARK: models
+
+    struct PricePoint: Codable { var at: Date; var price: Double }
+
+    struct WatchedRoute: Codable, Identifiable {
+        var id: UUID = UUID()
+        var originCode: String      // "BNE"
+        var destCode: String        // "DPS"
+        var destName: String        // "Denpasar"
+        var month: String           // "2026-09"
+        var currency: String = "AUD"
+        var lastPrice: Double?
+        var bestDate: String?
+        var history: [PricePoint] = []
+    }
+
+    struct TrackedFlight: Codable, Identifiable {
+        var id: UUID = UUID()
+        var number: String          // "QF52"
+        var date: Date
+        // BUILD 152 — FLIGHT DAY memory. Every field optional so flights
+        // tracked under build 150/151 still decode from UserDefaults.
+        var depAirport: String?     // "Brisbane Airport" — learned from the first live check
+        var depIata: String?        // "BNE"
+        var depTerminal: String?
+        var lastStatus: String?     // change detection: only CHANGES get spoken
+        var lastDelay: Int?
+        var lastGate: String?
+        var lastEstDep: String?     // "10:55"
+        var domestic: Bool?         // both timezones Australian → 90 min buffer, else 3 h
+        var slotsDone: [String]?    // "night","morning","t6","t3","t90","t45" — each fires once
+    }
+
+    @Published private(set) var watches: [WatchedRoute] = []
+    @Published private(set) var tracked: [TrackedFlight] = []
+    @Published private(set) var lastError: String?
+
+    var isConfigured: Bool {
+        APIKeyManager.shared.getAmadeusKey() != nil && APIKeyManager.shared.getAmadeusSecret() != nil
+    }
+
+    // MARK: persistence
+
+    private func save() {
+        let d = UserDefaults.standard
+        if let w = try? JSONEncoder().encode(watches) { d.set(w, forKey: "chappy_flight_watches") }
+        if let t = try? JSONEncoder().encode(tracked) { d.set(t, forKey: "chappy_flight_tracked") }
+    }
+
+    private func load() {
+        let d = UserDefaults.standard
+        if let data = d.data(forKey: "chappy_flight_watches"),
+           let w = try? JSONDecoder().decode([WatchedRoute].self, from: data) { watches = w }
+        if let data = d.data(forKey: "chappy_flight_tracked"),
+           let t = try? JSONDecoder().decode([TrackedFlight].self, from: data) { tracked = t }
+    }
+
+    // MARK: Amadeus plumbing
+
+    private var token: String?
+    private var tokenExpiry = Date.distantPast
+
+    private func bearer() async throws -> String {
+        if let t = token, Date() < tokenExpiry { return t }
+        guard let key = APIKeyManager.shared.getAmadeusKey(),
+              let secret = APIKeyManager.shared.getAmadeusSecret(),
+              let url = URL(string: "https://test.api.amadeus.com/v1/security/oauth2/token")
+        else { throw FlightError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "grant_type=client_credentials&client_id=\(key)&client_secret=\(secret)"
+            .data(using: .utf8)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let t = json["access_token"] as? String
+        else { throw FlightError.auth }
+        token = t
+        tokenExpiry = Date().addingTimeInterval(Double(json["expires_in"] as? Int ?? 1700) - 60)
+        return t
+    }
+
+    private func get(_ path: String) async throws -> [String: Any] {
+        let t = try await bearer()
+        guard let url = URL(string: "https://test.api.amadeus.com" + path) else { throw FlightError.bad }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 20
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard code == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw FlightError.http(code) }
+        return json
+    }
+
+    enum FlightError: LocalizedError {
+        case notConfigured, auth, bad, http(Int), noResults
+        var errorDescription: String? {
+            switch self {
+            case .notConfigured: return "Amadeus keys aren't set - Settings, Flights"
+            case .auth: return "Amadeus refused the keys"
+            case .bad: return "bad request"
+            case .http(let c): return "flight service error \(c)"
+            case .noResults: return "no flights found"
+            }
+        }
+    }
+
+    /// "denpasar" → ("DPS", "Denpasar"). Airports first, then cities.
+    func locationCode(for name: String) async throws -> (code: String, name: String) {
+        let q = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? name
+        let json = try await get("/v1/reference-data/locations?keyword=\(q)&subType=AIRPORT,CITY&page%5Blimit%5D=3")
+        guard let arr = json["data"] as? [[String: Any]], let first = arr.first,
+              let code = first["iataCode"] as? String else { throw FlightError.noResults }
+        let display = (first["name"] as? String)?.capitalized ?? name
+        return (code, display)
+    }
+
+    /// The cheapest dates for a route in a month. Returns (date, price) list.
+    func cheapestDates(origin: String, dest: String) async throws -> [(date: String, price: Double)] {
+        let json = try await get("/v1/shopping/flight-dates?origin=\(origin)&destination=\(dest)")
+        guard let arr = json["data"] as? [[String: Any]] else { throw FlightError.noResults }
+        return arr.compactMap { d in
+            guard let date = d["departureDate"] as? String,
+                  let priceObj = d["price"] as? [String: Any],
+                  let total = priceObj["total"] as? String, let p = Double(total)
+            else { return nil }
+            return (date, p)
+        }
+    }
+
+    /// Real offers for a fixed date.
+    func offers(origin: String, dest: String, date: String) async throws -> [(carrier: String, price: Double)] {
+        let json = try await get("/v2/shopping/flight-offers?originLocationCode=\(origin)&destinationLocationCode=\(dest)&departureDate=\(date)&adults=1&currencyCode=AUD&max=5")
+        guard let arr = json["data"] as? [[String: Any]] else { throw FlightError.noResults }
+        return arr.compactMap { o in
+            guard let priceObj = o["price"] as? [String: Any],
+                  let total = priceObj["total"] as? String, let p = Double(total) else { return nil }
+            let carrier = ((o["validatingAirlineCodes"] as? [String])?.first) ?? "—"
+            return (carrier, p)
+        }
+    }
+
+    // MARK: deal watch
+
+    func addWatch(destName: String, month: String, origin: String = "BNE") async -> String {
+        guard isConfigured else {
+            return "Flight watching needs the free Amadeus keys first - they go in Settings, Flights. Two minutes at developers dot amadeus dot com."
+        }
+        do {
+            let loc = try await locationCode(for: destName)
+            var w = WatchedRoute(originCode: origin, destCode: loc.code,
+                                 destName: loc.name, month: month)
+            let all = try await cheapestDates(origin: origin, dest: loc.code)
+            let inMonth = all.filter { $0.date.hasPrefix(month) }
+            let pick = (inMonth.isEmpty ? all : inMonth).min { $0.price < $1.price }
+            if let p = pick {
+                w.lastPrice = p.price
+                w.bestDate = p.date
+                w.history.append(PricePoint(at: Date(), price: p.price))
+            }
+            watches.append(w)
+            save()
+            if let p = pick {
+                return "Watching \(loc.name). Cheapest right now: \(Int(p.price)) dollars on \(Self.spokenDate(p.date)). I'll check a few times a day and sing out when it drops."
+            }
+            return "Watching \(loc.name). No prices back yet - I'll keep checking."
+        } catch {
+            lastError = error.localizedDescription
+            return "Couldn't set that watch: \(error.localizedDescription)"
+        }
+    }
+
+    func removeWatch(_ id: UUID) { watches.removeAll { $0.id == id }; save() }
+
+    /// Piggybacks the proactive passes; self-caps at 3 checks a day.
+    private var checksToday: Int {
+        get { UserDefaults.standard.string(forKey: "chappy_flight_check_day") == Self.dayKey()
+              ? UserDefaults.standard.integer(forKey: "chappy_flight_checks") : 0 }
+        set {
+            UserDefaults.standard.set(Self.dayKey(), forKey: "chappy_flight_check_day")
+            UserDefaults.standard.set(newValue, forKey: "chappy_flight_checks")
+        }
+    }
+    private static func dayKey() -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: Date())
+    }
+
+    func checkIfDue() async {
+        guard isConfigured, !watches.isEmpty, checksToday < 3 else { return }
+        checksToday += 1
+        for i in watches.indices {
+            let w = watches[i]
+            guard let all = try? await cheapestDates(origin: w.originCode, dest: w.destCode) else { continue }
+            let inMonth = all.filter { $0.date.hasPrefix(w.month) }
+            guard let pick = (inMonth.isEmpty ? all : inMonth).min(by: { $0.price < $1.price }) else { continue }
+            let old = watches[i].lastPrice
+            watches[i].lastPrice = pick.price
+            watches[i].bestDate = pick.date
+            watches[i].history.append(PricePoint(at: Date(), price: pick.price))
+            if watches[i].history.count > 60 { watches[i].history.removeFirst() }
+            // A real drop: 5%+ below the last seen price.
+            if let o = old, pick.price < o * 0.95 {
+                ChappyNotify.announce(.nav,
+                    spoken: "Flight deal: \(w.destName) just dropped to \(Int(pick.price)) dollars, \(Self.spokenDate(pick.date)).",
+                    title: "✈️ \(w.destName) ↓ $\(Int(pick.price))",
+                    body: "was $\(Int(o)) — \(Self.spokenDate(pick.date))")
+            }
+        }
+        save()
+    }
+
+    func spokenDeals() -> String {
+        guard isConfigured else {
+            return "Flight watching needs the free Amadeus keys - Settings, Flights."
+        }
+        guard !watches.isEmpty else {
+            return "No routes watched yet. Say: watch flights to Bali in September."
+        }
+        let lines = watches.prefix(4).map { w -> String in
+            guard let p = w.lastPrice else { return "\(w.destName): no price yet" }
+            return "\(w.destName): \(Int(p)) dollars\(w.bestDate.map { ", " + Self.spokenDate($0) } ?? "")"
+        }
+        return "Watching: " + lines.joined(separator: ". ") + "."
+    }
+
+    // MARK: my flight
+
+    func track(number: String, date: Date) -> String {
+        let f = TrackedFlight(number: number.uppercased(), date: date)
+        tracked.removeAll { Calendar.current.isDate($0.date, inSameDayAs: date) && $0.number == f.number }
+        tracked.append(f)
+        save()
+        // The travel-day scaffolding, as ordinary reminders he can edit.
+        _ = ChappyDataBridge.addReminder(text: "Check in for \(f.number)",
+                                         at: date.addingTimeInterval(-24 * 3600))
+        _ = ChappyDataBridge.addReminder(text: "Head to the airport for \(f.number)",
+                                         at: date.addingTimeInterval(-3 * 3600))
+        armFlightDayWatch()
+        let df = DateFormatter(); df.dateFormat = "EEEE h:mm a"
+        return "Tracking \(f.number), \(df.string(from: date)). Check-in reminder set for the day before, airport reminder three hours out. On the day I'll run flight-day mode - briefs, leave-by time, and I'll sing out if the gate or the delay changes."
+    }
+
+    /// BUILD 151 — LIVE STATUS, SPOKEN. AviationStack answers "how's my
+    /// flight" out loud: on time or delayed, gate, terminal. The free tier
+    /// is 100 calls a month, so this fires ONLY when asked — never polled —
+    /// and the screen handoff stays as the fallback.
+    func statusHandoff() -> String {
+        guard tracked.sorted(by: { $0.date < $1.date })
+            .first(where: { $0.date > Date().addingTimeInterval(-6 * 3600) }) != nil else {
+            return "No flight tracked. Say: track flight QF52 on Thursday."
+        }
+        Task { @MainActor in
+            TTSService.shared.speak(await self.liveStatus())
+        }
+        return "Checking."
+    }
+
+    private func liveStatus() async -> String {
+        guard let f = tracked.sorted(by: { $0.date < $1.date })
+            .first(where: { $0.date > Date().addingTimeInterval(-6 * 3600) }) else {
+            return "No flight tracked."
+        }
+        guard let snap = await fetchSnapshot(f) else { return screenFallback(f) }
+        apply(snap, to: f.id)
+        var line = spokenStatus(f.number, snap)
+        // BUILD 152: a manual "how's my flight" with the flight still ahead
+        // gets the leave-by plan bolted on — status without a plan is trivia.
+        if snap.status != "landed", snap.status != "active",
+           f.date.timeIntervalSinceNow > 45 * 60,
+           let lb = await leaveByLine(for: freshest(f.id) ?? f, snap: snap) {
+            line += " " + lb
+        }
+        return line
+    }
+
+    private func screenFallback(_ f: TrackedFlight) -> String {
+        let q = "\(f.number) flight status".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? f.number
+        if let u = URL(string: "https://www.google.com/search?q=\(q)") {
+            UIApplication.shared.open(u)
+        }
+        return "Couldn't reach the status service - it's on screen instead."
+    }
+
+    // =================================================================
+    // BUILD 152 — FLIGHT DAY MODE.
+    //
+    // The moment a tracked flight is inside 36 hours, Chappy runs the day:
+    // a night-before brief with a leave-by time, a morning brief, then
+    // budgeted re-checks at T-6h, T-3h, T-90m and T-45m that only SPEAK
+    // when something moved — gate changed, delay posted, cancelled.
+    // Each slot fires once and the day is hard-capped at 8 AviationStack
+    // calls, so a flight day costs ~6 of the free 100 a month. No flight
+    // inside 36 hours → the timer isn't even running.
+    // =================================================================
+
+    struct FlightSnapshot {
+        var status: String
+        var delay: Int?
+        var gate: String?
+        var terminal: String?
+        var estDep: String?         // "10:55"
+        var estArr: String?
+        var depAirport: String?     // "Brisbane Airport"
+        var depIata: String?
+        var schedDep: Date?         // the REAL scheduled departure, full date
+        var domestic: Bool?
+    }
+
+    /// One AviationStack call → one snapshot. Nil on any failure — callers
+    /// fall back to the screen handoff or stay quiet.
+    private func fetchSnapshot(_ f: TrackedFlight) async -> FlightSnapshot? {
+        guard let key = APIKeyManager.shared.getAviationStackKey(),
+              let url = URL(string: "http://api.aviationstack.com/v1/flights?access_key=\(key)&flight_iata=\(f.number)&limit=1")
+        else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 15
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = json["data"] as? [[String: Any]], let flight = arr.first
+        else { return nil }
+        let dep = flight["departure"] as? [String: Any] ?? [:]
+        let arr2 = flight["arrival"] as? [String: Any] ?? [:]
+        var s = FlightSnapshot(status: (flight["flight_status"] as? String) ?? "unknown")
+        s.delay = dep["delay"] as? Int
+        s.gate = dep["gate"] as? String
+        s.terminal = dep["terminal"] as? String
+        s.depAirport = dep["airport"] as? String
+        s.depIata = dep["iata"] as? String
+        if let est = (dep["estimated"] as? String) ?? (dep["scheduled"] as? String), est.count >= 16 {
+            s.estDep = String(est.dropFirst(11).prefix(5))
+        }
+        if let a = arr2["estimated"] as? String, a.count >= 16 {
+            s.estArr = String(a.dropFirst(11).prefix(5))
+        }
+        if let sched = dep["scheduled"] as? String {
+            s.schedDep = ISO8601DateFormatter().date(from: sched)
+        }
+        // Both ends on Australian clocks → domestic buffers. Anything
+        // else gets the international three hours.
+        if let dt = dep["timezone"] as? String, let at = arr2["timezone"] as? String {
+            s.domestic = dt.hasPrefix("Australia") && at.hasPrefix("Australia")
+        }
+        return s
+    }
+
+    /// Fold a snapshot into the stored flight so the NEXT check can tell
+    /// what changed. Also upgrades the tracked date to the real scheduled
+    /// departure the first time we see it — he says "Thursday", the API
+    /// knows 10:40 Thursday, and every slot and leave-by needs the 10:40.
+    private func apply(_ s: FlightSnapshot, to id: UUID) {
+        guard let i = tracked.firstIndex(where: { $0.id == id }) else { return }
+        tracked[i].lastStatus = s.status
+        tracked[i].lastDelay = s.delay
+        tracked[i].lastGate = s.gate
+        tracked[i].lastEstDep = s.estDep
+        if let a = s.depAirport { tracked[i].depAirport = a }
+        if let c = s.depIata { tracked[i].depIata = c }
+        if let t = s.terminal { tracked[i].depTerminal = t }
+        if let d = s.domestic { tracked[i].domestic = d }
+        if let real = s.schedDep,
+           abs(real.timeIntervalSince(tracked[i].date)) < 36 * 3600 {
+            tracked[i].date = real
+        }
+        save()
+    }
+
+    private func freshest(_ id: UUID) -> TrackedFlight? {
+        tracked.first(where: { $0.id == id })
+    }
+
+    /// The spoken verdict, shared by the manual ask and every brief.
+    private func spokenStatus(_ number: String, _ s: FlightSnapshot) -> String {
+        var bits: [String] = []
+        switch s.status {
+        case "cancelled": return "\(number) is CANCELLED. I'd call the airline now."
+        case "landed": bits.append("\(number) has landed")
+        case "active": bits.append("\(number) is in the air")
+        case "incident", "diverted": bits.append("\(number) reports \(s.status) - check with the airline")
+        default: bits.append("\(number) is scheduled")
+        }
+        if let delay = s.delay, delay > 0 {
+            bits.append("running \(delay) minutes late")
+        } else if s.status == "scheduled" {
+            bits.append("on time")
+        }
+        if let est = s.estDep { bits.append("departing \(est)") }
+        if let gate = s.gate { bits.append("gate \(gate)") }
+        if let term = s.terminal { bits.append("terminal \(term)") }
+        if s.status == "active", let a = s.estArr { bits.append("landing about \(a)") }
+        return bits.joined(separator: ", ") + "."
+    }
+
+    /// The whole point of flight day: a leave-by time built from LIVE drive
+    /// time to the actual airport, plus a realistic check-in buffer.
+    private func leaveByLine(for f: TrackedFlight, snap: FlightSnapshot) async -> String? {
+        guard let airport = snap.depAirport ?? f.depAirport else { return nil }
+        guard let mins = await NavEngine.shared.travelMinutes(to: airport) else { return nil }
+        let dom = snap.domestic ?? f.domestic ?? true
+        let buffer = dom ? 90 : 180
+        let leave = f.date.addingTimeInterval(-Double(buffer + mins + 10) * 60)
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+        if leave <= Date() {
+            return "Time to move - \(airport) is about \(mins) minutes away."
+        }
+        return "Leave by \(df.string(from: leave)) - about \(mins) minutes' drive, plus \(dom ? "ninety minutes" : "three hours") at the airport."
+    }
+
+    /// The flight that owns TODAY: departed less than 3 h ago or leaving
+    /// within 20 h. Drives the airport-nav swap and the Flights GUI banner.
+    func todayFlight() -> TrackedFlight? {
+        tracked.sorted { $0.date < $1.date }.first {
+            $0.date.timeIntervalSinceNow > -3 * 3600 &&
+            $0.date.timeIntervalSinceNow < 20 * 3600
+        }
+    }
+
+    /// "Take me to the airport" on flight day → the RIGHT airport and the
+    /// right terminal, no questions asked. Nil when today isn't a flight day.
+    func airportNavQuery() -> String? {
+        guard let f = todayFlight(), let ap = f.depAirport else { return nil }
+        if let t = f.depTerminal { return "\(ap) Terminal \(t)" }
+        return ap
+    }
+
+    // MARK: the flight-day heartbeat
+
+    private var flightDayTimer: Timer?
+
+    /// A 10-minute heartbeat that only exists while a flight is inside 36
+    /// hours. ChappyProactive's passes call flightDayPass too, so the
+    /// briefs still land even when the timer died with the app.
+    func armFlightDayWatch() {
+        flightDayTimer?.invalidate(); flightDayTimer = nil
+        guard tracked.contains(where: {
+            $0.date.timeIntervalSinceNow > -3 * 3600 &&
+            $0.date.timeIntervalSinceNow < 36 * 3600
+        }) else { return }
+        flightDayTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { _ in
+            Task { @MainActor in await ChappyFlights.shared.flightDayPass() }
+        }
+        print("✈️ [FlightDay] watch armed")
+    }
+
+    private var flightDayChecksToday: Int {
+        get { UserDefaults.standard.string(forKey: "chappy_flightday_day") == Self.dayKey()
+              ? UserDefaults.standard.integer(forKey: "chappy_flightday_checks") : 0 }
+        set {
+            UserDefaults.standard.set(Self.dayKey(), forKey: "chappy_flightday_day")
+            UserDefaults.standard.set(newValue, forKey: "chappy_flightday_checks")
+        }
+    }
+
+    func flightDayPass() async {
+        for f in tracked {
+            let toGo = f.date.timeIntervalSinceNow
+            guard toGo > -2 * 3600, toGo < 36 * 3600 else { continue }
+            guard let slot = dueFlightSlot(f) else { continue }
+            guard flightDayChecksToday < 8 else { return }   // the hard daily cap
+            flightDayChecksToday += 1
+            // Marked done BEFORE the network call — a failed fetch must not
+            // become three retries and three announcements an hour later.
+            markSlot(slot, on: f.id)
+            guard let snap = await fetchSnapshot(f) else { continue }
+            let before = freshest(f.id) ?? f
+            apply(snap, to: f.id)
+            await announceSlot(slot, flight: freshest(f.id) ?? f, before: before, snap: snap)
+        }
+        armFlightDayWatch()   // flight gone past → timer stands down
+    }
+
+    /// Which flight-day moment is NOW, if any. Tightest window wins; each
+    /// fires once. Windows are wide because the pass runs every 10 minutes.
+    private func dueFlightSlot(_ f: TrackedFlight) -> String? {
+        let done = f.slotsDone ?? []
+        let now = Date()
+        let dep = f.date
+        let cal = Calendar.current
+        let hour = cal.component(.hour, from: now)
+        let windows: [(String, ClosedRange<Date>)] = [
+            ("t45", dep.addingTimeInterval(-55 * 60)...dep.addingTimeInterval(-25 * 60)),
+            ("t90", dep.addingTimeInterval(-110 * 60)...dep.addingTimeInterval(-65 * 60)),
+            ("t3",  dep.addingTimeInterval(-3.6 * 3600)...dep.addingTimeInterval(-2.4 * 3600)),
+            ("t6",  dep.addingTimeInterval(-6.5 * 3600)...dep.addingTimeInterval(-4.8 * 3600))
+        ]
+        for (name, w) in windows where !done.contains(name) && w.contains(now) {
+            return name
+        }
+        // Morning brief: flight day, after 6am, more than 2.5 h before wheels-up.
+        if !done.contains("morning"), cal.isDate(now, inSameDayAs: dep),
+           hour >= 6, dep.timeIntervalSince(now) > 2.5 * 3600 {
+            return "morning"
+        }
+        // Night-before brief: 6pm to 11pm the evening before.
+        if !done.contains("night"),
+           let tomorrow = cal.date(byAdding: .day, value: 1, to: now),
+           cal.isDate(tomorrow, inSameDayAs: dep),
+           hour >= 18, hour < 23 {
+            return "night"
+        }
+        return nil
+    }
+
+    private func markSlot(_ s: String, on id: UUID) {
+        guard let i = tracked.firstIndex(where: { $0.id == id }) else { return }
+        var d = tracked[i].slotsDone ?? []
+        d.append(s)
+        tracked[i].slotsDone = d
+        save()
+    }
+
+    private func announceSlot(_ slot: String, flight f: TrackedFlight,
+                              before: TrackedFlight, snap: FlightSnapshot) async {
+        switch slot {
+        case "night":
+            var line = "Flight day tomorrow. " + spokenStatus(f.number, snap)
+            if let lb = await leaveByLine(for: f, snap: snap) { line += " " + lb }
+            line += " I'll check again in the morning."
+            ChappyNotify.announce(.nav, spoken: line,
+                title: "✈️ \(f.number) tomorrow",
+                body: (snap.estDep.map { "Departs \($0). " } ?? "") + "Night-before brief.")
+        case "morning":
+            var line = "Flight day. " + spokenStatus(f.number, snap)
+            if let lb = await leaveByLine(for: f, snap: snap) { line += " " + lb }
+            // BUILD 153: the ride is one sentence away on flight day.
+            line += " When you're ready, say: get me a \(ChappyRide.shared.provider.display) to the airport."
+            ChappyNotify.announce(.nav, spoken: line,
+                title: "✈️ \(f.number) today",
+                body: (snap.estDep.map { "Departs \($0). " } ?? "") + "Morning brief.")
+        default:
+            // The quiet checks: speak ONLY when something moved.
+            if snap.status == "cancelled" {
+                ChappyNotify.announce(.nav,
+                    spoken: "\(f.number) is CANCELLED. Call the airline now.",
+                    title: "✈️ \(f.number) CANCELLED",
+                    body: "Call the airline.", critical: true)
+                return
+            }
+            var changes: [String] = []
+            if let g = snap.gate, g != before.lastGate {
+                changes.append(before.lastGate == nil ? "gate is \(g)" : "gate moved to \(g)")
+            }
+            let oldDelay = before.lastDelay ?? 0
+            if let d = snap.delay, d >= 10, abs(d - oldDelay) >= 10 {
+                changes.append("now running \(d) minutes late")
+            } else if oldDelay >= 10, (snap.delay ?? 0) < 10 {
+                changes.append("back on time")
+            }
+            if let e = snap.estDep, let old = before.lastEstDep, e != old, changes.isEmpty {
+                changes.append("departure now \(e)")
+            }
+            guard !changes.isEmpty else {
+                print("✈️ [FlightDay] \(slot): no change — staying quiet"); return
+            }
+            let line = "\(f.number): " + changes.joined(separator: ", ") + "."
+            ChappyNotify.announce(.nav, spoken: line,
+                title: "✈️ \(f.number) update",
+                body: changes.joined(separator: ", "))
+        }
+    }
+
+    static func spokenDate(_ ymd: String) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        guard let d = f.date(from: ymd) else { return ymd }
+        let out = DateFormatter(); out.dateFormat = "EEEE d MMMM"
+        return out.string(from: d)
+    }
+
+    /// "september" → "2026-09" (next occurrence).
+    static func monthKey(from text: String) -> String? {
+        let months = ["january": 1, "february": 2, "march": 3, "april": 4,
+                      "may": 5, "june": 6, "july": 7, "august": 8,
+                      "september": 9, "october": 10, "november": 11, "december": 12]
+        let t = text.lowercased()
+        for (name, num) in months where t.contains(name) {
+            let now = Date()
+            var year = Calendar.current.component(.year, from: now)
+            if num < Calendar.current.component(.month, from: now) { year += 1 }
+            return String(format: "%04d-%02d", year, num)
+        }
+        return nil
+    }
+
+    /// Finds "qf52"-shaped tokens without regex: letters then digits, 3-7 chars.
+    static func flightNumber(in text: String) -> String? {
+        for tok in text.uppercased().split(separator: " ") {
+            let s = String(tok.filter { $0.isLetter || $0.isNumber })
+            guard s.count >= 3, s.count <= 7 else { continue }
+            let letters = s.prefix(while: { $0.isLetter })
+            let rest = s.dropFirst(letters.count)
+            if (1...3).contains(letters.count), rest.count >= 1, rest.allSatisfy({ $0.isNumber }) {
+                return s
+            }
+        }
+        return nil
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY RIDE & FOOD (Build 153)
+// =====================================================================
+//
+//   The honest shape of ride-hailing on iOS: Apple KILLED the SiriKit
+//   ride-booking domain, Grab's booking API is partner-only, and payment
+//   lives inside each provider's app — which is where you WANT your card.
+//   What survived everywhere (Google Maps does exactly this) is the
+//   DEEP-LINK HANDOFF: open Grab or Uber with pickup and drop-off
+//   already filled, so the whole booking is one tap and one thumbprint.
+//
+//   So Chappy owns everything AROUND that tap: the fare band (tariff
+//   table, editable in Settings), the live ETA (nav engine), the
+//   handoff itself, and the TRIP WATCH — Chappy can't see Grab's
+//   driver, but the Trail can see YOU: not moving 8 minutes after
+//   booking → a nudge; rolling → confirmation; arrived → the spend
+//   prompt straight into the cost log.
+//
+//   FOOD is the same pattern one screen over: GrabFood / Uber Eats /
+//   GoFood handoff plus a favourites list for "order the usual".
+//   No menu browsing by voice — there is no public API — and no
+//   pretending otherwise.
+
+@MainActor
+final class ChappyRide: ObservableObject {
+
+    static let shared = ChappyRide()
+    private init() {}
+
+    enum Provider: String, CaseIterable {
+        case grab, uber, gojek
+        var display: String {
+            switch self {
+            case .grab: return "Grab"
+            case .uber: return "Uber"
+            case .gojek: return "Gojek"
+            }
+        }
+    }
+
+    /// Auto: Australian clocks → Uber, everywhere else → Grab. The
+    /// Settings pick wins when set; "make it a Gojek" wins in the moment.
+    var provider: Provider {
+        if let p = Provider(rawValue: UserDefaults.standard.string(forKey: "chappy_ride_provider") ?? "") {
+            return p
+        }
+        return TimeZone.current.identifier.hasPrefix("Australia") ? .uber : .grab
+    }
+
+    // MARK: tariff — a BAND, not a quote, and it says so on the tin.
+
+    private var isAUD: Bool { TimeZone.current.identifier.hasPrefix("Australia") }
+
+    private func tariff() -> (base: Double, perKm: Double, perMin: Double) {
+        let d = UserDefaults.standard
+        if d.double(forKey: "chappy_ride_perkm") > 0 {
+            return (d.double(forKey: "chappy_ride_base"),
+                    d.double(forKey: "chappy_ride_perkm"),
+                    d.double(forKey: "chappy_ride_permin"))
+        }
+        // Defaults: UberX Brisbane in dollars, GrabCar Bali in rupiah.
+        return isAUD ? (3.5, 1.5, 0.4) : (10000, 6500, 350)
+    }
+
+    private func spokenFare(_ f: Double) -> String {
+        if isAUD {
+            let lo = max(5, Int((f / 5).rounded()) * 5)
+            return "\(lo) to \(Int((Double(lo) * 1.3 / 5).rounded()) * 5) dollars"
+        }
+        let k = max(10, Int((f / 1000).rounded()))
+        return "\(k) to \(Int((Double(k) * 1.3).rounded())) thousand rupiah"
+    }
+
+    // MARK: the quote → confirm → open flow
+
+    private var pending: (coord: CLLocationCoordinate2D, name: String)?
+    private var pendingUntil = Date.distantPast
+
+    func quote(to raw: String) async -> String {
+        let query = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?"))
+        guard !query.isEmpty else { return "Where to?" }
+        guard let est = await NavEngine.shared.travelEstimate(to: query) else {
+            openApp()   // couldn't price it — still open the app; that was the ask
+            return "Couldn't price that one - \(provider.display) is open, set the drop-off there."
+        }
+        let t = tariff()
+        let fare = t.base + t.perKm * est.km + t.perMin * Double(est.mins)
+        pending = (est.coord, est.name)
+        pendingUntil = Date().addingTimeInterval(120)
+        return "About \(est.mins) minutes to \(est.name), roughly \(spokenFare(fare)). Want me to open \(provider.display)?"
+    }
+
+    /// "Yes / book it / open it" inside two minutes of a quote. Word-bounded
+    /// so "yesterday" never books a car.
+    func consumeConfirm(_ c: String) -> Bool {
+        guard Date() < pendingUntil, let p = pending else { return false }
+        let padded = " " + c + " "
+        let yes = ["yes", "yeah", "yep", "book it", "open it", "do it", "go ahead", "sure"]
+        guard yes.contains(where: { padded.contains(" \($0) ") }) else { return false }
+        pendingUntil = .distantPast
+        openRide(to: p.coord, name: p.name)
+        return true
+    }
+
+    func openRide(to coord: CLLocationCoordinate2D, name: String) {
+        TTSService.shared.speak("Opening \(provider.display) - drop-off is set, you just confirm and pay.")
+        let enc = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let lat = coord.latitude, lon = coord.longitude
+        let deep: String
+        let web: String
+        switch provider {
+        case .grab:
+            deep = "grab://open?screenType=BOOKING&dropOffLatitude=\(lat)&dropOffLongitude=\(lon)&dropOffAddress=\(enc)"
+            web = "https://www.grab.com/download/"
+        case .uber:
+            deep = "uber://?action=setPickup&pickup=my_location&dropoff%5Blatitude%5D=\(lat)&dropoff%5Blongitude%5D=\(lon)&dropoff%5Bnickname%5D=\(enc)"
+            web = "https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff%5Blatitude%5D=\(lat)&dropoff%5Blongitude%5D=\(lon)&dropoff%5Bnickname%5D=\(enc)"
+        case .gojek:
+            deep = "gojek://"   // no public drop-off params — app opens, one search
+            web = "https://www.gojek.com/app/"
+        }
+        open(deep, fallback: web)
+        startTripWatch(dest: coord, name: name)
+    }
+
+    private func open(_ deep: String, fallback: String) {
+        guard let u = URL(string: deep) else { return }
+        UIApplication.shared.open(u, options: [:]) { ok in
+            if !ok {
+                DispatchQueue.main.async {
+                    if let w = URL(string: fallback) { UIApplication.shared.open(w) }
+                }
+            }
+        }
+    }
+
+    func openApp() {
+        switch provider {
+        case .grab: open("grab://", fallback: "https://www.grab.com/download/")
+        case .uber: open("uber://", fallback: "https://m.uber.com")
+        case .gojek: open("gojek://", fallback: "https://www.gojek.com/app/")
+        }
+    }
+
+    // MARK: trip watch — Chappy can't see the driver, but it can see YOU.
+
+    private var watchTimer: Timer?
+    private var watchDest: CLLocationCoordinate2D?
+    private var watchName = ""
+    private var watchStart: CLLocationCoordinate2D?
+    private var watchBegan = Date.distantPast
+    private var rolling = false
+    private var nudged = false
+
+    func startTripWatch(dest: CLLocationCoordinate2D, name: String) {
+        watchTimer?.invalidate()
+        watchDest = dest; watchName = name
+        let s = ContextEngine.shared.snapshot
+        if let la = s.latitude, let lo = s.longitude {
+            watchStart = CLLocationCoordinate2D(latitude: la, longitude: lo)
+        } else { watchStart = nil }
+        watchBegan = Date(); rolling = false; nudged = false
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            Task { @MainActor in ChappyRide.shared.tripTick() }
+        }
+        print("🚗 [Ride] trip watch armed → \(name)")
+    }
+
+    private func tripTick() {
+        guard let dest = watchDest else { watchTimer?.invalidate(); return }
+        // Two hours and we let it go — the day has moved on.
+        if Date().timeIntervalSince(watchBegan) > 2 * 3600 { stopTripWatch(); return }
+        let s = ContextEngine.shared.snapshot
+        guard let lat = s.latitude, let lon = s.longitude else { return }
+        let here = CLLocation(latitude: lat, longitude: lon)
+        let toDest = here.distance(from: CLLocation(latitude: dest.latitude, longitude: dest.longitude))
+        if toDest < 300 {
+            ChappyNotify.announce(.nav,
+                spoken: "You're at \(watchName). Say spent, and the amount, and I'll log the fare.",
+                title: "📍 Arrived", body: watchName)
+            stopTripWatch(); return
+        }
+        if let start = watchStart {
+            let fromStart = here.distance(from: CLLocation(latitude: start.latitude, longitude: start.longitude))
+            if !rolling, fromStart > 400 {
+                rolling = true
+                TTSService.shared.speak("Trip's rolling.")
+            } else if !rolling, !nudged,
+                      Date().timeIntervalSince(watchBegan) > 8 * 60, fromStart < 150 {
+                nudged = true
+                ChappyNotify.announce(.nav,
+                    spoken: "No movement yet - worth a look at the \(provider.display) app.",
+                    title: "🚗 Still waiting?", body: "No pickup detected after 8 minutes")
+            }
+        }
+    }
+
+    func stopTripWatch() {
+        watchTimer?.invalidate(); watchTimer = nil
+        watchDest = nil; watchStart = nil
+    }
+
+    // MARK: food
+
+    var favourites: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "chappy_food_favs") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_food_favs") }
+    }
+
+    func foodHandoff(from c: String) -> String {
+        // "order from Mama's Warung" carries a name; plain "order food" doesn't.
+        var place = ""
+        if let r = c.range(of: "order from ") { place = String(c[r.upperBound...]) }
+        place = place.trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?"))
+        if place == "the usual" { place = "" }
+        if place.isEmpty, c.contains("usual"), let fav = favourites.first { place = fav }
+        let enc = place.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let appName: String
+        let deep: String
+        let web: String
+        switch provider {
+        case .uber:
+            appName = "Uber Eats"
+            deep = "ubereats://"
+            web = place.isEmpty ? "https://www.ubereats.com" : "https://www.ubereats.com/search?q=\(enc)"
+        case .grab:
+            appName = "Grab Food"
+            deep = "grab://open?screenType=GRABFOOD"
+            web = "https://food.grab.com"
+        case .gojek:
+            appName = "Go Food"
+            deep = "gojek://"
+            web = "https://gofood.co.id"
+        }
+        open(deep, fallback: web)
+        if !place.isEmpty {
+            return "\(appName) is open - search \(place), it's one tap from there. Tell me what you spent after and I'll log it."
+        }
+        if !favourites.isEmpty {
+            return "\(appName) is open. Your usuals: \(favourites.prefix(3).joined(separator: ", "))."
+        }
+        return "\(appName) is open - order away, and tell me what you spent after."
     }
 }
