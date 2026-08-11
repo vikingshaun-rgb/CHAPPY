@@ -624,6 +624,76 @@ struct SettingsView: View {
                         .font(AppTypography.caption)
                 }
 
+                // BUILD 147 — MAIL AND MESSAGES.
+                Section {
+                    NavigationLink {
+                        MailSetupView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "envelope.badge")
+                                .foregroundColor(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Mail & Messages")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyMail.shared.isConfigured
+                                     ? "Connected: \(ChappyMail.shared.address) — say \u{201C}check my email\u{201D} or \u{201C}any texts\u{201D}"
+                                     : "Connect your inbox — email AND your TelTel texts, read and answered by voice")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Uses an app-specific password over an encrypted connection, stored only in this phone's Keychain. Reading a summary never marks mail as read.")
+                        .font(AppTypography.caption)
+                }
+
+                // BUILD 150 — FLIGHTS (Amadeus keys, addable any time).
+                Section {
+                    NavigationLink {
+                        FlightKeysView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "airplane.circle.fill")
+                                .foregroundColor(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Flights")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyFlights.shared.isConfigured
+                                     ? "Connected — say \u{201C}watch flights to Bali in September\u{201D}"
+                                     : "Add the free Amadeus keys to unlock deal watching")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Free developer account at developers.amadeus.com — create an app, copy the API Key and API Secret here. Watched routes are checked up to 3 times a day.")
+                        .font(AppTypography.caption)
+                }
+
+                // BUILD 153 — RIDES & FOOD (Grab / Uber / Gojek handoff).
+                Section {
+                    NavigationLink {
+                        RideSetupView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "car.circle.fill")
+                                .foregroundColor(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Rides & Food")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("Say \u{201C}get me a \(ChappyRide.shared.provider.display) to the airport\u{201D} or \u{201C}order food\u{201D}")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Chappy prices the trip and opens Grab, Uber or Gojek with the drop-off pre-filled — you confirm and pay in their app. Fares are estimates from the tariff table below, not live quotes.")
+                        .font(AppTypography.caption)
+                }
+
                 // Appearance — Chappy theme picker
                 Section {
                     NavigationLink {
@@ -2155,5 +2225,161 @@ struct CodexFactsList: View {
 
     private static func day(_ d: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "d MMM"; return f.string(from: d)
+    }
+}
+
+
+// BUILD 147 — MAIL & MESSAGES SETUP.
+//
+// One screen, three fields, honest instructions. iCloud needs an
+// app-specific password (appleid.apple.com → Sign-In & Security →
+// App-Specific Passwords) — the real account password will NOT work and
+// is never asked for.
+struct MailSetupView: View {
+    @ObservedObject private var mail = ChappyMail.shared
+    @State private var address = ChappyMail.shared.address
+    @State private var password = ""
+    @State private var useICloud = true
+    @State private var customHost = ""
+    @State private var status = ""
+
+    var body: some View {
+        Form {
+            Section("Email address") {
+                TextField("vikingshaun@icloud.com", text: $address)
+                    .keyboardType(.emailAddress)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+            }
+            Section {
+                Picker("Provider", selection: $useICloud) {
+                    Text("iCloud").tag(true)
+                    Text("Other (IMAP)").tag(false)
+                }
+                .pickerStyle(.segmented)
+                if !useICloud {
+                    TextField("imap.example.com", text: $customHost)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                }
+                SecureField("App-specific password", text: $password)
+            } footer: {
+                Text(useICloud
+                     ? "Make the password at appleid.apple.com → Sign-In & Security → App-Specific Passwords. Your real Apple password will not work and is never wanted."
+                     : "Your mail host's IMAP server, port 993. Use an app password if the provider offers them.")
+            }
+            Section {
+                Button("Save & test") {
+                    let host = useICloud ? "imap.mail.me.com" : customHost.trimmingCharacters(in: .whitespaces)
+                    let addr = address.trimmingCharacters(in: .whitespaces)
+                    guard !addr.isEmpty, !password.isEmpty, !host.isEmpty else {
+                        status = "Fill in the address and password first."; return
+                    }
+                    ChappyMail.shared.configure(address: addr, host: host, password: password)
+                    status = "Checking…"
+                    Task { status = await ChappyMail.shared.check() }
+                }
+                if !status.isEmpty {
+                    Text(status).font(.footnote).foregroundColor(.secondary)
+                }
+            } footer: {
+                Text("Texts arriving through TelTel (…@teltel.com.au) are announced as texts, and replying to one sends a real SMS back through the gateway.")
+            }
+        }
+        .navigationTitle("Mail & Messages")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+
+// BUILD 150 — FLIGHT KEYS. Two fields, Keychain-stored, addable whenever.
+struct FlightKeysView: View {
+    @State private var apiKey = ""
+    @State private var apiSecret = ""
+    @State private var status = ChappyFlights.shared.isConfigured ? "Keys are saved." : ""
+
+    var body: some View {
+        Form {
+            Section("Amadeus API key") {
+                SecureField("API Key", text: $apiKey)
+            }
+            Section("Amadeus API secret") {
+                SecureField("API Secret", text: $apiSecret)
+            }
+            Section {
+                Button("Save") {
+                    let k = apiKey.trimmingCharacters(in: .whitespaces)
+                    let sec = apiSecret.trimmingCharacters(in: .whitespaces)
+                    guard !k.isEmpty, !sec.isEmpty else { status = "Both fields, then Save."; return }
+                    _ = APIKeyManager.shared.saveAmadeusKey(k)
+                    _ = APIKeyManager.shared.saveAmadeusSecret(sec)
+                    apiKey = ""; apiSecret = ""
+                    status = "Saved. Say: watch flights to Bali in September."
+                }
+                if !status.isEmpty { Text(status).font(.footnote).foregroundColor(.secondary) }
+            } footer: {
+                Text("Make them free at developers.amadeus.com: sign up, My Self-Service Workspace, Create New App, copy both values. Chappy uses the test environment - 2,000 calls a month, plenty for a personal deal watcher.")
+            }
+        }
+        .navigationTitle("Flights")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// BUILD 153 — RIDES & FOOD settings: provider, tariff band, favourites.
+struct RideSetupView: View {
+    @State private var provider = UserDefaults.standard.string(forKey: "chappy_ride_provider") ?? "auto"
+    @State private var base = UserDefaults.standard.double(forKey: "chappy_ride_base")
+    @State private var perKm = UserDefaults.standard.double(forKey: "chappy_ride_perkm")
+    @State private var perMin = UserDefaults.standard.double(forKey: "chappy_ride_permin")
+    @State private var favs = (UserDefaults.standard.stringArray(forKey: "chappy_food_favs") ?? [])
+        .joined(separator: ", ")
+    @State private var status = ""
+
+    var body: some View {
+        Form {
+            Section("Ride service") {
+                Picker("Provider", selection: $provider) {
+                    Text("Auto (Uber here, Grab overseas)").tag("auto")
+                    Text("Grab").tag("grab")
+                    Text("Uber").tag("uber")
+                    Text("Gojek").tag("gojek")
+                }
+                .pickerStyle(.menu)
+            }
+            Section("Fare estimate (leave 0 for sensible defaults)") {
+                HStack { Text("Base fare"); Spacer()
+                    TextField("0", value: $base, format: .number)
+                        .keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 100) }
+                HStack { Text("Per km"); Spacer()
+                    TextField("0", value: $perKm, format: .number)
+                        .keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 100) }
+                HStack { Text("Per minute"); Spacer()
+                    TextField("0", value: $perMin, format: .number)
+                        .keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 100) }
+            }
+            Section("Favourite eats (comma separated)") {
+                TextField("Mama's Warung, Betty's Burgers", text: $favs)
+            }
+            Section {
+                Button("Save") {
+                    let d = UserDefaults.standard
+                    if provider == "auto" { d.removeObject(forKey: "chappy_ride_provider") }
+                    else { d.set(provider, forKey: "chappy_ride_provider") }
+                    d.set(base, forKey: "chappy_ride_base")
+                    d.set(perKm, forKey: "chappy_ride_perkm")
+                    d.set(perMin, forKey: "chappy_ride_permin")
+                    ChappyRide.shared.favourites = favs.split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    status = "Saved. Say: get me a \(ChappyRide.shared.provider.display) to the airport."
+                }
+                if !status.isEmpty { Text(status).font(.footnote).foregroundColor(.secondary) }
+            } footer: {
+                Text("Defaults: UberX Brisbane rates in dollars on Australian time, GrabCar Bali rates in rupiah anywhere else. Fares are spoken as a band — booking and payment always happen inside the provider's own app, where your card stays.")
+            }
+        }
+        .navigationTitle("Rides & Food")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
