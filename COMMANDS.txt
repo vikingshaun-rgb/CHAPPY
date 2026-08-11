@@ -1,0 +1,29 @@
+BUILD 136 — CUMULATIVE (includes 132 through 135)
+New in 136:
+ - "What time is it" (and every free pocket answer) now runs FIRST in the
+   command chain — Meta-fast, before anything slow or paid can touch it
+ - "Close maps" — ends Chappy's route and clears its map UI by voice
+
+One command per paste, from the project folder:
+
+1)
+unzip -o ~/Downloads/BUILD136.zip -d .
+
+2)
+perl -i -pe 's/CURRENT_PROJECT_VERSION = \d+;/CURRENT_PROJECT_VERSION = 136;/g' CameraAccess.xcodeproj/project.pbxproj
+
+3)  (must say 136, twice)
+grep "CURRENT_PROJECT_VERSION" CameraAccess.xcodeproj/project.pbxproj
+
+4) Xcode: Product > Clean Build Folder, then Product > Archive
+
+5) Organizer > Distribute App > App Store Connect > Upload
+
+6)
+git add -A
+
+7)
+git commit -m "Build 136: pocket answers first in line, close-maps command"
+
+8)
+git push

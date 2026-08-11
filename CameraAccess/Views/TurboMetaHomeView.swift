@@ -686,6 +686,9 @@ struct TurboMetaHomeView: View {
             // location recovered from the breadcrumb trail. The AI pass that
             // pulls the durable facts out runs later, on charge.
             ChappyMemory.shared.foldInConversationRecords()
+            // BUILD 132 — one-shot cleanup: the duplicate "glowing phone
+            // screen" pulse captions and model junk already in the store.
+            ChappyMemory.shared.sweepPulseJunk()
 
             // PHASE 5.5 — reminders. Permission, re-arm every notification
             // (they are lost on reinstall and after a restore), start the
@@ -777,8 +780,28 @@ struct TurboMetaHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: .chappyShowMap)) { _ in
             showMapSheet = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chappyMapsCleanup"))) { _ in
+            // BUILD 135: Google Maps was opened directly (Live AI paths) —
+            // do the same tidy-up the Standby handoff does: card gone,
+            // sheet gone, Chappy's own turns silenced.
+            let nav = NavEngine.shared
+            if nav.isNavigating { nav.stop(announce: false) }
+            showMapSheet = false
+            showNavMap = false
+        }
         .onReceive(NotificationCenter.default.publisher(for: .chappyOpenGoogleMaps)) { _ in
             let nav = NavEngine.shared
+            // BUILD 133: a multi-stop run built by addStops carries its own
+            // URL — destination plus every waypoint. It wins over the plain
+            // single-destination handoff below.
+            if let multi = nav.pendingHandoffURL {
+                nav.pendingHandoffURL = nil
+                if nav.isNavigating { nav.stop(announce: false) }
+                showMapSheet = false
+                showNavMap = false
+                UIApplication.shared.open(multi)
+                return
+            }
             var url: URL?
             if let d = nav.destinationCoord {
                 // Two-wheeler directions where Google supports them (most of
@@ -795,6 +818,15 @@ struct TurboMetaHomeView: View {
                 url = (appURL.map { UIApplication.shared.canOpenURL($0) } == true)
                     ? appURL : URL(string: "https://maps.google.com/")
             }
+            // BUILD 132 — A CLEAN HANDOFF. Once Google Maps has the route,
+            // Chappy steps back: its own map sheet and nav card close, and
+            // its spoken turn-by-turn stops — two voices reading the same
+            // turns was never guidance, it was noise. Come back to Chappy
+            // and the screen is clear, not mid-prompt. (URL is built above,
+            // BEFORE stop() clears the destination it needs.)
+            if nav.isNavigating { nav.stop(announce: false) }
+            showMapSheet = false
+            showNavMap = false
             if let u = url { UIApplication.shared.open(u) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .continuousVisionTriggered)) { _ in
@@ -2837,6 +2869,155 @@ struct OriginalMediaView: View {
 // wants to say "every second Tuesday at nine except public holidays" out
 // loud, and nobody wants to type "remind me to call mum at six".
 
+// BUILD 132 — ONE EVENT, ONE SHEET.
+//
+// Long-press menus are invisible; this is the discoverable version. Tap any
+// diary event and everything Chappy can do about it is on one card:
+// how important it is, and how far ahead the warning should come.
+struct EventDetailSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let event: EKEvent
+    let theme: ChappyTheme
+    var onChange: () -> Void
+
+    @State private var level: ChappyCalendar.EventLevel = .normal
+    @State private var lead: Int? = nil   // nil = calendar default
+
+    private static let leadChoices: [(label: String, minutes: Int?)] = [
+        ("Default", nil), ("15 min", 15), ("30 min", 30),
+        ("1 hour", 60), ("2 hours", 120), ("Day before", 1440),
+    ]
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LinearGradient(colors: [theme.bgTop, theme.bgBottom],
+                               startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        // WHAT AND WHEN.
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(event.title ?? "Appointment")
+                                .font(.title3).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                            if let s = event.startDate {
+                                let df: DateFormatter = {
+                                    let f = DateFormatter()
+                                    f.dateFormat = event.isAllDay ? "EEEE d MMMM" : "EEEE d MMMM, h:mm a"
+                                    return f
+                                }()
+                                Text(event.isAllDay ? "All day — \(df.string(from: s))" : df.string(from: s))
+                                    .font(.subheadline).foregroundColor(theme.textSecondary)
+                            }
+                            if let l = event.location, !l.isEmpty {
+                                Label(l, systemImage: "mappin.and.ellipse")
+                                    .font(.caption).foregroundColor(theme.textSecondary)
+                            }
+                            if let c = event.calendar?.title {
+                                Label(c, systemImage: "calendar")
+                                    .font(.caption).foregroundColor(theme.textSecondary)
+                            }
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+
+                        // HOW MUCH IT MATTERS.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("HOW IMPORTANT")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(theme.textSecondary)
+                            levelButton(.important, "flag.fill", "Important",
+                                        "Warned the day before AND closer in — pierces quiet hours")
+                            levelButton(.normal, "circle", "Normal",
+                                        "Warned once, at the time set below")
+                            levelButton(.muted, "bell.slash.fill", "Muted",
+                                        "Stays visible, never spoken, never pinged")
+                        }
+
+                        // HOW FAR AHEAD.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("WARN ME")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(theme.textSecondary)
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], spacing: 8) {
+                                ForEach(Self.leadChoices, id: \.label) { c in
+                                    Button {
+                                        lead = c.minutes
+                                        ChappyCalendar.shared.setLead(c.minutes, for: event)
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        onChange()
+                                    } label: {
+                                        Text(c.label)
+                                            .font(.caption).fontWeight(.semibold)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 9)
+                                            .background(RoundedRectangle(cornerRadius: 9)
+                                                .fill(lead == c.minutes ? theme.accent.opacity(0.22) : theme.cardFill))
+                                            .foregroundColor(lead == c.minutes ? theme.accent : theme.textPrimary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            if level == .muted {
+                                Text("Muted events never warn, whatever is set here.")
+                                    .font(.caption2).foregroundColor(theme.textSecondary)
+                            }
+                        }
+
+                        Spacer(minLength: 20)
+                    }
+                    .padding(16)
+                }
+            }
+            .navigationTitle("Event")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+        }
+        .onAppear {
+            level = ChappyCalendar.shared.level(for: event)
+            let own = ChappyCalendar.shared.leadMinutes(for: event)
+            let calDefault = event.calendar.map { ChappyCalendar.shared.leadMinutes(for: $0) } ?? 30
+            lead = own == calDefault ? nil : own
+        }
+    }
+
+    private func levelButton(_ l: ChappyCalendar.EventLevel, _ icon: String,
+                             _ title: String, _ detail: String) -> some View {
+        Button {
+            level = l
+            ChappyCalendar.shared.setLevel(l, for: event)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            onChange()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundColor(l == .important ? .orange : (l == .muted ? theme.textSecondary : theme.accent))
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                    Text(detail).font(.caption2).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                if level == l {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(theme.accent)
+                }
+            }
+            .padding(11)
+            .background(RoundedRectangle(cornerRadius: 12)
+                .fill(level == l ? theme.accent.opacity(0.12) : theme.cardFill))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct RemindersView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var reminders = ChappyReminders.shared
@@ -2859,19 +3040,44 @@ struct RemindersView: View {
     // does. Now time and type are peers — Schedule answers "what's next",
     // By type answers "what have I got on", and neither hides the other.
     private enum Mode: String, CaseIterable {
-        case schedule, byType, timeline, done
+        case schedule, byType, timeline, pings, lists, done
         var label: String {
             switch self {
             case .schedule: return "Schedule"
             case .byType:   return "By type"
             case .timeline: return "Timeline"
+            case .pings:    return "Pings"
+            case .lists:    return "Lists"
             case .done:     return "Done"
             }
         }
     }
+
+    /// BUILD 134 — one row of the Pings tab: a moment Chappy will make noise.
+    private struct PingItem: Identifiable {
+        enum Source { case reminder(ChappyMemory.Entry), event(EKEvent), timer(ChappyTimers.Countdown) }
+        let id: String
+        let at: Date
+        let icon: String
+        let tint: Color
+        let title: String
+        let sub: String
+        let source: Source
+    }
+
+    /// BUILD 132: a tapped diary event, wrapped so .sheet(item:) can use it.
+    private struct EventPick: Identifiable {
+        let id: String
+        let event: EKEvent
+    }
     @State private var mode: Mode = .schedule
     @State private var timelineDay = Calendar.current.startOfDay(for: Date())
     @State private var timelineEvents: [EKEvent] = []
+    // BUILD 132: tap an event → its own sheet (level + per-event warn time).
+    @State private var eventPick: EventPick?
+    // BUILD 132: the Lists tab — expanded list id and its fetched items.
+    @State private var expandedList: String?
+    @State private var listItems: [String: [String]] = [:]
 
     var body: some View {
         NavigationView {
@@ -2899,6 +3105,10 @@ struct RemindersView: View {
                         case .timeline:
                             weekStrip
                             timelineSection
+                        case .pings:
+                            pingsSection
+                        case .lists:
+                            listsSection
                         case .done:
                             doneSection
                         }
@@ -2922,6 +3132,9 @@ struct RemindersView: View {
         }
         .sheet(isPresented: $showAdd) { ReminderEditor(entry: nil, theme: theme) }
         .sheet(item: $editing) { e in ReminderEditor(entry: e, theme: theme) }
+        .sheet(item: $eventPick) { p in
+            EventDetailSheet(event: p.event, theme: theme) { diaryTick += 1 }
+        }
         .onAppear {
             ChappyReminders.shared.requestPermission()
             todaysEvents = ChappyCalendar.shared.today().filter {
@@ -3265,6 +3478,13 @@ struct RemindersView: View {
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
                 .padding(.horizontal, 16)
+                // BUILD 132 — TAP THE THING. Long-press was invisible; nobody
+                // finds a contextMenu they weren't told about. A tap now opens
+                // the event's own sheet: importance AND its own warn time.
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+                }
                 // MARK IT WHERE YOU SEE IT. No second screen, no separate list
                 // to maintain — long-press the thing you're already looking at.
                 .contextMenu {
@@ -3287,6 +3507,252 @@ struct RemindersView: View {
     private static func time(_ d: Date?) -> String {
         guard let d else { return "" }
         let f = DateFormatter(); f.dateFormat = "h:mm a"; return f.string(from: d)
+    }
+
+    // BUILD 134 — THE PINGS TAB.
+    //
+    // The question this answers: "what is going to make noise, and when?"
+    // Every future ping for the next 7 days, shown at the moment it will
+    // FIRE — a heads-up set 30 minutes before a 3pm job appears at 2:30, not
+    // at 3. Reminders open their editor on tap (change it, delete it),
+    // calendar heads-ups open the event sheet (change the warn time, mute
+    // it), timers show what's left. What you see here is what you'll hear.
+
+    private func pingItems() -> [PingItem] {
+        var items: [PingItem] = []
+        let now = Date()
+        let horizon = now.addingTimeInterval(7 * 86400)
+        let df = DateFormatter(); df.dateFormat = "h:mm a"
+
+        // Reminders, at their effective fire time.
+        for r in reminders.open where r.doneAt == nil {
+            guard let f = r.effectiveFire, f > now, f < horizon else { continue }
+            var sub = "Reminder"
+            if r.snoozedTo != nil, r.snoozedTo! > now { sub = "Snoozed reminder" }
+            else if r.repeatRule != nil { sub = "Repeating reminder" }
+            items.append(PingItem(id: "r-\(r.id)", at: f, icon: "bell.fill",
+                                  tint: theme.accent, title: r.title, sub: sub,
+                                  source: .reminder(r)))
+        }
+        // Place-triggered reminders have no clock — shown once, at the top of
+        // the list via distantPast+1 so they're visible but not scheduled.
+        for r in reminders.placeReminders() {
+            items.append(PingItem(id: "p-\(r.id)", at: now.addingTimeInterval(-1),
+                                  icon: "mappin.circle.fill", tint: .cyan,
+                                  title: r.title,
+                                  sub: "Fires near: \(r.placeTrigger ?? "a place")",
+                                  source: .reminder(r)))
+        }
+        // Calendar heads-ups, at start minus lead. Important events ping twice.
+        let cal = ChappyCalendar.shared
+        for e in cal.upcoming(days: 7) where !e.isAllDay {
+            guard cal.effectiveBehaviour(for: e) == .ping, let s = e.startDate else { continue }
+            let lead = cal.leadMinutes(for: e)
+            let important = cal.level(for: e) == .important
+            var fires: [(Date, String)] = [(s.addingTimeInterval(-Double(lead) * 60),
+                                            ChappyCalendar.leadLabel(lead))]
+            if important {
+                fires.append((s.addingTimeInterval(-86400), "the day before"))
+            }
+            for (f, label) in fires where f > now && f < horizon {
+                items.append(PingItem(
+                    id: "e-\(ChappyCalendar.fingerprint(e))-\(Int(f.timeIntervalSince1970))",
+                    at: f,
+                    icon: important ? "flag.fill" : "clock.badge",
+                    tint: important ? .orange : .purple,
+                    title: "\(e.title ?? "Appointment") at \(df.string(from: s))",
+                    sub: "Heads-up, \(label)",
+                    source: .event(e)))
+            }
+        }
+        // Timers.
+        for t in ChappyTimers.shared.active where !t.isExpired {
+            items.append(PingItem(id: "t-\(t.id)", at: t.fireAt, icon: "timer",
+                                  tint: .mint, title: t.name,
+                                  sub: "Timer", source: .timer(t)))
+        }
+        return items.sorted { $0.at < $1.at }
+    }
+
+    @ViewBuilder
+    private var pingsSection: some View {
+        let items = pingItems()
+        if items.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "bell.slash")
+                    .font(.system(size: 32)).foregroundColor(theme.textSecondary.opacity(0.5))
+                Text("Nothing will ping in the next 7 days")
+                    .font(.subheadline).foregroundColor(theme.textPrimary)
+            }
+            .frame(maxWidth: .infinity).padding(.top, 46)
+        } else {
+            let grouped = Dictionary(grouping: items) { pingDayLabel($0.at) }
+            let order = items.map { pingDayLabel($0.at) }.reduce(into: [String]()) {
+                if !$0.contains($1) { $0.append($1) }
+            }
+            ForEach(order, id: \.self) { day in
+                Text(day.uppercased())
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(theme.textSecondary)
+                    .padding(.horizontal, 20).padding(.top, 10)
+                ForEach(grouped[day] ?? []) { item in pingRow(item) }
+            }
+            Text("Tap a ping to change or clear it. This list is exactly what will make noise.")
+                .font(.caption2).foregroundColor(theme.textSecondary)
+                .padding(.horizontal, 20).padding(.top, 6)
+        }
+    }
+
+    private func pingDayLabel(_ d: Date) -> String {
+        if d < Date() { return "Whenever you're near" }
+        if Calendar.current.isDateInToday(d) { return "Today" }
+        if Calendar.current.isDateInTomorrow(d) { return "Tomorrow" }
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMM"; return f.string(from: d)
+    }
+
+    private func pingRow(_ item: PingItem) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(spacing: 1) {
+                if item.at > Date() {
+                    Text(Self.time(item.at))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(item.tint)
+                }
+                Image(systemName: item.icon)
+                    .font(.system(size: 13)).foregroundColor(item.tint)
+            }
+            .frame(width: 62)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.subheadline).foregroundColor(theme.textPrimary).lineLimit(2)
+                Text(item.sub)
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11)).foregroundColor(theme.textSecondary.opacity(0.5))
+        }
+        .padding(11)
+        .background(RoundedRectangle(cornerRadius: 13).fill(theme.cardFill))
+        .padding(.horizontal, 16)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            switch item.source {
+            case .reminder(let r): editing = r
+            case .event(let e):
+                eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+            case .timer: break
+            }
+        }
+        .contextMenu {
+            switch item.source {
+            case .reminder(let r):
+                Button { editing = r } label: { Label("Edit", systemImage: "pencil") }
+                Button(role: .destructive) {
+                    reminders.complete(r.id)
+                } label: { Label("Done — clear it", systemImage: "checkmark.circle") }
+            case .event(let e):
+                Button {
+                    eventPick = EventPick(id: e.eventIdentifier ?? UUID().uuidString, event: e)
+                } label: { Label("Change the warning", systemImage: "clock") }
+                Button {
+                    ChappyCalendar.shared.setLevel(.muted, for: e); diaryTick += 1
+                } label: { Label("Mute this one", systemImage: "bell.slash") }
+            case .timer(let t):
+                Button(role: .destructive) {
+                    _ = ChappyTimers.shared.cancel(matching: t.name)
+                } label: { Label("Cancel timer", systemImage: "xmark.circle") }
+            }
+        }
+    }
+
+    // BUILD 132 — THE LISTS TAB.
+    //
+    // The self-alerting lists (the ones that ping when you're near a shop
+    // that sells what's on them) existed only as voice: "add milk to the
+    // shopping list" worked, but there was nowhere to SEE them. Now they
+    // live where every other obligation lives. Tap a list to unfold it.
+    @ViewBuilder
+    private var listsSection: some View {
+        let all = ChappyLists.shared.lists
+        if all.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 32)).foregroundColor(theme.textSecondary.opacity(0.5))
+                Text("No lists yet").font(.subheadline).foregroundColor(theme.textPrimary)
+                Text("Say: \u{201C}Chappy, add milk to the shopping list\u{201D}\nA list pings you when you're near a shop that has it.")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity).padding(.top, 46)
+        } else {
+            ForEach(all) { l in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "checklist")
+                            .font(.system(size: 17)).foregroundColor(.mint)
+                            .frame(width: 34, height: 34)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(l.name)
+                                .font(.subheadline).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                            Text(l.placeHint.isEmpty
+                                 ? "Pings near a matching shop"
+                                 : "Pings near: \(l.placeHint)")
+                                .font(.caption2).foregroundColor(theme.textSecondary)
+                        }
+                        Spacer()
+                        if let items = listItems[l.id] {
+                            Text("\(items.count)")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(theme.textSecondary)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(Capsule().fill(Color.white.opacity(0.07)))
+                        }
+                        Image(systemName: expandedList == l.id ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    if expandedList == l.id {
+                        if let items = listItems[l.id], !items.isEmpty {
+                            ForEach(items, id: \.self) { item in
+                                HStack(spacing: 8) {
+                                    Image(systemName: "circle")
+                                        .font(.system(size: 9)).foregroundColor(.mint)
+                                    Text(item).font(.caption).foregroundColor(theme.textPrimary)
+                                    Spacer()
+                                }
+                                .padding(.leading, 46)
+                            }
+                            Text("Say \u{201C}Chappy, got the milk\u{201D} to tick one off.")
+                                .font(.caption2).foregroundColor(theme.textSecondary)
+                                .padding(.leading, 46).padding(.top, 2)
+                        } else {
+                            Text(listItems[l.id] == nil ? "Loading…" : "Everything's ticked off.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .padding(.leading, 46)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(theme.cardFill))
+                .padding(.horizontal, 16)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        expandedList = expandedList == l.id ? nil : l.id
+                    }
+                    guard listItems[l.id] == nil else { return }
+                    Task {
+                        let open = await ChappyLists.shared.openItems(listID: l.id)
+                        listItems[l.id] = open.compactMap { $0.title }
+                    }
+                }
+            }
+            Text("Lists ping on their own when you pass a shop that has what's on them.")
+                .font(.caption2).foregroundColor(theme.textSecondary)
+                .padding(.horizontal, 20).padding(.top, 4)
+        }
     }
 
     // BUILD 115 — CATEGORY CHIPS. Derived from where each reminder came from,

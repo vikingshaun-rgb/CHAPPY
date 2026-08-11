@@ -149,6 +149,16 @@ final class ChappyPulse: ObservableObject {
     private var lastPulseAt = Date.distantPast
     private var lastPrint: VNFeaturePrintObservation?
     private var lastFixAtPulse: CLLocation?
+    // BUILD 132 — WHY "GLOWING PHONE SCREEN" WAS FILED THREE TIMES.
+    //
+    // Dedup only compared against the single PREVIOUS frame. Phone screen →
+    // glance away → phone screen again read as three different scenes, and
+    // each one paid for a caption and cluttered memory. Two rings fix it:
+    // recent feature prints (the same SCENE within two hours is a duplicate
+    // no matter what came between), and recent caption TEXT (the same
+    // sentence within two days is a duplicate even when the pixels differ).
+    private var recentPrints: [(print: VNFeaturePrintObservation, at: Date)] = []
+    private var recentCaptions: [(text: String, at: Date)] = []
 
     // MARK: - Control
 
@@ -288,18 +298,36 @@ final class ChappyPulse: ObservableObject {
 
     private func consider(_ frame: UIImage) async {
         if let fp = featurePrint(frame) {
-            if let previous = lastPrint {
+            // BUILD 132: compare against every scene from the last two hours,
+            // not just the one immediately before. Glancing away and back no
+            // longer makes the same desk a "new" scene.
+            recentPrints.removeAll { Date().timeIntervalSince($0.at) > 7200 }
+            for prev in recentPrints {
                 var distance = Float(0)
-                try? previous.computeDistance(&distance, to: fp)
+                try? prev.print.computeDistance(&distance, to: fp)
                 if distance < sameSceneDistance {
                     print(String(format: "📸 [Pulse] same scene (%.1f) — no call", distance))
                     return
                 }
             }
+            recentPrints.append((fp, Date()))
+            if recentPrints.count > 8 { recentPrints.removeFirst() }
             lastPrint = fp
         }
 
         guard let text = await caption(frame), !text.isEmpty else { return }
+
+        // BUILD 132: the same SENTENCE inside two days is the same memory,
+        // whatever the pixels did. One "hand holding smartphone in bed" is
+        // an observation; five are a bug report.
+        let norm = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        recentCaptions.removeAll { Date().timeIntervalSince($0.at) > 172_800 }
+        if recentCaptions.contains(where: { $0.text == norm }) {
+            print("📸 [Pulse] same caption — not filing twice")
+            return
+        }
+        recentCaptions.append((norm, Date()))
+        if recentCaptions.count > 40 { recentCaptions.removeFirst() }
 
         captionsToday += 1
         spentTodayUSD += usdPerCaption
@@ -359,9 +387,27 @@ final class ChappyPulse: ObservableObject {
               let t = parts.first?["text"] as? String
         else { print("📸 [Pulse] caption failed"); return nil }
 
-        let clean = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        var clean = t.trimmingCharacters(in: .whitespacesAndNewlines)
         // The model is told to say NOTHING for a worthless frame. Honour it.
-        return clean.uppercased().hasPrefix("NOTHING") ? nil : clean
+        if clean.uppercased().hasPrefix("NOTHING") { return nil }
+        // BUILD 132 — SANITATION. "Word Count & Style Check:**" made it into
+        // the wearer's memory as a treasured moment. Strip markdown noise,
+        // and reject anything that reads as the model talking about its
+        // OUTPUT rather than the world in front of the camera.
+        clean = clean
+            .replacingOccurrences(of: "*", with: "")
+            .replacingOccurrences(of: "#", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let junk = ["word count", "style check", "caption:", "response:",
+                    "here is", "here's a", "as an ai", "i cannot", "i can't see"]
+        let lower = clean.lowercased()
+        if clean.isEmpty || clean.hasSuffix(":") || junk.contains(where: { lower.contains($0) }) {
+            print("📸 [Pulse] junk caption rejected: \(clean)")
+            return nil
+        }
+        if clean.count > 120 { clean = String(clean.prefix(120)) }
+        return clean
     }
 
     private static let captionPrompt = """
@@ -369,10 +415,12 @@ final class ChappyPulse: ObservableObject {
     business name or sign you can read, and anything notable. Under 15 words. No preamble, \
     no "the image shows".
 
-    If the frame is a blur, the inside of a pocket, a plain wall, the sky, an empty road, or \
-    anything else with no value as a memory, reply with exactly: NOTHING
+    If the frame is a blur, the inside of a pocket, a plain wall, the sky, an empty road, \
+    the wearer's own phone screen, a hand holding a phone, a screen glowing in a dark room, \
+    someone lying in bed, or anything else with no value as a memory, reply with exactly: NOTHING
 
-    Most frames are worth remembering. Blurry, dark and empty ones are not.
+    Most frames OUTDOORS and in new places are worth remembering. Blurry, dark, empty ones — \
+    and the wearer looking at their own devices — are not.
     """
 
     private func downscaled(_ image: UIImage, to maxSide: CGFloat) -> UIImage {

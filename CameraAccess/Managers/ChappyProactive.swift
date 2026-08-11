@@ -641,12 +641,40 @@ final class ChappyProactive: NSObject, ObservableObject {
 
 extension ChappyProactive: UNUserNotificationCenterDelegate {
 
+    // BUILD 132 — WHY REMINDER BANNERS NEVER SHOWED.
+    //
+    // iOS allows exactly ONE UNUserNotificationCenter delegate per app, and
+    // this class claimed it. ChappyReminders had its own complete
+    // willPresent/didReceive pair — haptics per urgency, Done and Snooze
+    // buttons that worked without unlocking — and NONE of it ever ran,
+    // because nothing routed to it. Worse: the old willPresent answered "[]"
+    // for anything it didn't recognise, so every reminder that fired while
+    // the wearer was looking at the phone was silently swallowed. The one
+    // time you're holding it was the one time it went missing.
+    //
+    // The fix: this delegate is now the ROUTER. Reminder notifications are
+    // forwarded to ChappyReminders' own handlers; everything else gets a
+    // banner, because every local notification in this app IS Chappy's —
+    // there is nobody else to defer to.
+
+    private nonisolated func isReminderNotification(_ info: [AnyHashable: Any]) -> Bool {
+        info["chappyReminderID"] != nil
+            || info["chappyUrgent"] != nil
+            || info["chappyPlace"] != nil
+            || info["chappyOpens"] != nil
+    }
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
+        if isReminderNotification(info) {
+            ChappyReminders.shared.userNotificationCenter(
+                center, didReceive: response, withCompletionHandler: completionHandler)
+            return
+        }
         let title = response.notification.request.content.title
         let body = response.notification.request.content.body
 
@@ -664,18 +692,20 @@ extension ChappyProactive: UNUserNotificationCenterDelegate {
         }
     }
 
-    /// AUDIT FIX: this claimed the app-wide delegate and forced a banner for
-    /// EVERY foreground notification, including ones other parts of the app
-    /// may want handled differently. Only Chappy's own get the banner.
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         let info = notification.request.content.userInfo
-        let mine = (info["chappy_proactive"] as? Bool ?? false)
-            || (info["chappy_list"] as? Bool ?? false)
-            || (info["chappy_timer"] as? Bool ?? false)
-        completionHandler(mine ? [.banner, .sound] : [])
+        if isReminderNotification(info) {
+            ChappyReminders.shared.userNotificationCenter(
+                center, willPresent: notification, withCompletionHandler: completionHandler)
+            return
+        }
+        // Everything Chappy schedules deserves to be SEEN. The old "[]" for
+        // unrecognised tags meant any new module's notifications shipped
+        // invisible until someone remembered to add its tag here.
+        completionHandler([.banner, .list, .sound])
     }
 }
