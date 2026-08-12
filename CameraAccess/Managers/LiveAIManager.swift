@@ -676,6 +676,19 @@ class LiveAIManager: ObservableObject {
             print("⚠️ [LiveAIManager] Already running")
             return
         }
+        // BUILD 171 — AND NOT TWICE AT ONCE.
+        //
+        // isRunning is only set several lines below, after the mic handoff
+        // and the key check. A second call arriving in that window — a
+        // double tap, or the voice command landing at the same moment as
+        // the tile — got past the guard and started a second session over
+        // the top of the first. Two sessions, one set of glasses.
+        guard !isStartingSession else {
+            print("⚠️ [LiveAIManager] Start already in flight")
+            return
+        }
+        isStartingSession = true
+        defer { isStartingSession = false }
         // MIC HANDOFF: Standby's local ear must let go before the deep layer
         // takes the microphone — two recognizers cannot share one input node.
         if ChappyStandby.shared.isListening {
@@ -729,23 +742,32 @@ class LiveAIManager: ObservableObject {
                 await streamViewModel.handleStartStreaming()
 
                 // BUILD 165 — FIVE SECONDS WAS THE WHOLE PROBLEM.
-                //
                 // Cold Ray-Bans routinely take eight to ten seconds to hand
-                // over a first frame — Burst hit exactly this in 162 and got
-                // twelve. Five seconds meant Live AI succeeded only when the
-                // glasses happened to be warm. Twelve, then one retry, then
-                // give up honestly.
-                var streamReady = await waitForCondition(timeout: 12.0) {
-                    streamViewModel.streamingStatus == .streaming
-                }
-                if !streamReady {
-                    print("📹 [LiveAIManager] Stream slow — one more go")
-                    tts.speak("Waking the glasses.")
-                    await streamViewModel.handleStartStreaming()
-                    streamReady = await waitForCondition(timeout: 10.0) {
-                        streamViewModel.streamingStatus == .streaming
+                // over a first frame; five meant Live AI only worked when
+                // the glasses were already warm.
+                //
+                // BUILD 171 — BUT THE RETRY I ADDED WAS WORSE THAN THE BUG.
+                //
+                // It called handleStartStreaming() a SECOND time, and
+                // startSession() begins by tearing down the existing
+                // session ("sessions are single-use"). So the retry
+                // demolished the very session it was waiting for, halfway
+                // through its handshake with the glasses — which is a
+                // crash, not a retry.
+                //
+                // Patience was the point, not re-triggering. One start, one
+                // long wait, with a spoken nudge partway so you know it's
+                // still working rather than dead.
+                let nudge = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    if streamViewModel.streamingStatus != .streaming {
+                        tts.speak("Still waking the glasses.")
                     }
                 }
+                let streamReady = await waitForCondition(timeout: 22.0) {
+                    streamViewModel.streamingStatus == .streaming
+                }
+                nudge.cancel()
 
                 if !streamReady {
                     print("❌ [LiveAIManager] Failed to start streaming")
@@ -783,6 +805,15 @@ class LiveAIManager: ObservableObject {
             print("🎤 [LiveAIManager] About to start recording...")
             startRecording()
 
+            // BUILD 172 AUDIT — SAY WHEN IT'S ACTUALLY READY.
+            //
+            // Every failure has spoken since 165, but SUCCESS was silent —
+            // so a session that took eighteen seconds to come up was
+            // indistinguishable from one that had quietly died, right up
+            // until you spoke into it and something answered. With the
+            // phone in a pocket you need the same courtesy for both
+            // outcomes.
+            ChappyEarcon.shared.wake()
             print("✅ [LiveAIManager] Live AI session started, ready to talk")
 
         } catch let error as LiveAIError {
@@ -802,12 +833,22 @@ class LiveAIManager: ObservableObject {
             ChappyEarcon.shared.fail()
             tts.speak(error.spokenAdvice)
             await stopSession()
+            // BUILD 172 AUDIT — belt and braces, AFTER the cleanup.
+            //
+            // stopSession() opens with `guard isRunning else { return }`, so
+            // clearing the flag before it would skip the teardown entirely.
+            // But a flag left set is the worst failure mode there is: every
+            // later attempt hits "Already running" and does nothing at all,
+            // silently and permanently, curable only by force-quitting. So
+            // it is forced down here, once the cleanup has definitely run.
+            isRunning = false
         } catch {
             errorMessage = error.localizedDescription
             print("❌ [LiveAIManager] Error: \(error)")
             ChappyEarcon.shared.fail()
             tts.speak("Live AI couldn't start. \(error.localizedDescription)")
             await stopSession()
+            isRunning = false        // BUILD 172 AUDIT — see above
         }
     }
 
@@ -1243,6 +1284,8 @@ final class ChappyStandby: NSObject, ObservableObject {
     private static var armAttempts = 0
     /// BUILD 160: the 2-second sweep that keeps the ear honest between renewals.
     private var livenessTimer: Timer?
+    /// BUILD 171: when the sweep last rebuilt, so it can never storm.
+    private var lastSweepRebuild = Date.distantPast
     /// BUILD 160: the most recent text heard AFTER the wake word. Empty means
     /// he said the name and nothing else — the only case that earns a beep.
     private var lastTail = ""
@@ -2763,6 +2806,42 @@ final class ChappyStandby: NSObject, ObservableObject {
         return false
     }
 
+    /// BUILD 170 — put every tool down and go back to the main screen.
+    func resetEverything() {
+        // 1. Silence first — you said this because something was talking
+        //    over you, or nothing was responding. Either way, quiet.
+        TTSService.shared.stop()
+        ChappyEarcon.shared.stopThinking()
+
+        // 2. End every live module. Each is a no-op if it wasn't running.
+        NavEngine.shared.stop(announce: false)
+        NotificationCenter.default.post(name: Notification.Name("chappyMapsCleanup"), object: nil)
+        if ContinuousVisionManager.shared.isRunning { ContinuousVisionManager.shared.stop() }
+        if LiveAIManager.shared.isRunning {
+            Task { await LiveAIManager.shared.stopSession() }
+        }
+        if ChappyDictate.shared.isRecording { ChappyDictate.shared.stop(andPolish: false) }
+        ChappyRide.shared.stopTripWatch()
+
+        // 3. Cancel every pending question window, so Chappy isn't still
+        //    waiting for an answer to something you've moved on from.
+        //    closeAllPrompts() already knows every window there is — better
+        //    than a list here that goes stale the next time one is added.
+        closeAllPrompts()
+        pendingNavDestination = nil
+
+        // 4. Close whatever is on screen.
+        NotificationCenter.default.post(name: .chappyCloseEverything, object: nil)
+
+        // 5. And make sure the ear is genuinely alive on the way out —
+        //    this command is most often said BECAUSE it had gone deaf.
+        rebuildEar()
+
+        ChappyHaptics.shared.straightStep()
+        ChappyEarcon.shared.done()
+        TTSService.shared.speak("All clear. Back to the start.")
+    }
+
     func askForTranslateLanguage() {
         expectingLanguageUntil = Date().addingTimeInterval(12)
         if !isListening { silentArm = true; start() }
@@ -2847,11 +2926,33 @@ final class ChappyStandby: NSObject, ObservableObject {
         // but a 2-second liveness sweep now runs alongside it so a gap that
         // does swallow a word is measured in seconds, not tens of seconds.
         livenessTimer?.invalidate()
-        livenessTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        livenessTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isListening, !self.awake, !self.busy else { return }
                 guard !TTSService.shared.isSpeaking else { return }
-                if Date().timeIntervalSince(self.lastBufferAt) > 3.5 {
+                // BUILD 171 — THE SWEEP HAD TO LEARN WHEN TO KEEP OUT.
+                //
+                // Two dangers in the 160 version. First, it ran every 2s
+                // against a rebuild throttle of exactly 2s — so a genuinely
+                // dead tap meant rebuilding the audio engine forever, and
+                // installTap during that churn is precisely the crash 142
+                // was written to stop. Second, it did not check whether
+                // ANOTHER module had taken the microphone: Live AI,
+                // Translate, Dictate and continuous vision all own the
+                // input node while they run, and a rebuild underneath them
+                // pulls the node out from under a live session.
+                //
+                // Now: never while another module holds the mic, never
+                // before a first buffer has ever arrived, and no more than
+                // one sweep-rebuild every 15 seconds.
+                guard !LiveAIManager.shared.isRunning,
+                      !ContinuousVisionManager.shared.isRunning,
+                      !ChappyDictate.shared.isRecording,
+                      GeminiLiveService.activeInstance == nil else { return }
+                guard self.lastBufferAt != .distantPast else { return }
+                guard Date().timeIntervalSince(self.lastSweepRebuild) > 15 else { return }
+                if Date().timeIntervalSince(self.lastBufferAt) > 4.5 {
+                    self.lastSweepRebuild = Date()
                     print("👂 [Standby] Liveness sweep: ear went quiet — rebuilding")
                     self.rebuildEar()
                 }
@@ -3666,6 +3767,31 @@ final class ChappyStandby: NSObject, ObservableObject {
         // Honesty note: iOS does not let one app quit another, so Google Maps
         // itself stays wherever it is — but Chappy's navigation ends and the
         // slate is clean the moment you come back.
+        // BUILD 170 — CHAPPY RESET. One phrase that always works, from
+        // anywhere, whatever is on screen.
+        //
+        // Every module had its own exit — "stop navigation", "close maps",
+        // "quiet mode" — and you had to remember which one applied to
+        // whatever was currently misbehaving. That is exactly backwards
+        // when something IS misbehaving. Every assistant worth using has a
+        // single escape hatch; this is Chappy's.
+        //
+        // It stops the voice mid-word, ends navigation, translate, Live AI
+        // and continuous vision, cancels every pending question window,
+        // closes every sheet on screen, and re-arms the ear. It never
+        // deletes anything — reset means "put the tools down", not
+        // "forget".
+        if c.contains("chappy reset") || c.contains("chappy close")
+            || c.contains("close everything") || c.contains("close it all")
+            || c.contains("shut it all down") || c.contains("stop everything")
+            || c.contains("back to the main screen") || c.contains("back to main screen")
+            || c.contains("back to home screen") || c.contains("go back to home")
+            || c.contains("clear the screen") || c.contains("start over")
+            || c.contains("close all") || c.contains("reset chappy")
+            || c == "reset" || c == "escape" {
+            resetEverything()
+            return
+        }
         if c.contains("close maps") || c.contains("close the maps")
             || c.contains("close google maps") || c.contains("exit maps")
             || c.contains("shut maps") {
@@ -3684,6 +3810,89 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and those questions now come back Meta-fast, offline, for free.
         if let pocket = ChappyPocket.answer(c) {
             speak(pocket)
+            return
+        }
+        // BUILD 174 — ASK THE VOICE WHAT'S WRONG WITH IT.
+        //
+        // "The voice isn't always Gemini" was impossible to act on because
+        // nothing reported WHY. Now it will tell you: set to System, no key,
+        // or in a five-minute fallback after a specific failure — named.
+        if c.contains("why is the voice") || c.contains("voice status")
+            || c.contains("check the voice") || c.contains("what's wrong with the voice")
+            || c.contains("whats wrong with the voice") || c.contains("is the voice ok") {
+            speak(TTSService.voiceStatusLine)
+            return
+        }
+        if c.contains("reset the voice") || c.contains("fix the voice")
+            || c.contains("clear the voice") {
+            TTSService.geminiVoiceGaveUp = false
+            TTSService.lastFallbackReason = ""
+            speak("Voice reset. That should be me again.")
+            return
+        }
+        // BUILD 173 — THE WEATHER STATION, by voice.
+        //
+        // Pocket still answers a bare "what's the weather" instantly from
+        // the cached snapshot — that stays, because speed is the feature
+        // there. These are the asks that want the real instruments.
+        if c.contains("full weather") || c.contains("open weather")
+            || c.contains("weather station") || c.contains("weather screen")
+            || c.contains("show me the weather") || c.contains("all the weather") {
+            NotificationCenter.default.post(name: .chappyOpenWeather, object: nil)
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                TTSService.shared.speakLong(ChappyWeather.shared.spokenFull())
+            }
+            return
+        }
+        if c.contains("will it rain") || c.contains("is it going to rain")
+            || c.contains("any rain") || c.contains("do i need an umbrella")
+            || c.contains("rain today") || c.contains("rain coming") {
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                TTSService.shared.speakLong(ChappyWeather.shared.spokenRain())
+            }
+            return
+        }
+        if c.contains("weather this week") || c.contains("weather for the week")
+            || c.contains("forecast this week") || c.contains("week's weather")
+            || c.contains("weeks weather") || c.contains("weather forecast") {
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                TTSService.shared.speakLong(ChappyWeather.shared.spokenWeek())
+            }
+            return
+        }
+        // "Weather in Bali" — anywhere, not just here.
+        if let r = c.range(of: "weather in ") {
+            let place = String(c[r.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?"))
+            if place.count > 1 {
+                TTSService.shared.speak("Looking up \(place).")
+                Task { @MainActor in
+                    await ChappyWeather.shared.loadPlace(place)
+                    TTSService.shared.speakLong(ChappyWeather.shared.spokenNow())
+                }
+                return
+            }
+        }
+        // BUILD 173 — THE BRIEF, on demand and on screen.
+        if c.contains("what was my brief") || c.contains("read my brief")
+            || c.contains("last brief") || c.contains("repeat the brief") {
+            let last = ChappyProactive.shared.lastBrief
+            speak(last.isEmpty ? "No brief yet today." : last)
+            return
+        }
+        if c.contains("brief me now") || c.contains("brief me")
+            || c.contains("give me a brief") {
+            speak("Putting one together.")
+            Task { await ChappyProactive.shared.runNow() }
+            return
+        }
+        if c.contains("open briefs") || c.contains("brief settings")
+            || c.contains("how is my brief") || c.contains("brief studio") {
+            NotificationCenter.default.post(name: .chappyOpenBriefs, object: nil)
+            speak("Here's how your briefs are built.")
             return
         }
         // BUILD 166 — "WHAT TIME IS THE BRONCOS GAME ON THIS WEEK."
@@ -4104,7 +4313,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         // showing?" now has an answer you can get by asking. Reads the REAL
         // authorization state and, if allowed, fires a test banner in 5s.
         if c.contains("test notification") || c.contains("notification test")
-            || c.contains("check notifications") || c.contains("test my notifications") {
+            || c.contains("check notifications") || c.contains("test my notifications")
+            // BUILD 170 — the ways people actually ask.
+            || c.contains("are my notifications on") || c.contains("notification status")
+            || c.contains("are notifications working") || c.contains("check my notifications")
+            || c.contains("why aren't i getting notifications")
+            || c.contains("why am i not getting notifications")
+            || c.contains("notification doctor") || c.contains("fix my notifications") {
+            // BUILD 172: put the full picture on screen as well as saying it —
+            // the pending queue is the part you have to SEE.
+            NotificationCenter.default.post(name: .chappyOpenNotifDoctor, object: nil)
             UNUserNotificationCenter.current().getNotificationSettings { settings in
                 DispatchQueue.main.async {
                     switch settings.authorizationStatus {
@@ -4118,6 +4336,24 @@ final class ChappyStandby: NSObject, ObservableObject {
                         var extras: [String] = []
                         if settings.alertSetting != .enabled { extras.append("banners are off") }
                         if settings.soundSetting != .enabled { extras.append("sound is off") }
+                        // BUILD 170 — THE TWO SETTINGS THAT SWALLOW EVERYTHING
+                        // AND NOBODY THINKS OF.
+                        //
+                        // Scheduled Summary holds notifications back and
+                        // delivers them in a batch at set times — so they
+                        // "never arrive", they arrive at 6pm in a pile. And
+                        // without Time Sensitive permission, a Focus mode
+                        // eats warn-times silently. Both look identical to
+                        // "notifications are broken" from the outside.
+                        if settings.scheduledDeliverySetting == .enabled {
+                            extras.append("Scheduled Summary is ON, which holds your notifications back and delivers them in a batch - that alone would explain missing pings. Turn it off under Settings, Notifications, Scheduled Summary")
+                        }
+                        if settings.timeSensitiveSetting == .disabled {
+                            extras.append("Time Sensitive is off, so a Focus mode will silence warn-times")
+                        }
+                        if settings.lockScreenSetting != .enabled {
+                            extras.append("lock screen notifications are off")
+                        }
                         let content = UNMutableNotificationContent()
                         content.title = "Chappy test"
                         content.body = "Notifications are working."
@@ -8090,6 +8326,8 @@ final class ChappyIngest: ObservableObject {
 
     @Published private(set) var isRunning = false
     @Published private(set) var progress = ""
+    /// BUILD 171: a start is in flight — see startLiveAISession().
+    private var isStartingSession = false
     @Published private(set) var lastResult = ""
 
     /// Library ids already turned into memories. Kept as a set of strings so
@@ -11650,15 +11888,33 @@ final class ChappyClip {
     private func run(seconds: Int) async {
         defer { isRecording = false }
 
-        // Wake the camera — Pulse's dance.
+        // BUILD 172 — VIDEO "STARTED AND IMMEDIATELY TURNED OFF."
+        //
+        // Clip still had the five-second camera wait that Burst was cured
+        // of in 162. Cold Ray-Bans take eight to ten seconds, so the wait
+        // expired, the frame grab found nothing, and it gave up — which
+        // from the outside looks exactly like starting and stopping.
+        // Same cure: twenty seconds, the waking tone so you know it's
+        // coming, the on-screen waking card, and an honest failure.
         let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
         if !wasStreaming {
+            ChappyEarcon.shared.cameraWaking()
+            SnapFeedback.shared.waking()
             NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
-            for _ in 0..<20 {
+            var awake = false
+            for _ in 0..<80 {                                   // up to ~20s
                 try? await Task.sleep(nanoseconds: 250_000_000)
-                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
+                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
+                    awake = true; break
+                }
             }
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard awake else {
+                TTSService.shared.speak("The glasses didn't wake up in time - no clip. Give them a moment and try again.")
+                ChappyStandby.shared.pokeEar(after: 1.5)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 900_000_000)     // exposure settle
+            TTSService.shared.speak("Rolling now.")
         }
 
         var frames: [UIImage] = []
@@ -13118,11 +13374,20 @@ final class ChappyBurst {
         }
         TTSService.shared.speak("Burst.")
 
+        // BUILD 172 — A BURST SHOULD SOUND LIKE A BURST.
+        //
+        // It sampled twenty frames in total silence, so there was no way to
+        // tell a working burst from a dead camera until it finished. Now
+        // the shutter fires as it goes — every third frame, which reads as
+        // rapid-fire without becoming a machine gun — and the count is
+        // both spoken and posted, so "seven shots" is a fact you're told
+        // rather than something you have to guess at.
         var frames: [UIImage] = []
         for i in 0..<20 {
             if i > 0 { try? await Task.sleep(nanoseconds: 125_000_000) }
             if let f = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
                 frames.append(f)
+                if frames.count % 3 == 1 { ChappyEarcon.shared.shutter() }
             }
         }
 
@@ -13154,7 +13419,11 @@ final class ChappyBurst {
             thumbnail: scored.best.jpegData(compressionQuality: 0.65),
             source: "burst")
         ChappyEarcon.shared.done()
-        TTSService.shared.speak("Got it - kept the sharpest of \(scored.count).")
+        ChappyHaptics.shared.shutter()
+        ChappyNotify.post(.nav,
+                          title: "📸 Burst: \(scored.count) shots",
+                          body: "Kept the sharpest. It's in Gallery under Photos.")
+        TTSService.shared.speak("\(scored.count) shots. Kept the sharpest.")
         // BUILD 162: waking the camera reroutes audio and can take the mic
         // tap down with it — same reason Snap pokes the ear twice.
         ChappyStandby.shared.pokeEar(after: 1.5)
@@ -13897,6 +14166,14 @@ final class ChappyDictate: NSObject, ObservableObject {
 extension Notification.Name {
     /// BUILD 157 — open Dictate, already recording.
     static let chappyOpenDictate = Notification.Name("chappyOpenDictate")
+    /// BUILD 173 — the weather station and the brief studio.
+    static let chappyOpenWeather = Notification.Name("chappyOpenWeather")
+    static let chappyOpenBriefs = Notification.Name("chappyOpenBriefs")
+    /// BUILD 172 — open the notification diagnostic screen.
+    static let chappyOpenNotifDoctor = Notification.Name("chappyOpenNotifDoctor")
+    /// BUILD 170 — the panic button: close every sheet and cover and go
+    /// back to the home screen.
+    static let chappyCloseEverything = Notification.Name("chappyCloseEverything")
     /// BUILD 168 — open Dictate WITHOUT starting the microphone, because
     /// the text is already loaded.
     static let chappyOpenDictateQuiet = Notification.Name("chappyOpenDictateQuiet")
@@ -13904,4 +14181,335 @@ extension Notification.Name {
     static let chappyOpenPlaces = Notification.Name("chappyOpenPlaces")
     /// BUILD 163 — open the 30-day Upcoming view.
     static let chappyOpenUpcoming = Notification.Name("chappyOpenUpcoming")
+}
+
+// =====================================================================
+// MARK: - CHAPPY WEATHER STATION (Build 173)
+// =====================================================================
+//
+//   There has never been a weather screen. Weather existed only as a
+//   single line inside the daily brief and a bubble on the Atlas — so
+//   asking "where's the weather module" was a fair question with an
+//   awkward answer. This is the real thing.
+//
+//   Open-Meteo, which is free, needs no key and no account, and gives
+//   the full instrument panel: temperature and what it feels like,
+//   humidity, dew point, pressure, wind speed, direction and gusts,
+//   rain now and rain probability, cloud cover, visibility, UV, and
+//   sunrise/sunset — plus 24 hours ahead and 7 days ahead in one call.
+//
+//   Located wherever you are, or anywhere you name. Every number is
+//   speakable, because reading a dashboard is not the point when the
+//   phone is in your pocket.
+
+@MainActor
+final class ChappyWeather: ObservableObject {
+
+    static let shared = ChappyWeather()
+    private init() {}
+
+    struct Now {
+        var tempC = 0.0
+        var feelsC = 0.0
+        var humidity = 0
+        var dewC = 0.0
+        var pressure = 0.0
+        var windKmh = 0.0
+        var gustKmh = 0.0
+        var windDeg = 0
+        var rainMm = 0.0
+        var cloudPct = 0
+        var visibilityM = 0.0
+        var uv = 0.0
+        var code = 0
+        var isDay = true
+    }
+
+    struct Hour: Identifiable {
+        var id: Int { Int(at.timeIntervalSince1970) }
+        var at: Date
+        var tempC: Double
+        var rainChance: Int
+        var code: Int
+    }
+
+    struct Day: Identifiable {
+        var id: Int { Int(at.timeIntervalSince1970) }
+        var at: Date
+        var maxC: Double
+        var minC: Double
+        var rainChance: Int
+        var rainMm: Double
+        var code: Int
+        var sunrise: Date?
+        var sunset: Date?
+        var uvMax: Double
+        var windMaxKmh: Double
+    }
+
+    @Published private(set) var placeName = ""
+    @Published private(set) var now: Now?
+    @Published private(set) var hours: [Hour] = []
+    @Published private(set) var days: [Day] = []
+    @Published private(set) var loading = false
+    @Published private(set) var error: String?
+    @Published private(set) var coord: CLLocationCoordinate2D?
+    @Published private(set) var fetchedAt: Date?
+
+    // MARK: fetching
+
+    /// Where you are right now.
+    func loadHere() async {
+        let snap = ContextEngine.shared.snapshot
+        guard let la = snap.latitude, let lo = snap.longitude else {
+            error = "No GPS fix yet — give it a few seconds outside."
+            return
+        }
+        let name = [snap.city, snap.country].compactMap { $0 }.joined(separator: ", ")
+        await load(lat: la, lon: lo, name: name.isEmpty ? "Where you are" : name)
+    }
+
+    /// Anywhere you can name. Apple's geocoder, so no key and no quota.
+    func loadPlace(_ query: String) async {
+        loading = true
+        defer { loading = false }
+        let req = MKLocalSearch.Request()
+        req.naturalLanguageQuery = query
+        guard let resp = try? await MKLocalSearch(request: req).start(),
+              let hit = resp.mapItems.first else {
+            error = "Couldn't find \(query)."
+            return
+        }
+        let c = hit.placemark.coordinate
+        let nm = hit.placemark.locality ?? hit.name ?? query
+        await load(lat: c.latitude, lon: c.longitude, name: nm)
+    }
+
+    func load(lat: Double, lon: Double, name: String) async {
+        loading = true
+        error = nil
+        defer { loading = false }
+        placeName = name
+        coord = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+
+        let current = "temperature_2m,relative_humidity_2m,apparent_temperature,is_day," +
+                      "precipitation,rain,weather_code,cloud_cover,pressure_msl," +
+                      "wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,dew_point_2m,uv_index"
+        let hourly  = "temperature_2m,precipitation_probability,weather_code"
+        let daily   = "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset," +
+                      "uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
+        guard let url = URL(string:
+            "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)" +
+            "&current=\(current)&hourly=\(hourly)&daily=\(daily)" +
+            "&timezone=auto&forecast_days=7")
+        else { error = "Bad request."; return }
+
+        var req = URLRequest(url: url); req.timeoutInterval = 20
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { error = "Couldn't reach the weather service."; return }
+
+        if let c = json["current"] as? [String: Any] {
+            var n = Now()
+            n.tempC       = c["temperature_2m"] as? Double ?? 0
+            n.feelsC      = c["apparent_temperature"] as? Double ?? n.tempC
+            n.humidity    = c["relative_humidity_2m"] as? Int ?? 0
+            n.dewC        = c["dew_point_2m"] as? Double ?? 0
+            n.pressure    = c["pressure_msl"] as? Double ?? 0
+            n.windKmh     = c["wind_speed_10m"] as? Double ?? 0
+            n.gustKmh     = c["wind_gusts_10m"] as? Double ?? 0
+            n.windDeg     = c["wind_direction_10m"] as? Int ?? 0
+            n.rainMm      = c["precipitation"] as? Double ?? 0
+            n.cloudPct    = c["cloud_cover"] as? Int ?? 0
+            n.visibilityM = c["visibility"] as? Double ?? 0
+            n.uv          = c["uv_index"] as? Double ?? 0
+            n.code        = c["weather_code"] as? Int ?? 0
+            n.isDay       = (c["is_day"] as? Int ?? 1) == 1
+            now = n
+        }
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withColonSeparatorInTimeZone]
+        func parse(_ s: String) -> Date? {
+            iso.date(from: s) ?? {
+                let f = DateFormatter()
+                f.dateFormat = "yyyy-MM-dd'T'HH:mm"
+                f.timeZone = TimeZone.current
+                return f.date(from: s)
+            }()
+        }
+
+        if let h = json["hourly"] as? [String: Any],
+           let times = h["time"] as? [String] {
+            let temps = h["temperature_2m"] as? [Double] ?? []
+            let probs = h["precipitation_probability"] as? [Int] ?? []
+            let codes = h["weather_code"] as? [Int] ?? []
+            var out: [Hour] = []
+            for (i, t) in times.enumerated() {
+                guard let d = parse(t), d >= Date().addingTimeInterval(-3600) else { continue }
+                out.append(Hour(at: d,
+                                tempC: i < temps.count ? temps[i] : 0,
+                                rainChance: i < probs.count ? probs[i] : 0,
+                                code: i < codes.count ? codes[i] : 0))
+                if out.count >= 24 { break }
+            }
+            hours = out
+        }
+
+        if let dd = json["daily"] as? [String: Any],
+           let times = dd["time"] as? [String] {
+            let maxs  = dd["temperature_2m_max"] as? [Double] ?? []
+            let mins  = dd["temperature_2m_min"] as? [Double] ?? []
+            let codes = dd["weather_code"] as? [Int] ?? []
+            let sr    = dd["sunrise"] as? [String] ?? []
+            let ss    = dd["sunset"] as? [String] ?? []
+            let uvs   = dd["uv_index_max"] as? [Double] ?? []
+            let sums  = dd["precipitation_sum"] as? [Double] ?? []
+            let probs = dd["precipitation_probability_max"] as? [Int] ?? []
+            let winds = dd["wind_speed_10m_max"] as? [Double] ?? []
+            var out: [Day] = []
+            let dayFmt = DateFormatter(); dayFmt.dateFormat = "yyyy-MM-dd"
+            for (i, t) in times.enumerated() {
+                guard let d = dayFmt.date(from: t) else { continue }
+                out.append(Day(at: d,
+                               maxC: i < maxs.count ? maxs[i] : 0,
+                               minC: i < mins.count ? mins[i] : 0,
+                               rainChance: i < probs.count ? probs[i] : 0,
+                               rainMm: i < sums.count ? sums[i] : 0,
+                               code: i < codes.count ? codes[i] : 0,
+                               sunrise: i < sr.count ? parse(sr[i]) : nil,
+                               sunset: i < ss.count ? parse(ss[i]) : nil,
+                               uvMax: i < uvs.count ? uvs[i] : 0,
+                               windMaxKmh: i < winds.count ? winds[i] : 0))
+            }
+            days = out
+        }
+        fetchedAt = Date()
+    }
+
+    // MARK: saying it
+
+    /// The everyday answer: what it's doing now and whether to take a coat.
+    func spokenNow() -> String {
+        guard let n = now else { return "No weather loaded yet." }
+        var bits = ["\(Int(n.tempC.rounded())) degrees in \(placeName), \(Self.describe(n.code))"]
+        if abs(n.feelsC - n.tempC) >= 2 {
+            bits.append("feels like \(Int(n.feelsC.rounded()))")
+        }
+        if n.windKmh >= 15 {
+            bits.append("wind \(Int(n.windKmh)) k m h from the \(Self.compass(n.windDeg))")
+        }
+        if n.gustKmh >= 40 { bits.append("gusting \(Int(n.gustKmh))") }
+        if let today = days.first, today.rainChance >= 20 {
+            bits.append("\(today.rainChance) percent chance of rain today")
+        }
+        if n.uv >= 6 { bits.append("U V index \(Int(n.uv.rounded())) - hat weather") }
+        return bits.joined(separator: ", ") + "."
+    }
+
+    /// Every instrument, for when you actually want the lot.
+    func spokenFull() -> String {
+        guard let n = now else { return "No weather loaded yet." }
+        var s = spokenNow()
+        s += " Humidity \(n.humidity) percent, dew point \(Int(n.dewC.rounded()))."
+        s += " Pressure \(Int(n.pressure.rounded())) hectopascals."
+        s += " Cloud cover \(n.cloudPct) percent."
+        if n.visibilityM > 0 {
+            s += " Visibility \(n.visibilityM >= 1000 ? "\(Int(n.visibilityM / 1000)) kilometres" : "\(Int(n.visibilityM)) metres")."
+        }
+        if n.rainMm > 0 { s += " \(String(format: "%.1f", n.rainMm)) millimetres falling now." }
+        if let d = days.first {
+            s += " Today \(Int(d.minC.rounded())) to \(Int(d.maxC.rounded()))."
+            if let sr = d.sunrise, let ss = d.sunset {
+                let f = DateFormatter(); f.dateFormat = "h:mm a"
+                s += " Sunrise \(f.string(from: sr)), sunset \(f.string(from: ss))."
+            }
+        }
+        return s
+    }
+
+    /// The week, in one breath.
+    func spokenWeek() -> String {
+        guard !days.isEmpty else { return "No forecast loaded yet." }
+        let f = DateFormatter(); f.dateFormat = "EEEE"
+        let lines = days.prefix(5).enumerated().map { i, d -> String in
+            let name = i == 0 ? "Today" : (i == 1 ? "Tomorrow" : f.string(from: d.at))
+            var s = "\(name), \(Int(d.minC.rounded())) to \(Int(d.maxC.rounded())), \(Self.describe(d.code))"
+            if d.rainChance >= 30 { s += ", \(d.rainChance) percent rain" }
+            return s
+        }
+        return lines.joined(separator: ". ") + "."
+    }
+
+    /// "Will it rain?" answered properly — when, and how likely.
+    func spokenRain() -> String {
+        guard !hours.isEmpty else { return "No forecast loaded yet." }
+        let wet = hours.prefix(12).filter { $0.rainChance >= 40 }
+        guard let first = wet.first else {
+            let peak = hours.prefix(12).map { $0.rainChance }.max() ?? 0
+            return peak < 15
+                ? "No rain coming in the next twelve hours."
+                : "Nothing likely - the highest chance in the next twelve hours is \(peak) percent."
+        }
+        let f = DateFormatter(); f.dateFormat = "h a"
+        return "Rain likely from about \(f.string(from: first.at)), \(first.rainChance) percent. \(wet.count) of the next twelve hours look wet."
+    }
+
+    // MARK: shared vocabulary
+
+    static func describe(_ c: Int) -> String {
+        switch c {
+        case 0: return "clear"
+        case 1: return "mostly clear"
+        case 2: return "partly cloudy"
+        case 3: return "overcast"
+        case 45, 48: return "fog"
+        case 51, 53, 55: return "drizzle"
+        case 56, 57: return "freezing drizzle"
+        case 61: return "light rain"
+        case 63: return "rain"
+        case 65: return "heavy rain"
+        case 66, 67: return "freezing rain"
+        case 71, 73, 75, 77: return "snow"
+        case 80, 81: return "showers"
+        case 82: return "heavy showers"
+        case 85, 86: return "snow showers"
+        case 95: return "thunderstorms"
+        case 96, 99: return "thunderstorms with hail"
+        default: return "mixed"
+        }
+    }
+
+    static func symbol(_ c: Int, day: Bool = true) -> String {
+        switch c {
+        case 0: return day ? "sun.max.fill" : "moon.stars.fill"
+        case 1, 2: return day ? "cloud.sun.fill" : "cloud.moon.fill"
+        case 3: return "cloud.fill"
+        case 45, 48: return "cloud.fog.fill"
+        case 51...57: return "cloud.drizzle.fill"
+        case 61...67: return "cloud.rain.fill"
+        case 71...77, 85, 86: return "cloud.snow.fill"
+        case 80...82: return "cloud.heavyrain.fill"
+        case 95...99: return "cloud.bolt.rain.fill"
+        default: return "cloud.sun.fill"
+        }
+    }
+
+    static func compass(_ deg: Int) -> String {
+        let dirs = ["north", "north-east", "east", "south-east",
+                    "south", "south-west", "west", "north-west"]
+        let i = Int((Double(deg) / 45.0).rounded()) % 8
+        return dirs[max(0, i)]
+    }
+
+    static func uvWord(_ uv: Double) -> String {
+        switch uv {
+        case ..<3: return "low"
+        case ..<6: return "moderate"
+        case ..<8: return "high"
+        case ..<11: return "very high"
+        default: return "extreme"
+        }
+    }
 }
