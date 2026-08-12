@@ -196,7 +196,7 @@ struct QuickVisionView: View {
 
                         // Replay-speech button
                         Button {
-                            tts.speak(result)
+                            tts.speakLong(result)
                         } label: {
                             Image(systemName: tts.isSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2")
                                 .foregroundColor(.white)

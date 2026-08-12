@@ -990,25 +990,11 @@ struct LiveTranslateView: View {
               }
               HStack(spacing: 3) {
 
-                // SCAN — the menu he's holding up. Sits with the other controls
-                // because it belongs to the conversation, not to a separate mode.
-                toggleSegment(viewModel.isScanning ? "READING" : "SCAN",
-                              icon: "doc.text.viewfinder",
-                              on: viewModel.isScanning) {
-                    // The camera is normally OFF during a conversation — running
-                    // it continuously to watch for text would flatten both
-                    // batteries for a feature used a few times a day. So spin it
-                    // up for the scan, give it a beat to produce a frame, then
-                    // let it go again.
-                    if streamViewModel.currentVideoFrame == nil {
-                        startVideoStream()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                            viewModel.scanDocument()
-                        }
-                    } else {
-                        viewModel.scanDocument()
-                    }
-                }
+                // BUILD 158 — SCAN REMOVED. It never worked reliably inside a
+                // live conversation (the camera is off, the mic is busy, and
+                // the scan fought both), and the Reader on the Home screen
+                // does the same job properly with on-device OCR. One good
+                // door beats two, one of which sticks.
 
                 // SAY — pronunciation line under non-Latin script.
                 toggleSegment("SAY",

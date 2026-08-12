@@ -9,6 +9,8 @@ import MWDATCore
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    // BUILD 157 — the advanced-tools switch, read by the Home grid.
+    @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
     @ObservedObject var streamViewModel: StreamSessionViewModel
     @ObservedObject var languageManager = LanguageManager.shared
     @ObservedObject var providerManager = APIProviderManager.shared
@@ -669,6 +671,30 @@ struct SettingsView: View {
                     }
                 } footer: {
                     Text("Free developer account at developers.amadeus.com — create an app, copy the API Key and API Secret here. Watched routes are checked up to 3 times a day.")
+                        .font(AppTypography.caption)
+                }
+
+
+                // BUILD 157 — ADVANCED TOOLS. RTMP, Screen Stream and LeanEat
+                // are leftovers from the project this app grew out of. They
+                // still work; they just don't earn a place on the Home screen
+                // unless you say so.
+                Section {
+                    Toggle(isOn: $showAdvancedTools) {
+                        HStack {
+                            Image(systemName: "wrench.adjustable.fill")
+                                .foregroundColor(.gray)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Show advanced tools")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text("RTMP Streaming, Screen Stream, LeanEat")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Off by default — these are experimental leftovers, not part of Chappy. Turning this on puts them back on the Home screen.")
                         .font(AppTypography.caption)
                 }
 

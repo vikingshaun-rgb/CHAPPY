@@ -294,6 +294,13 @@ struct TurboMetaHomeView: View {
     @State private var pulseOn = false          // BUILD 149: listening rings
     @State private var showCommands = false     // BUILD 149: what can I say
     @State private var showFlights = false      // BUILD 150: the flight deck
+    @State private var showAtlas = false        // BUILD 156: the travel atlas
+    @State private var atlasTarget: String?
+    @State private var atlasLayer: ChappyAtlas.Layer?
+    @State private var showDictate = false      // BUILD 157: voice -> clean text
+    @State private var showPlaces = false       // BUILD 158: saved places
+    @State private var dictateAutoStart = false
+    @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
     @State private var showEmergencyContact = false
     @State private var emergencyContactText = UserDefaults.standard.string(forKey: "chappy_emergency_contact") ?? ""
     let apiKey: String
@@ -439,6 +446,24 @@ struct TurboMetaHomeView: View {
                 if next.isEmpty {
                     Text("Nothing left on today.")
                         .font(.subheadline).foregroundColor(theme.textSecondary)
+                    // BUILD 155 — today's done? Show what's coming, the way
+                    // Google's at-a-glance and Apple's calendar widget do.
+                    let ahead = ChappyCalendar.shared.upcoming(days: 3)
+                        .filter { !$0.isAllDay && !($0.startDate.map { Calendar.current.isDateInToday($0) } ?? false) }
+                        .prefix(2)
+                    ForEach(Array(ahead.enumerated()), id: \.offset) { _, e in
+                        if let s = e.startDate {
+                            HStack(spacing: 8) {
+                                Image(systemName: "calendar")
+                                    .font(.system(size: 11)).foregroundColor(.purple)
+                                    .frame(width: 16)
+                                Text("\(e.title ?? "Appointment") · \(Self.aheadStamp(s))")
+                                    .font(.subheadline).foregroundColor(theme.textSecondary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    }
                 } else {
                     ForEach(Array(next.enumerated()), id: \.offset) { _, row in
                         HStack(spacing: 8) {
@@ -459,6 +484,23 @@ struct TurboMetaHomeView: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 16)
+    }
+
+    /// BUILD 155 — "Tomorrow 9:00 AM" / "Thursday 2:30 PM" for the look-ahead.
+    private static func aheadStamp(_ d: Date) -> String {
+        let t = DateFormatter(); t.dateFormat = "h:mm a"
+        if Calendar.current.isDateInTomorrow(d) { return "Tomorrow \(t.string(from: d))" }
+        let day = DateFormatter(); day.dateFormat = "EEEE"
+        return "\(day.string(from: d)) \(t.string(from: d))"
+    }
+
+    /// BUILD 158 — how many places, and how many still need a name.
+    private var placesDetailLine: String {
+        let all = TripRecorder.shared.spots
+        guard !all.isEmpty else { return "Everywhere you've pinned — tap Remember to add" }
+        let unnamed = all.filter { $0.name.lowercased().hasPrefix("spot at") }.count
+        if unnamed > 0 { return "\(all.count) saved · \(unnamed) need a name" }
+        return "\(all.count) saved · notes, arrival alerts, pings"
     }
 
     private var memoryDetailLine: String {
@@ -507,8 +549,13 @@ struct TurboMetaHomeView: View {
     }
 
     private func armStandbyIfClear(reason: String) {
+        // BUILD 160: showDictate was missing — and Dictate is the one new
+        // screen that OWNS the microphone. Arming into it meant two
+        // recognisers fighting over one mic, which is a very effective way
+        // to make both of them deaf.
         guard !showLiveAI, !showLiveTranslate, !showQuickVision,
-              !showLiveStream, !showRTMPStreaming, !showOpenClaw, !showLeanEat
+              !showLiveStream, !showRTMPStreaming, !showOpenClaw, !showLeanEat,
+              !showDictate
         else {
             print("👂 [Standby] Auto-arm skipped (\(reason)) — a module is on screen")
             return
@@ -706,6 +753,27 @@ struct TurboMetaHomeView: View {
                                 ChappyStandby.shared.snapSilently()
                                 journalTick += 1
                             }
+                            // BUILD 155 — HOLD Snap for the burst: ~20 frames
+                            // sampled, sharpest kept. Apple/Top-Shot style.
+                            .simultaneousGesture(
+                                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                                    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                                    ChappyBurst.shared.fire()
+                                    journalTick += 1
+                                })
+                            // BUILD 155 — VIDEO finally gets a button: same
+                            // engine as "record a clip", 20s summarised to
+                            // text and filed as a video memory.
+                            QuickActionButton(icon: "video.fill", label: "Video") {
+                                TTSService.shared.speak("Rolling - about twenty seconds.")
+                                ChappyClip.shared.record()
+                                journalTick += 1
+                            }
+                            // BUILD 157 — DICTATE: talk, get clean text.
+                            QuickActionButton(icon: "mic.fill", label: "Dictate") {
+                                dictateAutoStart = true
+                                showDictate = true
+                            }
                             QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
                                 // Remember always DID save — but it named the pin
                                 // "spot at 4:53PM near Cresthaven Court", which is
@@ -772,51 +840,82 @@ struct TurboMetaHomeView: View {
                         // buttons now: look at the thing, tap the verb.
                         readerCard.chappyScrollFX()
 
-                        // MORE
-                        VStack(spacing: 8) {
-                            // PHASE 5 — the one spot. Sits first because it is
-                            // the thing you come back to, not a setting.
-                            MoreRow(icon: "book.closed.fill",
-                                    title: "Diary",
-                                    detail: remindersDetailLine) {
+                        // BUILD 157 — THE TILE GRID. Nine identical grey rows
+                        // became a two-column grid of colour-coded tiles, each
+                        // with its own hue, glowing icon chip and gradient
+                        // edge. Apple's Control Center and Samsung's One UI
+                        // both proved the same thing: the eye finds a colour
+                        // faster than it reads a word, and a grid halves the
+                        // scroll. RTMP / Screen Stream / LeanEat moved behind
+                        // the "advanced tools" switch in Settings — they were
+                        // leftovers from the app this was built on.
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
+                                            GridItem(.flexible(), spacing: 11)],
+                                  spacing: 11) {
+                            ChappyTile(icon: "book.closed.fill", title: "Diary",
+                                       detail: remindersDetailLine,
+                                       tint: Color(red: 0.68, green: 0.5, blue: 1.0)) {
                                 showReminders = true
                             }
-                            // BUILD 149 — the feature index. Eighty phrasings
-                            // existed and nothing showed them. Now they're a
-                            // searchable screen; tap a row and Chappy says it.
-                            MoreRow(icon: "questionmark.bubble.fill",
-                                    title: "What can I say?",
-                                    detail: "Every voice command, searchable") {
-                                showCommands = true
+                            ChappyTile(icon: "mic.fill", title: "Dictate",
+                                       detail: "Talk it out — get clean, professional text",
+                                       tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
+                                dictateAutoStart = false
+                                showDictate = true
                             }
-                            MoreRow(icon: "airplane",
-                                    title: "Flights",
-                                    detail: ChappyFlights.shared.watches.isEmpty
-                                        ? "Watch routes, track your flight"
-                                        : "\(ChappyFlights.shared.watches.count) route\(ChappyFlights.shared.watches.count == 1 ? "" : "s") watched") {
-                                showFlights = true
+                            ChappyTile(icon: "globe.asia.australia.fill", title: "Atlas",
+                                       detail: ChappyAtlas.shared.summary.isEmpty
+                                            ? "Everywhere you've been, mapped"
+                                            : ChappyAtlas.shared.summary,
+                                       tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
+                                atlasTarget = nil; atlasLayer = nil
+                                showAtlas = true
                             }
-                            MoreRow(icon: "brain",
-                                    title: "Memory",
-                                    detail: memoryDetailLine) {
+                            ChappyTile(icon: "brain", title: "Memory",
+                                       detail: memoryDetailLine,
+                                       tint: Color(red: 0.55, green: 0.45, blue: 1.0)) {
                                 showMemory = true
                             }
-                            MoreRow(icon: "link.circle.fill", title: "OpenClaw",
-                                    detail: openClawService.connectionState == .connected ? "Connected" : "Home computer bridge") {
+                            ChappyTile(icon: "mappin.and.ellipse", title: "Places",
+                                       detail: placesDetailLine,
+                                       tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
+                                showPlaces = true
+                            }
+                            ChappyTile(icon: "airplane", title: "Flights",
+                                       detail: ChappyFlights.shared.watches.isEmpty
+                                            ? "Watch routes, track your flight"
+                                            : "\(ChappyFlights.shared.watches.count) route\(ChappyFlights.shared.watches.count == 1 ? "" : "s") watched",
+                                       tint: Color(red: 0.30, green: 0.75, blue: 1.0)) {
+                                showFlights = true
+                            }
+                            ChappyTile(icon: "questionmark.bubble.fill", title: "What can I say?",
+                                       detail: "Every voice command, searchable",
+                                       tint: Color(red: 0.25, green: 0.85, blue: 0.72)) {
+                                showCommands = true
+                            }
+                            ChappyTile(icon: "link.circle.fill", title: "OpenClaw",
+                                       detail: openClawService.connectionState == .connected
+                                            ? "Connected" : "Home computer bridge",
+                                       tint: Color(red: 0.55, green: 0.62, blue: 0.72)) {
                                 showOpenClaw = true
                             }
-                            MoreRow(icon: "antenna.radiowaves.left.and.right", title: "RTMP Streaming", detail: "Experimental") {
-                                showRTMPStreaming = true
-                            }
-                            MoreRow(icon: "video.fill", title: "Screen Stream", detail: "Record and stream") {
-                                showLiveStream = true
-                            }
-                            MoreRow(icon: "chart.bar.fill", title: "LeanEat", detail: "Food analysis") {
-                                showLeanEat = true
-                            }
-                            MoreRow(icon: "cross.circle.fill", title: "Emergency Contact",
-                                    detail: emergencyContactText.isEmpty ? "Set the WhatsApp number for emergencies" : "Saved — tap to change") {
+                            ChappyTile(icon: "cross.circle.fill", title: "Emergency",
+                                       detail: emergencyContactText.isEmpty
+                                            ? "Set the WhatsApp number" : "Saved — tap to change",
+                                       tint: Color(red: 1.0, green: 0.35, blue: 0.38)) {
                                 showEmergencyContact = true
+                            }
+                            // The old experimental tools, only when asked for.
+                            if showAdvancedTools {
+                                ChappyTile(icon: "antenna.radiowaves.left.and.right",
+                                           title: "RTMP", detail: "Experimental streaming",
+                                           tint: .gray) { showRTMPStreaming = true }
+                                ChappyTile(icon: "video.fill", title: "Screen Stream",
+                                           detail: "Record and stream",
+                                           tint: .gray) { showLiveStream = true }
+                                ChappyTile(icon: "chart.bar.fill", title: "LeanEat",
+                                           detail: "Food analysis",
+                                           tint: .gray) { showLeanEat = true }
                             }
                         }
                         .padding(.bottom, 30)
@@ -854,6 +953,59 @@ struct TurboMetaHomeView: View {
             }
             .sheet(isPresented: $showCommands) {
                 WhatCanISayView(theme: theme)
+            }
+            .fullScreenCover(isPresented: $showAtlas) {
+                AtlasView(initialTarget: atlasTarget, initialLayer: atlasLayer)
+            }
+            .fullScreenCover(isPresented: $showDictate) {
+                DictateView(autoStart: dictateAutoStart)
+            }
+            .fullScreenCover(isPresented: $showPlaces) {
+                PlacesView()
+            }
+            // BUILD 160 — RE-ARM ON THE WAY OUT. Standby only ever armed on
+            // launch and on foreground, so closing a screen that had taken
+            // the microphone left the ear shut until you backgrounded the
+            // app and came back. Every mic-owning cover now hands it back.
+            .onChange(of: showDictate) { _, open in
+                if !open {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                        armStandbyIfClear(reason: "dictate closed")
+                    }
+                }
+            }
+            .onChange(of: showQuickVision) { _, open in
+                if !open {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                        armStandbyIfClear(reason: "quick vision closed")
+                    }
+                }
+            }
+            .onChange(of: showLiveAI) { _, open in
+                if !open {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
+                        armStandbyIfClear(reason: "live ai closed")
+                    }
+                }
+            }
+            .onChange(of: showLiveTranslate) { _, open in
+                if !open {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
+                        armStandbyIfClear(reason: "translate closed")
+                    }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenPlaces)) { _ in
+                showPlaces = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlas)) { note in
+                atlasTarget = note.userInfo?["target"] as? String
+                atlasLayer = (note.userInfo?["layer"] as? String).flatMap { ChappyAtlas.Layer(rawValue: $0) }
+                showAtlas = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictate)) { _ in
+                dictateAutoStart = true
+                showDictate = true
             }
             .sheet(isPresented: $showFlights) {
                 FlightsView(theme: theme)
@@ -3493,8 +3645,38 @@ struct FlightsView: View {
                             Text("WATCH A ROUTE")
                                 .font(.caption2).fontWeight(.heavy).tracking(0.6)
                                 .foregroundColor(.cyan)
-                            TextField("Where to? e.g. Denpasar", text: $destField)
+                            TextField("Where to? Name or code - Bali, BNE, Denpasar...", text: $destField)
                                 .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
+                            // BUILD 155 — AIRPORT AUTOCOMPLETE. Type 2 letters
+                            // and the offline table answers instantly: "bali"
+                            // -> Denpasar DPS, "bne" -> Brisbane. Tap to fill.
+                            let hits = ChappyAirports.search(destField)
+                            if !hits.isEmpty, destField.count >= 2 {
+                                ForEach(hits.prefix(4), id: \.code) { a in
+                                    Button {
+                                        destField = a.code
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        HStack {
+                                            Image(systemName: "airplane")
+                                                .font(.caption).foregroundColor(.cyan)
+                                            Text(a.city).font(.subheadline)
+                                                .foregroundColor(theme.textPrimary)
+                                            Text(a.name).font(.caption2)
+                                                .foregroundColor(theme.textSecondary)
+                                                .lineLimit(1)
+                                            Spacer()
+                                            Text(a.code).font(.caption).fontWeight(.heavy)
+                                                .foregroundColor(.cyan)
+                                        }
+                                        .padding(.vertical, 7).padding(.horizontal, 10)
+                                        .background(RoundedRectangle(cornerRadius: 9)
+                                            .fill(Color.cyan.opacity(0.08)))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
                             TextField("Month, e.g. September (optional)", text: $monthField)
                                 .textFieldStyle(.roundedBorder)
                             Button {
@@ -3693,8 +3875,11 @@ struct WhatCanISayView: View {
           "Get fuel on the way", "Open maps", "Close maps", "Stop navigation", "Take me home",
           "Where am I", "Remember this spot, call it the blue warung"]),
         ("Camera & Reader", "camera.fill",
-         ["Take a photo", "Record a clip", "What did I just see", "Read this", "Read the menu",
-          "Translate this", "Scan this", "Keep reading", "Read my last scan"]),
+         ["Take a photo", "Action shot", "Record a clip", "What did I just see", "Read this",
+          "Read the menu", "Translate this", "Scan this", "Keep reading", "Read my last scan",
+          // BUILD 159 — press the glasses button first, then say these.
+          "Read that properly", "Read the fine print", "Read my photo",
+          "Scan my photo"]),
         ("Mail & texts", "envelope.fill",
          ["Check my email", "Any texts?", "Read the first one", "Reply saying on my way"]),
         ("Diary & reminders", "book.closed.fill",
@@ -3711,6 +3896,16 @@ struct WhatCanISayView: View {
          ["Watch flights to Bali in September", "Any flight deals?",
           "Track flight QF52 on Thursday", "How's my flight",
           "Take me to the airport"]),
+        ("Atlas & travel map", "globe.asia.australia.fill",
+         ["Open the atlas", "Where have I been", "Zoom to Ubud",
+          "Show me temples", "Show me waterfalls", "What's around me",
+          "Show me lookouts", "Fly to Bali"]),
+        ("Places", "mappin.and.ellipse",
+         ["Remember this spot, call it the blue warung", "My places",
+          "Show my places", "What do you remember about the warung"]),
+        ("Dictate & write", "mic.fill",
+         ["Take a report", "Dictate a note", "Write this up",
+          "Dictate an email", "Take a job report"]),
         ("Rides & food", "car.fill",
          ["Get me a Grab to the airport", "How much is an Uber to Coles",
           "Ride home", "Order food", "Order from Mama's Warung",
@@ -3992,6 +4187,17 @@ struct RemindersView: View {
             case .done:     return "Done"
             }
         }
+        // BUILD 155 — chip icons.
+        var icon: String {
+            switch self {
+            case .schedule: return "calendar"
+            case .byType:   return "square.grid.2x2"
+            case .timeline: return "clock"
+            case .pings:    return "bell"
+            case .lists:    return "checklist"
+            case .done:     return "checkmark.circle"
+            }
+        }
     }
 
     /// BUILD 134 — one row of the Pings tab: a moment Chappy will make noise.
@@ -4086,26 +4292,35 @@ struct RemindersView: View {
     }
 
     // BUILD 127: Schedule / By type / Done.
+    // BUILD 155: six words crammed in one row was a desktop habit — thumbs
+    // need 44 points. Now a 2x3 grid of real chips with icons, the pattern
+    // Google Calendar and Fantastical both settled on for phones.
     private var modePicker: some View {
-        HStack(spacing: 3) {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8)], spacing: 8) {
             ForEach(Mode.allCases, id: \.rawValue) { m in
                 Button {
                     withAnimation(.easeInOut(duration: 0.16)) { mode = m }
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 } label: {
-                    Text(m.label)
-                        .font(.caption).fontWeight(.semibold)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 8)
-                            .fill(mode == m ? theme.accent.opacity(0.18) : Color.clear))
-                        .foregroundColor(mode == m ? theme.accent : theme.textSecondary)
+                    HStack(spacing: 5) {
+                        Image(systemName: m.icon)
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(m.label)
+                            .font(.footnote).fontWeight(.semibold)
+                            .lineLimit(1).minimumScaleFactor(0.8)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .background(RoundedRectangle(cornerRadius: 12)
+                        .fill(mode == m ? theme.accent.opacity(0.22) : Color.white.opacity(0.045)))
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                        .stroke(mode == m ? theme.accent.opacity(0.55) : Color.clear, lineWidth: 1))
+                    .foregroundColor(mode == m ? theme.accent : theme.textSecondary)
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(3)
-        .background(RoundedRectangle(cornerRadius: 11).fill(.ultraThinMaterial))
         .padding(.horizontal, 16)
     }
 
@@ -5391,6 +5606,1325 @@ struct ReminderEditor: View {
                                        escalate: escalate,
                                        source: "typed")
         }
+        dismiss()
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY AIRPORTS (Build 155) — the offline autocomplete table
+// =====================================================================
+//
+//   ~90 airports that cover how Shaun actually flies: all of Australia,
+//   all of South-East Asia, and the majors beyond. Matching is dumb and
+//   instant — code, city, name, or a nickname ("bali") — no network,
+//   no key. Amadeus still does the authoritative lookup at watch time.
+
+enum ChappyAirports {
+
+    struct Airport { let code: String; let city: String; let name: String; let alts: [String] }
+
+    static func search(_ q: String) -> [Airport] {
+        let t = q.trimmingCharacters(in: .whitespaces).lowercased()
+        guard t.count >= 2 else { return [] }
+        return table.filter { a in
+            a.code.lowercased().hasPrefix(t)
+                || a.city.lowercased().contains(t)
+                || a.name.lowercased().contains(t)
+                || a.alts.contains(where: { $0.contains(t) })
+        }
+    }
+
+    static let table: [Airport] = [
+        .init(code: "BNE", city: "Brisbane", name: "Brisbane Airport", alts: []),
+        .init(code: "SYD", city: "Sydney", name: "Kingsford Smith", alts: []),
+        .init(code: "MEL", city: "Melbourne", name: "Tullamarine", alts: []),
+        .init(code: "OOL", city: "Gold Coast", name: "Coolangatta", alts: ["gold coast"]),
+        .init(code: "CNS", city: "Cairns", name: "Cairns Airport", alts: []),
+        .init(code: "TSV", city: "Townsville", name: "Townsville Airport", alts: []),
+        .init(code: "MKY", city: "Mackay", name: "Mackay Airport", alts: []),
+        .init(code: "ROK", city: "Rockhampton", name: "Rockhampton Airport", alts: []),
+        .init(code: "PER", city: "Perth", name: "Perth Airport", alts: []),
+        .init(code: "ADL", city: "Adelaide", name: "Adelaide Airport", alts: []),
+        .init(code: "CBR", city: "Canberra", name: "Canberra Airport", alts: []),
+        .init(code: "HBA", city: "Hobart", name: "Hobart Airport", alts: []),
+        .init(code: "DRW", city: "Darwin", name: "Darwin Airport", alts: []),
+        .init(code: "LST", city: "Launceston", name: "Launceston Airport", alts: []),
+        .init(code: "NTL", city: "Newcastle", name: "Williamtown", alts: []),
+        .init(code: "SUN", city: "Sunshine Coast", name: "Maroochydore", alts: ["maroochydore", "sunshine coast"]),
+        .init(code: "DPS", city: "Denpasar (Bali)", name: "Ngurah Rai", alts: ["bali", "kuta", "seminyak", "ubud"]),
+        .init(code: "CGK", city: "Jakarta", name: "Soekarno-Hatta", alts: []),
+        .init(code: "SUB", city: "Surabaya", name: "Juanda", alts: []),
+        .init(code: "LOP", city: "Lombok", name: "Lombok Intl", alts: ["lombok"]),
+        .init(code: "JOG", city: "Yogyakarta", name: "YIA", alts: []),
+        .init(code: "SIN", city: "Singapore", name: "Changi", alts: []),
+        .init(code: "KUL", city: "Kuala Lumpur", name: "KLIA", alts: []),
+        .init(code: "BKK", city: "Bangkok", name: "Suvarnabhumi", alts: []),
+        .init(code: "DMK", city: "Bangkok", name: "Don Mueang", alts: []),
+        .init(code: "HKT", city: "Phuket", name: "Phuket Intl", alts: []),
+        .init(code: "CNX", city: "Chiang Mai", name: "Chiang Mai Intl", alts: []),
+        .init(code: "USM", city: "Koh Samui", name: "Samui", alts: ["samui"]),
+        .init(code: "SGN", city: "Ho Chi Minh City", name: "Tan Son Nhat", alts: ["saigon"]),
+        .init(code: "HAN", city: "Hanoi", name: "Noi Bai", alts: []),
+        .init(code: "DAD", city: "Da Nang", name: "Da Nang Intl", alts: []),
+        .init(code: "MNL", city: "Manila", name: "Ninoy Aquino", alts: []),
+        .init(code: "CEB", city: "Cebu", name: "Mactan-Cebu", alts: []),
+        .init(code: "PNH", city: "Phnom Penh", name: "Phnom Penh Intl", alts: []),
+        .init(code: "REP", city: "Siem Reap", name: "Siem Reap-Angkor", alts: ["angkor"]),
+        .init(code: "VTE", city: "Vientiane", name: "Wattay", alts: []),
+        .init(code: "RGN", city: "Yangon", name: "Yangon Intl", alts: []),
+        .init(code: "BWN", city: "Brunei", name: "Brunei Intl", alts: []),
+        .init(code: "HKG", city: "Hong Kong", name: "Chek Lap Kok", alts: []),
+        .init(code: "TPE", city: "Taipei", name: "Taoyuan", alts: []),
+        .init(code: "NRT", city: "Tokyo", name: "Narita", alts: []),
+        .init(code: "HND", city: "Tokyo", name: "Haneda", alts: []),
+        .init(code: "KIX", city: "Osaka", name: "Kansai", alts: []),
+        .init(code: "ICN", city: "Seoul", name: "Incheon", alts: []),
+        .init(code: "PVG", city: "Shanghai", name: "Pudong", alts: []),
+        .init(code: "PEK", city: "Beijing", name: "Capital", alts: []),
+        .init(code: "CAN", city: "Guangzhou", name: "Baiyun", alts: []),
+        .init(code: "DEL", city: "Delhi", name: "Indira Gandhi", alts: []),
+        .init(code: "BOM", city: "Mumbai", name: "Chhatrapati Shivaji", alts: []),
+        .init(code: "CMB", city: "Colombo", name: "Bandaranaike", alts: []),
+        .init(code: "MLE", city: "Maldives", name: "Velana", alts: ["male", "maldives"]),
+        .init(code: "DXB", city: "Dubai", name: "Dubai Intl", alts: []),
+        .init(code: "AUH", city: "Abu Dhabi", name: "Zayed Intl", alts: []),
+        .init(code: "DOH", city: "Doha", name: "Hamad", alts: []),
+        .init(code: "AKL", city: "Auckland", name: "Auckland Airport", alts: []),
+        .init(code: "WLG", city: "Wellington", name: "Wellington Airport", alts: []),
+        .init(code: "CHC", city: "Christchurch", name: "Christchurch Airport", alts: []),
+        .init(code: "ZQN", city: "Queenstown", name: "Queenstown Airport", alts: []),
+        .init(code: "NAN", city: "Fiji (Nadi)", name: "Nadi Intl", alts: ["fiji"]),
+        .init(code: "POM", city: "Port Moresby", name: "Jacksons", alts: []),
+        .init(code: "NOU", city: "Noumea", name: "La Tontouta", alts: []),
+        .init(code: "PPT", city: "Tahiti", name: "Faa'a", alts: ["tahiti"]),
+        .init(code: "HNL", city: "Honolulu", name: "Daniel K. Inouye", alts: ["hawaii"]),
+        .init(code: "LAX", city: "Los Angeles", name: "LAX", alts: []),
+        .init(code: "SFO", city: "San Francisco", name: "SFO", alts: []),
+        .init(code: "JFK", city: "New York", name: "JFK", alts: []),
+        .init(code: "YVR", city: "Vancouver", name: "Vancouver Intl", alts: []),
+        .init(code: "MEX", city: "Mexico City", name: "Benito Juarez", alts: []),
+        .init(code: "GRU", city: "Sao Paulo", name: "Guarulhos", alts: []),
+        .init(code: "EZE", city: "Buenos Aires", name: "Ezeiza", alts: []),
+        .init(code: "LHR", city: "London", name: "Heathrow", alts: []),
+        .init(code: "LGW", city: "London", name: "Gatwick", alts: []),
+        .init(code: "CDG", city: "Paris", name: "Charles de Gaulle", alts: []),
+        .init(code: "AMS", city: "Amsterdam", name: "Schiphol", alts: []),
+        .init(code: "FRA", city: "Frankfurt", name: "Frankfurt Airport", alts: []),
+        .init(code: "MUC", city: "Munich", name: "Munich Airport", alts: []),
+        .init(code: "ZRH", city: "Zurich", name: "Zurich Airport", alts: []),
+        .init(code: "FCO", city: "Rome", name: "Fiumicino", alts: []),
+        .init(code: "MAD", city: "Madrid", name: "Barajas", alts: []),
+        .init(code: "BCN", city: "Barcelona", name: "El Prat", alts: []),
+        .init(code: "ATH", city: "Athens", name: "Eleftherios Venizelos", alts: []),
+        .init(code: "IST", city: "Istanbul", name: "Istanbul Airport", alts: []),
+        .init(code: "JNB", city: "Johannesburg", name: "O.R. Tambo", alts: []),
+        .init(code: "CPT", city: "Cape Town", name: "Cape Town Intl", alts: []),
+        .init(code: "CAI", city: "Cairo", name: "Cairo Intl", alts: []),
+        .init(code: "MRU", city: "Mauritius", name: "SSR Intl", alts: ["mauritius"]),
+    ]
+}
+
+// =====================================================================
+// MARK: - ATLAS VIEW (Build 156)
+// =====================================================================
+//
+//   The map that makes the whole thing feel like a life rather than a
+//   log. Opens at country scale with every journey drawn — cyan for
+//   flights, teal for driving, green on foot — each line laid down
+//   twice so it GLOWS: a wide soft stroke underneath, a bright thin one
+//   on top. Zoom in and Apple's own places light up, live, tappable,
+//   free. Chips toggle waterfalls, temples, lookouts, transport. The
+//   weather where you're looking sits in the corner with a door
+//   through to Zoom Earth's live satellite.
+
+struct AtlasView: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var atlas = ChappyAtlas.shared
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var camera: MapCameraPosition = .automatic
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: -27.47, longitude: 153.02),
+        span: MKCoordinateSpan(latitudeDelta: 12, longitudeDelta: 12))
+    @State private var span: ChappyAtlas.Span = .all
+    @State private var layers: Set<ChappyAtlas.Layer> = []
+    @State private var places: [ChappyAtlas.Place] = []
+    @State private var searching = false
+    @State private var selectedStop: ChappyAtlas.Stop?
+    @State private var selectedPlace: ChappyAtlas.Place?
+    @State private var weather: ChappyAtlas.Weather?
+    @State private var satellite = false
+    @State private var pulse = false
+    @State private var showLegend = false
+
+    var initialTarget: String?
+    var initialLayer: ChappyAtlas.Layer?
+
+    var body: some View {
+        NavigationView {
+            ZStack(alignment: .top) {
+                map.ignoresSafeArea(edges: .bottom)
+                topFurniture
+                VStack {
+                    Spacer()
+                    if let s = selectedStop { stopCard(s) }
+                    else if let p = selectedPlace { placeCard(p) }
+                    else { bottomBar }
+                }
+            }
+            .navigationTitle("Atlas")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        satellite.toggle()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Image(systemName: satellite ? "globe.americas.fill" : "map")
+                            .foregroundColor(theme.accent)
+                    }
+                }
+            }
+            .task {
+                atlas.build(span: span)
+                pulse = true
+                if let t = initialTarget { await flyTo(t) }
+                if let l = initialLayer {
+                    layers.insert(l)
+                    await refreshPlaces()
+                }
+                await refreshWeather()
+            }
+        }
+    }
+
+    private var map: some View {
+        Map(position: $camera) {
+            ForEach(atlas.legs) { leg in
+                MapPolyline(coordinates: leg.coords)
+                    .stroke(leg.mode.tint.opacity(0.22), style: StrokeStyle(
+                        lineWidth: 11, lineCap: .round, lineJoin: .round))
+                MapPolyline(coordinates: leg.coords)
+                    .stroke(leg.mode.tint.opacity(0.95), style: StrokeStyle(
+                        lineWidth: 3, lineCap: .round, lineJoin: .round,
+                        dash: leg.mode == .flight ? [9, 7] : []))
+            }
+            ForEach(atlas.stops) { stop in
+                Annotation(stop.name, coordinate: stop.coord, anchor: .center) {
+                    Button {
+                        withAnimation(.spring(response: 0.35)) {
+                            selectedPlace = nil
+                            selectedStop = stop
+                        }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: { stopGlyph(stop) }
+                    .buttonStyle(.plain)
+                }
+                .annotationTitles(.hidden)
+            }
+            ForEach(places) { p in
+                Annotation(p.name, coordinate: p.coord, anchor: .bottom) {
+                    Button {
+                        withAnimation(.spring(response: 0.35)) {
+                            selectedStop = nil
+                            selectedPlace = p
+                        }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        VStack(spacing: 1) {
+                            Image(systemName: p.layer.icon)
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(6)
+                                .background(Circle().fill(p.layer.tint))
+                                .shadow(color: p.layer.tint.opacity(0.8), radius: 6)
+                            Text(p.name)
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(Capsule().fill(.black.opacity(0.55)))
+                                .lineLimit(1).frame(maxWidth: 96)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .annotationTitles(.hidden)
+            }
+            UserAnnotation()
+        }
+        .mapStyle(satellite
+                  ? .hybrid(elevation: .realistic, pointsOfInterest: .all)
+                  : .standard(elevation: .realistic, pointsOfInterest: .all))
+        .mapControls {
+            MapUserLocationButton()
+            MapCompass()
+            MapScaleView()
+        }
+        .onMapCameraChange(frequency: .onEnd) { ctx in
+            region = ctx.region
+            Task {
+                await refreshWeather()
+                if !layers.isEmpty { await refreshPlaces() }
+            }
+        }
+    }
+
+    /// Home gets a house, starred places a star, everywhere else a dot
+    /// that grows with how often you've been — the "you keep coming back
+    /// here" signal Google Timeline never draws.
+    @ViewBuilder
+    private func stopGlyph(_ s: ChappyAtlas.Stop) -> some View {
+        let size: CGFloat = s.isHome ? 30 : (s.starred ? 26 : min(12 + CGFloat(s.visits) * 2, 24))
+        ZStack {
+            Circle()
+                .fill(glowTint(s).opacity(0.28))
+                .frame(width: size * 2.1, height: size * 2.1)
+                .blur(radius: 5)
+                .scaleEffect(pulse && (s.isHome || s.starred) ? 1.12 : 0.95)
+                .animation(.easeInOut(duration: 2.2).repeatForever(autoreverses: true), value: pulse)
+            Circle()
+                .fill(glowTint(s))
+                .frame(width: size, height: size)
+                .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: 1.5))
+                .shadow(color: glowTint(s).opacity(0.9), radius: 6)
+            if s.isHome {
+                Image(systemName: "house.fill").font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+            } else if s.starred {
+                Image(systemName: "star.fill").font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white)
+            } else if s.photos > 0 {
+                Image(systemName: "camera.fill").font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+        }
+    }
+
+    private func glowTint(_ s: ChappyAtlas.Stop) -> Color {
+        if s.isHome { return Color(red: 1.0, green: 0.45, blue: 0.35) }
+        if s.starred { return .yellow }
+        if s.visits >= 4 { return Color(red: 0.55, green: 0.45, blue: 1.0) }
+        return theme.accent
+    }
+
+    private var topFurniture: some View {
+        VStack(spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(ChappyAtlas.Layer.allCases) { l in
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                if layers.contains(l) { layers.remove(l) } else { layers.insert(l) }
+                            }
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            Task { await refreshPlaces() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: l.icon).font(.system(size: 11, weight: .bold))
+                                Text(l.label).font(.caption).fontWeight(.semibold)
+                            }
+                            .padding(.horizontal, 11).padding(.vertical, 7)
+                            .background(Capsule().fill(layers.contains(l)
+                                ? l.tint.opacity(0.9) : Color.black.opacity(0.45)))
+                            .foregroundStyle(layers.contains(l) ? .white : .white.opacity(0.75))
+                            .shadow(color: layers.contains(l) ? l.tint.opacity(0.7) : .clear, radius: 7)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            HStack(spacing: 8) {
+                if let w = weather {
+                    Button {
+                        if let u = ChappyAtlas.zoomEarthURL(region.center, zoom: zoomLevel()) {
+                            UIApplication.shared.open(u)
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: w.icon).font(.caption).foregroundStyle(.cyan)
+                            Text(w.line).font(.caption).fontWeight(.semibold)
+                                .foregroundStyle(.white)
+                            Image(systemName: "arrow.up.forward.app")
+                                .font(.system(size: 9)).foregroundStyle(.white.opacity(0.6))
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(.ultraThinMaterial))
+                    }
+                    .buttonStyle(.plain)
+                }
+                if searching { ProgressView().scaleEffect(0.7).tint(.white) }
+                Spacer()
+                Button { withAnimation { showLegend.toggle() } } label: {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.white.opacity(0.75))
+                        .padding(7)
+                        .background(Circle().fill(.ultraThinMaterial))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            if showLegend { legend }
+        }
+        .padding(.top, 6)
+    }
+
+    private var legend: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach([ChappyAtlas.Mode.flight, .drive, .walk], id: \.rawValue) { m in
+                HStack(spacing: 7) {
+                    Capsule().fill(m.tint).frame(width: 20, height: 3)
+                        .shadow(color: m.tint, radius: 4)
+                    Image(systemName: m.icon).font(.system(size: 10)).foregroundStyle(m.tint)
+                    Text(m.label).font(.caption2).foregroundStyle(.white.opacity(0.85))
+                }
+            }
+            Divider().background(.white.opacity(0.2))
+            Text("House = home · Star = starred · bigger dot = more visits")
+                .font(.system(size: 10)).foregroundStyle(.white.opacity(0.7))
+            Text("Say: \u{201C}zoom to Ubud\u{201D} · \u{201C}show me temples\u{201D} · \u{201C}where have I been\u{201D}")
+                .font(.system(size: 10)).foregroundStyle(.cyan.opacity(0.9))
+        }
+        .padding(11)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
+        .padding(.horizontal, 12)
+    }
+
+    private var bottomBar: some View {
+        VStack(spacing: 7) {
+            if !atlas.summary.isEmpty {
+                Text(atlas.summary)
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(.ultraThinMaterial))
+            }
+            HStack(spacing: 6) {
+                ForEach(ChappyAtlas.Span.allCases, id: \.rawValue) { s in
+                    Button {
+                        span = s
+                        atlas.build(span: s)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Text(s.rawValue)
+                            .font(.caption2).fontWeight(.bold)
+                            .padding(.horizontal, 11).padding(.vertical, 7)
+                            .background(Capsule().fill(span == s
+                                ? theme.accent.opacity(0.9) : Color.black.opacity(0.45)))
+                            .foregroundStyle(span == s ? .white : .white.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.6)) {
+                        camera = .region(atlas.homeRegion())
+                    }
+                } label: {
+                    Image(systemName: "globe.asia.australia.fill")
+                        .font(.caption)
+                        .padding(8)
+                        .background(Circle().fill(.ultraThinMaterial))
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.bottom, 14)
+    }
+
+    private func stopCard(_ s: ChappyAtlas.Stop) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: s.isHome ? "house.fill" : (s.starred ? "star.fill" : "mappin.circle.fill"))
+                    .foregroundStyle(glowTint(s))
+                Text(s.name).font(.headline).foregroundStyle(.white)
+                Spacer()
+                Button { withAnimation { selectedStop = nil } } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            HStack(spacing: 14) {
+                Label("\(s.visits) visit\(s.visits == 1 ? "" : "s")", systemImage: "clock.arrow.circlepath")
+                if s.photos > 0 { Label("\(s.photos)", systemImage: "camera.fill") }
+                Text(Self.stamp(s.lastAt))
+            }
+            .font(.caption).foregroundStyle(.white.opacity(0.75))
+            HStack(spacing: 9) {
+                Button {
+                    Task { _ = await NavEngine.shared.navigate(to: s.name, driving: true) }
+                } label: { pill("Take me", "location.fill", .cyan) }
+                .buttonStyle(.plain)
+                Button {
+                    _ = TripRecorder.shared.saveSpot(named: s.name, lat: s.coord.latitude,
+                                                     lon: s.coord.longitude)
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                } label: { pill("Star it", "star.fill", .yellow) }
+                .buttonStyle(.plain)
+                Button {
+                    if let a = ChappyMemory.shared.spokenRecall(s.name) {
+                        TTSService.shared.speak(a)
+                    } else {
+                        TTSService.shared.speak("Nothing else stored about \(s.name) yet.")
+                    }
+                } label: { pill("Recall", "brain.head.profile", .purple) }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 17).stroke(glowTint(s).opacity(0.5), lineWidth: 1))
+        .shadow(color: glowTint(s).opacity(0.4), radius: 12)
+        .padding(.horizontal, 12).padding(.bottom, 14)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func placeCard(_ p: ChappyAtlas.Place) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: p.layer.icon).foregroundStyle(p.layer.tint)
+                Text(p.name).font(.headline).foregroundStyle(.white).lineLimit(2)
+                Spacer()
+                Button { withAnimation { selectedPlace = nil } } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            Text(p.category.isEmpty ? p.layer.label : p.category)
+                .font(.caption).foregroundStyle(.white.opacity(0.7))
+            HStack(spacing: 9) {
+                Button {
+                    Task { _ = await NavEngine.shared.navigate(to: p.name, driving: true) }
+                } label: { pill("Take me", "location.fill", .cyan) }
+                .buttonStyle(.plain)
+                Button {
+                    _ = ChappyMemory.shared.rememberAt(.place, title: p.name,
+                        lat: p.coord.latitude, lon: p.coord.longitude,
+                        tags: ["atlas", p.layer.rawValue], source: "atlas")
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    TTSService.shared.speak("\(p.name) saved.")
+                } label: { pill("Save", "bookmark.fill", .yellow) }
+                .buttonStyle(.plain)
+                Button {
+                    let q = p.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                    if let u = URL(string: "https://www.google.com/search?q=\(q)") {
+                        UIApplication.shared.open(u)
+                    }
+                } label: { pill("Look up", "magnifyingglass", .green) }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 17).stroke(p.layer.tint.opacity(0.5), lineWidth: 1))
+        .shadow(color: p.layer.tint.opacity(0.4), radius: 12)
+        .padding(.horizontal, 12).padding(.bottom, 14)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func pill(_ text: String, _ icon: String, _ tint: Color) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 10, weight: .bold))
+            Text(text).font(.caption).fontWeight(.semibold)
+        }
+        .padding(.horizontal, 11).padding(.vertical, 7)
+        .background(Capsule().fill(tint.opacity(0.22)))
+        .foregroundStyle(tint)
+    }
+
+    private func refreshPlaces() async {
+        guard !layers.isEmpty else { places = []; return }
+        // A whole country's worth of "restaurant" is meaningless — the
+        // live layers only make sense once you've zoomed in a bit.
+        guard region.span.latitudeDelta < 2.2 else { places = []; return }
+        searching = true
+        places = await atlas.findPlaces(in: region, layers: layers)
+        searching = false
+    }
+
+    private func refreshWeather() async {
+        weather = await atlas.weather(at: region.center)
+    }
+
+    private func flyTo(_ query: String) async {
+        if let spot = TripRecorder.shared.spots.last(where: {
+            $0.name.lowercased().contains(query.lowercased()) }) {
+            withAnimation(.easeInOut(duration: 0.8)) {
+                camera = .region(MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon),
+                    span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)))
+            }
+            return
+        }
+        let req = MKLocalSearch.Request()
+        req.naturalLanguageQuery = query
+        req.region = region
+        guard let resp = try? await MKLocalSearch(request: req).start(),
+              let first = resp.mapItems.first else {
+            TTSService.shared.speak("Couldn't find \(query) on the map.")
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.8)) {
+            camera = .region(MKCoordinateRegion(
+                center: first.placemark.coordinate,
+                span: MKCoordinateSpan(latitudeDelta: 0.09, longitudeDelta: 0.09)))
+        }
+    }
+
+    private func zoomLevel() -> Int {
+        let d = region.span.latitudeDelta
+        switch d {
+        case ..<0.05: return 14
+        case ..<0.2:  return 12
+        case ..<1:    return 10
+        case ..<5:    return 8
+        case ..<20:   return 6
+        default:      return 4
+        }
+    }
+
+    private static func stamp(_ d: Date) -> String {
+        if Calendar.current.isDateInToday(d) { return "today" }
+        if Calendar.current.isDateInYesterday(d) { return "yesterday" }
+        let f = DateFormatter(); f.dateFormat = "d MMM yyyy"
+        return f.string(from: d)
+    }
+}
+
+// =====================================================================
+// MARK: - DICTATE VIEW (Build 157)
+// =====================================================================
+//
+//   Speak a mess, walk away with clean text on your clipboard. A big
+//   breathing mic while you talk, your words appearing live, then tone
+//   chips to re-cut it — Professional, Job Report, Email, Brief,
+//   Bullets, Plain — and Copy / Share / Save. The raw transcript stays
+//   visible underneath so nothing the polish trims is ever lost.
+
+struct DictateView: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var dictate = ChappyDictate.shared
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var wave = false
+    @State private var showRaw = false
+    @State private var shareURL: URL?
+    @State private var copied = false
+
+    var autoStart = false
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(spacing: 18) {
+                        micArea
+                        if !dictate.transcript.isEmpty { toneRow }
+                        if dictate.isPolishing { polishingRow }
+                        if !dictate.polished.isEmpty { resultCard }
+                        if !dictate.transcript.isEmpty { rawCard }
+                        if let e = dictate.error { errorRow(e) }
+                        if dictate.transcript.isEmpty && !dictate.isRecording { hintCard }
+                    }
+                    .padding(16)
+                }
+            }
+            .navigationTitle("Dictate")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        if dictate.isRecording { dictate.stop(andPolish: false) }
+                        dismiss()
+                    }
+                    .foregroundColor(theme.accent)
+                }
+            }
+            .onAppear {
+                wave = true
+                if autoStart && !dictate.isRecording { dictate.start() }
+            }
+            .sheet(item: $shareURL) { url in ShareSheet(items: [url]) }
+        }
+    }
+
+    // MARK: mic
+
+    private var micArea: some View {
+        VStack(spacing: 14) {
+            Button {
+                if dictate.isRecording { dictate.stop(andPolish: true) }
+                else { dictate.start() }
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            } label: {
+                ZStack {
+                    // Breathing halo while live.
+                    ForEach(0..<3, id: \.self) { i in
+                        Circle()
+                            .stroke(theme.accent.opacity(dictate.isRecording ? 0.35 : 0.12),
+                                    lineWidth: 2)
+                            .frame(width: 110 + CGFloat(i) * 34, height: 110 + CGFloat(i) * 34)
+                            .scaleEffect(wave && dictate.isRecording ? 1.10 : 0.92)
+                            .opacity(wave && dictate.isRecording ? 0.15 : 0.6)
+                            .animation(.easeInOut(duration: 1.6)
+                                .repeatForever(autoreverses: true)
+                                .delay(Double(i) * 0.25), value: wave)
+                    }
+                    Circle()
+                        .fill(LinearGradient(
+                            colors: dictate.isRecording
+                                ? [.red.opacity(0.95), .orange.opacity(0.85)]
+                                : [theme.accent.opacity(0.95), theme.accent.opacity(0.6)],
+                            startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 108, height: 108)
+                        .shadow(color: (dictate.isRecording ? Color.red : theme.accent).opacity(0.75),
+                                radius: 22)
+                    Image(systemName: dictate.isRecording ? "stop.fill" : "mic.fill")
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Text(dictate.isRecording
+                 ? "Listening — tap to finish"
+                 : (dictate.transcript.isEmpty ? "Tap and talk" : "Tap to record again"))
+                .font(.subheadline).fontWeight(.semibold)
+                .foregroundColor(theme.textSecondary)
+
+            if dictate.isRecording && !dictate.transcript.isEmpty {
+                Text(dictate.transcript)
+                    .font(.body)
+                    .foregroundColor(theme.textPrimary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(13)
+                    .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+                    .transition(.opacity)
+            }
+        }
+        .padding(.top, 10)
+    }
+
+    // MARK: tones
+
+    private var toneRow: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("STYLE")
+                .font(.caption2).fontWeight(.heavy).tracking(0.8)
+                .foregroundColor(theme.accent)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(ChappyDictate.Tone.allCases) { t in
+                        Button {
+                            dictate.tone = t
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            Task { await dictate.polish() }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: t.icon).font(.system(size: 11, weight: .bold))
+                                Text(t.label).font(.caption).fontWeight(.semibold)
+                            }
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(Capsule().fill(dictate.tone == t
+                                ? t.tint.opacity(0.9) : Color.white.opacity(0.07)))
+                            .foregroundStyle(dictate.tone == t ? .white : theme.textSecondary)
+                            .shadow(color: dictate.tone == t ? t.tint.opacity(0.7) : .clear, radius: 8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private var polishingRow: some View {
+        HStack(spacing: 9) {
+            ProgressView().tint(theme.accent)
+            Text("Writing it up…")
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+    }
+
+    // MARK: result
+
+    private var resultCard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Image(systemName: dictate.tone.icon)
+                    .foregroundStyle(dictate.tone.tint)
+                Text(dictate.tone.label.uppercased())
+                    .font(.caption2).fontWeight(.heavy).tracking(0.8)
+                    .foregroundStyle(dictate.tone.tint)
+                Spacer()
+                Text("\(dictate.polished.split(separator: " ").count) words")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            Text(dictate.polished)
+                .font(.body)
+                .foregroundColor(theme.textPrimary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 9) {
+                Button {
+                    dictate.copyToClipboard()
+                    withAnimation { copied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        withAnimation { copied = false }
+                    }
+                } label: {
+                    actionPill(copied ? "Copied!" : "Copy",
+                               copied ? "checkmark" : "doc.on.doc.fill",
+                               copied ? .green : theme.accent)
+                }
+                .buttonStyle(.plain)
+                Button {
+                    shareURL = dictate.save()
+                } label: { actionPill("Share", "square.and.arrow.up", .blue) }
+                .buttonStyle(.plain)
+                Button {
+                    _ = dictate.save()
+                    TTSService.shared.speak("Saved to your memory.")
+                } label: { actionPill("Save", "tray.and.arrow.down.fill", .yellow) }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(15)
+        .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 17)
+            .stroke(dictate.tone.tint.opacity(0.45), lineWidth: 1))
+        .shadow(color: dictate.tone.tint.opacity(0.28), radius: 14)
+    }
+
+    private var rawCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { showRaw.toggle() }
+            } label: {
+                HStack {
+                    Image(systemName: "waveform")
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                    Text("What you actually said")
+                        .font(.caption).fontWeight(.semibold)
+                        .foregroundColor(theme.textSecondary)
+                    Spacer()
+                    Image(systemName: showRaw ? "chevron.up" : "chevron.down")
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                }
+            }
+            .buttonStyle(.plain)
+            if showRaw {
+                Text(dictate.transcript)
+                    .font(.callout)
+                    .foregroundColor(theme.textSecondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.045)))
+    }
+
+    private func errorRow(_ e: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange).font(.caption)
+            Text(e).font(.caption).foregroundColor(theme.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.12)))
+    }
+
+    private var hintCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("HOW IT WORKS")
+                .font(.caption2).fontWeight(.heavy).tracking(0.8)
+                .foregroundColor(theme.accent)
+            Text("Talk normally — ramble, correct yourself, it doesn't matter. Chappy transcribes on the phone, then rewrites it in the style you pick. Copy drops it straight on your clipboard for any app.")
+                .font(.callout).foregroundColor(theme.textSecondary)
+            Divider().background(theme.textSecondary.opacity(0.2))
+            Text("Hands free: \u{201C}take a report\u{201D} · \u{201C}dictate a note\u{201D} · \u{201C}write this up\u{201D}")
+                .font(.caption).foregroundColor(theme.accent.opacity(0.9))
+        }
+        .padding(15)
+        .background(RoundedRectangle(cornerRadius: 16).fill(.ultraThinMaterial))
+    }
+
+    private func actionPill(_ text: String, _ icon: String, _ tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 12, weight: .bold))
+            Text(text).font(.subheadline).fontWeight(.semibold)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 12).fill(tint.opacity(0.2)))
+        .foregroundStyle(tint)
+    }
+}
+
+/// Minimal share-sheet bridge so a saved .txt can go anywhere iOS goes.
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}
+
+extension URL: Identifiable {
+    public var id: String { absoluteString }
+}
+
+// =====================================================================
+// MARK: - CHAPPY TILE (Build 157) — the colour-coded grid
+// =====================================================================
+//
+//   The old MoreRow was a grey list: nine identical rows, no hierarchy,
+//   endless scrolling. Apple's Control Center and Samsung's One UI quick
+//   panel both solved this the same way — a GRID of tiles, each with its
+//   own colour, so the eye finds things by hue instead of by reading.
+//   Half the scroll, twice the speed, and it finally looks like an app
+//   somebody designed.
+
+struct ChappyTile: View {
+    let icon: String
+    let title: String
+    let detail: String
+    let tint: Color
+    let action: () -> Void
+
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    @State private var pressed = false
+
+    var body: some View {
+        Button {
+            ChappyEarcon.shared.tap()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                // The glowing icon chip.
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(tint.opacity(0.22))
+                        .frame(width: 38, height: 38)
+                    Image(systemName: icon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                .shadow(color: tint.opacity(0.55), radius: 9)
+                Text(title)
+                    .font(.subheadline).fontWeight(.bold)
+                    .foregroundColor(theme.textPrimary)
+                    .lineLimit(1).minimumScaleFactor(0.85)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundColor(theme.textSecondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(13)
+            .frame(maxWidth: .infinity, minHeight: 116, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(LinearGradient(colors: [tint.opacity(0.14), .clear],
+                                                 startPoint: .topLeading,
+                                                 endPoint: .bottomTrailing))
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(LinearGradient(colors: [tint.opacity(0.65), tint.opacity(0.12)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                            lineWidth: 1)
+            )
+            .shadow(color: tint.opacity(0.22), radius: 10, y: 4)
+            .scaleEffect(pressed ? 0.96 : 1)
+            .animation(.spring(response: 0.25, dampingFraction: 0.6), value: pressed)
+        }
+        .buttonStyle(.plain)
+        .simultaneousGesture(DragGesture(minimumDistance: 0)
+            .onChanged { _ in pressed = true }
+            .onEnded { _ in pressed = false })
+    }
+}
+
+// =====================================================================
+// MARK: - PLACES (BUILD 158)
+// =====================================================================
+//
+//   The Remember button always saved. It just saved into the dark —
+//   spots existed only as pins on a map, so one saved in a hurry with
+//   no name was gone forever, and there was no way to rename, delete,
+//   or do anything WITH a place once you had it.
+//
+//   Google Maps solved this with Saved lists, Apple with the Library.
+//   Both stop at "here is your list". The bit neither does well is the
+//   one that matters most on a job: an ARRIVAL NOTE — the gate code,
+//   the parking, the dog — spoken the moment you pull up, before you
+//   knock. That is what this screen is really for.
+
+struct PlacesView: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var spots: [TripRecorder.Spot] = []
+    @State private var filter = "All"
+    @State private var editing: Int?
+    @State private var search = ""
+
+    private static let categories = ["All", "Favourites", "Work", "Food", "Stay", "Other"]
+
+    /// Anything auto-named ("spot at 4:53PM near…") still needs a name.
+    private func needsName(_ s: TripRecorder.Spot) -> Bool {
+        s.name.lowercased().hasPrefix("spot at")
+    }
+
+    private var shown: [(offset: Int, element: TripRecorder.Spot)] {
+        let indexed = Array(spots.enumerated())
+        return indexed.filter { pair in
+            let s = pair.element
+            let catOK: Bool = {
+                switch filter {
+                case "All": return true
+                case "Favourites": return s.starred == true
+                default: return (s.category ?? "Other") == filter
+                }
+            }()
+            let searchOK = search.isEmpty
+                || s.name.localizedCaseInsensitiveContains(search)
+                || (s.note ?? "").localizedCaseInsensitiveContains(search)
+                || (s.street ?? "").localizedCaseInsensitiveContains(search)
+            return catOK && searchOK
+        }
+        .sorted { a, b in
+            // Unnamed first — they're the ones you need to fix.
+            if needsName(a.element) != needsName(b.element) { return needsName(a.element) }
+            return a.element.t > b.element.t
+        }
+        .map { (offset: $0.offset, element: $0.element) }
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                VStack(spacing: 0) {
+                    chips
+                    if shown.isEmpty { empty } else { list }
+                }
+            }
+            .navigationTitle("Places")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $search, prompt: "Search places and notes")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+            .onAppear { reload() }
+            .sheet(item: Binding(
+                get: { editing.map { PlaceIndex(id: $0) } },
+                set: { editing = $0?.id })) { wrapped in
+                    if spots.indices.contains(wrapped.id) {
+                        PlaceEditor(index: wrapped.id, theme: theme) { reload() }
+                    }
+                }
+        }
+    }
+
+    private struct PlaceIndex: Identifiable { let id: Int }
+
+    private func reload() { spots = TripRecorder.shared.spots }
+
+    private var chips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                ForEach(Self.categories, id: \.self) { c in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { filter = c }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Text(c)
+                            .font(.footnote).fontWeight(.semibold)
+                            .padding(.horizontal, 13).padding(.vertical, 7)
+                            .background(Capsule().fill(filter == c
+                                ? theme.accent.opacity(0.25) : Color.white.opacity(0.06)))
+                            .foregroundColor(filter == c ? theme.accent : theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+        }
+    }
+
+    private var empty: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "mappin.slash")
+                .font(.system(size: 50))
+                .foregroundColor(theme.textSecondary.opacity(0.6))
+            Text(search.isEmpty
+                 ? "No places yet.\nTap Remember on the Home screen, or say\n\u{201C}remember this spot, call it the blue warung\u{201D}."
+                 : "Nothing matches \u{201C}\(search)\u{201D}.")
+                .font(.subheadline)
+                .foregroundColor(theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 36)
+            Spacer()
+        }
+    }
+
+    private var list: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVStack(spacing: 9) {
+                ForEach(shown, id: \.offset) { pair in
+                    row(index: pair.offset, spot: pair.element)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 26)
+        }
+    }
+
+    private func row(index: Int, spot s: TripRecorder.Spot) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            editing = index
+        } label: {
+            HStack(spacing: 11) {
+                ZStack {
+                    Circle()
+                        .fill(tint(s).opacity(0.2))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: icon(s))
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(tint(s))
+                }
+                .shadow(color: tint(s).opacity(0.5), radius: 7)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Text(s.name)
+                            .font(.subheadline).fontWeight(.semibold)
+                            .foregroundColor(theme.textPrimary)
+                            .lineLimit(1)
+                        if s.starred == true {
+                            Image(systemName: "star.fill")
+                                .font(.system(size: 9)).foregroundStyle(.yellow)
+                        }
+                        if s.arrivalNote?.isEmpty == false {
+                            Image(systemName: "bell.badge.fill")
+                                .font(.system(size: 9)).foregroundStyle(.orange)
+                        }
+                    }
+                    if needsName(s) {
+                        Text("Needs a name — tap to fix")
+                            .font(.caption2).fontWeight(.semibold)
+                            .foregroundColor(.orange)
+                    } else if let n = s.note, !n.isEmpty {
+                        Text(n).font(.caption2)
+                            .foregroundColor(theme.textSecondary).lineLimit(1)
+                    } else if let street = s.street {
+                        Text(street).font(.caption2)
+                            .foregroundColor(theme.textSecondary).lineLimit(1)
+                    }
+                    Text(Self.stamp(s.t) + distanceSuffix(s))
+                        .font(.caption2)
+                        .foregroundColor(theme.textSecondary.opacity(0.75))
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 15)
+                .stroke(needsName(s) ? Color.orange.opacity(0.45) : Color.clear, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func icon(_ s: TripRecorder.Spot) -> String {
+        switch s.category ?? "" {
+        case "Work": return "wrench.and.screwdriver.fill"
+        case "Food": return "fork.knife"
+        case "Stay": return "bed.double.fill"
+        default: return s.starred == true ? "star.fill" : "mappin.circle.fill"
+        }
+    }
+
+    private func tint(_ s: TripRecorder.Spot) -> Color {
+        if s.starred == true { return .yellow }
+        switch s.category ?? "" {
+        case "Work": return .orange
+        case "Food": return .pink
+        case "Stay": return .purple
+        default: return theme.accent
+        }
+    }
+
+    private func distanceSuffix(_ s: TripRecorder.Spot) -> String {
+        let snap = ContextEngine.shared.snapshot
+        guard let la = snap.latitude, let lo = snap.longitude else { return "" }
+        let d = CLLocation(latitude: la, longitude: lo)
+            .distance(from: CLLocation(latitude: s.lat, longitude: s.lon))
+        if d < 950 { return " · \(Int(d)) m away" }
+        return String(format: " · %.1f km away", d / 1000)
+    }
+
+    private static func stamp(_ d: Date) -> String {
+        if Calendar.current.isDateInToday(d) { return "Today" }
+        if Calendar.current.isDateInYesterday(d) { return "Yesterday" }
+        let f = DateFormatter(); f.dateFormat = "d MMM yyyy"
+        return f.string(from: d)
+    }
+}
+
+// MARK: - One place, fully editable
+
+private struct PlaceEditor: View {
+
+    let index: Int
+    let theme: ChappyTheme
+    let onChange: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var note = ""
+    @State private var arrivalNote = ""
+    @State private var category = "Other"
+    @State private var starred = false
+    @State private var confirmDelete = false
+
+    private var spot: TripRecorder.Spot? {
+        TripRecorder.shared.spots.indices.contains(index)
+            ? TripRecorder.shared.spots[index] : nil
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Name") {
+                    TextField("What do you call it?", text: $name)
+                        .font(.body)
+                }
+                Section("Category") {
+                    Picker("Category", selection: $category) {
+                        ForEach(["Work", "Food", "Stay", "Other"], id: \.self) { Text($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("Favourite", isOn: $starred)
+                }
+                Section {
+                    TextField("Anything worth remembering", text: $note, axis: .vertical)
+                        .lineLimit(2...5)
+                } header: {
+                    Text("Note")
+                } footer: {
+                    Text("Searchable, and Chappy can read it back — \u{201C}what do you remember about the blue warung\u{201D}.")
+                }
+                Section {
+                    TextField("e.g. Gate code 4321, dog out back, park on the street",
+                              text: $arrivalNote, axis: .vertical)
+                        .lineLimit(2...4)
+                } header: {
+                    Label("Say this when I arrive", systemImage: "bell.badge")
+                } footer: {
+                    Text("Spoken automatically the moment you get within about 150 metres — once an hour at most. The gate code, before you knock.")
+                }
+                Section {
+                    Button {
+                        if let s = spot {
+                            dismiss()
+                            Task { _ = await NavEngine.shared.navigate(to: s.name, driving: true) }
+                        }
+                    } label: { Label("Take me here", systemImage: "location.fill") }
+
+                    Button {
+                        if let s = spot {
+                            _ = ChappyDataBridge.addReminder(text: "At \(s.name)",
+                                                             at: nil, place: s.name)
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            TTSService.shared.speak("Ping set for \(s.name).")
+                            dismiss()
+                        }
+                    } label: { Label("Remind me when I'm here", systemImage: "bell.fill") }
+
+                    Button {
+                        if let s = spot,
+                           let u = URL(string: "https://maps.apple.com/?ll=\(s.lat),\(s.lon)&q=\(s.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")") {
+                            UIApplication.shared.open(u)
+                        }
+                    } label: { Label("Open in Maps", systemImage: "map") }
+                }
+                Section {
+                    Button(role: .destructive) { confirmDelete = true } label: {
+                        Label("Delete this place", systemImage: "trash")
+                    }
+                }
+            }
+            .navigationTitle("Place")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") { save() }.fontWeight(.semibold)
+                }
+            }
+            .onAppear {
+                guard let s = spot else { return }
+                name = s.name.lowercased().hasPrefix("spot at") ? "" : s.name
+                note = s.note ?? ""
+                arrivalNote = s.arrivalNote ?? ""
+                category = s.category ?? "Other"
+                starred = s.starred ?? false
+            }
+            .alert("Delete this place?", isPresented: $confirmDelete) {
+                Button("Delete", role: .destructive) {
+                    TripRecorder.shared.deleteSpot(at: index)
+                    onChange()
+                    dismiss()
+                }
+                Button("Keep", role: .cancel) { }
+            } message: {
+                Text("The place is removed. Photos and notes you took there stay in Memory.")
+            }
+        }
+    }
+
+    private func save() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            TripRecorder.shared.renameSpot(id: nil, at: index, to: trimmed)
+        }
+        TripRecorder.shared.updateSpot(index: index, note: note,
+                                       arrivalNote: arrivalNote,
+                                       category: category, starred: starred)
+        onChange()
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         dismiss()
     }
 }
