@@ -682,7 +682,15 @@ class LiveAIManager: ObservableObject {
             // AUDIT FIX (LA-H9): handOff() so stopSession()'s
             // resumeAfterHandOff() actually re-arms the wake word.
             ChappyStandby.shared.handOff()
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            // BUILD 165: 300ms was optimistic. Tearing down a recogniser and
+            // releasing the input node is not instant, and starting the deep
+            // layer while Standby still holds the node is a second way this
+            // failed intermittently. Wait for the release, up to 2 seconds.
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if !ChappyStandby.shared.isListening { break }
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
 
         guard let streamViewModel = streamViewModel else {
@@ -720,9 +728,23 @@ class LiveAIManager: ObservableObject {
                 print("📹 [LiveAIManager] Starting stream...")
                 await streamViewModel.handleStartStreaming()
 
-                // Wait for the stream to reach streaming state (max 5 s)
-                let streamReady = await waitForCondition(timeout: 5.0) {
+                // BUILD 165 — FIVE SECONDS WAS THE WHOLE PROBLEM.
+                //
+                // Cold Ray-Bans routinely take eight to ten seconds to hand
+                // over a first frame — Burst hit exactly this in 162 and got
+                // twelve. Five seconds meant Live AI succeeded only when the
+                // glasses happened to be warm. Twelve, then one retry, then
+                // give up honestly.
+                var streamReady = await waitForCondition(timeout: 12.0) {
                     streamViewModel.streamingStatus == .streaming
+                }
+                if !streamReady {
+                    print("📹 [LiveAIManager] Stream slow — one more go")
+                    tts.speak("Waking the glasses.")
+                    await streamViewModel.handleStartStreaming()
+                    streamReady = await waitForCondition(timeout: 10.0) {
+                        streamViewModel.streamingStatus == .streaming
+                    }
                 }
 
                 if !streamReady {
@@ -742,7 +764,9 @@ class LiveAIManager: ObservableObject {
             connectService()
 
             // Wait for connection (max 10 s)
-            let connected = await waitForCondition(timeout: 10.0) {
+            // BUILD 165: 10s is tight on a weak mobile signal — the exact
+            // condition under which you most want it to keep trying.
+            let connected = await waitForCondition(timeout: 16.0) {
                 self.isConnected
             }
 
@@ -762,12 +786,27 @@ class LiveAIManager: ObservableObject {
             print("✅ [LiveAIManager] Live AI session started, ready to talk")
 
         } catch let error as LiveAIError {
+            // BUILD 165 — "IT RANDOMLY WORKS."
+            //
+            // It wasn't random. Every failure path here set errorMessage,
+            // printed to a console nobody is reading, and DIED IN SILENCE.
+            // With the phone in a pocket, "Live AI failed because the glasses
+            // took six seconds instead of five" and "Live AI ignored me" are
+            // the same experience. So it worked whenever the hardware was
+            // quick, and appeared broken whenever it wasn't.
+            //
+            // Now every failure says WHICH failure, out loud, in a sentence
+            // that tells you what to do about it.
             errorMessage = error.localizedDescription
             print("❌ [LiveAIManager] LiveAIError: \(error)")
+            ChappyEarcon.shared.fail()
+            tts.speak(error.spokenAdvice)
             await stopSession()
         } catch {
             errorMessage = error.localizedDescription
             print("❌ [LiveAIManager] Error: \(error)")
+            ChappyEarcon.shared.fail()
+            tts.speak("Live AI couldn't start. \(error.localizedDescription)")
             await stopSession()
         }
     }
@@ -1098,6 +1137,22 @@ enum LiveAIError: LocalizedError {
             return "AI AI service connection failed — check your network"
         case .noAPIKey:
             return "Please configure an API key in Settings first"
+        }
+    }
+
+    /// BUILD 165 — what to SAY, which is not the same as what to log. Each
+    /// one names the cause and the next action, because a failure you can't
+    /// act on is just noise.
+    var spokenAdvice: String {
+        switch self {
+        case .noDevice:
+            return "I can't see the glasses. Check they're on and connected in the Meta AI app."
+        case .streamNotReady:
+            return "The glasses camera didn't wake up in time. Give it a few seconds and ask again."
+        case .connectionFailed:
+            return "Couldn't reach the AI service - that's usually signal. Try again when you've got bars."
+        case .noAPIKey:
+            return "No API key set. Settings, then API keys."
         }
     }
 }
@@ -3309,15 +3364,36 @@ final class ChappyStandby: NSObject, ObservableObject {
             // BUILD 160: short commands tightened 0.9 -> 0.75. A two-word
             // imperative is finished the moment it lands; the long wait in
             // 144 was for SENTENCES and that stays exactly where it was.
+            // BUILD 163: tightened once more now the turn-taking is proven.
+            // 0.65 for a two-word imperative is about as low as it can go
+            // before the recogniser's own partial-delivery jitter starts
+            // clipping words; sentences keep their patience.
             if wordCount <= 2 {
-                debounce = 0.75          // short command — near-instant
+                debounce = 0.65          // short command — as snappy as it gets
             } else if wordCount <= 4 {
-                debounce = 1.0           // short sentence
+                debounce = 0.9           // short sentence
             } else {
-                debounce = 1.2           // a real sentence — let him finish it
+                debounce = 1.15          // a real sentence — let him finish it
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
+    }
+
+    /// BUILD 166 — a question about WHEN SOMETHING ELSE happens, as opposed
+    /// to a question about the clock. Deliberately narrow: it must open with
+    /// a when-shape AND not name anything of his, because everything
+    /// personal has its own handler further up the ladder.
+    static func looksLikeEventTimeQuestion(_ c: String) -> Bool {
+        let opens = ["what time is the ", "what time is a ", "what time does the ",
+                     "what time does ", "what time do the ", "when is the ",
+                     "when's the ", "whens the ", "what time are the ",
+                     "when does the ", "when do the ", "what time is brisbane"]
+        guard opens.contains(where: { c.contains($0) }) else { return false }
+        let mine = ["my flight", "my appointment", "my reminder", "my meeting",
+                    "my job", "my next", "my day", "my calendar", "my ride",
+                    "my grab", "my uber", "i have", "i've got", "ive got"]
+        if mine.contains(where: { c.contains($0) }) { return false }
+        return true
     }
 
     /// AUDIT P0 — THE MISTAKE THIS SET USED TO MAKE.
@@ -3608,6 +3684,25 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and those questions now come back Meta-fast, offline, for free.
         if let pocket = ChappyPocket.answer(c) {
             speak(pocket)
+            return
+        }
+        // BUILD 166 — "WHAT TIME IS THE BRONCOS GAME ON THIS WEEK."
+        //
+        // Fixing the clock is half the job. The other half is answering the
+        // question that was actually asked — and being honest that Chappy
+        // has no live sports, cinema or shop-hours feed. Nothing here knows
+        // this week's NRL draw, and a confident guess from a model trained
+        // months ago is WORSE than no answer, because you'd act on it.
+        //
+        // So: say what it is, put it on screen, don't pretend. Same pattern
+        // as the flight-status fallback. Personal questions ("what time is
+        // my flight") are handled far above this and never reach here.
+        if Self.looksLikeEventTimeQuestion(c) {
+            let q = c.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+            if let u = URL(string: "https://www.google.com/search?q=\(q)") {
+                UIApplication.shared.open(u)
+            }
+            speak("I don't have live listings for that, so it's on screen.")
             return
         }
 
@@ -4162,6 +4257,75 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("i'm lost") || c.contains("im lost") || c.contains("i am lost") {
             speak(TripRecorder.shared.lostReport()); return
         }
+        // BUILD 164 — STAR IT, BY VOICE. Works on subscribed calendars too,
+        // because the star is Chappy's own overlay, not a calendar edit.
+        if c.contains("star that") || c.contains("star this") || c.contains("star it")
+            || c.contains("make that important") || c.contains("make this important")
+            || c.contains("that's important") || c.contains("thats important")
+            || c.contains("flag that") || c.contains("prioritise that")
+            || c.contains("prioritize that") {
+            guard let e = ChappyCalendar.shared.focusEvent() else {
+                speak("Nothing on right now to star."); return
+            }
+            ChappyCalendar.shared.setStarred(true, for: e)
+            speak("Starred \(e.title ?? "it"). It'll lead the brief.")
+            return
+        }
+        if c.contains("unstar") || c.contains("not important")
+            || c.contains("remove the star") {
+            guard let e = ChappyCalendar.shared.focusEvent() else {
+                speak("Nothing starred right now."); return
+            }
+            ChappyCalendar.shared.setStarred(false, for: e)
+            speak("Star off."); return
+        }
+        // BUILD 164 — MAKE AN APPOINTMENT BY VOICE.
+        if c.contains("add an appointment") || c.contains("add appointment")
+            || c.contains("new appointment") || c.contains("put in my calendar")
+            || c.contains("put it in my calendar") || c.contains("add to my calendar")
+            || c.contains("book an appointment") || c.contains("add a meeting")
+            || c.contains("new event") || c.contains("add an event") {
+            guard ChappyCalendar.shared.canCreate else {
+                speak("I can't write to your calendar yet — check Chappy has calendar access in iOS Settings.")
+                return
+            }
+            // Reuse the reminder time parser — it is the battle-tested one
+            // that already handles "Friday at three" and "tomorrow morning".
+            // It needs an opener to bite, so we lend it one.
+            let stripped = ["add an appointment", "add appointment", "new appointment",
+                            "put it in my calendar", "put in my calendar",
+                            "add to my calendar", "book an appointment",
+                            "add a meeting", "add an event", "new event"]
+                .reduce(c) { $0.replacingOccurrences(of: $1, with: " ") }
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard let parsed = ChappyStandby.parseReminder("remind me to " + stripped),
+                  let when = parsed.date else {
+                speak("When? Say: add an appointment Friday at three, dentist.")
+                return
+            }
+            let title = parsed.title.isEmpty ? "Appointment" : parsed.title
+            if let problem = ChappyCalendar.shared.createEvent(title: title, start: when) {
+                speak("Couldn't add it: \(problem)")
+                return
+            }
+            let df = DateFormatter(); df.dateFormat = "EEEE h:mm a"
+            speak("Added. \(title), \(df.string(from: when)).")
+            return
+        }
+        // BUILD 163 — UPCOMING. "What's my week" had no answer in the app.
+        if c.contains("what's coming up") || c.contains("whats coming up")
+            || c.contains("my calendar") || c.contains("open calendar")
+            || c.contains("show my calendar") || c.contains("upcoming")
+            || c.contains("what's my week") || c.contains("whats my week")
+            || c.contains("my appointments") || c.contains("my schedule")
+            || c.contains("what's on this month") || c.contains("show my diary") {
+            NotificationCenter.default.post(name: .chappyOpenUpcoming, object: nil)
+            let n = ChappyCalendar.shared.upcoming(days: 30).count
+            speak(n == 0
+                  ? "Nothing in the diary for the next month. Check which calendars are switched on."
+                  : "\(n) thing\(n == 1 ? "" : "s") in the next month. Here they are.")
+            return
+        }
         // BUILD 158 — PLACES. The saved-spot list, finally reachable.
         if c.contains("my places") || c.contains("show my places")
             || c.contains("saved places") || c.contains("saved spots")
@@ -4178,10 +4342,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("take a report") || c.contains("dictate") || c.contains("write this up")
             || c.contains("take a note for work") || c.contains("job report")
             || c.contains("start a report") || c.contains("write a report")
-            || c.contains("take dictation") {
+            || c.contains("take dictation")
+            // BUILD 167 — straight into an email.
+            || c.contains("dictate an email") || c.contains("write an email")
+            || c.contains("compose an email") || c.contains("draft an email")
+            || c.contains("send an email") {
             var tone = "professional"
             if c.contains("job report") || c.contains("work report") { tone = "jobReport" }
-            else if c.contains("email") { tone = "email" }
+            else if c.contains("email") || c.contains("e-mail") { tone = "email" }
             else if c.contains("bullet") { tone = "bullets" }
             ChappyDictate.shared.tone = ChappyDictate.Tone(rawValue: tone) ?? .professional
             NotificationCenter.default.post(name: .chappyOpenDictate, object: nil)
@@ -4295,8 +4463,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
 
         // ---------- TIER 2 — live sessions ----------
+        // BUILD 162 — "OPEN LIVE AI" WASN'T A COMMAND. The triggers were
+        // "let's talk", "start live", "eyes on" — and the single most obvious
+        // phrasing, the name of the thing, was missing. So it fell through
+        // every branch and landed on whatever matched loosely further down,
+        // which is how asking for Live AI opened Maps.
         if c.contains("let's talk") || c.contains("lets talk") || c.contains("start live")
-            || c.contains("eyes on") || c.contains("come with me") || c.contains("watch with me") {
+            || c.contains("eyes on") || c.contains("come with me") || c.contains("watch with me")
+            || c.contains("live ai") || c.contains("live a i") || c.contains("liveai")
+            || c.contains("open talk") || c.contains("start talk") || c.contains("talk mode")
+            || c.contains("open live") || c.contains("live mode") {
             speak("Opening Live AI.")
             handOff() // AUDIT FIX: ear remembers to come back
             NotificationCenter.default.post(name: .liveAITriggered, object: nil)
@@ -4356,6 +4532,31 @@ final class ChappyStandby: NSObject, ObservableObject {
                               "chinese", "mandarin", "french", "german", "spanish",
                               "korean", "italian", "hindi", "balinese", "malay"]
             .contains { c.contains($0) }
+        // BUILD 168 — REWRITE WHAT I'M LOOKING AT.
+        if c.contains("rewrite this") || c.contains("rewrite that")
+            || c.contains("reword this") || c.contains("reword that")
+            || c.contains("rewrite the letter") || c.contains("rewrite this document")
+            || c.contains("reword the document") || c.contains("rewrite it") {
+            ChappyReader.shared.rewriteWhatYouSee(tone: .reword)
+            return
+        }
+        if c.contains("simplify this") || c.contains("simplify that")
+            || c.contains("plain english") || c.contains("in plain english")
+            || c.contains("what does this say in plain") {
+            ChappyReader.shared.rewriteWhatYouSee(tone: .simplify)
+            return
+        }
+        if c.contains("summarise this") || c.contains("summarize this")
+            || c.contains("summarise that") || c.contains("summarize that")
+            || c.contains("sum this up") || c.contains("give me the gist") {
+            ChappyReader.shared.rewriteWhatYouSee(tone: .summary)
+            return
+        }
+        if c.contains("turn this into a letter") || c.contains("make this a letter")
+            || c.contains("write this as a letter") {
+            ChappyReader.shared.rewriteWhatYouSee(tone: .letter)
+            return
+        }
         // BUILD 159 — SHARP EYE, asked for by name. Press the glasses
         // capture button, then say one of these: Chappy waits for the
         // full-resolution photo to sync and reads THAT.
@@ -4518,7 +4719,26 @@ final class ChappyStandby: NSObject, ObservableObject {
             // Human ears get the human string; the model-directed one is for
             // Live AI only. See AUDIT FIX (SPOKEN-LEAK) in NavEngine.navigate.
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
-            if NavEngine.shared.isNavigating { offerGoogleMaps(driving: driving) }
+            // BUILD 163 — THE MISSING "WANT GOOGLE MAPS?"
+            //
+            // This fired the offer IMMEDIATELY after the summary — and
+            // TTSService.speak() cancels whatever is already speaking. So with
+            // stops in the route (a long summary) the two collided and one of
+            // them lost. You heard a route and then had to reach for Maps
+            // yourself, because the question never survived.
+            //
+            // Now it waits for the summary to actually finish, then asks.
+            if NavEngine.shared.isNavigating {
+                Task { @MainActor in
+                    var waited = 0
+                    while TTSService.shared.isSpeaking && waited < 250 {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                        waited += 1
+                    }
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    self.offerGoogleMaps(driving: driving)
+                }
+            }
             return
         }
         // AUDIT FIX (coverage gap): mode follow-ups re-route the last
@@ -10256,6 +10476,14 @@ final class ChappyCalendar: ObservableObject {
         return events(from: start, to: end)
     }
 
+    /// BUILD 164 — any single day, for the week and month grids.
+    func events(onDay d: Date) -> [EKEvent] {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: d)
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? d
+        return events(from: start, to: end)
+    }
+
     func upcoming(days: Int = 7) -> [EKEvent] {
         let end = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
         return events(from: Date(), to: end)
@@ -10284,6 +10512,102 @@ final class ChappyCalendar: ObservableObject {
     }
 
     func briefOverride(for e: EKEvent) -> Bool? { eventBriefs[Self.fingerprint(e)] }
+
+    // =================================================================
+    // MARK: - BUILD 164: writing to the calendar, honestly
+    // =================================================================
+    //
+    //   The Geeks2U feed is a SUBSCRIBED calendar, and iOS makes those
+    //   strictly read-only — not a Chappy limitation, an EventKit one.
+    //   Apple's own Calendar app can't edit them either. So:
+    //
+    //     * Chappy's own overlay (star, warn time, brief) works on
+    //       EVERY event including subscribed ones, because it's stored
+    //       against a fingerprint on this phone.
+    //     * Real edits — title, time, place, notes — work on writable
+    //       calendars (iCloud, On My iPhone).
+    //     * New events go to your default calendar.
+    //
+    //   canEdit() is what the UI asks before offering the fields, so
+    //   nothing ever presents an edit that will silently fail.
+
+    func canEdit(_ e: EKEvent) -> Bool {
+        e.calendar?.allowsContentModifications ?? false
+    }
+
+    var canCreate: Bool {
+        authorised && store.defaultCalendarForNewEvents != nil
+    }
+
+    /// Create an event. Returns nil on success, or a reason it failed.
+    @discardableResult
+    func createEvent(title: String, start: Date, minutes: Int = 60,
+                     location: String? = nil, notes: String? = nil,
+                     allDay: Bool = false) -> String? {
+        guard authorised else { return "Chappy doesn't have calendar access yet." }
+        guard let cal = store.defaultCalendarForNewEvents else {
+            return "No writable calendar — add an iCloud calendar in iOS Settings."
+        }
+        let e = EKEvent(eventStore: store)
+        e.calendar = cal
+        e.title = title
+        e.startDate = start
+        e.isAllDay = allDay
+        e.endDate = allDay ? start : start.addingTimeInterval(Double(minutes) * 60)
+        if let l = location, !l.isEmpty { e.location = l }
+        if let nts = notes, !nts.isEmpty { e.notes = nts }
+        do { try store.save(e, span: .thisEvent, commit: true); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    /// Edit a writable event in place. Returns nil on success.
+    @discardableResult
+    func updateEvent(_ e: EKEvent, title: String? = nil, start: Date? = nil,
+                     minutes: Int? = nil, location: String? = nil,
+                     notes: String? = nil) -> String? {
+        guard canEdit(e) else {
+            return "That one lives on a subscribed calendar, so nobody can edit it — not even Apple's Calendar. You can still star it and set a warn time."
+        }
+        if let t = title, !t.isEmpty { e.title = t }
+        if let s = start {
+            let length = e.endDate?.timeIntervalSince(e.startDate ?? s) ?? 3600
+            e.startDate = s
+            e.endDate = s.addingTimeInterval(minutes.map { Double($0) * 60 } ?? length)
+        } else if let m = minutes, let s = e.startDate {
+            e.endDate = s.addingTimeInterval(Double(m) * 60)
+        }
+        if let l = location { e.location = l }
+        if let nts = notes { e.notes = nts }
+        do { try store.save(e, span: .thisEvent, commit: true); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    @discardableResult
+    func deleteEvent(_ e: EKEvent) -> String? {
+        guard canEdit(e) else { return "Subscribed calendars can't be edited from any app." }
+        do { try store.remove(e, span: .thisEvent, commit: true); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    /// BUILD 164 — the star, as its own idea. `level` already had
+    /// .important, but nothing surfaced it and nothing could set it by
+    /// voice. This is the same storage with a name a person would use.
+    func isStarred(_ e: EKEvent) -> Bool { level(for: e) == .important }
+
+    func setStarred(_ on: Bool, for e: EKEvent) {
+        setLevel(on ? .important : .normal, for: e)
+    }
+
+    /// The event a "star that" / "make that important" should act on:
+    /// whatever is happening now, or the next thing today.
+    func focusEvent() -> EKEvent? {
+        let now = Date()
+        let live = today().first { e in
+            guard let s = e.startDate else { return false }
+            return s <= now && (e.endDate ?? s) >= now
+        }
+        return live ?? upcoming(days: 2).first { ($0.startDate ?? .distantPast) > now }
+    }
 
     func setBriefOverride(_ on: Bool?, for e: EKEvent) {
         var v = eventBriefs
@@ -10431,15 +10755,42 @@ enum ChappyPocket {
 
     // MARK: time & date
 
+    // BUILD 166 — "WHAT TIME IS THE BRONCOS GAME" GOT THE CLOCK.
+    //
+    // This matched contains("what time"), so ANY question with those two
+    // words in it was answered with the current time. "What time is the
+    // Broncos game", "what time does Coles shut", "what time did I get
+    // home" — all of them got "it's twenty past four in the afternoon",
+    // which is both wrong and maddening, because it sounds like Chappy
+    // heard you fine and simply doesn't care.
+    //
+    // The clock only ever answers a question ABOUT THE CLOCK. The moment
+    // there is a subject after "what time is", the question is about an
+    // EVENT and belongs to something that can actually look it up.
+    // Whitelisted phrasings only — no contains().
+    private static let clockAsks: Set<String> = [
+        "what time is it", "what time is it now", "whats the time", "what's the time",
+        "what is the time", "the time", "time", "time please", "tell me the time",
+        "got the time", "have you got the time", "what time do you have",
+        "what's the time now", "whats the time now", "current time", "time now",
+    ]
+
+    private static let dateAsks: Set<String> = [
+        "what's the date", "whats the date", "what is the date", "what date is it",
+        "what's today's date", "whats todays date", "todays date", "today's date",
+        "what day is it", "what day is it today", "what's today", "whats today",
+        "what day", "the date",
+    ]
+
     private static func timeOrDate(_ t: String) -> String? {
-        if t.contains("what time") || t.hasSuffix("the time") || t == "time" {
+        let bare = t.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if clockAsks.contains(bare) {
             let df = DateFormatter(); df.dateFormat = "h:mm"
             let h = Calendar.current.component(.hour, from: Date())
             let part = h < 12 ? "in the morning" : (h < 18 ? "in the afternoon" : "at night")
             return "It's \(df.string(from: Date())) \(part)."
         }
-        if t.contains("what's the date") || t.contains("what is the date")
-            || t.contains("what date") || t.contains("what day") || t.contains("today's date") {
+        if dateAsks.contains(bare) {
             let df = DateFormatter(); df.dateFormat = "EEEE, d MMMM"
             return "It's \(df.string(from: Date()))."
         }
@@ -10620,6 +10971,36 @@ final class ChappyReader {
     func begin(_ mode: Mode) {
         lastMode = mode
         Task { await run(mode) }
+    }
+
+    /// BUILD 168 — READ IT, THEN REWRITE IT.
+    ///
+    /// Look at a page (or press the glasses button first, and Sharp Eye
+    /// uses the full-resolution photo), OCR it on-device, and hand the
+    /// text straight to the rewriter — where Reword, Plain English,
+    /// Formal letter and Summary are one tap apart, and Email is one tap
+    /// after that. No retyping, and the original text stays visible
+    /// underneath so nothing is lost behind the rewrite.
+    func rewriteWhatYouSee(tone: ChappyDictate.Tone = .reword) {
+        Task {
+            TTSService.shared.speak("Reading it.")
+            ChappyEarcon.shared.startThinking()
+            let frame = await grabFrame()
+            ChappyEarcon.shared.stopThinking()
+            guard let f = frame else {
+                TTSService.shared.speak("The camera didn't come up. Try that again.")
+                return
+            }
+            let text = await ocr(f)
+            guard text.count >= 20 else {
+                TTSService.shared.speak("I couldn't get enough text off that. Try the phone scanner - it flattens the page properly.")
+                NotificationCenter.default.post(name: .chappyOpenDictate, object: nil)
+                return
+            }
+            ChappyDictate.shared.load(text: text, tone: tone)
+            NotificationCenter.default.post(name: .chappyOpenDictateQuiet, object: nil)
+            TTSService.shared.speak("Got it. Rewriting now - pick a style when it lands.")
+        }
     }
 
     /// BUILD 159 — "read this properly": press the glasses button, then
@@ -11469,6 +11850,40 @@ final class ChappyMail: ObservableObject {
             return "Text from \(Self.smsSender(m)): \(m.preview.isEmpty ? m.subject : m.preview)"
         }
         return "From \(m.from). \(m.subject). \(m.preview)"
+    }
+
+    /// BUILD 167 — COMPOSE, into whichever mail app he actually uses.
+    ///
+    /// iOS won't let an app silently create a draft in Mail or Outlook —
+    /// that's a hard sandbox rule, not a Chappy limit. What IS allowed is
+    /// handing a fully-written message to the mail app, which lands as an
+    /// editable draft with one tap to send. Same one-tap-consent pattern
+    /// as the reply path, which has worked since 147.
+    ///
+    /// Outlook publishes its own URL scheme, so if it's installed and
+    /// preferred we go straight there; otherwise mailto: opens whatever
+    /// iOS has set as the default mail app (which may well BE Outlook).
+    @discardableResult
+    static func compose(to: String, subject: String, body: String,
+                        preferOutlook: Bool = false) -> Bool {
+        let enc: (String) -> String = {
+            $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        }
+        if preferOutlook,
+           let ol = URL(string: "ms-outlook://compose?to=\(enc(to))&subject=\(enc(subject))&body=\(enc(body))"),
+           UIApplication.shared.canOpenURL(ol) {
+            UIApplication.shared.open(ol)
+            return true
+        }
+        guard let u = URL(string: "mailto:\(enc(to))?subject=\(enc(subject))&body=\(enc(body))")
+        else { return false }
+        UIApplication.shared.open(u)
+        return true
+    }
+
+    /// Is Outlook actually on this phone? Used to decide whether to offer it.
+    static var hasOutlook: Bool {
+        URL(string: "ms-outlook://").map { UIApplication.shared.canOpenURL($0) } ?? false
     }
 
     /// Reply — opens Mail pre-filled; ONE human tap sends. A reply to a
@@ -12660,7 +13075,6 @@ final class ChappyBurst {
     func fire() {
         guard !isFiring else { return }
         isFiring = true
-        TTSService.shared.speak("Burst.")
         Task { await run() }
     }
 
@@ -12669,13 +13083,34 @@ final class ChappyBurst {
 
         let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
         if !wasStreaming {
+            // BUILD 162 — THE GLASSES NEED LONGER, AND YOU NEED TO KNOW.
+            //
+            // The old version said "Burst" and gave the camera five seconds
+            // to wake. Cold glasses routinely take longer than that, so you
+            // got a promise, a silence, and no photo. Snap has always handled
+            // this properly: a waking tone, something on screen, and patience.
+            // Burst now does the same — twelve seconds, with the wake-up
+            // sound so you know it is coming rather than broken.
+            ChappyEarcon.shared.cameraWaking()
+            SnapFeedback.shared.waking()
             NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
-            for _ in 0..<20 {
+            var awake = false
+            for _ in 0..<48 {                                  // up to ~12s
                 try? await Task.sleep(nanoseconds: 250_000_000)
-                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
+                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
+                    awake = true; break
+                }
             }
-            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard awake else {
+                TTSService.shared.speak("The glasses didn't wake up in time. Try again in a moment.")
+                ChappyStandby.shared.pokeEar(after: 1.5)
+                return
+            }
+            // Let exposure settle — the first frames off a cold camera are
+            // dark, and a dark frame always scores as the blurriest.
+            try? await Task.sleep(nanoseconds: 900_000_000)
         }
+        TTSService.shared.speak("Burst.")
 
         var frames: [UIImage] = []
         for i in 0..<20 {
@@ -12714,6 +13149,10 @@ final class ChappyBurst {
             source: "burst")
         ChappyEarcon.shared.done()
         TTSService.shared.speak("Got it - kept the sharpest of \(scored.count).")
+        // BUILD 162: waking the camera reroutes audio and can take the mic
+        // tap down with it — same reason Snap pokes the ear twice.
+        ChappyStandby.shared.pokeEar(after: 1.5)
+        ChappyStandby.shared.pokeEar(after: 5.0)
     }
 
     /// Edge energy on a 64×64 grayscale: sum of squared neighbour
@@ -13166,6 +13605,9 @@ final class ChappyDictate: NSObject, ObservableObject {
 
     enum Tone: String, CaseIterable, Identifiable {
         case professional, jobReport, email, brief, bullets, plain
+        // BUILD 168 — the document styles. Rewriting something you've
+        // scanned is a different job from tidying something you said.
+        case reword, simplify, letter, summary
         var id: String { rawValue }
         var label: String {
             switch self {
@@ -13175,6 +13617,10 @@ final class ChappyDictate: NSObject, ObservableObject {
             case .brief:        return "Brief"
             case .bullets:      return "Bullets"
             case .plain:        return "Plain"
+            case .reword:       return "Reword"
+            case .simplify:     return "Plain English"
+            case .letter:       return "Formal letter"
+            case .summary:      return "Summary"
             }
         }
         var icon: String {
@@ -13185,6 +13631,10 @@ final class ChappyDictate: NSObject, ObservableObject {
             case .brief:        return "bolt.fill"
             case .bullets:      return "list.bullet"
             case .plain:        return "text.alignleft"
+            case .reword:       return "arrow.triangle.2.circlepath"
+            case .simplify:     return "textformat.size.smaller"
+            case .letter:       return "doc.richtext"
+            case .summary:      return "text.line.first.and.arrowtriangle.forward"
             }
         }
         var tint: Color {
@@ -13195,6 +13645,10 @@ final class ChappyDictate: NSObject, ObservableObject {
             case .brief:        return .green
             case .bullets:      return .teal
             case .plain:        return .gray
+            case .reword:       return .indigo
+            case .simplify:     return .mint
+            case .letter:       return .brown
+            case .summary:      return .cyan
             }
         }
         /// The instruction. Deliberately strict about INVENTING: a report
@@ -13223,6 +13677,17 @@ final class ChappyDictate: NSObject, ObservableObject {
                 return "Rewrite this dictation as a bulleted list, one point per line starting with a dash. \(rule)"
             case .plain:
                 return "Clean up this dictation: fix grammar and punctuation, remove filler words and false starts, keep the speaker's own voice and wording otherwise. \(rule)"
+            // BUILD 168 — document rewriting. Note these say TEXT, not
+            // dictation: they're used on scanned documents as often as
+            // on speech, and the instruction has to fit both.
+            case .reword:
+                return "Rewrite this text completely in your own words. Change the sentence structure and vocabulary throughout so it does not read like the original, while keeping every fact, figure, name and instruction exactly as given. Keep roughly the same length. \(rule)"
+            case .simplify:
+                return "Rewrite this text in plain English a busy person can read once and act on. Short sentences. No jargon, and if a technical term is unavoidable, say what it means. Keep every fact and number. \(rule)"
+            case .letter:
+                return "Rewrite this text as a formal letter body: measured, courteous and businesslike. No address block, no date line, no signature - just the body paragraphs. \(rule)"
+            case .summary:
+                return "Summarise this text: the key points only, as short paragraphs or bullets, in the order they matter. Keep every figure, date, name and deadline. Say what it is asking of the reader, if anything. \(rule)"
             }
         }
     }
@@ -13323,6 +13788,22 @@ final class ChappyDictate: NSObject, ObservableObject {
         }
     }
 
+    /// BUILD 168 — feed the polisher something you didn't say out loud.
+    /// A scanned page, a pasted block, the last thing Reader read. The
+    /// original goes into `transcript` exactly as before, so "what you
+    /// actually said" becomes "what the page actually said" and nothing
+    /// is ever lost behind the rewrite.
+    func load(text: String, tone newTone: Tone = .reword) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        if isRecording { stop(andPolish: false) }
+        transcript = t
+        polished = ""
+        error = nil
+        tone = newTone
+        Task { await polish() }
+    }
+
     // MARK: the polish
 
     func polish() async {
@@ -13410,6 +13891,11 @@ final class ChappyDictate: NSObject, ObservableObject {
 extension Notification.Name {
     /// BUILD 157 — open Dictate, already recording.
     static let chappyOpenDictate = Notification.Name("chappyOpenDictate")
+    /// BUILD 168 — open Dictate WITHOUT starting the microphone, because
+    /// the text is already loaded.
+    static let chappyOpenDictateQuiet = Notification.Name("chappyOpenDictateQuiet")
     /// BUILD 158 — open the saved-places list.
     static let chappyOpenPlaces = Notification.Name("chappyOpenPlaces")
+    /// BUILD 163 — open the 30-day Upcoming view.
+    static let chappyOpenUpcoming = Notification.Name("chappyOpenUpcoming")
 }
