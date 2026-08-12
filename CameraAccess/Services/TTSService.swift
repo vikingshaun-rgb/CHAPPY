@@ -760,11 +760,21 @@ class TTSService: NSObject, ObservableObject {
         // First chunk out loud immediately; the rest queue behind it.
         speak(chunks[0], languageCode: languageCode)
         let rest = Array(chunks.dropFirst())
-        // Warm them in the cache so each one plays from disk the moment
-        // the previous finishes — the queue below then never waits.
-        prerenderNow(rest)
+        // BUILD 162 — WHY THE VOICE WENT HALF-ROBOT.
+        //
+        // This used to fire prerenderNow(rest) in the same instant as the
+        // live render of chunk one — several Gemini TTS calls at once, over
+        // the same connection. That is a 429 waiting to happen, and two
+        // consecutive failures latch the Apple fallback for five minutes.
+        // It is precisely the mistake BUILD 135 documented for navigation,
+        // repeated here.
+        //
+        // Now: warm only ONE chunk ahead, and only after the current one is
+        // actually speaking. Same seamlessness, a quarter of the requests,
+        // no thundering herd.
         Task { @MainActor in
             for chunk in rest {
+                self.prerenderNow([chunk])
                 // Wait for the current line to finish, with a hard ceiling
                 // so a stuck player can never freeze the rest of the answer.
                 var waited = 0
@@ -797,7 +807,16 @@ class TTSService: NSObject, ObservableObject {
                         text: line, model: self.ttsModels[0], apiKey: key)
                     VoiceCache.shared.save(audio, text: line, voice: voice)
                     CostMeter.shared.addTTSChars(line.count)
-                } catch { break }
+                } catch {
+                    // A warm-up is a nicety. It must never contribute to the
+                    // failure count that latches the robot voice.
+                    print("🔊 [TTS] Warm-up skipped: \(error.localizedDescription)")
+                    break
+                }
+                // BUILD 162: breathing room between renders, same 350ms the
+                // nav pre-render has always used. Back-to-back calls are what
+                // earn a 429.
+                try? await Task.sleep(nanoseconds: 350_000_000)
             }
         }
     }
