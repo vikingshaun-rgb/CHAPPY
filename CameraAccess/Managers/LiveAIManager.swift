@@ -10664,7 +10664,12 @@ final class ChappyReader {
     // MARK: - The run
 
     private func run(_ mode: Mode, override: UIImage? = nil) async {
-        guard let frame = override ?? (await grabFrame()) else {
+        // BUILD 161: `override ?? (await grabFrame())` doesn't compile — the
+        // right-hand side of ?? is an autoclosure and autoclosures can't be
+        // async. Spelled out, which is clearer anyway.
+        var picked = override
+        if picked == nil { picked = await grabFrame() }
+        guard let frame = picked else {
             TTSService.shared.speak("The camera didn't come up. Try that again.")
             return
         }
@@ -12607,7 +12612,11 @@ final class ChappyLiveActivity {
 //   group.com.shaun.chappy, on BOTH targets) the note lands nowhere and
 //   the widget shows its graceful fallback — nothing breaks either way.
 
+@MainActor
 enum ChappyGlance {
+    // BUILD 161: everything this reads — ChappyFlights, ChappyReminders — is
+    // MainActor-isolated, so the enum has to be too. It was only ever called
+    // from MainActor contexts; the compiler just wanted it said out loud.
     static func write() {
         guard let d = UserDefaults(suiteName: "group.com.shaun.chappy") else { return }
         var flightLine = ""
