@@ -12,6 +12,9 @@ import AVFoundation
 import AVKit
 import Speech
 import MapKit
+import UserNotifications   // BUILD 163: the permission truth-check
+import VisionKit          // BUILD 168: Apple's document scanner
+import Vision              // BUILD 168: on-device OCR for scanned pages
 import EventKit
 
 // MARK: - BUILD 126: SNAP CONFIRMATION
@@ -299,6 +302,8 @@ struct TurboMetaHomeView: View {
     @State private var atlasLayer: ChappyAtlas.Layer?
     @State private var showDictate = false      // BUILD 157: voice -> clean text
     @State private var showPlaces = false       // BUILD 158: saved places
+    @State private var showUpcoming = false     // BUILD 163: the 30-day diary
+    @State private var notifsOff = false        // BUILD 163: permission truth
     @State private var dictateAutoStart = false
     @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
     @State private var showEmergencyContact = false
@@ -494,6 +499,19 @@ struct TurboMetaHomeView: View {
         return "\(day.string(from: d)) \(t.string(from: d))"
     }
 
+    /// BUILD 163 — the next thing, on the tile, so the week is visible
+    /// without opening anything.
+    private var upcomingDetailLine: String {
+        let ev = ChappyCalendar.shared.upcoming(days: 30)
+        guard let next = ev.first, let s = next.startDate else {
+            return "Your calendar and reminders, 30 days ahead"
+        }
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(s) ? "h:mm a"
+            : (Calendar.current.isDateInTomorrow(s) ? "'Tomorrow' h:mm a" : "EEE h:mm a")
+        return "Next: \(next.title ?? "Appointment") · \(f.string(from: s))"
+    }
+
     /// BUILD 158 — how many places, and how many still need a name.
     private var placesDetailLine: String {
         let all = TripRecorder.shared.spots
@@ -545,6 +563,25 @@ struct TurboMetaHomeView: View {
         } else {
             let today = memory.recent.filter { Calendar.current.isDateInToday($0.at) }.count
             cachedMemoryLine = "\(all) stored · \(today) today · searchable"
+        }
+    }
+
+    /// BUILD 163 — ask iOS the truth about notifications, and if they are
+    /// off, request them once; only show the banner if that request is
+    /// refused or was already permanently denied.
+    private func checkNotificationPermission() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                DispatchQueue.main.async { notifsOff = false }
+            case .notDetermined:
+                UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound, .badge, .timeSensitive]) { ok, _ in
+                        DispatchQueue.main.async { notifsOff = !ok }
+                    }
+            default:
+                DispatchQueue.main.async { notifsOff = true }
+            }
         }
     }
 
@@ -741,70 +778,64 @@ struct TurboMetaHomeView: View {
                             }
                         }
 
-                        // QUICK ACTIONS
-                        HStack(spacing: 10) {
-                            QuickActionButton(icon: "camera.fill", label: "Snap") {
-                                // SNAP is now the SILENT one. It used to open
-                                // Quick Vision — the identical thing the Look
-                                // tile does — so the button had no job of its
-                                // own. Photo, quietly described, stored. No
-                                // talking: you take it because you want it
-                                // later, not to be told about it now.
+                        // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
+                        // cramped single row. Seven actions never fitted
+                        // across one line on a phone; now they breathe, each
+                        // in its own colour, and Ear On lights up when live.
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                            GridItem(.flexible(), spacing: 9),
+                                            GridItem(.flexible(), spacing: 9),
+                                            GridItem(.flexible(), spacing: 9)],
+                                  spacing: 9) {
+                            QuickActionButton(icon: "camera.fill", label: "Snap",
+                                              tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
                                 ChappyStandby.shared.snapSilently()
                                 journalTick += 1
                             }
-                            // BUILD 155 — HOLD Snap for the burst: ~20 frames
-                            // sampled, sharpest kept. Apple/Top-Shot style.
+                            // HOLD Snap for the burst: ~20 frames sampled,
+                            // sharpest kept. Apple/Top-Shot style.
                             .simultaneousGesture(
                                 LongPressGesture(minimumDuration: 0.45).onEnded { _ in
                                     UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
                                     ChappyBurst.shared.fire()
                                     journalTick += 1
                                 })
-                            // BUILD 155 — VIDEO finally gets a button: same
-                            // engine as "record a clip", 20s summarised to
-                            // text and filed as a video memory.
-                            QuickActionButton(icon: "video.fill", label: "Video") {
+                            QuickActionButton(icon: "video.fill", label: "Video",
+                                              tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
                                 TTSService.shared.speak("Rolling - about twenty seconds.")
                                 ChappyClip.shared.record()
                                 journalTick += 1
                             }
-                            // BUILD 157 — DICTATE: talk, get clean text.
-                            QuickActionButton(icon: "mic.fill", label: "Dictate") {
+                            QuickActionButton(icon: "mic.fill", label: "Dictate",
+                                              tint: Color(red: 0.98, green: 0.55, blue: 0.35)) {
                                 dictateAutoStart = true
                                 showDictate = true
                             }
-                            QuickActionButton(icon: "mappin.circle.fill", label: "Remember") {
-                                // Remember always DID save — but it named the pin
-                                // "spot at 4:53PM near Cresthaven Court", which is
-                                // a timestamp, not a memory. Forty of those and
-                                // none of them mean anything. Now it clicks, saves,
-                                // and asks what to call it, so you can answer
-                                // "the warung with the good coffee" out loud in the
-                                // two seconds while you still remember why you
-                                // pressed it.
+                            QuickActionButton(icon: "mappin.circle.fill", label: "Remember",
+                                              tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
                                 ChappyStandby.shared.rememberSpotByVoice()
                                 journalTick += 1
                                 UINotificationFeedbackGenerator().notificationOccurred(.success)
                             }
                             QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
-                                              label: continuousVision.isRunning ? "Stop" : "Watch") {
+                                              label: continuousVision.isRunning ? "Stop" : "Watch",
+                                              tint: Color(red: 0.85, green: 0.45, blue: 1.0),
+                                              active: continuousVision.isRunning) {
                                 if continuousVision.isRunning {
                                     continuousVision.stop()
                                 } else {
-                                    // AUDIT FIX: mic handoff (the Talk tile did
-                                    // this, the Watch tile didn't — two
-                                    // recognizers fought over one microphone)
                                     if standby.isListening { standby.handOff() }
                                     continuousVision.start(streamViewModel: streamViewModel)
                                 }
                             }
-                            // CHAPPY STANDBY — the wake-word ear (free while waiting)
                             QuickActionButton(icon: standby.isListening ? "ear.fill" : "ear",
-                                              label: standby.isListening ? "Ear On" : "Standby") {
+                                              label: standby.isListening ? "Ear On" : "Standby",
+                                              tint: Color(red: 0.35, green: 0.95, blue: 0.70),
+                                              active: standby.isListening) {
                                 standby.toggle()
                             }
-                            QuickActionButton(icon: "map.fill", label: "Map") {
+                            QuickActionButton(icon: "map.fill", label: "Map",
+                                              tint: Color(red: 0.45, green: 0.65, blue: 1.0)) {
                                 ContextEngine.shared.start()
                                 showMapSheet = true
                             }
@@ -829,6 +860,50 @@ struct TurboMetaHomeView: View {
                         .padding(12)
                         .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                         .id(journalTick) // refresh counts when Remember fires
+
+                        // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
+                        //
+                        // Every ping, warn time and flight alert in Chappy
+                        // goes through iOS notifications. If permission was
+                        // never granted — or was granted once and later
+                        // switched off, or Focus is eating them — the app has
+                        // no way to tell you and everything just silently
+                        // stops. That is indistinguishable from "the feature
+                        // is broken", which is exactly how it felt.
+                        //
+                        // So: check on every appearance, and if they're off,
+                        // SAY SO, right here, with the button that fixes it.
+                        if notifsOff {
+                            Button {
+                                if let u = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(u)
+                                }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "bell.slash.fill")
+                                        .foregroundStyle(.orange)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Notifications are off")
+                                            .font(.subheadline).fontWeight(.semibold)
+                                            .foregroundColor(theme.textPrimary)
+                                        Text("Reminders, warn times and flight alerts can't reach you. Tap to turn them on.")
+                                            .font(.caption2)
+                                            .foregroundColor(theme.textSecondary)
+                                            .multilineTextAlignment(.leading)
+                                    }
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2).foregroundColor(theme.textSecondary)
+                                }
+                                .padding(13)
+                                .background(RoundedRectangle(cornerRadius: 15)
+                                    .fill(Color.orange.opacity(0.14)))
+                                .overlay(RoundedRectangle(cornerRadius: 15)
+                                    .stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                            }
+                            .buttonStyle(ChappyPressStyle())
+                            .padding(.horizontal, 16)
+                        }
 
                         // BUILD 140 — THE GLANCE. The day, on the home screen,
                         // before you've opened anything: next events, next
@@ -856,6 +931,11 @@ struct TurboMetaHomeView: View {
                                        detail: remindersDetailLine,
                                        tint: Color(red: 0.68, green: 0.5, blue: 1.0)) {
                                 showReminders = true
+                            }
+                            ChappyTile(icon: "calendar", title: "Upcoming",
+                                       detail: upcomingDetailLine,
+                                       tint: Color(red: 0.72, green: 0.55, blue: 1.0)) {
+                                showUpcoming = true
                             }
                             ChappyTile(icon: "mic.fill", title: "Dictate",
                                        detail: "Talk it out — get clean, professional text",
@@ -963,6 +1043,12 @@ struct TurboMetaHomeView: View {
             .fullScreenCover(isPresented: $showPlaces) {
                 PlacesView()
             }
+            .fullScreenCover(isPresented: $showUpcoming) {
+                UpcomingView()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
+                showUpcoming = true
+            }
             // BUILD 160 — RE-ARM ON THE WAY OUT. Standby only ever armed on
             // launch and on foreground, so closing a screen that had taken
             // the microphone left the ear shut until you backgrounded the
@@ -1005,6 +1091,11 @@ struct TurboMetaHomeView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictate)) { _ in
                 dictateAutoStart = true
+                showDictate = true
+            }
+            // BUILD 168: text is already loaded (a scan) — open, don't record.
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictateQuiet)) { _ in
+                dictateAutoStart = false
                 showDictate = true
             }
             .sheet(isPresented: $showFlights) {
@@ -1164,6 +1255,7 @@ struct TurboMetaHomeView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                 armStandbyIfClear(reason: "app opened")
             }
+            checkNotificationPermission()
         }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didBecomeActiveNotification)) { _ in
@@ -1173,6 +1265,7 @@ struct TurboMetaHomeView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 armStandbyIfClear(reason: "foreground")
             }
+            checkNotificationPermission()
         }
         .onReceive(NotificationCenter.default.publisher(for: .liveAITriggered)) { _ in
             // Triggered from Shortcuts — auto-open the Live AI screen
@@ -2726,12 +2819,22 @@ struct ModeTile: View {
     }
 }
 
+// BUILD 162 — THE QUICK ROW, REBUILT.
+//
+// Six flat grey squares in a cramped row, no colour, no glow, and touch
+// targets you had to aim at. Now every one carries its own hue, a glowing
+// icon chip and a gradient edge — the same language as the tile grid — and
+// they wrap onto two rows so nothing is squeezed. Scroll-safe: the press
+// effect comes from ChappyPressStyle, never a gesture.
 struct QuickActionButton: View {
     let icon: String
     let label: String
+    var tint: Color = .cyan
+    var active: Bool = false
     let action: () -> Void
     @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
     private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
     var body: some View {
         // Every quick action clicks and taps back. These buttons are pressed
         // one-handed, often without looking — glasses on, walking, phone half
@@ -2743,19 +2846,42 @@ struct QuickActionButton: View {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             action()
         } label: {
-            VStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 20))
-                    .foregroundColor(theme.textPrimary.opacity(0.9))
+            VStack(spacing: 7) {
+                ZStack {
+                    Circle()
+                        .fill(tint.opacity(active ? 0.32 : 0.18))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: icon)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(active ? .white : tint)
+                }
+                .shadow(color: tint.opacity(active ? 0.85 : 0.5), radius: active ? 11 : 7)
                 Text(label)
-                    .font(.caption2)
-                    .foregroundColor(theme.textPrimary.opacity(0.6))
+                    .font(.caption2).fontWeight(.semibold)
+                    .foregroundColor(active ? tint : theme.textPrimary.opacity(0.72))
+                    .lineLimit(1).minimumScaleFactor(0.75)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+            .frame(minHeight: 78)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(LinearGradient(colors: [tint.opacity(active ? 0.22 : 0.10), .clear],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(LinearGradient(colors: [tint.opacity(active ? 0.9 : 0.55),
+                                                    tint.opacity(0.10)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                            lineWidth: 1)
+            )
+            .shadow(color: tint.opacity(active ? 0.35 : 0.18), radius: 9, y: 3)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ChappyPressStyle())
     }
 }
 
@@ -3900,12 +4026,21 @@ struct WhatCanISayView: View {
          ["Open the atlas", "Where have I been", "Zoom to Ubud",
           "Show me temples", "Show me waterfalls", "What's around me",
           "Show me lookouts", "Fly to Bali"]),
+        ("Calendar & upcoming", "calendar",
+         ["What's coming up", "My calendar", "What's on today",
+          "What's on next week", "My appointments", "Upcoming",
+          "Add an appointment Friday at three, dentist",
+          "Star that", "Make that important"]),
         ("Places", "mappin.and.ellipse",
          ["Remember this spot, call it the blue warung", "My places",
           "Show my places", "What do you remember about the warung"]),
-        ("Dictate & write", "mic.fill",
+        ("Dictate & rewrite", "mic.fill",
          ["Take a report", "Dictate a note", "Write this up",
-          "Dictate an email", "Take a job report"]),
+          "Dictate an email", "Draft an email", "Take a job report",
+          "Reply saying on my way",
+          // BUILD 168 — look at a page, get it rewritten.
+          "Rewrite this", "Reword this", "Simplify this",
+          "Summarise this", "Turn this into a letter"]),
         ("Rides & food", "car.fill",
          ["Get me a Grab to the airport", "How much is an Uber to Coles",
           "Ride home", "Order food", "Order from Mama's Warung",
@@ -3984,6 +4119,7 @@ struct EventDetailSheet: View {
 
     @State private var level: ChappyCalendar.EventLevel = .normal
     @State private var lead: Int? = nil   // nil = calendar default
+    @State private var starred = false    // BUILD 164
 
     // BUILD 145: the full menu the wearer asked for.
     private static let leadChoices: [(label: String, minutes: Int?)] = [
@@ -4023,6 +4159,52 @@ struct EventDetailSheet: View {
                         .padding(14)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+
+                        // BUILD 164 — THE STAR, and the honest note about
+                        // what can and can't be edited. A subscribed feed
+                        // (your Geeks2U one) is read-only in iOS for EVERY
+                        // app including Apple's — but Chappy's own overlay
+                        // (star, warn time, brief) is stored on this phone
+                        // against a fingerprint, so it works on all of them.
+                        Button {
+                            let now = !ChappyCalendar.shared.isStarred(event)
+                            ChappyCalendar.shared.setStarred(now, for: event)
+                            starred = now
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            TTSService.shared.speak(now ? "Starred." : "Star off.")
+                            onChange()
+                        } label: {
+                            HStack {
+                                Image(systemName: starred ? "star.fill" : "star")
+                                    .foregroundStyle(starred ? .yellow : theme.textSecondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(starred ? "Starred" : "Star this")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundColor(theme.textPrimary)
+                                    Text("Leads the morning brief and gets a firmer warn-time")
+                                        .font(.caption2).foregroundColor(theme.textSecondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(13)
+                            .background(RoundedRectangle(cornerRadius: 14)
+                                .fill(starred ? Color.yellow.opacity(0.14) : Color.white.opacity(0.045)))
+                            .overlay(RoundedRectangle(cornerRadius: 14)
+                                .stroke(starred ? Color.yellow.opacity(0.5) : .clear, lineWidth: 1))
+                        }
+                        .buttonStyle(ChappyPressStyle())
+
+                        if !ChappyCalendar.shared.canEdit(event) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "lock.fill")
+                                    .font(.caption).foregroundStyle(theme.textSecondary)
+                                Text("This lives on a subscribed calendar, so its title and time can't be changed from any app — not even Apple's. Everything below still works.")
+                                    .font(.caption2).foregroundColor(theme.textSecondary)
+                            }
+                            .padding(11)
+                            .background(RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.white.opacity(0.04)))
+                        }
 
                         // HOW MUCH IT MATTERS.
                         VStack(alignment: .leading, spacing: 8) {
@@ -4094,6 +4276,7 @@ struct EventDetailSheet: View {
         }
         .onAppear {
             level = ChappyCalendar.shared.level(for: event)
+            starred = ChappyCalendar.shared.isStarred(event)   // BUILD 164
             let own = ChappyCalendar.shared.leadMinutes(for: event)
             let calDefault = event.calendar.map { ChappyCalendar.shared.leadMinutes(for: $0) } ?? 30
             lead = own == calDefault ? nil : own
@@ -6217,6 +6400,9 @@ struct DictateView: View {
     @State private var showRaw = false
     @State private var shareURL: URL?
     @State private var copied = false
+    @State private var showEmail = false   // BUILD 167
+    @State private var showScanner = false // BUILD 168
+    @State private var reading = false
 
     var autoStart = false
 
@@ -6253,6 +6439,29 @@ struct DictateView: View {
                 if autoStart && !dictate.isRecording { dictate.start() }
             }
             .sheet(item: $shareURL) { url in ChappyShareSheet(items: [url]) }
+            .fullScreenCover(isPresented: $showScanner) {
+                DocumentScanner { pages in
+                    guard !pages.isEmpty else { return }
+                    reading = true
+                    Task {
+                        let text = await ChappyPageOCR.read(pages)
+                        reading = false
+                        guard !text.isEmpty else {
+                            TTSService.shared.speak("Couldn't read any text off that page.")
+                            return
+                        }
+                        // Reword by default — that's what you scan a
+                        // document to do. Every other style is one tap away.
+                        dictate.load(text: text, tone: .reword)
+                        TTSService.shared.speak("Read \(pages.count) page\(pages.count == 1 ? "" : "s"). Rewriting it now.")
+                    }
+                }
+                .ignoresSafeArea()
+            }
+            .sheet(isPresented: $showEmail) {
+                DictateEmailSheet(theme: theme,
+                                  body: dictate.polished.isEmpty ? dictate.transcript : dictate.polished)
+            }
         }
     }
 
@@ -6300,6 +6509,31 @@ struct DictateView: View {
                 .font(.subheadline).fontWeight(.semibold)
                 .foregroundColor(theme.textSecondary)
 
+            // BUILD 168 — OR START FROM A PAGE. Scan a document with the
+            // phone camera (Apple's own scanner: finds the edges, flattens
+            // the perspective, does multiple pages), read it on-device,
+            // and hand the text to the same rewriter. Then Reword it,
+            // simplify it, or email it — exactly as if you'd said it.
+            if !dictate.isRecording {
+                Button {
+                    showScanner = true
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: reading ? "hourglass" : "doc.viewfinder")
+                            .font(.system(size: 14, weight: .bold))
+                        Text(reading ? "Reading the page…" : "Scan a document")
+                            .font(.subheadline).fontWeight(.semibold)
+                    }
+                    .padding(.horizontal, 16).frame(minHeight: 46)
+                    .background(Capsule().fill(.ultraThinMaterial))
+                    .overlay(Capsule().stroke(theme.accent.opacity(0.5), lineWidth: 1))
+                    .foregroundColor(theme.accent)
+                    .shadow(color: theme.accent.opacity(0.25), radius: 8)
+                }
+                .buttonStyle(ChappyPressStyle())
+                .disabled(reading)
+            }
+
             if dictate.isRecording && !dictate.transcript.isEmpty {
                 Text(dictate.transcript)
                     .font(.body)
@@ -6338,7 +6572,7 @@ struct DictateView: View {
                             .foregroundStyle(dictate.tone == t ? .white : theme.textSecondary)
                             .shadow(color: dictate.tone == t ? t.tint.opacity(0.7) : .clear, radius: 8)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(ChappyPressStyle(scale: 0.94))
                     }
                 }
             }
@@ -6376,7 +6610,11 @@ struct DictateView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 9) {
+            // BUILD 167 — the same button language as everywhere else:
+            // glowing icon chip, gradient edge, coloured shadow, a real
+            // 52-point target and the shared press squeeze.
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                GridItem(.flexible(), spacing: 9)], spacing: 9) {
                 Button {
                     dictate.copyToClipboard()
                     withAnimation { copied = true }
@@ -6386,18 +6624,31 @@ struct DictateView: View {
                 } label: {
                     actionPill(copied ? "Copied!" : "Copy",
                                copied ? "checkmark" : "doc.on.doc.fill",
-                               copied ? .green : theme.accent)
+                               copied ? .green : Color(red: 0.35, green: 0.85, blue: 1.0))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(ChappyPressStyle())
+                Button {
+                    showEmail = true
+                } label: {
+                    actionPill("Email", "envelope.fill",
+                               Color(red: 0.68, green: 0.5, blue: 1.0))
+                }
+                .buttonStyle(ChappyPressStyle())
                 Button {
                     shareURL = dictate.save()
-                } label: { actionPill("Share", "square.and.arrow.up", .blue) }
-                .buttonStyle(.plain)
+                } label: {
+                    actionPill("Share", "square.and.arrow.up",
+                               Color(red: 0.45, green: 0.65, blue: 1.0))
+                }
+                .buttonStyle(ChappyPressStyle())
                 Button {
                     _ = dictate.save()
                     TTSService.shared.speak("Saved to your memory.")
-                } label: { actionPill("Save", "tray.and.arrow.down.fill", .yellow) }
-                .buttonStyle(.plain)
+                } label: {
+                    actionPill("Save", "tray.and.arrow.down.fill",
+                               Color(red: 1.0, green: 0.68, blue: 0.25))
+                }
+                .buttonStyle(ChappyPressStyle())
             }
         }
         .padding(15)
@@ -6455,7 +6706,9 @@ struct DictateView: View {
             Text("Talk normally — ramble, correct yourself, it doesn't matter. Chappy transcribes on the phone, then rewrites it in the style you pick. Copy drops it straight on your clipboard for any app.")
                 .font(.callout).foregroundColor(theme.textSecondary)
             Divider().background(theme.textSecondary.opacity(0.2))
-            Text("Hands free: \u{201C}take a report\u{201D} · \u{201C}dictate a note\u{201D} · \u{201C}write this up\u{201D}")
+            Text("Or scan a document and have it rewritten — tap Scan a document above, then pick a style.")
+                .font(.callout).foregroundColor(theme.textSecondary)
+            Text("Hands free: \u{201C}take a report\u{201D} · \u{201C}dictate a note\u{201D} · \u{201C}rewrite this\u{201D}")
                 .font(.caption).foregroundColor(theme.accent.opacity(0.9))
         }
         .padding(15)
@@ -6463,14 +6716,33 @@ struct DictateView: View {
     }
 
     private func actionPill(_ text: String, _ icon: String, _ tint: Color) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon).font(.system(size: 12, weight: .bold))
+        HStack(spacing: 7) {
+            ZStack {
+                Circle().fill(tint.opacity(0.22)).frame(width: 30, height: 30)
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(tint)
+            }
+            .shadow(color: tint.opacity(0.55), radius: 7)
             Text(text).font(.subheadline).fontWeight(.semibold)
+                .foregroundStyle(tint)
+                .lineLimit(1).minimumScaleFactor(0.8)
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 12).fill(tint.opacity(0.2)))
-        .foregroundStyle(tint)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 52)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(LinearGradient(colors: [tint.opacity(0.14), .clear],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing)))
+        )
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(LinearGradient(colors: [tint.opacity(0.6), tint.opacity(0.12)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
+                    lineWidth: 1))
+        .shadow(color: tint.opacity(0.2), radius: 8, y: 3)
     }
 }
 
@@ -6510,7 +6782,6 @@ struct ChappyTile: View {
 
     @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
     private var theme: ChappyTheme { ChappyTheme.named(themeName) }
-    @State private var pressed = false
 
     var body: some View {
         Button {
@@ -6559,13 +6830,27 @@ struct ChappyTile: View {
                             lineWidth: 1)
             )
             .shadow(color: tint.opacity(0.22), radius: 10, y: 4)
-            .scaleEffect(pressed ? 0.96 : 1)
-            .animation(.spring(response: 0.25, dampingFraction: 0.6), value: pressed)
         }
-        .buttonStyle(.plain)
-        .simultaneousGesture(DragGesture(minimumDistance: 0)
-            .onChanged { _ in pressed = true }
-            .onEnded { _ in pressed = false })
+        // BUILD 162 — THE SCROLL BUG. This used to drive the press animation
+        // with .simultaneousGesture(DragGesture(minimumDistance: 0)), and a
+        // zero-distance drag gesture EATS THE SCROLL: rest a finger on a tile
+        // and the page would not move. A ButtonStyle gets the identical
+        // squeeze from configuration.isPressed and leaves scrolling alone,
+        // which is exactly why SwiftUI provides it.
+        .buttonStyle(ChappyPressStyle())
+    }
+}
+
+/// The press effect every Chappy button shares: a small spring squeeze and
+/// a touch of dimming. Scroll-safe by construction.
+struct ChappyPressStyle: ButtonStyle {
+    var scale: CGFloat = 0.96
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .opacity(configuration.isPressed ? 0.88 : 1)
+            .animation(.spring(response: 0.25, dampingFraction: 0.6),
+                       value: configuration.isPressed)
     }
 }
 
@@ -6929,5 +7214,1043 @@ private struct PlaceEditor: View {
         onChange()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         dismiss()
+    }
+}
+
+// =====================================================================
+// MARK: - UPCOMING (Build 163)
+// =====================================================================
+//
+//   The gap you named: "I have no idea when my appointments are."
+//
+//   Everything was there — iCloud events, Geeks2U jobs, timed reminders
+//   — but only ever as TODAY. The Diary showed today, the home card
+//   showed today, the brief read today. Nothing in the app answered
+//   "what's my week?" without going to Apple's Calendar app.
+//
+//   So: one screen, thirty days, EVERYTHING merged and grouped by day.
+//   Google Calendar's Schedule view and Apple's Calendar list view both
+//   settled on the same shape for the same reason — a flat chronological
+//   list with day headers is the only layout that survives a busy week
+//   on a phone. Events and reminders sit together because your day
+//   doesn't separate them.
+//
+//   Tap an event for warn times and brief settings. Tap a reminder to
+//   tick or snooze it. The Calendars button is right there, because the
+//   first question when something's missing is always "is that calendar
+//   switched on?"
+
+struct UpcomingView: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var days = 30
+    @State private var refresh = 0
+    @State private var pickedEvent: EKEvent?
+    @State private var showCalendars = false
+    @State private var showAll = false     // include untimed reminders
+    // BUILD 164 — three ways to look at the same month.
+    @State private var mode: Look = .list
+    @State private var anchor = Date()     // which week/month is on screen
+    @State private var pickedDay: Date?
+    @State private var showNewEvent = false
+
+    enum Look: String, CaseIterable {
+        case list = "List", week = "Week", month = "Month"
+        var icon: String {
+            switch self {
+            case .list: return "list.bullet"
+            case .week: return "calendar.day.timeline.left"
+            case .month: return "calendar"
+            }
+        }
+    }
+
+    private struct Row: Identifiable {
+        let id = UUID()
+        var at: Date
+        var isEvent: Bool
+        var title: String
+        var detail: String?
+        var allDay: Bool
+        var event: EKEvent?
+        var reminder: ChappyMemory.Entry?
+    }
+
+    private var rows: [Row] {
+        _ = refresh
+        var out: [Row] = []
+        for e in ChappyCalendar.shared.upcoming(days: days) {
+            guard let s = e.startDate else { continue }
+            out.append(Row(at: s, isEvent: true,
+                           title: e.title ?? "Appointment",
+                           detail: e.location?.isEmpty == false ? e.location : nil,
+                           allDay: e.isAllDay, event: e, reminder: nil))
+        }
+        let horizon = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
+        for r in ChappyReminders.shared.open where r.doneAt == nil {
+            if let f = r.effectiveFire, f <= horizon {
+                out.append(Row(at: f, isEvent: false, title: r.title,
+                               detail: r.placeTrigger, allDay: false,
+                               event: nil, reminder: r))
+            } else if showAll, r.effectiveFire == nil {
+                out.append(Row(at: .distantFuture, isEvent: false, title: r.title,
+                               detail: "no time set", allDay: false,
+                               event: nil, reminder: r))
+            }
+        }
+        return out.sorted { $0.at < $1.at }
+    }
+
+    private var grouped: [(key: Date, rows: [Row])] {
+        let cal = Calendar.current
+        let buckets = Dictionary(grouping: rows) { r -> Date in
+            r.at == .distantFuture ? .distantFuture : cal.startOfDay(for: r.at)
+        }
+        return buckets.keys.sorted().map { (key: $0, rows: buckets[$0] ?? []) }
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                VStack(spacing: 0) {
+                    lookPicker
+                    switch mode {
+                    case .list:  if rows.isEmpty { empty } else { list }
+                    case .week:  weekView
+                    case .month: monthView
+                    }
+                }
+            }
+            .navigationTitle("Upcoming")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        showCalendars = true
+                    } label: {
+                        Image(systemName: "calendar.badge.checkmark")
+                            .foregroundColor(theme.accent)
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    HStack(spacing: 14) {
+                        Button {
+                            showNewEvent = true
+                        } label: {
+                            Image(systemName: "plus.circle.fill")
+                                .foregroundColor(theme.accent)
+                        }
+                        Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                    }
+                }
+            }
+            .sheet(isPresented: $showCalendars) { CalendarPickerSheet(theme: theme) }
+            .sheet(isPresented: $showNewEvent) {
+                NewEventSheet(theme: theme, start: pickedDay ?? Date()) { refresh += 1 }
+            }
+            .sheet(item: Binding(
+                get: { pickedDay.map { DayBox(day: $0) } },
+                set: { pickedDay = $0?.day })) { box in
+                    DayListSheet(day: box.day, theme: theme) { refresh += 1 }
+                }
+            .sheet(item: Binding(
+                get: { pickedEvent.map { EventBox(event: $0) } },
+                set: { pickedEvent = $0?.event })) { box in
+                    EventDetailSheet(event: box.event, theme: theme) { refresh += 1 }
+                }
+            .onAppear { refresh += 1 }
+        }
+    }
+
+    private struct EventBox: Identifiable {
+        let event: EKEvent
+        var id: String { (event.eventIdentifier ?? UUID().uuidString)
+            + String(Int((event.startDate ?? Date()).timeIntervalSince1970)) }
+    }
+
+    private var empty: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "calendar.badge.exclamationmark")
+                .font(.system(size: 50))
+                .foregroundColor(theme.textSecondary.opacity(0.6))
+            Text("Nothing in the next \(days) days.")
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+            Text("If that's wrong, check which calendars are switched on \u{2014} the button top left.")
+                .font(.caption).foregroundColor(theme.textSecondary.opacity(0.8))
+                .multilineTextAlignment(.center).padding(.horizontal, 40)
+            Spacer()
+        }
+    }
+
+    private var list: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVStack(alignment: .leading, spacing: 14, pinnedViews: [.sectionHeaders]) {
+                ForEach(grouped, id: \.key) { group in
+                    Section {
+                        VStack(spacing: 8) {
+                            ForEach(group.rows) { r in row(r) }
+                        }
+                    } header: {
+                        HStack {
+                            Text(Self.dayLabel(group.key).uppercased())
+                                .font(.caption2).fontWeight(.heavy).tracking(0.9)
+                                .foregroundColor(theme.accent)
+                            Spacer()
+                            Text("\(group.rows.count)")
+                                .font(.caption2).foregroundColor(theme.textSecondary)
+                        }
+                        .padding(.horizontal, 16).padding(.vertical, 7)
+                        .background(.ultraThinMaterial)
+                    }
+                }
+                // Range switch
+                HStack(spacing: 7) {
+                    ForEach([7, 30, 90], id: \.self) { d in
+                        Button {
+                            days = d
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Text(d == 7 ? "Week" : (d == 30 ? "Month" : "3 Months"))
+                                .font(.caption2).fontWeight(.bold)
+                                .padding(.horizontal, 12).padding(.vertical, 7)
+                                .background(Capsule().fill(days == d
+                                    ? theme.accent.opacity(0.25) : Color.white.opacity(0.06)))
+                                .foregroundColor(days == d ? theme.accent : theme.textSecondary)
+                        }
+                        .buttonStyle(ChappyPressStyle(scale: 0.94))
+                    }
+                    Spacer()
+                    Button {
+                        showAll.toggle()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Text(showAll ? "Hide undated" : "Show undated")
+                            .font(.caption2).fontWeight(.bold)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Capsule().fill(Color.white.opacity(0.06)))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(ChappyPressStyle(scale: 0.94))
+                }
+                .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 26)
+            }
+        }
+    }
+
+    private func row(_ r: Row) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            if let e = r.event { pickedEvent = e }
+            else if let rem = r.reminder {
+                ChappyReminders.shared.complete(rem.id)
+                TTSService.shared.speak("Done.")
+                refresh += 1
+            }
+        } label: {
+            HStack(spacing: 11) {
+                VStack(spacing: 1) {
+                    if r.allDay {
+                        Text("ALL").font(.system(size: 10, weight: .heavy))
+                        Text("DAY").font(.system(size: 10, weight: .heavy))
+                    } else if r.at == .distantFuture {
+                        Image(systemName: "infinity").font(.caption)
+                    } else {
+                        Text(Self.timeLabel(r.at))
+                            .font(.system(size: 13, weight: .bold))
+                            .monospacedDigit()
+                    }
+                }
+                .frame(width: 52)
+                .foregroundColor(r.isEvent ? .purple : theme.accent)
+
+                Rectangle()
+                    .fill(r.isEvent ? Color.purple : theme.accent)
+                    .frame(width: 3)
+                    .clipShape(Capsule())
+                    .shadow(color: (r.isEvent ? Color.purple : theme.accent).opacity(0.7), radius: 4)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(r.title)
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                        .lineLimit(2)
+                    if let d = r.detail, !d.isEmpty {
+                        Label(d, systemImage: r.isEvent ? "mappin" : "bell")
+                            .font(.caption2).foregroundColor(theme.textSecondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+                Image(systemName: r.isEvent ? "chevron.right" : "circle")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            .padding(11)
+            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 14)
+                .stroke((r.isEvent ? Color.purple : theme.accent).opacity(0.22), lineWidth: 1))
+        }
+        .buttonStyle(ChappyPressStyle())
+        .padding(.horizontal, 14)
+    }
+
+    // MARK: BUILD 164 — the three looks
+
+    private var lookPicker: some View {
+        HStack(spacing: 7) {
+            ForEach(Look.allCases, id: \.rawValue) { m in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) { mode = m; anchor = Date() }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: m.icon).font(.system(size: 12, weight: .bold))
+                        Text(m.rawValue).font(.footnote).fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .background(RoundedRectangle(cornerRadius: 11)
+                        .fill(mode == m ? theme.accent.opacity(0.22) : Color.white.opacity(0.05)))
+                    .overlay(RoundedRectangle(cornerRadius: 11)
+                        .stroke(mode == m ? theme.accent.opacity(0.55) : .clear, lineWidth: 1))
+                    .foregroundColor(mode == m ? theme.accent : theme.textSecondary)
+                }
+                .buttonStyle(ChappyPressStyle(scale: 0.95))
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+    }
+
+    /// WEEK — seven days down the screen, each with its own events. The
+    /// shape Google Calendar's phone "3 day" and Outlook's agenda both
+    /// use, because seven columns on a phone is unreadable.
+    private var weekView: some View {
+        let cal = Calendar.current
+        let start = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear],
+                                                      from: anchor)) ?? anchor
+        let daysOfWeek = (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: start) }
+        return VStack(spacing: 0) {
+            stepper(title: Self.weekTitle(start), back: -7, fwd: 7)
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 9) {
+                    ForEach(daysOfWeek, id: \.self) { d in
+                        dayCard(d)
+                    }
+                }
+                .padding(.horizontal, 14).padding(.bottom, 26)
+            }
+        }
+    }
+
+    private func dayCard(_ d: Date) -> some View {
+        let items = itemsOn(d)
+        let isToday = Calendar.current.isDateInToday(d)
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            pickedDay = d
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(Self.dayLabel(d))
+                        .font(.subheadline).fontWeight(.bold)
+                        .foregroundColor(isToday ? theme.accent : theme.textPrimary)
+                    if isToday {
+                        Text("TODAY").font(.system(size: 9, weight: .heavy))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(theme.accent.opacity(0.25)))
+                            .foregroundColor(theme.accent)
+                    }
+                    Spacer()
+                    if items.isEmpty {
+                        Text("clear").font(.caption2)
+                            .foregroundColor(theme.textSecondary.opacity(0.6))
+                    } else {
+                        Text("\(items.count)").font(.caption2).fontWeight(.bold)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                }
+                ForEach(items.prefix(4), id: \.id) { r in
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(r.isEvent ? Color.purple : theme.accent)
+                            .frame(width: 6, height: 6)
+                        Text(r.allDay ? "all day" : Self.shortTime(r.at))
+                            .font(.caption2).monospacedDigit()
+                            .foregroundColor(theme.textSecondary)
+                            .frame(width: 58, alignment: .leading)
+                        Text(r.title).font(.caption)
+                            .foregroundColor(theme.textPrimary).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                }
+                if items.count > 4 {
+                    Text("+ \(items.count - 4) more").font(.caption2)
+                        .foregroundColor(theme.accent)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 14)
+                .stroke(isToday ? theme.accent.opacity(0.55) : Color.white.opacity(0.06),
+                        lineWidth: 1))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+
+    /// MONTH — the grid everyone knows, with a dot per event. Tap a day
+    /// for its list. Apple, Google and Outlook all converged here; the
+    /// only real choice is what the dots mean, and here they mean
+    /// "something is on", coloured by event vs reminder.
+    private var monthView: some View {
+        let cal = Calendar.current
+        let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: anchor)) ?? anchor
+        let range = cal.range(of: .day, in: .month, for: monthStart) ?? 1..<31
+        let firstWeekday = cal.component(.weekday, from: monthStart) - cal.firstWeekday
+        let pad = (firstWeekday + 7) % 7
+        let cells: [Date?] = Array(repeating: nil, count: pad)
+            + range.compactMap { cal.date(byAdding: .day, value: $0 - 1, to: monthStart) }
+        return VStack(spacing: 0) {
+            stepper(title: Self.monthTitle(monthStart), back: -1, fwd: 1, byMonth: true)
+            HStack(spacing: 0) {
+                ForEach(Self.weekdayInitials(), id: \.self) { w in
+                    Text(w).font(.system(size: 10, weight: .bold))
+                        .foregroundColor(theme.textSecondary)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.horizontal, 10).padding(.bottom, 6)
+            ScrollView(showsIndicators: false) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 7),
+                          spacing: 4) {
+                    ForEach(Array(cells.enumerated()), id: \.offset) { _, day in
+                        if let d = day { monthCell(d) } else { Color.clear.frame(height: 52) }
+                    }
+                }
+                .padding(.horizontal, 10).padding(.bottom, 26)
+            }
+        }
+    }
+
+    private func monthCell(_ d: Date) -> some View {
+        let items = itemsOn(d)
+        let isToday = Calendar.current.isDateInToday(d)
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            pickedDay = d
+        } label: {
+            VStack(spacing: 3) {
+                Text("\(Calendar.current.component(.day, from: d))")
+                    .font(.system(size: 14, weight: isToday ? .heavy : .medium))
+                    .foregroundColor(isToday ? .white : theme.textPrimary)
+                    .frame(width: 25, height: 25)
+                    .background(Circle().fill(isToday ? theme.accent : .clear))
+                HStack(spacing: 2) {
+                    ForEach(0..<min(items.count, 3), id: \.self) { i in
+                        Circle()
+                            .fill(items[i].isEvent ? Color.purple : theme.accent)
+                            .frame(width: 4, height: 4)
+                    }
+                }
+                .frame(height: 5)
+            }
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .background(RoundedRectangle(cornerRadius: 9)
+                .fill(items.isEmpty ? Color.clear : Color.white.opacity(0.05)))
+        }
+        .buttonStyle(ChappyPressStyle(scale: 0.93))
+    }
+
+    private func stepper(title: String, back: Int, fwd: Int, byMonth: Bool = false) -> some View {
+        HStack {
+            Button {
+                anchor = Calendar.current.date(byAdding: byMonth ? .month : .day,
+                                               value: back, to: anchor) ?? anchor
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            } label: { Image(systemName: "chevron.left").padding(8) }
+                .buttonStyle(ChappyPressStyle(scale: 0.9))
+            Spacer()
+            Button {
+                anchor = Date()
+            } label: {
+                Text(title).font(.subheadline).fontWeight(.bold)
+                    .foregroundColor(theme.textPrimary)
+            }
+            .buttonStyle(.plain)
+            Spacer()
+            Button {
+                anchor = Calendar.current.date(byAdding: byMonth ? .month : .day,
+                                               value: fwd, to: anchor) ?? anchor
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            } label: { Image(systemName: "chevron.right").padding(8) }
+                .buttonStyle(ChappyPressStyle(scale: 0.9))
+        }
+        .foregroundColor(theme.accent)
+        .padding(.horizontal, 14).padding(.bottom, 6)
+    }
+
+    /// Everything on one day — events and timed reminders together.
+    private func itemsOn(_ d: Date) -> [Row] {
+        _ = refresh
+        let cal = Calendar.current
+        var out: [Row] = []
+        for e in ChappyCalendar.shared.events(onDay: d) {
+            guard let s = e.startDate else { continue }
+            out.append(Row(at: s, isEvent: true, title: e.title ?? "Appointment",
+                           detail: e.location, allDay: e.isAllDay, event: e, reminder: nil))
+        }
+        for r in ChappyReminders.shared.open where r.doneAt == nil {
+            if let f = r.effectiveFire, cal.isDate(f, inSameDayAs: d) {
+                out.append(Row(at: f, isEvent: false, title: r.title,
+                               detail: r.placeTrigger, allDay: false,
+                               event: nil, reminder: r))
+            }
+        }
+        return out.sorted { $0.at < $1.at }
+    }
+
+    private static func weekTitle(_ start: Date) -> String {
+        let end = Calendar.current.date(byAdding: .day, value: 6, to: start) ?? start
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        return "\(f.string(from: start)) – \(f.string(from: end))"
+    }
+
+    private static func monthTitle(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        return f.string(from: d)
+    }
+
+    private static func weekdayInitials() -> [String] {
+        let f = DateFormatter()
+        let syms = f.veryShortWeekdaySymbols ?? ["S","M","T","W","T","F","S"]
+        let first = Calendar.current.firstWeekday - 1
+        return Array(syms[first...] + syms[..<first])
+    }
+
+    private static func shortTime(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        return f.string(from: d)
+    }
+
+    private struct DayBox: Identifiable {
+        let day: Date
+        var id: Double { day.timeIntervalSince1970 }
+    }
+
+    private static func dayLabel(_ d: Date) -> String {
+        if d == .distantFuture { return "No time set" }
+        let cal = Calendar.current
+        if cal.isDateInToday(d) { return "Today" }
+        if cal.isDateInTomorrow(d) { return "Tomorrow" }
+        let f = DateFormatter()
+        f.dateFormat = cal.isDate(d, equalTo: Date(), toGranularity: .weekOfYear)
+            ? "EEEE" : "EEEE d MMMM"
+        return f.string(from: d)
+    }
+
+    private static func timeLabel(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        return f.string(from: d).replacingOccurrences(of: " ", with: "\n")
+    }
+}
+
+/// Which calendars feed Chappy — the first question whenever something
+/// expected doesn't show up.
+private struct CalendarPickerSheet: View {
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @State private var tick = 0
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    ForEach(ChappyCalendar.shared.allCalendars, id: \.calendarIdentifier) { cal in
+                        Button {
+                            ChappyCalendar.shared.setOn(cal, !ChappyCalendar.shared.isEnabled(cal))
+                            tick += 1
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            HStack {
+                                Circle()
+                                    .fill(Color(cal.cgColor ?? UIColor.systemGray.cgColor))
+                                    .frame(width: 11, height: 11)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(cal.title)
+                                    if let src = cal.source?.title {
+                                        Text(src).font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                if ChappyCalendar.shared.isEnabled(cal) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                        }
+                        .id("\(cal.calendarIdentifier)-\(tick)")
+                    }
+                } footer: {
+                    Text("Everything is on until you switch it off. If your iCloud events aren't here at all, Chappy hasn't been granted calendar access \u{2014} check iOS Settings, Chappy, Calendars.")
+                }
+            }
+            .navigationTitle("Calendars")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - BUILD 164: one day, and making new events
+
+/// Tapping a day in Week or Month lands here: everything on it, plus a
+/// button to add something.
+private struct DayListSheet: View {
+    let day: Date
+    let theme: ChappyTheme
+    var onChange: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var tick = 0
+    @State private var picked: EKEvent?
+    @State private var showNew = false
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                let events = ChappyCalendar.shared.events(onDay: day)
+                let rems = ChappyReminders.shared.open.filter {
+                    $0.doneAt == nil && ($0.effectiveFire.map {
+                        Calendar.current.isDate($0, inSameDayAs: day) } ?? false)
+                }
+                if events.isEmpty && rems.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "calendar.badge.plus")
+                            .font(.system(size: 46))
+                            .foregroundColor(theme.textSecondary.opacity(0.6))
+                        Text("Nothing on.")
+                            .font(.subheadline).foregroundColor(theme.textSecondary)
+                        Button {
+                            showNew = true
+                        } label: {
+                            Label("Add something", systemImage: "plus")
+                                .font(.subheadline).fontWeight(.semibold)
+                                .padding(.horizontal, 18).padding(.vertical, 10)
+                                .background(Capsule().fill(theme.accent.opacity(0.22)))
+                                .foregroundColor(theme.accent)
+                        }
+                        .buttonStyle(ChappyPressStyle())
+                    }
+                } else {
+                    List {
+                        Section("Appointments") {
+                            ForEach(events, id: \.eventIdentifier) { e in
+                                Button {
+                                    picked = e
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        if ChappyCalendar.shared.isStarred(e) {
+                                            Image(systemName: "star.fill")
+                                                .font(.caption).foregroundStyle(.yellow)
+                                        }
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(e.title ?? "Appointment")
+                                                .foregroundColor(theme.textPrimary)
+                                            Text(e.isAllDay ? "All day"
+                                                 : Self.time(e.startDate ?? day))
+                                                .font(.caption)
+                                                .foregroundColor(theme.textSecondary)
+                                        }
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption2)
+                                            .foregroundColor(theme.textSecondary)
+                                    }
+                                }
+                            }
+                        }
+                        if !rems.isEmpty {
+                            Section("Reminders") {
+                                ForEach(rems) { r in
+                                    Button {
+                                        ChappyReminders.shared.complete(r.id)
+                                        tick += 1; onChange()
+                                    } label: {
+                                        HStack {
+                                            Image(systemName: "circle")
+                                                .foregroundColor(theme.accent)
+                                            Text(r.title).foregroundColor(theme.textPrimary)
+                                            Spacer()
+                                            if let f = r.effectiveFire {
+                                                Text(Self.time(f)).font(.caption)
+                                                    .foregroundColor(theme.textSecondary)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+                }
+            }
+            .navigationTitle(Self.title(day))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { showNew = true } label: { Image(systemName: "plus") }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showNew) {
+                NewEventSheet(theme: theme, start: day) { tick += 1; onChange() }
+            }
+            .sheet(item: Binding(
+                get: { picked.map { EvBox(e: $0) } },
+                set: { picked = $0?.e })) { box in
+                    EventDetailSheet(event: box.e, theme: theme) { tick += 1; onChange() }
+                }
+        }
+    }
+
+    private struct EvBox: Identifiable {
+        let e: EKEvent
+        var id: String { (e.eventIdentifier ?? UUID().uuidString) }
+    }
+
+    private static func title(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
+        return f.string(from: d)
+    }
+    private static func time(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        return f.string(from: d)
+    }
+}
+
+/// Making an appointment inside Chappy, instead of leaving for Apple's
+/// Calendar and losing your place.
+private struct NewEventSheet: View {
+    let theme: ChappyTheme
+    let start: Date
+    var onSaved: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title = ""
+    @State private var when = Date()
+    @State private var minutes = 60
+    @State private var place = ""
+    @State private var notes = ""
+    @State private var starred = false
+    @State private var error: String?
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("What") {
+                    TextField("Appointment", text: $title)
+                }
+                Section("When") {
+                    DatePicker("Starts", selection: $when)
+                    Picker("For", selection: $minutes) {
+                        Text("15 min").tag(15); Text("30 min").tag(30)
+                        Text("1 hour").tag(60); Text("2 hours").tag(120)
+                        Text("Half day").tag(240); Text("All day").tag(1440)
+                    }
+                }
+                Section("Where") {
+                    TextField("Address or place (optional)", text: $place)
+                }
+                Section("Notes") {
+                    TextField("Anything worth remembering", text: $notes, axis: .vertical)
+                        .lineLimit(2...5)
+                }
+                Section {
+                    Toggle(isOn: $starred) {
+                        Label("Star it", systemImage: "star.fill")
+                    }
+                } footer: {
+                    Text("Starred appointments lead the morning brief and get a firmer warn-time.")
+                }
+                if let e = error {
+                    Section { Text(e).font(.caption).foregroundStyle(.orange) }
+                }
+            }
+            .navigationTitle("New appointment")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Add") { save() }.fontWeight(.semibold)
+                        .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .onAppear {
+                // Land on the tapped day, at the next sensible hour.
+                let cal = Calendar.current
+                let hour = cal.isDateInToday(start)
+                    ? min(cal.component(.hour, from: Date()) + 1, 20) : 9
+                when = cal.date(bySettingHour: hour, minute: 0, second: 0, of: start) ?? start
+            }
+        }
+    }
+
+    private func save() {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let problem = ChappyCalendar.shared.createEvent(
+            title: t, start: when, minutes: minutes,
+            location: place, notes: notes, allDay: minutes == 1440) {
+            error = problem
+            return
+        }
+        if starred, let made = ChappyCalendar.shared.events(onDay: when)
+            .first(where: { $0.title == t }) {
+            ChappyCalendar.shared.setStarred(true, for: made)
+        }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        TTSService.shared.speak("Added. \(t).")
+        onSaved()
+        dismiss()
+    }
+}
+
+// =====================================================================
+// MARK: - DICTATE → EMAIL (Build 167)
+// =====================================================================
+//
+//   Talk it, tidy it, send it — without retyping a word.
+//
+//   The honest boundary: iOS will not let any app silently drop a draft
+//   into Mail or Outlook. That's a sandbox rule, not a Chappy limit —
+//   no third-party app on your phone can do it. What IS allowed, and
+//   what every assistant uses, is handing the finished message over so
+//   it opens as an editable draft with one tap to send. Your address
+//   book, your account, your send button.
+//
+//   Outlook publishes its own scheme, so if it's installed you get the
+//   choice; otherwise it goes to whatever iOS has set as default mail —
+//   which may well be Outlook anyway.
+
+struct DictateEmailSheet: View {
+
+    let theme: ChappyTheme
+    let body_: String
+
+    init(theme: ChappyTheme, body: String) {
+        self.theme = theme
+        self.body_ = body
+        _subject = State(initialValue: Self.suggestedSubject(body))
+    }
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_email_recents") private var recentsRaw = ""
+    @AppStorage("chappy_email_prefer_outlook") private var preferOutlook = false
+
+    @State private var to = ""
+    @State private var subject: String
+    @State private var sent = false
+
+    private var recents: [String] {
+        recentsRaw.split(separator: "|").map(String.init).filter { !$0.isEmpty }
+    }
+
+    /// Chappy already knows the addresses you actually use.
+    private var known: [String] {
+        var out = recents
+        if ChappyMail.shared.isConfigured, !ChappyMail.shared.address.isEmpty {
+            out.append(ChappyMail.shared.address)
+        }
+        return Array(NSOrderedSet(array: out).compactMap { $0 as? String }).prefix(6).map { $0 }
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("To") {
+                    TextField("name@example.com", text: $to)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if !known.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 7) {
+                                ForEach(known, id: \.self) { a in
+                                    Button {
+                                        to = a
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        Text(a)
+                                            .font(.caption).fontWeight(.medium)
+                                            .padding(.horizontal, 11).padding(.vertical, 6)
+                                            .background(Capsule().fill(theme.accent.opacity(0.16)))
+                                            .foregroundColor(theme.accent)
+                                            .lineLimit(1)
+                                    }
+                                    .buttonStyle(ChappyPressStyle(scale: 0.94))
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+                Section("Subject") {
+                    TextField("Subject", text: $subject)
+                }
+                Section("Message") {
+                    Text(body_)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(8)
+                }
+                if ChappyMail.hasOutlook {
+                    Section {
+                        Toggle("Open in Outlook", isOn: $preferOutlook)
+                    } footer: {
+                        Text("Off sends it to whichever mail app iOS has set as your default.")
+                    }
+                }
+                Section {
+                    Button {
+                        hand(off: true)
+                    } label: {
+                        Label("Open as a draft", systemImage: "square.and.pencil")
+                            .fontWeight(.semibold)
+                    }
+                    .disabled(to.trimmingCharacters(in: .whitespaces).isEmpty)
+                } footer: {
+                    Text("Opens your mail app with everything filled in — recipient, subject and message. One tap there sends it. Chappy never sends mail on your behalf.")
+                }
+            }
+            .navigationTitle("Email this")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func hand(off: Bool) {
+        let address = to.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else { return }
+        // Remember who you write to, so next time it's one tap.
+        var list = recents.filter { $0.caseInsensitiveCompare(address) != .orderedSame }
+        list.insert(address, at: 0)
+        recentsRaw = list.prefix(6).joined(separator: "|")
+
+        _ = ChappyMail.compose(to: address,
+                               subject: subject.isEmpty ? "Note from Chappy" : subject,
+                               body: body_,
+                               preferOutlook: preferOutlook)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        dismiss()
+    }
+
+    /// First sensible line becomes the subject — the thing you'd have
+    /// typed anyway.
+    private static func suggestedSubject(_ text: String) -> String {
+        // A Job Report starts with a label; the line after it is the meat.
+        let lines = text.split(separator: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }.filter { !$0.isEmpty }
+        for l in lines {
+            let cleaned = l.replacingOccurrences(of: "Reported issue:", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            if cleaned.count > 3 {
+                return String(cleaned.split(separator: ".").first.map(String.init) ?? cleaned)
+                    .prefix(60).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return "Note from Chappy"
+    }
+}
+
+// =====================================================================
+// MARK: - DOCUMENT SCANNER (Build 168)
+// =====================================================================
+//
+//   For a page in your hand, the phone beats the glasses at any
+//   resolution — you're photographing a flat thing at an angle from a
+//   moving head, and no amount of megapixels fixes the geometry.
+//
+//   iOS gives us the right tool free: VNDocumentCameraViewController,
+//   the exact scanner Apple Notes and Files use. It finds the page
+//   edges by itself, corrects the perspective so the page comes out
+//   flat and square, handles multiple pages in one go, and hands back
+//   clean images. Then the same on-device OCR reads them.
+
+struct DocumentScanner: UIViewControllerRepresentable {
+    var onFinished: ([UIImage]) -> Void
+
+    func makeUIViewController(context: Context) -> VNDocumentCameraViewController {
+        let vc = VNDocumentCameraViewController()
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ vc: VNDocumentCameraViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onFinished: onFinished) }
+
+    final class Coordinator: NSObject, VNDocumentCameraViewControllerDelegate {
+        let onFinished: ([UIImage]) -> Void
+        init(onFinished: @escaping ([UIImage]) -> Void) { self.onFinished = onFinished }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController,
+                                          didFinishWith scan: VNDocumentCameraScan) {
+            var pages: [UIImage] = []
+            for i in 0..<scan.pageCount { pages.append(scan.imageOfPage(at: i)) }
+            controller.dismiss(animated: true)
+            onFinished(pages)
+        }
+
+        func documentCameraViewControllerDidCancel(_ controller: VNDocumentCameraViewController) {
+            controller.dismiss(animated: true)
+            onFinished([])
+        }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController,
+                                          didFailWithError error: Error) {
+            controller.dismiss(animated: true)
+            onFinished([])
+        }
+    }
+}
+
+/// On-device OCR for scanned pages. Free, private, no network — the same
+/// engine Reader uses, exposed here so the scanner can feed Dictate.
+enum ChappyPageOCR {
+    static func read(_ images: [UIImage]) async -> String {
+        var out: [String] = []
+        for img in images {
+            guard let cg = img.cgImage else { continue }
+            let text: String = await withCheckedContinuation { cont in
+                let req = VNRecognizeTextRequest { r, _ in
+                    let lines = (r.results as? [VNRecognizedTextObservation] ?? [])
+                        .compactMap { $0.topCandidates(1).first?.string }
+                    cont.resume(returning: lines.joined(separator: "\n"))
+                }
+                req.recognitionLevel = .accurate
+                req.usesLanguageCorrection = true
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let h = VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:])
+                    do { try h.perform([req]) } catch { cont.resume(returning: "") }
+                }
+            }
+            if !text.isEmpty { out.append(text) }
+        }
+        return out.joined(separator: "\n\n")
     }
 }
