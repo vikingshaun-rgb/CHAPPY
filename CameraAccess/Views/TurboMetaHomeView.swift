@@ -876,7 +876,7 @@ struct TurboMetaHomeView: View {
                         if notifsOff {
                             Button {
                                 if let u = URL(string: UIApplication.openSettingsURLString) {
-                                    UIApplication.shared.open(u)
+                                    UIApplication.shared.open(u, options: [:], completionHandler: nil)
                                 }
                             } label: {
                                 HStack(spacing: 10) {
@@ -1304,7 +1304,7 @@ struct TurboMetaHomeView: View {
                 if nav.isNavigating { nav.stop(announce: false) }
                 showMapSheet = false
                 showNavMap = false
-                UIApplication.shared.open(multi)
+                UIApplication.shared.open(multi, options: [:], completionHandler: nil)
                 return
             }
             var url: URL?
@@ -1332,7 +1332,7 @@ struct TurboMetaHomeView: View {
             if nav.isNavigating { nav.stop(announce: false) }
             showMapSheet = false
             showNavMap = false
-            if let u = url { UIApplication.shared.open(u) }
+            if let u = url { UIApplication.shared.open(u, options: [:], completionHandler: nil) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .continuousVisionTriggered)) { _ in
             // "Hey Siri, Continuous Vision"
@@ -2043,7 +2043,7 @@ struct TodayMapSheet: View {
                                     let u = q.isEmpty
                                         ? "https://www.google.com/maps/search/?api=1&query=\(v.lat),\(v.lon)"
                                         : "https://www.google.com/maps/search/?api=1&query=\(q)&center=\(v.lat),\(v.lon)"
-                                    if let url = URL(string: u) { UIApplication.shared.open(url) }
+                                    if let url = URL(string: u) { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
                                 } label: { Label("Place info in Google Maps", systemImage: "safari") }
                             }
                         }
@@ -3619,8 +3619,8 @@ struct MemoryDetailView: View {
             withAllowedCharacters: .urlQueryAllowed) ?? "Saved"
         let app = URL(string: "comgooglemaps://?q=\(lat),\(lon)&center=\(lat),\(lon)&zoom=17")
         let web = URL(string: "https://www.google.com/maps/search/?api=1&query=\(lat),\(lon)&query_place_id=&hl=en#\(label)")
-        if let a = app, UIApplication.shared.canOpenURL(a) { UIApplication.shared.open(a) }
-        else if let w = web { UIApplication.shared.open(w) }
+        if let a = app, UIApplication.shared.canOpenURL(a) { UIApplication.shared.open(a, options: [:], completionHandler: nil) }
+        else if let w = web { UIApplication.shared.open(w, options: [:], completionHandler: nil) }
     }
 
     private func openInGoogleMaps(mode: String) {
@@ -3628,9 +3628,9 @@ struct MemoryDetailView: View {
         let app = URL(string: "comgooglemaps://?daddr=\(lat),\(lon)&directionsmode=\(mode)")
         let web = URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lon)&travelmode=\(mode)")
         if let a = app, UIApplication.shared.canOpenURL(a) {
-            UIApplication.shared.open(a)
+            UIApplication.shared.open(a, options: [:], completionHandler: nil)
         } else if let w = web {
-            UIApplication.shared.open(w)
+            UIApplication.shared.open(w, options: [:], completionHandler: nil)
         }
     }
 }
@@ -3871,7 +3871,7 @@ struct FlightsView: View {
                                         let q = "flights to \(w.destName)"
                                             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
                                         if let u = URL(string: "https://www.google.com/travel/flights?q=\(q)") {
-                                            UIApplication.shared.open(u)
+                                            UIApplication.shared.open(u, options: [:], completionHandler: nil)
                                         }
                                     } label: {
                                         Label("Book", systemImage: "arrow.up.right.square")
@@ -5419,14 +5419,14 @@ struct ReminderRow: View {
             let q = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
             url = URL(string: "https://www.google.com/maps/search/?api=1&query=\(q)")
         }
-        if let url { UIApplication.shared.open(url) }
+        if let url { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
     }
 
     private func openSearch() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         let q = entry.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         if let url = URL(string: "https://www.google.com/search?q=\(q)") {
-            UIApplication.shared.open(url)
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
         }
     }
 
@@ -6126,7 +6126,7 @@ struct AtlasView: View {
                 if let w = weather {
                     Button {
                         if let u = ChappyAtlas.zoomEarthURL(region.center, zoom: zoomLevel()) {
-                            UIApplication.shared.open(u)
+                            UIApplication.shared.open(u, options: [:], completionHandler: nil)
                         }
                     } label: {
                         HStack(spacing: 5) {
@@ -6296,7 +6296,7 @@ struct AtlasView: View {
                 Button {
                     let q = p.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
                     if let u = URL(string: "https://www.google.com/search?q=\(q)") {
-                        UIApplication.shared.open(u)
+                        UIApplication.shared.open(u, options: [:], completionHandler: nil)
                     }
                 } label: { pill("Look up", "magnifyingglass", .green) }
                 .buttonStyle(.plain)
@@ -7162,7 +7162,7 @@ private struct PlaceEditor: View {
                     Button {
                         if let s = spot,
                            let u = URL(string: "https://maps.apple.com/?ll=\(s.lat),\(s.lon)&q=\(s.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")") {
-                            UIApplication.shared.open(u)
+                            UIApplication.shared.open(u, options: [:], completionHandler: nil)
                         }
                     } label: { Label("Open in Maps", systemImage: "map") }
                 }
