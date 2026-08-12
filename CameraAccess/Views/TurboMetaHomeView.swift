@@ -304,6 +304,9 @@ struct TurboMetaHomeView: View {
     @State private var showPlaces = false       // BUILD 158: saved places
     @State private var showUpcoming = false     // BUILD 163: the 30-day diary
     @State private var notifsOff = false        // BUILD 163: permission truth
+    @State private var showNotifDoctor = false  // BUILD 172
+    @State private var showWeather = false      // BUILD 173
+    @State private var showBriefs = false       // BUILD 173
     @State private var dictateAutoStart = false
     @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
     @State private var showEmergencyContact = false
@@ -497,6 +500,19 @@ struct TurboMetaHomeView: View {
         if Calendar.current.isDateInTomorrow(d) { return "Tomorrow \(t.string(from: d))" }
         let day = DateFormatter(); day.dateFormat = "EEEE"
         return "\(day.string(from: d)) \(t.string(from: d))"
+    }
+
+    /// BUILD 173 — live conditions on the tile face, so the common question
+    /// is answered without opening anything.
+    private var weatherDetailLine: String {
+        guard let n = ChappyWeather.shared.now else {
+            return "Wind, rain, UV, pressure — 7 days ahead"
+        }
+        var s = "\(Int(n.tempC.rounded()))° \(ChappyWeather.describe(n.code))"
+        if let d = ChappyWeather.shared.days.first, d.rainChance >= 30 {
+            s += " · \(d.rainChance)% rain"
+        }
+        return s
     }
 
     /// BUILD 163 — the next thing, on the tile, so the week is visible
@@ -875,9 +891,9 @@ struct TurboMetaHomeView: View {
                         // SAY SO, right here, with the button that fixes it.
                         if notifsOff {
                             Button {
-                                if let u = URL(string: UIApplication.openSettingsURLString) {
-                                    UIApplication.shared.open(u, options: [:], completionHandler: nil)
-                                }
+                                // BUILD 172: the doctor first — it shows WHY,
+                                // and iOS Settings is one tap from there.
+                                showNotifDoctor = true
                             } label: {
                                 HStack(spacing: 10) {
                                     Image(systemName: "bell.slash.fill")
@@ -979,6 +995,23 @@ struct TurboMetaHomeView: View {
                                        tint: Color(red: 0.55, green: 0.62, blue: 0.72)) {
                                 showOpenClaw = true
                             }
+                            ChappyTile(icon: "cloud.sun.fill", title: "Weather",
+                                       detail: weatherDetailLine,
+                                       tint: Color(red: 0.35, green: 0.78, blue: 1.0)) {
+                                showWeather = true
+                            }
+                            ChappyTile(icon: "sun.horizon.fill", title: "Briefs",
+                                       detail: "How your daily brief is built — and when",
+                                       tint: Color(red: 1.0, green: 0.72, blue: 0.35)) {
+                                showBriefs = true
+                            }
+                            ChappyTile(icon: "bell.badge.fill", title: "Notifications",
+                                       detail: notifsOff ? "OFF — tap to see why"
+                                                         : "Check what iOS is holding or hiding",
+                                       tint: notifsOff ? Color(red: 1.0, green: 0.55, blue: 0.2)
+                                                       : Color(red: 0.35, green: 0.95, blue: 0.70)) {
+                                showNotifDoctor = true
+                            }
                             ChappyTile(icon: "cross.circle.fill", title: "Emergency",
                                        detail: emergencyContactText.isEmpty
                                             ? "Set the WhatsApp number" : "Saved — tap to change",
@@ -1046,6 +1079,18 @@ struct TurboMetaHomeView: View {
             .fullScreenCover(isPresented: $showUpcoming) {
                 UpcomingView()
             }
+            .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
+            .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
+            .sheet(isPresented: $showBriefs) { BriefStudio() }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenWeather)) { _ in
+                showWeather = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenBriefs)) { _ in
+                showBriefs = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenNotifDoctor)) { _ in
+                showNotifDoctor = true
+            }
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
                 showUpcoming = true
             }
@@ -1097,6 +1142,27 @@ struct TurboMetaHomeView: View {
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictateQuiet)) { _ in
                 dictateAutoStart = false
                 showDictate = true
+            }
+            // BUILD 170 — "CHAPPY RESET": close every sheet and cover, from
+            // wherever you are, and come back to this screen.
+            .onReceive(NotificationCenter.default.publisher(for: .chappyCloseEverything)) { _ in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showLiveAI = false;      showLiveTranslate = false
+                    showQuickVision = false; showLiveStream = false
+                    showRTMPStreaming = false; showOpenClaw = false
+                    showLeanEat = false;     showMemory = false
+                    showAtlas = false;       showPlaces = false
+                    showUpcoming = false;    showDictate = false
+                    showWeather = false;     showBriefs = false
+                    showNotifDoctor = false
+                    showFlights = false;     showCommands = false
+                    showReminders = false;   showMapSheet = false
+                    showEmergencyContact = false
+                }
+                // The ear may have been handed to a module that just closed.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    armStandbyIfClear(reason: "reset")
+                }
             }
             .sheet(isPresented: $showFlights) {
                 FlightsView(theme: theme)
@@ -2795,27 +2861,45 @@ struct ModeTile: View {
     @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
     private var theme: ChappyTheme { ChappyTheme.named(themeName) }
     var body: some View {
+        // BUILD 173 — TIGHTER. These four were 110pt tall with a 14pt pad and
+        // a two-line subtitle, which is a lot of screen for four words. The
+        // icon now sits BESIDE the title rather than above it, the subtitle
+        // is one line, and the whole tile is 78pt — a third shorter, still
+        // well over the 44pt touch minimum, and it lifts everything below
+        // it up the screen. Active tiles now also carry a coloured glow, so
+        // "which one is running" reads at a glance.
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 26))
-                    .foregroundColor(accent)
-                Spacer(minLength: 2)
-                Text(title)
-                    .font(.headline)
-                    .foregroundColor(theme.textPrimary)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    ZStack {
+                        Circle().fill(accent.opacity(active ? 0.3 : 0.18))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: icon)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(active ? .white : accent)
+                    }
+                    .shadow(color: accent.opacity(active ? 0.8 : 0.45), radius: active ? 9 : 6)
+                    Text(title)
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundColor(theme.textPrimary)
+                        .lineLimit(1).minimumScaleFactor(0.85)
+                    Spacer(minLength: 0)
+                }
                 Text(subtitle)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundColor(theme.textSecondary)
-                    .lineLimit(2)
+                    .lineLimit(1).minimumScaleFactor(0.8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 110)
-            .padding(14)
-            .background(RoundedRectangle(cornerRadius: 20).fill(active ? theme.cardActive : theme.cardFill))
-            .overlay(RoundedRectangle(cornerRadius: 20).stroke(active ? accent.opacity(0.7) : theme.stroke, lineWidth: 1))
+            .frame(height: 78)
+            .padding(.horizontal, 12)
+            .background(RoundedRectangle(cornerRadius: 17)
+                .fill(active ? theme.cardActive : theme.cardFill))
+            .overlay(RoundedRectangle(cornerRadius: 17)
+                .stroke(active ? accent.opacity(0.8) : theme.stroke, lineWidth: 1))
+            .shadow(color: active ? accent.opacity(0.3) : .clear, radius: 10, y: 3)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ChappyPressStyle())
     }
 }
 
@@ -4026,6 +4110,14 @@ struct WhatCanISayView: View {
          ["Open the atlas", "Where have I been", "Zoom to Ubud",
           "Show me temples", "Show me waterfalls", "What's around me",
           "Show me lookouts", "Fly to Bali"]),
+        ("Voice", "waveform",
+         ["Why is the voice robotic", "Voice status", "Check the voice",
+          "Reset the voice", "Test the voice"]),
+        ("Weather", "cloud.sun.fill",
+         ["What's the weather", "Full weather", "Will it rain",
+          "Weather this week", "Weather in Bali", "Open weather"]),
+        ("Briefs", "sun.horizon.fill",
+         ["What was my brief", "Brief me now", "Open briefs"]),
         ("Calendar & upcoming", "calendar",
          ["What's coming up", "My calendar", "What's on today",
           "What's on next week", "My appointments", "Upcoming",
@@ -4050,7 +4142,10 @@ struct WhatCanISayView: View {
           "Can I eat this", "Emergency"]),
         ("Modes & checks", "gearshape.fill",
          ["Let's talk", "Translate", "Quiet mode", "Battery check", "Spent today",
-          "Test the voice", "Test notification"]),
+          "Test the voice", "Test notification", "Are my notifications on",
+          // BUILD 170 — the escape hatch, from anywhere.
+          "Chappy reset", "Close everything", "Back to the main screen",
+          "Stop everything", "Close maps", "Stop navigation"]),
     ]
 
     private var filtered: [(name: String, icon: String, items: [String])] {
@@ -8252,5 +8347,724 @@ enum ChappyPageOCR {
             if !text.isEmpty { out.append(text) }
         }
         return out.joined(separator: "\n\n")
+    }
+}
+
+// =====================================================================
+// MARK: - NOTIFICATION DOCTOR (Build 172)
+// =====================================================================
+//
+//   "Notifications don't work outside the app at all."
+//
+//   Chappy's reminders ARE real iOS notifications — scheduled with
+//   UNCalendarNotificationTrigger and UNTimeIntervalNotificationTrigger,
+//   handed to the system, and delivered by iOS whether the app is
+//   running or not. That machinery is correct and it re-arms on every
+//   launch. So when nothing arrives, the cause is one of exactly four
+//   things, and until now there was no way to tell which:
+//
+//     1. Permission is off or was never granted.
+//     2. Scheduled Summary is holding them for a batch delivery.
+//     3. A Focus mode is eating them (no Time Sensitive permission).
+//     4. Nothing was ever actually scheduled.
+//
+//   Number 4 is the one nobody can diagnose by feel — and it's the one
+//   this screen settles instantly, because it shows you the PENDING
+//   QUEUE: every notification iOS is currently holding for Chappy, with
+//   its fire time. If that list has items and they never arrive, it's
+//   1-3. If it's empty, the fault is upstream and I need to fix it.
+
+struct NotificationDoctor: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var settings: UNNotificationSettings?
+    @State private var pending: [UNNotificationRequest] = []
+    @State private var note = ""
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                List {
+                    permissionSection
+                    suppressionSection
+                    queueSection
+                    actionsSection
+                    if !note.isEmpty {
+                        Section { Text(note).font(.footnote).foregroundStyle(.secondary) }
+                    }
+                }
+                .scrollContentBackground(.hidden)
+            }
+            .navigationTitle("Notifications")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+            .task { await refresh() }
+        }
+    }
+
+    // MARK: sections
+
+    @ViewBuilder
+    private var permissionSection: some View {
+        Section("Permission") {
+            row("Allowed", ok: settings.map {
+                $0.authorizationStatus == .authorized || $0.authorizationStatus == .provisional
+            } ?? false)
+            row("Banners", ok: settings?.alertSetting == .enabled)
+            row("Sounds", ok: settings?.soundSetting == .enabled)
+            row("Lock screen", ok: settings?.lockScreenSetting == .enabled)
+        }
+    }
+
+    @ViewBuilder
+    private var suppressionSection: some View {
+        Section {
+            // These two are the usual culprits, and neither is obvious.
+            row("Scheduled Summary OFF",
+                ok: settings?.scheduledDeliverySetting != .enabled,
+                bad: "ON — iOS is holding your notifications back and delivering them in a batch. This alone explains \"nothing arrives\".")
+            row("Time Sensitive allowed",
+                ok: settings?.timeSensitiveSetting != .disabled,
+                bad: "Off — any Focus mode will silence warn-times.")
+        } header: {
+            Text("The quiet killers")
+        } footer: {
+            Text("Scheduled Summary is under iOS Settings > Notifications > Scheduled Summary. Time Sensitive is under Settings > Chappy > Notifications.")
+        }
+    }
+
+    @ViewBuilder
+    private var queueSection: some View {
+        Section {
+            if pending.isEmpty {
+                Label("Nothing queued", systemImage: "tray")
+                    .foregroundStyle(.orange)
+                Text("If you have reminders set and this is empty, they were never handed to iOS — that's a fault in Chappy, not a setting. Tap \u{201C}Re-arm everything\u{201D} below, then come back. If it's still empty, tell me.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(pending.prefix(8), id: \.identifier) { r in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(r.content.title.isEmpty ? "Reminder" : r.content.title)
+                            .font(.subheadline)
+                        Text(Self.when(r.trigger))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if pending.count > 8 {
+                    Text("+ \(pending.count - 8) more").font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Queued with iOS (\(pending.count))")
+        } footer: {
+            Text("These are handed to the system — they fire whether Chappy is open, closed or the phone is locked. If they're listed here and still never appear, the cause is one of the settings above.")
+        }
+    }
+
+    @ViewBuilder
+    private var actionsSection: some View {
+        Section {
+            Button {
+                if let u = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                }
+            } label: { Label("Open iOS notification settings", systemImage: "gear") }
+
+            Button {
+                fireTest(after: 20)
+            } label: {
+                Label("Test in 20 seconds — then LOCK THE PHONE",
+                      systemImage: "lock.iphone")
+            }
+
+            Button {
+                ChappyReminders.shared.rescheduleAll()
+                Task { await refresh() }
+                note = "Re-armed. Check the queue count above."
+            } label: { Label("Re-arm everything", systemImage: "arrow.clockwise") }
+        } header: {
+            Text("Prove it")
+        } footer: {
+            Text("The 20-second test is the honest one: lock the phone and put it down. A banner that arrives on a locked screen proves the whole chain works outside the app.")
+        }
+    }
+
+    // MARK: work
+
+    private func row(_ label: String, ok: Bool, bad: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Image(systemName: ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                    .foregroundStyle(ok ? .green : .orange)
+                Text(label)
+                Spacer()
+            }
+            if !ok, let b = bad {
+                Text(b).font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func refresh() async {
+        let s = await UNUserNotificationCenter.current().notificationSettings()
+        let p = await UNUserNotificationCenter.current().pendingNotificationRequests()
+        await MainActor.run {
+            settings = s
+            pending = p.sorted { a, b in
+                (Self.fireDate(a.trigger) ?? .distantFuture) < (Self.fireDate(b.trigger) ?? .distantFuture)
+            }
+        }
+    }
+
+    private func fireTest(after seconds: TimeInterval) {
+        let c = UNMutableNotificationContent()
+        c.title = "Chappy works outside the app"
+        c.body = "This arrived with Chappy closed. The chain is fine."
+        c.sound = .default
+        c.interruptionLevel = .timeSensitive
+        let req = UNNotificationRequest(
+            identifier: "chappy-doctor-\(Int(Date().timeIntervalSince1970))",
+            content: c,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false))
+        UNUserNotificationCenter.current().add(req)
+        note = "Sent. Lock the phone now — it lands in \(Int(seconds)) seconds."
+        TTSService.shared.speak("Lock the phone. It'll arrive in twenty seconds.")
+        Task { await refresh() }
+    }
+
+    private static func fireDate(_ t: UNNotificationTrigger?) -> Date? {
+        if let c = t as? UNCalendarNotificationTrigger { return c.nextTriggerDate() }
+        if let i = t as? UNTimeIntervalNotificationTrigger { return i.nextTriggerDate() }
+        return nil
+    }
+
+    private static func when(_ t: UNNotificationTrigger?) -> String {
+        guard let d = fireDate(t) else { return "when you arrive somewhere" }
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM, h:mm a"
+        return f.string(from: d)
+    }
+}
+
+// =====================================================================
+// MARK: - WEATHER STATION (Build 173)
+// =====================================================================
+//
+//   Every instrument on one screen, for wherever you are or anywhere
+//   you name — and every panel speakable, because the phone is usually
+//   in a pocket when the question comes up.
+
+struct WeatherStation: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var wx = ChappyWeather.shared
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @State private var search = ""
+    @State private var searching = false
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 12) {
+                        searchBar
+                        if wx.loading && wx.now == nil {
+                            ProgressView().tint(theme.accent).padding(.top, 40)
+                        }
+                        if let e = wx.error, wx.now == nil {
+                            Text(e).font(.subheadline)
+                                .foregroundColor(.orange).padding()
+                        }
+                        if let n = wx.now {
+                            headline(n)
+                            instruments(n)
+                            if !wx.hours.isEmpty { hourStrip }
+                            if !wx.days.isEmpty { weekPanel }
+                            sunPanel(n)
+                            speakRow
+                            satelliteRow
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 30)
+                }
+            }
+            .navigationTitle("Weather")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        Task { await wx.loadHere() }
+                    } label: {
+                        Image(systemName: "location.fill").foregroundColor(theme.accent)
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+            .task { if wx.now == nil { await wx.loadHere() } }
+        }
+    }
+
+    // MARK: pieces
+
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(theme.textSecondary)
+            TextField("Anywhere — Ubud, Brisbane, Denpasar…", text: $search)
+                .submitLabel(.search)
+                .onSubmit {
+                    let q = search.trimmingCharacters(in: .whitespaces)
+                    guard !q.isEmpty else { return }
+                    searching = true
+                    Task { await wx.loadPlace(q); searching = false }
+                }
+            if searching { ProgressView().scaleEffect(0.7) }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 13).fill(.ultraThinMaterial))
+    }
+
+    private func headline(_ n: ChappyWeather.Now) -> some View {
+        VStack(spacing: 6) {
+            Text(wx.placeName)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundColor(theme.textSecondary)
+            Image(systemName: ChappyWeather.symbol(n.code, day: n.isDay))
+                .font(.system(size: 56))
+                .foregroundStyle(theme.accent)
+                .shadow(color: theme.accent.opacity(0.6), radius: 18)
+            Text("\(Int(n.tempC.rounded()))°")
+                .font(.system(size: 62, weight: .thin))
+                .foregroundColor(theme.textPrimary)
+            Text(ChappyWeather.describe(n.code).capitalized)
+                .font(.title3).foregroundColor(theme.textPrimary)
+            Text("Feels like \(Int(n.feelsC.rounded()))°"
+                 + (wx.days.first.map { " · \(Int($0.minC.rounded()))° to \(Int($0.maxC.rounded()))°" } ?? ""))
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 18)
+        .background(RoundedRectangle(cornerRadius: 20).fill(.ultraThinMaterial))
+    }
+
+    private func instruments(_ n: ChappyWeather.Now) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                            GridItem(.flexible(), spacing: 9)], spacing: 9) {
+            gauge("Wind", "\(Int(n.windKmh)) km/h",
+                  sub: "from the \(ChappyWeather.compass(n.windDeg))",
+                  icon: "wind", tint: .cyan)
+            gauge("Gusts", "\(Int(n.gustKmh)) km/h",
+                  sub: n.gustKmh >= 40 ? "strong" : "steady",
+                  icon: "wind.circle", tint: n.gustKmh >= 40 ? .orange : .cyan)
+            gauge("Humidity", "\(n.humidity)%",
+                  sub: "dew point \(Int(n.dewC.rounded()))°",
+                  icon: "humidity.fill", tint: .blue)
+            gauge("Rain now", String(format: "%.1f mm", n.rainMm),
+                  sub: wx.days.first.map { "\($0.rainChance)% today" } ?? "",
+                  icon: "drop.fill", tint: .blue)
+            gauge("Cloud", "\(n.cloudPct)%",
+                  sub: n.cloudPct > 70 ? "overcast" : (n.cloudPct > 30 ? "broken" : "clear"),
+                  icon: "cloud.fill", tint: .gray)
+            gauge("Pressure", "\(Int(n.pressure.rounded())) hPa",
+                  sub: n.pressure < 1005 ? "low — change coming" : "steady",
+                  icon: "barometer", tint: .purple)
+            gauge("UV", String(format: "%.0f", n.uv),
+                  sub: ChappyWeather.uvWord(n.uv),
+                  icon: "sun.max.trianglebadge.exclamationmark",
+                  tint: n.uv >= 6 ? .orange : .yellow)
+            gauge("Visibility",
+                  n.visibilityM >= 1000 ? "\(Int(n.visibilityM / 1000)) km"
+                                        : "\(Int(n.visibilityM)) m",
+                  sub: n.visibilityM < 2000 ? "poor" : "clear",
+                  icon: "eye.fill", tint: .teal)
+        }
+    }
+
+    private func gauge(_ title: String, _ value: String, sub: String,
+                       icon: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 11, weight: .bold))
+                Text(title.uppercased())
+                    .font(.system(size: 10, weight: .heavy)).tracking(0.6)
+            }
+            .foregroundStyle(tint)
+            Text(value)
+                .font(.title3).fontWeight(.semibold)
+                .foregroundColor(theme.textPrimary)
+                .minimumScaleFactor(0.7).lineLimit(1)
+            if !sub.isEmpty {
+                Text(sub).font(.caption2).foregroundColor(theme.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 15)
+            .stroke(tint.opacity(0.28), lineWidth: 1))
+    }
+
+    private var hourStrip: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("NEXT 24 HOURS")
+                .font(.caption2).fontWeight(.heavy).tracking(0.7)
+                .foregroundColor(theme.accent)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(wx.hours) { h in
+                        VStack(spacing: 5) {
+                            Text(Self.hourLabel(h.at))
+                                .font(.caption2).foregroundColor(theme.textSecondary)
+                            Image(systemName: ChappyWeather.symbol(h.code))
+                                .font(.system(size: 16))
+                                .foregroundStyle(theme.accent)
+                            Text("\(Int(h.tempC.rounded()))°")
+                                .font(.caption).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                            Text(h.rainChance > 0 ? "\(h.rainChance)%" : " ")
+                                .font(.system(size: 9))
+                                .foregroundColor(h.rainChance >= 40 ? .blue : theme.textSecondary)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+    }
+
+    private var weekPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("THE WEEK")
+                .font(.caption2).fontWeight(.heavy).tracking(0.7)
+                .foregroundColor(theme.accent)
+            ForEach(Array(wx.days.enumerated()), id: \.element.id) { i, d in
+                HStack(spacing: 10) {
+                    Text(i == 0 ? "Today" : Self.dayLabel(d.at))
+                        .font(.subheadline)
+                        .foregroundColor(theme.textPrimary)
+                        .frame(width: 82, alignment: .leading)
+                    Image(systemName: ChappyWeather.symbol(d.code))
+                        .font(.system(size: 14)).foregroundStyle(theme.accent)
+                        .frame(width: 22)
+                    if d.rainChance > 0 {
+                        Text("\(d.rainChance)%")
+                            .font(.caption2)
+                            .foregroundColor(d.rainChance >= 40 ? .blue : theme.textSecondary)
+                            .frame(width: 34, alignment: .leading)
+                    } else {
+                        Spacer().frame(width: 34)
+                    }
+                    Spacer()
+                    Text("\(Int(d.minC.rounded()))°")
+                        .font(.subheadline).foregroundColor(theme.textSecondary)
+                    Capsule()
+                        .fill(LinearGradient(colors: [.blue.opacity(0.7), .orange.opacity(0.9)],
+                                             startPoint: .leading, endPoint: .trailing))
+                        .frame(width: 52, height: 4)
+                    Text("\(Int(d.maxC.rounded()))°")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                }
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+    }
+
+    private func sunPanel(_ n: ChappyWeather.Now) -> some View {
+        HStack(spacing: 0) {
+            if let d = wx.days.first {
+                sunCell("Sunrise", d.sunrise, "sunrise.fill", .orange)
+                sunCell("Sunset", d.sunset, "sunset.fill", .pink)
+            }
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+    }
+
+    private func sunCell(_ title: String, _ d: Date?, _ icon: String, _ tint: Color) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 17)).foregroundStyle(tint)
+            Text(title).font(.caption2).foregroundColor(theme.textSecondary)
+            Text(d.map { Self.timeLabel($0) } ?? "—")
+                .font(.subheadline).fontWeight(.semibold)
+                .foregroundColor(theme.textPrimary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var speakRow: some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                            GridItem(.flexible(), spacing: 9)], spacing: 9) {
+            speakButton("Read it out", "speaker.wave.2.fill", theme.accent) {
+                TTSService.shared.speakLong(wx.spokenFull())
+            }
+            speakButton("The week", "calendar", .purple) {
+                TTSService.shared.speakLong(wx.spokenWeek())
+            }
+            speakButton("Will it rain?", "umbrella.fill", .blue) {
+                TTSService.shared.speakLong(wx.spokenRain())
+            }
+            speakButton("Refresh", "arrow.clockwise", .green) {
+                Task {
+                    if let c = wx.coord {
+                        await wx.load(lat: c.latitude, lon: c.longitude, name: wx.placeName)
+                    } else { await wx.loadHere() }
+                }
+            }
+        }
+    }
+
+    private func speakButton(_ t: String, _ icon: String, _ tint: Color,
+                             _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 13, weight: .bold))
+                Text(t).font(.subheadline).fontWeight(.semibold)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .background(RoundedRectangle(cornerRadius: 13).fill(tint.opacity(0.18)))
+            .overlay(RoundedRectangle(cornerRadius: 13).stroke(tint.opacity(0.45), lineWidth: 1))
+            .foregroundStyle(tint)
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+
+    private var satelliteRow: some View {
+        Button {
+            if let c = wx.coord, let u = ChappyAtlas.zoomEarthURL(c, zoom: 7) {
+                UIApplication.shared.open(u, options: [:], completionHandler: nil)
+            }
+        } label: {
+            HStack {
+                Image(systemName: "globe.americas.fill").foregroundStyle(.cyan)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Live satellite & radar").font(.subheadline)
+                        .foregroundColor(theme.textPrimary)
+                    Text("Opens Zoom Earth on this spot")
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                Image(systemName: "arrow.up.forward.app")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+            }
+            .padding(13)
+            .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+
+    private static func hourLabel(_ d: Date) -> String {
+        if Calendar.current.isDate(d, equalTo: Date(), toGranularity: .hour) { return "Now" }
+        let f = DateFormatter(); f.dateFormat = "h a"
+        return f.string(from: d)
+    }
+    private static func dayLabel(_ d: Date) -> String {
+        if Calendar.current.isDateInTomorrow(d) { return "Tomorrow" }
+        let f = DateFormatter(); f.dateFormat = "EEEE"
+        return f.string(from: d)
+    }
+    private static func timeLabel(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        return f.string(from: d)
+    }
+}
+
+// =====================================================================
+// MARK: - THE BRIEF STUDIO (Build 173)
+// =====================================================================
+//
+//   "How is the morning brief composed, and where can I change it?"
+//
+//   Fair question, because until now the answer was: nowhere. There was
+//   a single on/off toggle buried in Settings and no way to see what
+//   went into a brief, when they happen, or what the last one actually
+//   said.
+//
+//   HOW IT'S BUILT, plainly: at each scheduled time Chappy gathers four
+//   things — your agenda for the period, your open reminders, a digest
+//   of what it has remembered recently, and where you are — hands them
+//   to Claude with instructions to be brief and to stay silent if
+//   there's nothing worth saying, and speaks the result. If nothing is
+//   notable it says nothing at all, which is why some slots pass in
+//   silence. That is the design, not a fault.
+
+struct BriefStudio: View {
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @AppStorage("chappy_morning_brief") private var morningBrief = true
+    @State private var times: [String] = ChappyProactive.shared.times
+    @State private var quietStart = ChappyProactive.shared.quietStartHour
+    @State private var quietEnd = ChappyProactive.shared.quietEndHour
+    @State private var enabled = ChappyProactive.shared.isEnabled
+    @State private var running = false
+    @State private var note = ""
+
+    private static let allTimes = ["06:00","07:00","08:00","09:00","10:00","11:00",
+                                   "12:00","13:00","14:00","15:00","16:00","17:00",
+                                   "18:00","19:00","20:00","21:00","22:00"]
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                List {
+                    lastBriefSection
+                    ingredientsSection
+                    timesSection
+                    quietSection
+                    actionsSection
+                    if !note.isEmpty {
+                        Section { Text(note).font(.footnote).foregroundStyle(.secondary) }
+                    }
+                }
+                .scrollContentBackground(.hidden)
+            }
+            .navigationTitle("Briefs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }.foregroundColor(theme.accent)
+                }
+            }
+        }
+    }
+
+    private var lastBriefSection: some View {
+        Section {
+            let last = ChappyProactive.shared.lastBrief
+            if last.isEmpty {
+                Text("No brief yet today.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            } else {
+                Text(last).font(.callout)
+                Button {
+                    TTSService.shared.speakLong(last)
+                } label: { Label("Read it again", systemImage: "speaker.wave.2.fill") }
+            }
+        } header: {
+            Text("The last brief")
+        } footer: {
+            Text("Say \u{201C}what was my brief\u{201D} any time to hear this again.")
+        }
+    }
+
+    private var ingredientsSection: some View {
+        Section {
+            row("Your agenda", "calendar",
+                "Calendar events and jobs in the period ahead")
+            row("Open reminders", "bell.fill",
+                "Anything due, overdue or place-triggered")
+            row("Recent memory", "brain",
+                "A digest of what Chappy has filed lately")
+            row("Where you are", "location.fill",
+                "Place, and the weather there")
+        } header: {
+            Text("What goes into one")
+        } footer: {
+            Text("Chappy hands those four to Claude with one instruction above all others: if there is nothing worth saying, say nothing. That's why some slots pass in silence — it's the design, not a fault. Starred appointments always lead.")
+        }
+    }
+
+    private var timesSection: some View {
+        Section {
+            ForEach(Self.allTimes, id: \.self) { t in
+                Button {
+                    if times.contains(t) { times.removeAll { $0 == t } }
+                    else { times.append(t) }
+                    times.sort()
+                    ChappyProactive.shared.times = times
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    HStack {
+                        Text(Self.pretty(t))
+                        Spacer()
+                        if times.contains(t) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("When (\(times.count) a day)")
+        } footer: {
+            Text("Chappy checks at each of these. It only speaks when there's something notable, so more times doesn't mean more talking — it means fewer missed things.")
+        }
+    }
+
+    private var quietSection: some View {
+        Section {
+            Stepper("Quiet from \(quietStart):00", value: $quietStart, in: 18...23)
+                .onChange(of: quietStart) { _, v in ChappyProactive.shared.quietStartHour = v }
+            Stepper("Quiet until \(quietEnd):00", value: $quietEnd, in: 4...10)
+                .onChange(of: quietEnd) { _, v in ChappyProactive.shared.quietEndHour = v }
+            Toggle("Morning brief on first pick-up", isOn: $morningBrief)
+        } header: {
+            Text("Quiet hours")
+        } footer: {
+            Text("Nothing is spoken between these hours. Reminders still land silently and come back in the morning brief — except anything marked must-not-miss.")
+        }
+    }
+
+    private var actionsSection: some View {
+        Section {
+            Button {
+                running = true
+                note = "Composing…"
+                Task {
+                    await ChappyProactive.shared.runNow()
+                    running = false
+                    note = "Done — see The last brief above."
+                }
+            } label: {
+                Label(running ? "Composing…" : "Compose one now", systemImage: "wand.and.stars")
+            }
+            .disabled(running)
+        } footer: {
+            Text("Builds a brief from right now, whatever the time. The quickest way to see what yours actually sounds like.")
+        }
+    }
+
+    private func row(_ title: String, _ icon: String, _ detail: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).foregroundStyle(theme.accent).frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                Text(detail).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private static func pretty(_ t: String) -> String {
+        let parts = t.split(separator: ":")
+        guard let h = Int(parts.first ?? "") else { return t }
+        let ampm = h < 12 ? "am" : "pm"
+        let display = h == 0 ? 12 : (h > 12 ? h - 12 : h)
+        return "\(display):00 \(ampm)"
     }
 }
