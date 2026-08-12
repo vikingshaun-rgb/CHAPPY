@@ -423,7 +423,15 @@ class QuickVisionManager: ObservableObject {
 
             // If the SDK capturePhoto fails, fall back to the current video frame
             let photo: UIImage
-            if let capturedPhoto = streamViewModel.capturedPhoto {
+            // BUILD 159 — SHARP EYE. A photo you took with the glasses
+            // capture button in the last two minutes is sitting in the
+            // library at FULL resolution — the same pixels Meta AI reads.
+            // Prefer it over any stream frame; fall through untouched when
+            // there isn't one.
+            if let sharp = await ChappyPhotoIngest.shared.freshFullResPhoto(within: 120) {
+                photo = sharp.image
+                print("📸 [QuickVision] Sharp Eye: full-res photo from \(Int(sharp.age))s ago")
+            } else if let capturedPhoto = streamViewModel.capturedPhoto {
                 photo = capturedPhoto
                 print("📸 [QuickVision] Using SDK captured photo")
             } else if let videoFrame = streamViewModel.currentVideoFrame {
@@ -450,7 +458,13 @@ class QuickVisionManager: ObservableObject {
                 await streamViewModel.stopSession()
             }
 
-            // 7. Call the vision API
+            // 7. Call the vision API.
+            // BUILD 159: the thinking pulse — a soft repeating tone so the
+            // wait is audible with the phone in a pocket. It stops itself
+            // the instant the voice starts, so it can never talk over the
+            // answer. Same earcon navigation already uses.
+            ChappyEarcon.shared.startThinking()
+            defer { ChappyEarcon.shared.stopThinking() }
             let service = QuickVisionService(apiKey: apiKey)
             let result = try await service.analyzeImage(photo, customPrompt: prompt)
 
@@ -460,17 +474,23 @@ class QuickVisionManager: ObservableObject {
             // 9. Save to history
             saveToHistory(mode: mode, prompt: prompt, result: result, image: photo)
 
-            // 10. Speak the result via TTS
-            tts.speak(result, apiKey: apiKey)
+            // 10. Speak the result via TTS.
+            // BUILD 158: speakLong chunks by sentence so the first words
+            // land in ~2 seconds instead of waiting out a whole paragraph
+            // render (which was the 15-20 second silence after the text
+            // had already appeared on screen).
+            tts.speakLong(result)
 
             print("✅ [QuickVision] Complete: \(result)")
 
         } catch let error as QuickVisionError {
+            ChappyEarcon.shared.stopThinking()
             errorMessage = error.localizedDescription
             print("❌ [QuickVision] QuickVisionError: \(error)")
             tts.speak(error.localizedDescription, apiKey: apiKey)
             if startedStreamForThisSnap { await streamViewModel.stopSession() }
         } catch {
+            ChappyEarcon.shared.stopThinking()
             errorMessage = error.localizedDescription
             print("❌ [QuickVision] Error: \(error)")
             // AUDIT FIX (QV-H3): raw API/URLSession errors were read aloud —
