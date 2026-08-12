@@ -239,6 +239,79 @@ final class ChappyPhotoIngest: ObservableObject {
         }
     }
 
+    // =================================================================
+    // MARK: - SHARP EYE (Build 159)
+    // =================================================================
+    //
+    //   The correction to something I had wrong: the glasses DO give
+    //   Chappy the full-resolution photo. Press the capture button and
+    //   Meta's app writes the real still into the iOS photo library —
+    //   the same pixels Meta AI reads. Chappy had access all along and
+    //   was throwing it away: the daily pass asks for a 768px thumbnail
+    //   because it captions fifty at a time, and the live reading
+    //   commands never looked at the library at all, they grabbed a
+    //   video-stream frame instead.
+    //
+    //   So: when you ask Chappy to READ something, look for a photo
+    //   taken in the last minute or two and use it at FULL SIZE. If
+    //   there isn't one, fall back to the live frame exactly as before —
+    //   this can only ever improve the picture, never take one away.
+
+    /// The newest library photo inside `within` seconds, at full size.
+    /// Nil when there isn't one, or Photos access was never granted.
+    func freshFullResPhoto(within seconds: TimeInterval = 120) async -> (image: UIImage, age: TimeInterval)? {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+                || PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited
+        else { return nil }
+
+        let cutoff = Date().addingTimeInterval(-seconds)
+        let opts = PHFetchOptions()
+        opts.predicate = NSPredicate(format: "creationDate > %@ AND mediaType == %d",
+                                     cutoff as NSDate, PHAssetMediaType.image.rawValue)
+        opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        opts.fetchLimit = 1
+        let result = PHAsset.fetchAssets(with: opts)
+        guard let asset = result.firstObject else { return nil }
+        guard !asset.mediaSubtypes.contains(.photoScreenshot) else { return nil }
+        guard let img = await requestFullImage(asset) else { return nil }
+        let age = Date().timeIntervalSince(asset.creationDate ?? Date())
+        return (img, age)
+    }
+
+    /// Same as requestImage but at the asset's own dimensions — this is
+    /// the whole point, so no target size and no fast resize.
+    private func requestFullImage(_ asset: PHAsset) async -> UIImage? {
+        let opts = PHImageRequestOptions()
+        opts.isNetworkAccessAllowed = true
+        opts.deliveryMode = .highQualityFormat
+        opts.resizeMode = .none
+        opts.isSynchronous = false
+        return await withCheckedContinuation { c in
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: PHImageManagerMaximumSize,
+                contentMode: .default,
+                options: opts
+            ) { image, info in
+                if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
+                c.resume(returning: image)
+            }
+        }
+    }
+
+    /// Wait a few seconds for a photo you have JUST taken to arrive —
+    /// the glasses sync over Bluetooth and it is rarely instant. Polls
+    /// once a second and gives up quietly.
+    func waitForFreshPhoto(seconds: Int = 6) async -> UIImage? {
+        for _ in 0..<seconds {
+            if let hit = await freshFullResPhoto(within: 25), hit.age < 25 {
+                return hit.image
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return nil
+    }
+
     // MARK: - Bookkeeping
 
     private func markSeen(_ id: String) {

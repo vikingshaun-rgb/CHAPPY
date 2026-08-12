@@ -15,6 +15,8 @@ import Photos
 import Network
 import UserNotifications
 import Vision   // BUILD 134: on-device OCR for the Reader
+import ActivityKit   // BUILD 154: flight-day Live Activity (lock screen + Dynamic Island)
+import WidgetKit     // BUILD 154: nudges the home-screen widget to refresh
 
 // MARK: - CHAPPY EARCONS — the sound of being heard
 //
@@ -1181,6 +1183,14 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// for. Stamped by the input tap; a stale stamp means the ear is deaf no
     /// matter what the flag says.
     private var lastBufferAt = Date.distantPast
+    /// BUILD 160: consecutive failed arming attempts, so a cold launch that
+    /// loses the race with the audio session retries instead of going mute.
+    private static var armAttempts = 0
+    /// BUILD 160: the 2-second sweep that keeps the ear honest between renewals.
+    private var livenessTimer: Timer?
+    /// BUILD 160: the most recent text heard AFTER the wake word. Empty means
+    /// he said the name and nothing else — the only case that earns a beep.
+    private var lastTail = ""
 
     /// AUDIT P0 (SB-LATCH): wasListeningBeforeHandoff was cleared in exactly one
     /// place — the first line of resumeAfterHandOff(). Any module that failed to
@@ -1394,7 +1404,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         // is to rebuild rather than to skip — the old `guard !isListening` was
         // precisely what made this hook useless after the failures it exists for.
         if isListening {
-            guard Date().timeIntervalSince(lastBufferAt) > 10 else { return }
+            // BUILD 160: was 10 seconds. A route change with glasses and a
+            // pocketed phone happens constantly, and ten seconds of talking
+            // to a dead mic is exactly what "I have to repeat myself" is.
+            guard Date().timeIntervalSince(lastBufferAt) > 3.5 else { return }
             print("👂 [Standby] Chip says armed but the ear is deaf (\(reason)) — rebuilding")
             rebuildEar()
             return
@@ -1513,6 +1526,7 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     func stop() {
         restartTimer?.invalidate(); restartTimer = nil
+        livenessTimer?.invalidate(); livenessTimer = nil
         speechWatch?.invalidate(); speechWatch = nil // AUDIT P0 (SB-SELFTALK)
         routeWork?.cancel(); routeWork = nil
         routeTask?.cancel(); routeTask = nil
@@ -1582,7 +1596,36 @@ final class ChappyStandby: NSObject, ObservableObject {
             try? session.setPreferredInput(builtIn)
         }
 
-        guard startRecognition() else { starting = false; return }
+        // BUILD 160 — THE SILENT FAILURE THAT ATE THE STARTUP VOICE.
+        //
+        // startRecognition() returns false whenever the audio session is
+        // still settling — which on a cold launch is most of the time, since
+        // arming fires 1.2s after the app appears. The old code just gave up
+        // here: no ear, no greeting, no sound, no way to know. You'd talk to
+        // a dead microphone and assume Chappy was ignoring you.
+        //
+        // Now it retries with backoff, three times, and only then admits
+        // defeat out loud. Nothing about the success path changes.
+        guard startRecognition() else {
+            starting = false
+            let attempt = Self.armAttempts
+            Self.armAttempts += 1
+            guard attempt < 3 else {
+                Self.armAttempts = 0
+                print("👂 [Standby] Arming failed three times — telling him")
+                announceArmFailure("I couldn't open the microphone. Tap Ear On to try again.")
+                return
+            }
+            let delay = 0.8 + Double(attempt) * 0.7      // 0.8s, 1.5s, 2.2s
+            print("👂 [Standby] Arming failed (attempt \(attempt + 1)) — retrying in \(delay)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, !self.isListening, !self.userTurnedOff else { return }
+                self.silentArm = true
+                self.start()
+            }
+            return
+        }
+        Self.armAttempts = 0
         isListening = true
         starting = false
         installAudioResilience()
@@ -1659,7 +1702,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // that hasn't delivered a buffer in minutes. That is the state the chip
         // was lying about. Buffers arrive continuously when the mic is live, so
         // 10 seconds of silence from the tap means dead, not quiet.
-        if Date().timeIntervalSince(lastBufferAt) > 10 {
+        if Date().timeIntervalSince(lastBufferAt) > 3.5 {   // BUILD 160: was 10
             print("👂 [Standby] No audio for \(Int(Date().timeIntervalSince(lastBufferAt)))s — ear is deaf, rebuilding")
             rebuildEar()
             return
@@ -1781,6 +1824,8 @@ final class ChappyStandby: NSObject, ObservableObject {
                         // isListening, which was now false, and never recovered.
                         // A phone call permanently killed the wake word.
                         self.restartTimer?.invalidate(); self.restartTimer = nil
+                self.livenessTimer?.invalidate(); self.livenessTimer = nil
+                        self.livenessTimer?.invalidate(); self.livenessTimer = nil
                         print("👂 [Standby] Interrupted — holding")
                     }
                 case .ended:
@@ -1849,6 +1894,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if self.engine.isRunning { self.engine.stop() }
                 self.engine.inputNode.removeTap(onBus: 0)
                 self.restartTimer?.invalidate(); self.restartTimer = nil
+                self.livenessTimer?.invalidate(); self.livenessTimer = nil
                 self.speechWatch?.invalidate(); self.speechWatch = nil
                 try? AVAudioSession.sharedInstance()
                     .setActive(false, options: .notifyOthersOnDeactivation)
@@ -2226,16 +2272,36 @@ final class ChappyStandby: NSObject, ObservableObject {
         // speech arrives in that window you were mid-sentence, and it stays
         // silent and simply listens — the haptic above has already told you it
         // heard the name.
-        let mark = Date()
-        pendingWakeToneAt = mark
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.33) { [weak self] in
-            guard let self, self.pendingWakeToneAt == mark else { return }
-            // Still talking? Then the acknowledgement would be an interruption.
-            guard Date().timeIntervalSince(self.lastHeardAt) > 0.30 else { return }
-            ChappyEarcon.shared.wake()
-        }
-
+        // BUILD 160 — ONE BEEP, AND ONLY WHEN IT SAYS SOMETHING.
+        //
+        // The tone used to fire 0.33 seconds after the NAME, whether or not a
+        // command was still coming. So "Chappy, what's on today" got a beep
+        // dropped into the middle of the sentence, every single time. That is
+        // the beeping.
+        //
+        // The rule now: the tone only exists to answer "did you hear me?" —
+        // which is a question you only have when you said the name and
+        // nothing else. If a command follows, the ANSWER is the
+        // acknowledgement and a beep is noise. Wait long enough to know which
+        // situation this is, then beep only for the bare one.
+        lastTail = tail
         let bare = tail.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).isEmpty
+        if bare {
+            let mark = Date()
+            pendingWakeToneAt = mark
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+                guard let self, self.pendingWakeToneAt == mark else { return }
+                // A command arrived in the meantime — no beep, the reply covers it.
+                guard self.lastTail.trimmingCharacters(
+                    in: CharacterSet(charactersIn: " ,.:;!?-")).isEmpty else { return }
+                // Still mid-word? An acknowledgement would be an interruption.
+                guard Date().timeIntervalSince(self.lastHeardAt) > 0.35 else { return }
+                ChappyEarcon.shared.wake()
+            }
+        } else {
+            // A command came with the name — cancel any pending tone.
+            pendingWakeToneAt = Date()
+        }
         guard bare else { return }
 
         let now = Date()
@@ -2702,7 +2768,6 @@ final class ChappyStandby: NSObject, ObservableObject {
         let spot = TripRecorder.shared.rememberSpot(named: "")
         ChappyHaptics.shared.straightStep()
         guard spot.lat != 0 || spot.lon != 0 else {
-            ChappyEarcon.shared.fail()
             TTSService.shared.speak("Saved, but GPS hasn't locked yet - give it a few seconds outside and try again.")
             return
         }
@@ -2722,7 +2787,22 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// The 50s renewal, in one place so the interruption handler can restart it.
     private func restartRenewTimer() {
         restartTimer?.invalidate()
-        restartTimer = Timer.scheduledTimer(withTimeInterval: 50, repeats: true) { [weak self] _ in
+        // BUILD 160: 50s renewals leave a small deaf gap each time. The
+        // renewal itself stays (the recogniser genuinely expires near 60s),
+        // but a 2-second liveness sweep now runs alongside it so a gap that
+        // does swallow a word is measured in seconds, not tens of seconds.
+        livenessTimer?.invalidate()
+        livenessTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isListening, !self.awake, !self.busy else { return }
+                guard !TTSService.shared.isSpeaking else { return }
+                if Date().timeIntervalSince(self.lastBufferAt) > 3.5 {
+                    print("👂 [Standby] Liveness sweep: ear went quiet — rebuilding")
+                    self.rebuildEar()
+                }
+            }
+        }
+        restartTimer = Timer.scheduledTimer(withTimeInterval: 55, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 // BUILD 119: never rebuild the recogniser while he is talking.
@@ -3055,7 +3135,6 @@ final class ChappyStandby: NSObject, ObservableObject {
                         expectingLanguageUntil = .distantPast
                         beginTranslate(code: code)
                     } else {
-                        ChappyEarcon.shared.fail()
                         TTSService.shared.speak("I don't have that one. Try Indonesian, Thai, Vietnamese, Japanese, Chinese, French, German or Spanish.")
                         expectingLanguageUntil = Date().addingTimeInterval(12)
                     }
@@ -3116,7 +3195,6 @@ final class ChappyStandby: NSObject, ObservableObject {
                         ChappyHaptics.shared.straightStep()
                         TTSService.shared.speak("Saved as \(cleaned).")
                     } else {
-                        ChappyEarcon.shared.fail()
                         TTSService.shared.speak("Couldn't catch the name, but the spot's safe.")
                     }
                     resetRecognition()
@@ -3228,10 +3306,15 @@ final class ChappyStandby: NSObject, ObservableObject {
             // being talked over, and the reply itself got fast in 143.
             // Terminals ("stop") stay instant; short imperatives stay snappy.
             let wordCount = snapshot.split(separator: " ").count
+            // BUILD 160: short commands tightened 0.9 -> 0.75. A two-word
+            // imperative is finished the moment it lands; the long wait in
+            // 144 was for SENTENCES and that stays exactly where it was.
             if wordCount <= 2 {
-                debounce = 0.9           // short command — keep it snappy
+                debounce = 0.75          // short command — near-instant
+            } else if wordCount <= 4 {
+                debounce = 1.0           // short sentence
             } else {
-                debounce = 1.2           // a sentence — let him finish it
+                debounce = 1.2           // a real sentence — let him finish it
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
@@ -3360,7 +3443,6 @@ final class ChappyStandby: NSObject, ObservableObject {
             // dropped" and "never heard at all" are indistinguishable — so he
             // repeats himself into a void. Say something.
             print("👂 [Standby] Busy — dropped: \(raw)")
-            ChappyEarcon.shared.fail()
             ChappyHaptics.shared.straightStep()
             TTSService.shared.speak("One thing at a time - still on the last.")
             // AUDIT P1 (SB-AWAKE): `awake` was left TRUE here. The next sentence
@@ -3542,10 +3624,21 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT FIX (P0): bare "photo"/"picture"/"snap" used to eat
         // "log this, snap peas are 20,000" and "take me to the photo shop".
         // Imperative shapes only.
+        // BUILD 155 — BURST first, so "action shot" never falls through to
+        // the single-photo matcher. Hold the Snap button does the same.
+        if ["action shot", "burst shot", "burst mode", "rapid shot", "quick shots",
+            "sports shot", "action photo", "burst it", "take a burst",
+            "rapid fire", "motion shot"].contains(where: { c.contains($0) }) {
+            ChappyBurst.shared.fire()
+            return
+        }
         if after(c, ["take a photo", "take a picture", "take a shot", "get a shot",
                      "snap a photo", "snap that", "snap this", "capture this",
-                     "capture that", "photo quick"]) != nil
-            || c == "photo" || c == "take photo" {
+                     "capture that", "photo quick",
+                     "grab a photo", "grab a picture", "get a photo", "get a picture",
+                     "take a pic", "snap a pic", "get a pic", "shoot that",
+                     "shoot this", "photograph this", "photograph that"]) != nil
+            || c == "photo" || c == "take photo" || c == "snap" || c == "picture" {
             // Silent by design — see snapSilently(). A tone confirms it; there
             // is nothing to say about a photo taken to look at later.
             snapSilently()
@@ -3584,7 +3677,6 @@ final class ChappyStandby: NSObject, ObservableObject {
             let spot = TripRecorder.shared.rememberSpot(named: name)
             ChappyHaptics.shared.straightStep()
             if spot.lat == 0 {
-                ChappyEarcon.shared.fail()
                 speak("Saved it, though GPS hasn't settled - it may be a little off.")
             } else {
                 // BUILD 144 earcon diet: the spoken line IS the confirmation
@@ -3655,7 +3747,6 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // BUILD 144 earcon diet: the spoken line IS the confirmation
                 speak("Done: \(t.title).")
             } else {
-                ChappyEarcon.shared.fail()
                 speak("I don't have a reminder like that.")
             }
             return
@@ -3749,7 +3840,11 @@ final class ChappyStandby: NSObject, ObservableObject {
             return
         }
         if c.contains("how's my flight") || c.contains("hows my flight")
-            || c.contains("flight status") || c.contains("is my flight on time") {
+            || c.contains("flight status") || c.contains("is my flight on time")
+            || c.contains("when's my flight") || c.contains("whens my flight")
+            || c.contains("what gate") || c.contains("which gate")
+            || c.contains("is the flight delayed") || c.contains("my flight delayed")
+            || c.contains("check my flight") || c.contains("flight update") {
             speak(ChappyFlights.shared.statusHandoff()); return
         }
         // BUILD 153 — RIDE & FOOD. The Google-Maps pattern: Chappy prices
@@ -3762,7 +3857,12 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("get me a gojek") || c.contains("book a gojek")
             || c.contains("grab home") || c.contains("uber home") || c.contains("ride home")
             || c.contains("how much is a grab") || c.contains("how much is an uber")
-            || c.contains("how much is a ride") {
+            || c.contains("how much is a ride")
+            || c.contains("call me a grab") || c.contains("call me an uber")
+            || c.contains("get us a grab") || c.contains("get us an uber")
+            || c.contains("order a grab") || c.contains("order an uber")
+            || c.contains("grab me a ride") || c.contains("need a ride")
+            || c.contains("call a taxi") || c.contains("get a taxi") {
             // "make it a Gojek" in the moment: a named provider wins from here on.
             if c.contains("gojek") { UserDefaults.standard.set("gojek", forKey: "chappy_ride_provider") }
             else if c.contains("uber") { UserDefaults.standard.set("uber", forKey: "chappy_ride_provider") }
@@ -3785,7 +3885,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         if c.contains("order food") || c.contains("get food") || c.contains("food delivery")
             || c.contains("uber eats") || c.contains("grab food") || c.contains("go food")
             || c.contains("order from ") || c.contains("i'm hungry") || c.contains("im hungry")
-            || c.contains("order the usual") || c.contains("order dinner") || c.contains("order lunch") {
+            || c.contains("order the usual") || c.contains("order dinner") || c.contains("order lunch")
+            || c.contains("feed me") || c.contains("get dinner") || c.contains("get lunch")
+            || c.contains("get takeaway") || c.contains("order takeaway")
+            || c.contains("get some food") || c.contains("order some food") {
             speak(ChappyRide.shared.foodHandoff(from: c))
             return
         }
@@ -3814,7 +3917,11 @@ final class ChappyStandby: NSObject, ObservableObject {
         // BUILD 147 — CLIP. Video, summarised: "record a clip" rolls ~20s of
         // frames and files the story of what happened.
         if c.contains("record a clip") || c.contains("record this") || c.contains("take a video")
-            || c.contains("record a video") || c.contains("watch this and remember") {
+            || c.contains("record a video") || c.contains("watch this and remember")
+            || c.contains("film this") || c.contains("video this") || c.contains("take a clip")
+            || c.contains("start recording") || c.contains("roll camera")
+            || c.contains("get this on video") || c.contains("shoot a video")
+            || c.contains("capture a clip") || c.contains("record that") {
             speak("Rolling - about twenty seconds.")
             ChappyClip.shared.record()
             return
@@ -3949,7 +4056,6 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // BUILD 144 earcon diet: the spoken line IS the confirmation
                 speak(answer)
             } else {
-                ChappyEarcon.shared.fail()
                 speak("Nothing stored about \(subject) yet.")
             }
             return
@@ -4055,6 +4161,63 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
         if c.contains("i'm lost") || c.contains("im lost") || c.contains("i am lost") {
             speak(TripRecorder.shared.lostReport()); return
+        }
+        // BUILD 158 — PLACES. The saved-spot list, finally reachable.
+        if c.contains("my places") || c.contains("show my places")
+            || c.contains("saved places") || c.contains("saved spots")
+            || c.contains("my spots") || c.contains("list my places")
+            || c.contains("open places") {
+            NotificationCenter.default.post(name: .chappyOpenPlaces, object: nil)
+            let n = TripRecorder.shared.spots.count
+            speak(n == 0 ? "No places saved yet. Say: remember this spot, call it the blue warung."
+                          : "\(n) place\(n == 1 ? "" : "s") saved.")
+            return
+        }
+        // BUILD 157 — DICTATE. "Take a report" and Chappy opens the mic,
+        // transcribes, then writes it up properly.
+        if c.contains("take a report") || c.contains("dictate") || c.contains("write this up")
+            || c.contains("take a note for work") || c.contains("job report")
+            || c.contains("start a report") || c.contains("write a report")
+            || c.contains("take dictation") {
+            var tone = "professional"
+            if c.contains("job report") || c.contains("work report") { tone = "jobReport" }
+            else if c.contains("email") { tone = "email" }
+            else if c.contains("bullet") { tone = "bullets" }
+            ChappyDictate.shared.tone = ChappyDictate.Tone(rawValue: tone) ?? .professional
+            NotificationCenter.default.post(name: .chappyOpenDictate, object: nil)
+            speak("Go ahead - I'm listening.")
+            return
+        }
+        // BUILD 156 — THE ATLAS, hands free. Checked BEFORE the day map so
+        // "open the atlas" and "zoom to Ubud" never fall into today's trail.
+        if c.contains("atlas") || c.contains("travel map")
+            || c.contains("where have i been") || c.contains("everywhere i've been")
+            || c.contains("everywhere i have been") || c.contains("my trips") {
+            var payload: [String: Any] = [:]
+            if let t = ChappyAtlas.voiceTarget(in: c) { payload["target"] = t }
+            if let l = ChappyAtlas.layerMentioned(in: c) { payload["layer"] = l.rawValue }
+            NotificationCenter.default.post(name: .chappyOpenAtlas, object: nil, userInfo: payload)
+            let sum = ChappyAtlas.shared.summary
+            speak(sum.isEmpty ? "Opening the atlas." : "Opening the atlas. \(sum).")
+            return
+        }
+        // "Zoom to Ubud", "fly to Bali" — the atlas takes the wheel.
+        if (c.contains("zoom to ") || c.contains("zoom in on ")
+            || c.hasPrefix("fly to ") || c.contains("centre on ") || c.contains("center on ")),
+           let t = ChappyAtlas.voiceTarget(in: c) {
+            NotificationCenter.default.post(name: .chappyOpenAtlas, object: nil,
+                                            userInfo: ["target": t])
+            speak("Flying to \(t)."); return
+        }
+        // Deliberately NARROW: "find me a restaurant" must still navigate, so
+        // only browse-shaped phrasings open a map layer.
+        if (c.hasPrefix("show me ") || c.contains("what's around") || c.contains("whats around")
+            || c.contains("around here") || c.contains("on the atlas")),
+           !c.contains("take me"), !c.contains("navigate"), !c.contains("drive me"),
+           let l = ChappyAtlas.layerMentioned(in: c) {
+            NotificationCenter.default.post(name: .chappyOpenAtlas, object: nil,
+                                            userInfo: ["layer": l.rawValue])
+            speak("\(l.label) on the map."); return
         }
         // AUDIT P1 (RG-MAP): "where am I on the map" was swallowed here by the
         // broader "where am i" test and the map never opened. The map branch
@@ -4193,6 +4356,22 @@ final class ChappyStandby: NSObject, ObservableObject {
                               "chinese", "mandarin", "french", "german", "spanish",
                               "korean", "italian", "hindi", "balinese", "malay"]
             .contains { c.contains($0) }
+        // BUILD 159 — SHARP EYE, asked for by name. Press the glasses
+        // capture button, then say one of these: Chappy waits for the
+        // full-resolution photo to sync and reads THAT.
+        if c.contains("read that properly") || c.contains("read this properly")
+            || c.contains("read my photo") || c.contains("read the photo")
+            || c.contains("read that photo") || c.contains("sharp read")
+            || c.contains("read it properly") || c.contains("read the fine print")
+            || c.contains("read the small print") {
+            ChappyReader.shared.beginSharp(.read)
+            return
+        }
+        if c.contains("scan my photo") || c.contains("scan the photo")
+            || c.contains("scan that properly") {
+            ChappyReader.shared.beginSharp(.scan)
+            return
+        }
         if !namesALanguage,
            c.contains("scan this") || c.contains("scan that") || c.contains("scan the ")
             || c.contains("save this document") || c.contains("scan and save")
@@ -4754,7 +4933,6 @@ final class ChappyStandby: NSObject, ObservableObject {
             if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming {
                 ChappyEarcon.shared.done(); speak("Got it.")
             } else {
-                ChappyEarcon.shared.fail()
                 speak("Camera isn't running - open Talk or Look first.")
             }
             return true
@@ -4766,7 +4944,6 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // off a plane the pin saves at 0,0 and "Saved" is a lie — you
                 // find out weeks later when the spot is in the ocean.
                 if spot.lat == 0 && spot.lon == 0 {
-                    ChappyEarcon.shared.fail()
                     speak("Saved it, though GPS hasn't settled - it may be a little off.")
                 } else {
                     // BUILD 144 earcon diet: the spoken line IS the confirmation
@@ -5112,12 +5289,10 @@ final class ChappyStandby: NSObject, ObservableObject {
             // command, and the mic heard it. Never put the wake word inside
             // something Chappy says out loud.
             TTSService.shared.speak("\(reason) Want me to open Live AI so we can talk it through? Just say the word.")
-            ChappyEarcon.shared.fail()
         } else {
             // Rotated so the second miss doesn't sound like a stuck record —
             // the moment a wearer notices the identical phrasing twice is the
             // moment the thing stops feeling like a companion.
-            ChappyEarcon.shared.fail()
             TTSService.shared.speak("\(reason) \(ChappyVoice.stumble())")
         }
     }
@@ -5631,6 +5806,17 @@ final class TripRecorder {
         var street: String?
         var city: String?
         var country: String?
+        // BUILD 158 — a saved place stops being just a pin.
+        /// Free text you dictate or type: "gate code 4321, dog out back".
+        var note: String?
+        /// Spoken the moment you arrive within ~150 m. The killer one for
+        /// job sites — the code, the parking, the dog, said before you knock.
+        var arrivalNote: String?
+        /// Favourites / Work / Food / Stay / Other — one tap in the list.
+        var category: String?
+        var starred: Bool?
+        /// The real name Apple Maps knows this address by, learned lazily.
+        var placeName: String?
     }
 
     private(set) var crumbs: [Crumb] = []
@@ -5991,6 +6177,50 @@ final class TripRecorder {
         }
     }
 
+    // MARK: - BUILD 158: places you can actually manage
+
+    func renameSpot(id: UUID?, at index: Int, to newName: String) {
+        guard spots.indices.contains(index) else { return }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        spots[index].name = trimmed
+        if let mid = spots[index].memID {
+            ChappyMemory.shared.relabel(id: mid, to: trimmed)
+        }
+        saveSpots()
+    }
+
+    func updateSpot(index: Int, note: String? = nil, arrivalNote: String? = nil,
+                    category: String? = nil, starred: Bool? = nil) {
+        guard spots.indices.contains(index) else { return }
+        if let n = note { spots[index].note = n.isEmpty ? nil : n }
+        if let a = arrivalNote { spots[index].arrivalNote = a.isEmpty ? nil : a }
+        if let c = category { spots[index].category = c }
+        if let st = starred {
+            spots[index].starred = st
+            if let mid = spots[index].memID { ChappyMemory.shared.setPinned(id: mid, st) }
+        }
+        saveSpots()
+    }
+
+    func deleteSpot(at index: Int) {
+        guard spots.indices.contains(index) else { return }
+        spots.remove(at: index)
+        saveSpots()
+    }
+
+    /// The nearest saved place within 150 m — used on arrival so Chappy can
+    /// speak the note you left for yourself.
+    func spotNear(lat: Double, lon: Double, metres: Double = 150) -> Spot? {
+        let here = CLLocation(latitude: lat, longitude: lon)
+        return spots
+            .filter { here.distance(from: CLLocation(latitude: $0.lat, longitude: $0.lon)) < metres }
+            .min { a, b in
+                here.distance(from: CLLocation(latitude: a.lat, longitude: a.lon))
+                    < here.distance(from: CLLocation(latitude: b.lat, longitude: b.lon))
+            }
+    }
+
     private func saveSpots() {
         let snapshot = spots
         let url = spotsURL
@@ -6042,6 +6272,8 @@ final class NavEngine: NSObject, ObservableObject {
     private var lastReroute = Date.distantPast
     // STEP 8: "tell me when I'm near X" watch target
     private var watchTarget: (name: String, coord: CLLocationCoordinate2D)?
+    /// BUILD 158: last time each place's arrival note was spoken.
+    fileprivate static var arrivalSpoken: [String: Date] = [:]
 
     /// STEP 8 FUSION: nav speaks through the live Chappy session when one
     /// is running (camera-aware turns); falls back to plain TTS otherwise.
@@ -6332,6 +6564,19 @@ final class NavEngine: NSObject, ObservableObject {
     /// Fed by ContextEngine on every fix: speaks turns, detects off-route.
     func updateLocation(_ loc: CLLocation) {
         // STEP 8: proximity watch fires even when not navigating
+        // BUILD 158 — ARRIVAL NOTES. The single most useful thing a saved
+        // place can do: say the thing you left for yourself, before you
+        // knock. Gate codes, parking, the dog, which door. Fires once per
+        // place per hour so a long job never nags.
+        if let spot = TripRecorder.shared.spotNear(lat: loc.coordinate.latitude,
+                                                   lon: loc.coordinate.longitude),
+           let note = spot.arrivalNote, !note.isEmpty,
+           Self.arrivalSpoken[spot.name].map({ Date().timeIntervalSince($0) > 3600 }) ?? true {
+            Self.arrivalSpoken[spot.name] = Date()
+            ChappyNotify.announce(.nav,
+                spoken: "\(spot.name): \(note)",
+                title: "📍 \(spot.name)", body: note)
+        }
         if let w = watchTarget {
             let dw = loc.distance(from: CLLocation(latitude: w.coord.latitude, longitude: w.coord.longitude))
             if dw < 150 {
@@ -10368,9 +10613,32 @@ final class ChappyReader {
 
     // MARK: - Entry points
 
+    /// BUILD 159 — which eye answered last: the full-res glasses photo or
+    /// the live view. Surfaced so a poor reading tells you which to fix.
+    nonisolated(unsafe) static var lastSourceWasSharp = false
+
     func begin(_ mode: Mode) {
         lastMode = mode
         Task { await run(mode) }
+    }
+
+    /// BUILD 159 — "read this properly": press the glasses button, then
+    /// say it. Chappy waits a few seconds for the photo to sync across
+    /// and reads THAT at full resolution.
+    func beginSharp(_ mode: Mode) {
+        lastMode = mode
+        Task {
+            TTSService.shared.speak("Looking at your photo.")
+            ChappyEarcon.shared.startThinking()
+            let shot = await ChappyPhotoIngest.shared.waitForFreshPhoto(seconds: 6)
+            ChappyEarcon.shared.stopThinking()
+            if shot != nil {
+                Self.lastSourceWasSharp = true
+            } else {
+                TTSService.shared.speak("No new photo - using the live view.")
+            }
+            await self.run(mode, override: shot)
+        }
     }
 
     func continueReading() {
@@ -10395,8 +10663,8 @@ final class ChappyReader {
 
     // MARK: - The run
 
-    private func run(_ mode: Mode) async {
-        guard let frame = await grabFrame() else {
+    private func run(_ mode: Mode, override: UIImage? = nil) async {
+        guard let frame = override ?? (await grabFrame()) else {
             TTSService.shared.speak("The camera didn't come up. Try that again.")
             return
         }
@@ -10448,6 +10716,18 @@ final class ChappyReader {
     // MARK: - Camera (Pulse's wake-grab-sleep dance, one frame)
 
     private func grabFrame() async -> UIImage? {
+        // BUILD 159 — SHARP EYE. If you pressed the capture button on the
+        // glasses in the last two minutes, Meta has already written the
+        // FULL-RESOLUTION still into the photo library — the same pixels
+        // Meta AI reads. That beats a video-stream frame for fine print by
+        // a mile, and it is free. Falls straight through to the live frame
+        // when there isn't one, so this can only ever improve the picture.
+        if let hit = await ChappyPhotoIngest.shared.freshFullResPhoto(within: 120) {
+            print("👁️ [Reader] Sharp Eye: full-res photo from \(Int(hit.age))s ago")
+            ChappyReader.lastSourceWasSharp = true
+            return hit.image
+        }
+        ChappyReader.lastSourceWasSharp = false
         let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
         if !wasStreaming {
             NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
@@ -10755,7 +11035,12 @@ final class ChappyTrail: NSObject, ObservableObject {
     }
 
     private func pruneOldDays() {
-        let keepDays = d.object(forKey: "chappy_trail_keep_days") as? Int ?? 90
+        // BUILD 156 — LIFETIME BY DEFAULT. The Atlas is only worth having if
+        // the history actually accumulates: a year of visits is well under a
+        // megabyte, and "where was I in April" should still answer in 2028.
+        // 0 = keep forever. Anyone who set a limit by hand keeps it.
+        let keepDays = d.object(forKey: "chappy_trail_keep_days") as? Int ?? 0
+        guard keepDays > 0 else { return }
         let cutoff = Self.key(Calendar.current.date(byAdding: .day, value: -keepDays, to: Date()) ?? Date())
         let fm = FileManager.default
         for f in (try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil)) ?? [] {
@@ -11032,13 +11317,16 @@ final class ChappyClip {
             "text": "These are sequential frames from a short first-person video clip, in order. Narrate what happened across them as 2-3 vivid spoken sentences - what the place is, what changed, anything notable or readable. No preamble."
         ]]
         for f in frames {
-            let side: CGFloat = 384
+            // BUILD 158: 384px could narrate a scene but never read a label
+            // or a serial number. 768 is four times the pixels and still
+            // cheap enough to send fourteen of them.
+            let side: CGFloat = 768
             let scale = side / max(f.size.width, f.size.height)
             let sz = CGSize(width: f.size.width * scale, height: f.size.height * scale)
             let small = UIGraphicsImageRenderer(size: sz).image { _ in
                 f.draw(in: CGRect(origin: .zero, size: sz))
             }
-            guard let jpeg = small.jpegData(compressionQuality: 0.45) else { continue }
+            guard let jpeg = small.jpegData(compressionQuality: 0.6) else { continue }
             parts.append(["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]])
         }
         var req = URLRequest(url: url)
@@ -11651,7 +11939,21 @@ final class ChappyFlights: ObservableObject {
            let lb = await leaveByLine(for: freshest(f.id) ?? f, snap: snap) {
             line += " " + lb
         }
+        // BUILD 154: a manual check inside 12 h lights the Live Activity too.
+        if let f2 = freshest(f.id), f2.date.timeIntervalSinceNow < 12 * 3600 {
+            ChappyLiveActivity.shared.sync(flight: f2,
+                                           leaveBy: await leaveByDate(for: f2, snap: snap))
+        }
         return line
+    }
+
+    /// BUILD 154 — the leave-by moment as a Date, for the Live Activity
+    /// countdown. Same maths as the spoken line.
+    private func leaveByDate(for f: TrackedFlight, snap: FlightSnapshot?) async -> Date? {
+        guard let airport = snap?.depAirport ?? f.depAirport else { return nil }
+        guard let mins = await NavEngine.shared.travelMinutes(to: airport) else { return nil }
+        let dom = snap?.domestic ?? f.domestic ?? true
+        return f.date.addingTimeInterval(-Double((dom ? 90 : 180) + mins + 10) * 60)
     }
 
     private func screenFallback(_ f: TrackedFlight) -> String {
@@ -11744,6 +12046,7 @@ final class ChappyFlights: ObservableObject {
             tracked[i].date = real
         }
         save()
+        ChappyGlance.write()   // BUILD 154: the home widget rides every snapshot
     }
 
     private func freshest(_ id: UUID) -> TrackedFlight? {
@@ -11846,6 +12149,11 @@ final class ChappyFlights: ObservableObject {
             let before = freshest(f.id) ?? f
             apply(snap, to: f.id)
             await announceSlot(slot, flight: freshest(f.id) ?? f, before: before, snap: snap)
+            // BUILD 154: inside 12 hours the Live Activity mirrors every check.
+            if let f2 = freshest(f.id), f2.date.timeIntervalSinceNow < 12 * 3600 {
+                ChappyLiveActivity.shared.sync(flight: f2,
+                                               leaveBy: await leaveByDate(for: f2, snap: snap))
+            }
         }
         armFlightDayWatch()   // flight gone past → timer stands down
     }
@@ -12220,4 +12528,879 @@ final class ChappyRide: ObservableObject {
         }
         return "\(appName) is open - order away, and tell me what you spent after."
     }
+}
+
+// =====================================================================
+// MARK: - CHAPPY LIVE ACTIVITY (Build 154)
+// =====================================================================
+//
+//   The flight, living on the lock screen and in the Dynamic Island all
+//   day: countdown to wheels-up, gate, terminal, delay, leave-by. The
+//   app updates it from the same flight-day passes that speak — one
+//   source of truth, two surfaces.
+//
+//   ⚠️ ChappyFlightAttributes exists in TWO places on purpose: here, and
+//   in ChappyWidgets/ChappyWidgetsLiveActivity.swift. ActivityKit
+//   matches them by TYPE NAME and Codable shape across the process
+//   boundary — the two copies must stay IDENTICAL, field for field.
+
+struct ChappyFlightAttributes: ActivityAttributes {
+    public struct ContentState: Codable, Hashable {
+        var status: String       // scheduled / active / landed / cancelled
+        var gate: String?
+        var terminal: String?
+        var delayMin: Int
+        var departure: Date      // countdown target
+        var leaveBy: Date?       // when to walk out the door
+    }
+    var number: String           // "QF52"
+    var airport: String          // "Brisbane Airport"
+}
+
+@MainActor
+final class ChappyLiveActivity {
+
+    static let shared = ChappyLiveActivity()
+    private init() {}
+
+    private var current: Activity<ChappyFlightAttributes>?
+
+    /// Start on first sync inside 12 hours, update on every snapshot,
+    /// end itself once the flight has landed or gone 3 hours past.
+    func sync(flight f: ChappyFlights.TrackedFlight, leaveBy: Date?) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        if f.lastStatus == "landed" || f.date.timeIntervalSinceNow < -3 * 3600 {
+            end(); return
+        }
+        let state = ChappyFlightAttributes.ContentState(
+            status: f.lastStatus ?? "scheduled",
+            gate: f.lastGate,
+            terminal: f.depTerminal,
+            delayMin: f.lastDelay ?? 0,
+            departure: f.date,
+            leaveBy: leaveBy)
+        let content = ActivityContent(state: state, staleDate: Date().addingTimeInterval(3 * 3600))
+        if let a = current {
+            Task { await a.update(content) }
+        } else {
+            let attrs = ChappyFlightAttributes(number: f.number,
+                                               airport: f.depAirport ?? "the airport")
+            current = try? Activity.request(attributes: attrs, content: content)
+            print("✈️ [LiveActivity] started for \(f.number)")
+        }
+    }
+
+    func end() {
+        guard let a = current else { return }
+        current = nil
+        Task { await a.end(nil, dismissalPolicy: .default) }
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY GLANCE (Build 154) — feeds the home-screen widget
+// =====================================================================
+//
+//   The widget process can't call into the app; it reads a tiny shared
+//   note the app leaves in the App Group. Until the App Group capability
+//   is added in Xcode (Signing & Capabilities → App Groups →
+//   group.com.shaun.chappy, on BOTH targets) the note lands nowhere and
+//   the widget shows its graceful fallback — nothing breaks either way.
+
+enum ChappyGlance {
+    static func write() {
+        guard let d = UserDefaults(suiteName: "group.com.shaun.chappy") else { return }
+        var flightLine = ""
+        if let f = ChappyFlights.shared.todayFlight() {
+            let df = DateFormatter(); df.dateFormat = "h:mm a"
+            var bits = ["✈️ \(f.number) \(df.string(from: f.date))"]
+            if let g = f.lastGate { bits.append("Gate \(g)") }
+            if let delay = f.lastDelay, delay > 0 { bits.append("+\(delay)m") }
+            flightLine = bits.joined(separator: " · ")
+        }
+        let od = ChappyReminders.shared.overdue().count
+        let today = ChappyReminders.shared.today().count
+        let remLine = od > 0 ? "\(od) overdue · \(today) today"
+                    : (today > 0 ? "\(today) reminders today" : "Day's clear")
+        d.set(flightLine, forKey: "glance_flight")
+        d.set(remLine, forKey: "glance_reminders")
+        d.set(Date().timeIntervalSince1970, forKey: "glance_at")
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY BURST (Build 155) — the action shot
+// =====================================================================
+//
+//   Apple's burst is 10 frames a second with the sharpest auto-picked;
+//   Google's Top Shot is the same idea. The glasses can't burst — Meta
+//   hands over one still at a time — but the STREAM is already frames,
+//   so Chappy samples it hard for ~2.5 seconds, scores every frame for
+//   sharpness (edge energy on a 64px grayscale — blur kills edges), and
+//   keeps the winner. Hold the Snap button, or say "action shot".
+
+@MainActor
+final class ChappyBurst {
+
+    static let shared = ChappyBurst()
+    private init() {}
+
+    private(set) var isFiring = false
+
+    func fire() {
+        guard !isFiring else { return }
+        isFiring = true
+        TTSService.shared.speak("Burst.")
+        Task { await run() }
+    }
+
+    private func run() async {
+        defer { isFiring = false }
+
+        let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
+        if !wasStreaming {
+            NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
+            }
+            try? await Task.sleep(nanoseconds: 600_000_000)
+        }
+
+        var frames: [UIImage] = []
+        for i in 0..<20 {
+            if i > 0 { try? await Task.sleep(nanoseconds: 125_000_000) }
+            if let f = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
+                frames.append(f)
+            }
+        }
+
+        if !wasStreaming {
+            if GeminiLiveService.activeInstance == nil, !ContinuousVisionManager.shared.isRunning {
+                await LiveAIManager.shared.streamViewModel?.stopSession()
+            }
+        }
+
+        guard frames.count >= 3 else {
+            TTSService.shared.speak("The camera never settled - no burst this time.")
+            return
+        }
+
+        let scored: (best: UIImage, count: Int) = await Task.detached(priority: .userInitiated) {
+            var bestScore = -1.0
+            var best = frames[0]
+            for f in frames {
+                let s = Self.sharpness(of: f)
+                if s > bestScore { bestScore = s; best = f }
+            }
+            return (best, frames.count)
+        }.value
+
+        SnapFeedback.shared.captured(scored.best)
+        _ = ChappyMemory.shared.remember(.photo,
+            title: "Action shot - sharpest of \(scored.count)",
+            tags: ["burst", "photo"],
+            thumbnail: scored.best.jpegData(compressionQuality: 0.65),
+            source: "burst")
+        ChappyEarcon.shared.done()
+        TTSService.shared.speak("Got it - kept the sharpest of \(scored.count).")
+    }
+
+    /// Edge energy on a 64×64 grayscale: sum of squared neighbour
+    /// differences. Motion blur and focus misses flatten edges, so the
+    /// sharpest frame wins by a wide margin. Cheap enough for 20 frames.
+    nonisolated private static func sharpness(of image: UIImage) -> Double {
+        let side = 64
+        let fmt = UIGraphicsImageRendererFormat.default()
+        fmt.scale = 1
+        let small = UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: fmt)
+            .image { _ in image.draw(in: CGRect(x: 0, y: 0, width: side, height: side)) }
+        guard let cg = small.cgImage else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        guard let ctx = CGContext(data: &pixels, width: side, height: side,
+                                  bitsPerComponent: 8, bytesPerRow: side,
+                                  space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return 0 }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        var energy = 0.0
+        for y in 0..<(side - 1) {
+            for x in 0..<(side - 1) {
+                let i = y * side + x
+                let dx = Double(pixels[i]) - Double(pixels[i + 1])
+                let dy = Double(pixels[i]) - Double(pixels[i + side])
+                energy += dx * dx + dy * dy
+            }
+        }
+        return energy
+    }
+}
+
+// =====================================================================
+// MARK: - THE ATLAS (Build 156)
+// =====================================================================
+//
+//   Every place you have been, drawn as one map, for as long as you keep
+//   the app. The design borrows from three places on purpose:
+//
+//     Google Timeline   — the journey, coloured by how you travelled
+//     Polarsteps        — the TRIP as the hero: a glowing line across a
+//                         country, not a table of coordinates
+//     Apple Maps        — live points of interest that appear as you
+//                         zoom, free, no key, tappable
+//
+//   The data layer lives here; the map itself is AtlasView. Nothing in
+//   the Atlas has its own database — visits come from ChappyTrail,
+//   stars and photos from ChappyMemory, home from TripRecorder. The
+//   Atlas is a WINDOW onto the brain, not a second brain.
+
+@MainActor
+final class ChappyAtlas: ObservableObject {
+
+    static let shared = ChappyAtlas()
+    private init() {}
+
+    enum Mode: String, Codable {
+        case flight, drive, walk
+        var tint: Color {
+            switch self {
+            case .flight: return Color(red: 0.35, green: 0.85, blue: 1.0)
+            case .drive:  return Color(red: 0.20, green: 0.90, blue: 0.75)
+            case .walk:   return Color(red: 0.55, green: 0.95, blue: 0.45)
+            }
+        }
+        var icon: String {
+            switch self {
+            case .flight: return "airplane"
+            case .drive:  return "car.fill"
+            case .walk:   return "figure.walk"
+            }
+        }
+        var label: String {
+            switch self {
+            case .flight: return "Flight"
+            case .drive:  return "Drive"
+            case .walk:   return "Walk"
+            }
+        }
+    }
+
+    struct Leg: Identifiable {
+        let id = UUID()
+        var mode: Mode
+        var coords: [CLLocationCoordinate2D]
+        var km: Double
+        var at: Date
+    }
+
+    struct Stop: Identifiable {
+        let id: UUID
+        var name: String
+        var coord: CLLocationCoordinate2D
+        var visits: Int
+        var lastAt: Date
+        var starred: Bool
+        var isHome: Bool
+        var photos: Int
+    }
+
+    enum Span: String, CaseIterable {
+        case month = "Month", threeMonths = "3 Months", year = "Year", all = "All time"
+        var days: Int {
+            switch self {
+            case .month: return 31
+            case .threeMonths: return 92
+            case .year: return 366
+            case .all: return 3650
+            }
+        }
+    }
+
+    @Published private(set) var legs: [Leg] = []
+    @Published private(set) var stops: [Stop] = []
+    @Published private(set) var summary = ""
+    @Published private(set) var isBuilding = false
+
+    func build(span: Span) {
+        guard !isBuilding else { return }
+        isBuilding = true
+        let days = span.days
+        Task { @MainActor in
+            let result = await Self.assemble(days: days)
+            self.legs = result.0
+            self.stops = result.1
+            self.summary = result.2
+            self.isBuilding = false
+        }
+    }
+
+    private static func assemble(days: Int) async -> ([Leg], [Stop], String) {
+        var visits: [ChappyTrail.Visit] = []
+        var allPoints: [ChappyTrail.Point] = []
+        let cal = Calendar.current
+        for back in 0..<days {
+            guard let d = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
+            let v = ChappyTrail.shared.visits(for: d)
+            if v.isEmpty { continue }
+            visits.append(contentsOf: v)
+            allPoints.append(contentsOf: ChappyTrail.shared.points(for: d))
+        }
+        visits.sort { $0.arrive < $1.arrive }
+        allPoints.sort { $0.at < $1.at }
+
+        // ── STOPS: visits collapsed by proximity, enriched with stars,
+        // home and photo counts.
+        var stops: [Stop] = []
+        let spots = TripRecorder.shared.spots
+        let mems = ChappyMemory.shared.recent.filter { $0.lat != nil && $0.lon != nil }
+        for v in visits {
+            let here = CLLocation(latitude: v.lat, longitude: v.lon)
+            if let i = stops.firstIndex(where: {
+                here.distance(from: CLLocation(latitude: $0.coord.latitude,
+                                               longitude: $0.coord.longitude)) < 300 }) {
+                stops[i].visits += 1
+                if v.arrive > stops[i].lastAt { stops[i].lastAt = v.arrive }
+                if stops[i].name == "Stop", let n = v.name { stops[i].name = n }
+                continue
+            }
+            let spot = spots.first { s in
+                here.distance(from: CLLocation(latitude: s.lat, longitude: s.lon)) < 250
+            }
+            let name = spot?.name ?? v.name ?? "Stop"
+            let photos = mems.filter { m in
+                guard let la = m.lat, let lo = m.lon else { return false }
+                return here.distance(from: CLLocation(latitude: la, longitude: lo)) < 300
+                    && (m.kind == .photo || m.kind == .video)
+            }.count
+            var starred = false
+            if let mid = spot?.memID {
+                starred = ChappyMemory.shared.recent.first { $0.id == mid }?.pinned ?? false
+            }
+            let isHome = ["home", "hotel", "my hotel", "the hotel"]
+                .contains((spot?.name ?? "").lowercased())
+            stops.append(Stop(id: v.id, name: name,
+                              coord: CLLocationCoordinate2D(latitude: v.lat, longitude: v.lon),
+                              visits: 1, lastAt: v.arrive,
+                              starred: starred, isHome: isHome, photos: photos))
+        }
+
+        // ── LEGS: consecutive visits become a journey, classified by the
+        // speed it took to cover the gap.
+        var legs: [Leg] = []
+        var totalKm = 0.0
+        if visits.count > 1 {
+            for i in 1..<visits.count {
+                let a = visits[i - 1], b = visits[i]
+                let from = CLLocation(latitude: a.lat, longitude: a.lon)
+                let to = CLLocation(latitude: b.lat, longitude: b.lon)
+                let km = from.distance(from: to) / 1000
+                if km <= 0.15 { continue }
+                let start = a.depart ?? a.arrive
+                let hours = max(b.arrive.timeIntervalSince(start) / 3600, 0.02)
+                let kmh = km / hours
+                let mode: Mode = (km > 400 || kmh > 200) ? .flight : (kmh > 11 ? .drive : .walk)
+                var shape = allPoints.filter { $0.at >= start && $0.at <= b.arrive }
+                    .map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+                if mode == .flight || shape.count < 2 {
+                    shape = [from.coordinate, to.coordinate]
+                } else {
+                    shape.insert(from.coordinate, at: 0)
+                    shape.append(to.coordinate)
+                }
+                legs.append(Leg(mode: mode, coords: shape, km: km, at: b.arrive))
+                totalKm += km
+            }
+        }
+
+        let towns = Set(stops.map { $0.name.lowercased() }).count
+        let flights = legs.filter { $0.mode == .flight }.count
+        var bits: [String] = []
+        bits.append("\(stops.count) stop\(stops.count == 1 ? "" : "s")")
+        if towns > 1 { bits.append("\(towns) places") }
+        if totalKm >= 1 { bits.append("\(Int(totalKm)) km") }
+        if flights > 0 { bits.append("\(flights) flight\(flights == 1 ? "" : "s")") }
+        return (legs, stops, bits.joined(separator: " · "))
+    }
+
+    /// The region that holds everything — the Atlas opens here, which for
+    /// a life lived in two countries means a continent, not a street.
+    func homeRegion() -> MKCoordinateRegion {
+        let cs = stops.map { $0.coord }
+        guard !cs.isEmpty else {
+            let s = ContextEngine.shared.snapshot
+            return MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: s.latitude ?? -27.47,
+                                               longitude: s.longitude ?? 153.02),
+                span: MKCoordinateSpan(latitudeDelta: 12, longitudeDelta: 12))
+        }
+        let lats = cs.map { $0.latitude }, lons = cs.map { $0.longitude }
+        let minLat = lats.min() ?? 0, maxLat = lats.max() ?? 0
+        let minLon = lons.min() ?? 0, maxLon = lons.max() ?? 0
+        return MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
+                                           longitude: (minLon + maxLon) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max((maxLat - minLat) * 1.4, 1.5),
+                                   longitudeDelta: max((maxLon - minLon) * 1.4, 1.5)))
+    }
+
+    // MARK: the live layers
+
+    enum Layer: String, CaseIterable, Identifiable {
+        case sights, nature, temples, food, transport, gems
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .sights: return "Sights"
+            case .nature: return "Nature"
+            case .temples: return "Temples"
+            case .food: return "Food"
+            case .transport: return "Transport"
+            case .gems: return "Gems"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .sights: return "star.circle.fill"
+            case .nature: return "leaf.fill"
+            case .temples: return "building.columns.fill"
+            case .food: return "fork.knife"
+            case .transport: return "tram.fill"
+            case .gems: return "sparkles"
+            }
+        }
+        var tint: Color {
+            switch self {
+            case .sights: return .yellow
+            case .nature: return .green
+            case .temples: return .orange
+            case .food: return .pink
+            case .transport: return .blue
+            case .gems: return .purple
+            }
+        }
+        var queries: [String] {
+            switch self {
+            case .sights:    return ["tourist attraction", "landmark", "museum"]
+            case .nature:    return ["waterfall", "beach", "national park"]
+            case .temples:   return ["temple", "church", "shrine"]
+            case .food:      return ["restaurant", "cafe", "market"]
+            case .transport: return ["train station", "bus station", "airport"]
+            // Geocaching.com has no open API, so "Gems" is the honest
+            // version: the things worth detouring for that ordinary map
+            // searches bury.
+            case .gems:      return ["lookout", "viewpoint", "hot spring", "cave"]
+            }
+        }
+    }
+
+    struct Place: Identifiable, Hashable {
+        let id = UUID()
+        var name: String
+        var category: String
+        var coord: CLLocationCoordinate2D
+        var layer: Layer
+        func hash(into h: inout Hasher) { h.combine(id) }
+        static func == (a: Place, b: Place) -> Bool { a.id == b.id }
+    }
+
+    /// Search the visible region for every switched-on layer. Keyless —
+    /// MKLocalSearch is Apple's own data.
+    func findPlaces(in region: MKCoordinateRegion, layers: Set<Layer>) async -> [Place] {
+        guard !layers.isEmpty else { return [] }
+        var out: [Place] = []
+        for layer in layers {
+            for q in layer.queries {
+                let req = MKLocalSearch.Request()
+                req.naturalLanguageQuery = q
+                req.region = region
+                guard let resp = try? await MKLocalSearch(request: req).start() else { continue }
+                for item in resp.mapItems.prefix(8) {
+                    guard let name = item.name else { continue }
+                    let c = item.placemark.coordinate
+                    if out.contains(where: {
+                        abs($0.coord.latitude - c.latitude) < 0.0006 &&
+                        abs($0.coord.longitude - c.longitude) < 0.0006 }) { continue }
+                    let cat = item.pointOfInterestCategory?.rawValue
+                        .replacingOccurrences(of: "MKPOICategory", with: "") ?? q.capitalized
+                    out.append(Place(name: name, category: cat, coord: c, layer: layer))
+                }
+            }
+        }
+        return out
+    }
+
+    // MARK: weather — free, keyless
+
+    struct Weather {
+        var tempC: Double
+        var code: Int
+        var windKmh: Double
+        var line: String { "\(Int(tempC.rounded()))°, \(Weather.describe(code))" }
+        var icon: String { Weather.symbol(code) }
+        static func describe(_ c: Int) -> String {
+            switch c {
+            case 0: return "clear"
+            case 1, 2: return "partly cloudy"
+            case 3: return "overcast"
+            case 45, 48: return "fog"
+            case 51...57: return "drizzle"
+            case 61...67: return "rain"
+            case 71...77: return "snow"
+            case 80...82: return "showers"
+            case 95...99: return "storms"
+            default: return "mixed"
+            }
+        }
+        static func symbol(_ c: Int) -> String {
+            switch c {
+            case 0: return "sun.max.fill"
+            case 1, 2: return "cloud.sun.fill"
+            case 3: return "cloud.fill"
+            case 45, 48: return "cloud.fog.fill"
+            case 51...67, 80...82: return "cloud.rain.fill"
+            case 71...77: return "cloud.snow.fill"
+            case 95...99: return "cloud.bolt.rain.fill"
+            default: return "cloud.sun.fill"
+            }
+        }
+    }
+
+    private var wxCache: [String: (Weather, Date)] = [:]
+
+    /// Open-Meteo: no key, no account. Cached six minutes per rough spot.
+    func weather(at c: CLLocationCoordinate2D) async -> Weather? {
+        let key = String(format: "%.1f,%.1f", c.latitude, c.longitude)
+        if let hit = wxCache[key], Date().timeIntervalSince(hit.1) < 360 { return hit.0 }
+        guard let url = URL(string:
+            "https://api.open-meteo.com/v1/forecast?latitude=\(c.latitude)&longitude=\(c.longitude)&current=temperature_2m,weather_code,wind_speed_10m")
+        else { return nil }
+        var req = URLRequest(url: url); req.timeoutInterval = 12
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cur = json["current"] as? [String: Any],
+              let t = cur["temperature_2m"] as? Double else { return nil }
+        let w = Weather(tempC: t,
+                        code: (cur["weather_code"] as? Int) ?? 0,
+                        windKmh: (cur["wind_speed_10m"] as? Double) ?? 0)
+        wxCache[key] = (w, Date())
+        return w
+    }
+
+    /// Zoom Earth — live satellite, radar and storm tracks. A link, not a
+    /// scrape: their site does it better than any embed could.
+    static func zoomEarthURL(_ c: CLLocationCoordinate2D, zoom: Int = 8) -> URL? {
+        URL(string: String(format: "https://zoom.earth/maps/satellite/#view=%.4f,%.4f,%dz",
+                           c.latitude, c.longitude, zoom))
+    }
+
+    // MARK: voice bridge
+
+    static func voiceTarget(in c: String) -> String? {
+        for cut in ["zoom to ", "zoom in on ", "take the atlas to ", "atlas to ",
+                    "fly to ", "centre on ", "center on "] {
+            if let r = c.range(of: cut) {
+                let t = String(c[r.upperBound...])
+                    .replacingOccurrences(of: "on the map", with: "")
+                    .replacingOccurrences(of: "in the atlas", with: "")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?"))
+                if t.count > 1 { return t }
+            }
+        }
+        return nil
+    }
+
+    static func layerMentioned(in c: String) -> Layer? {
+        if c.contains("temple") || c.contains("church") || c.contains("shrine") { return .temples }
+        if c.contains("waterfall") || c.contains("beach") || c.contains("nature")
+            || c.contains("national park") { return .nature }
+        if c.contains("sight") || c.contains("attraction") || c.contains("landmark")
+            || c.contains("museum") { return .sights }
+        if c.contains("restaurant") || c.contains("cafe") { return .food }
+        if c.contains("train") || c.contains("bus station") || c.contains("transport") { return .transport }
+        if c.contains("lookout") || c.contains("viewpoint") || c.contains("gem")
+            || c.contains("hidden") { return .gems }
+        return nil
+    }
+}
+
+extension Notification.Name {
+    /// BUILD 156 — open the Atlas, optionally already flying somewhere.
+    static let chappyOpenAtlas = Notification.Name("chappyOpenAtlas")
+}
+
+// =====================================================================
+// MARK: - CHAPPY DICTATE (Build 157)
+// =====================================================================
+//
+//   Speak a mess, get clean text on the clipboard. Every serious player
+//   converged on this in 2024-25 and they all landed in the same place:
+//
+//     Apple Writing Tools  — Proofread / Rewrite, with TONES
+//     Samsung Note Assist  — transcribe, then REFORMAT into templates
+//     Google (Gboard/Pixel)— polish and proofread on device
+//     Wispr Flow, Superwhisper — the whole point is speak → paste
+//
+//   So the flow is: talk → raw transcript kept forever → Gemini cleans
+//   it into the tone you pick → Copy / Share / Save. The RAW words are
+//   never thrown away, because a polish that loses a detail is worse
+//   than no polish at all.
+//
+//   The transcription itself is Apple's on-device recogniser, the same
+//   ear Standby already uses — so the words cost nothing and never
+//   leave the phone until you ask for the polish.
+
+@MainActor
+final class ChappyDictate: NSObject, ObservableObject {
+
+    static let shared = ChappyDictate()
+    private override init() { super.init() }
+
+    enum Tone: String, CaseIterable, Identifiable {
+        case professional, jobReport, email, brief, bullets, plain
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .professional: return "Professional"
+            case .jobReport:    return "Job Report"
+            case .email:        return "Email"
+            case .brief:        return "Brief"
+            case .bullets:      return "Bullets"
+            case .plain:        return "Plain"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .professional: return "briefcase.fill"
+            case .jobReport:    return "wrench.and.screwdriver.fill"
+            case .email:        return "envelope.fill"
+            case .brief:        return "bolt.fill"
+            case .bullets:      return "list.bullet"
+            case .plain:        return "text.alignleft"
+            }
+        }
+        var tint: Color {
+            switch self {
+            case .professional: return .blue
+            case .jobReport:    return .orange
+            case .email:        return .purple
+            case .brief:        return .green
+            case .bullets:      return .teal
+            case .plain:        return .gray
+            }
+        }
+        /// The instruction. Deliberately strict about INVENTING: a report
+        /// that adds a fact you didn't say is a liability, not a feature.
+        var prompt: String {
+            let rule = "Never invent facts, names, numbers or outcomes that are not in the transcript. If something is unclear, keep it vague rather than guessing. Fix grammar, remove filler and false starts, and keep every real detail. Output only the finished text - no preamble, no notes, no markdown headers."
+            switch self {
+            case .professional:
+                return "Rewrite this dictation as clear, professional prose suitable for a work document. \(rule)"
+            case .jobReport:
+                return """
+                Rewrite this dictation as a structured job report using exactly these labelled sections, each on its own line, omitting any section the transcript does not cover:
+                Reported issue:
+                Findings:
+                Work performed:
+                Outcome:
+                Parts / time:
+                Follow-up:
+                \(rule)
+                """
+            case .email:
+                return "Rewrite this dictation as a polite, concise email body. No subject line, no greeting placeholder like [Name] - start with a natural greeting only if the transcript implies one. \(rule)"
+            case .brief:
+                return "Rewrite this dictation as tightly as possible - the same information in as few clear sentences as it takes. \(rule)"
+            case .bullets:
+                return "Rewrite this dictation as a bulleted list, one point per line starting with a dash. \(rule)"
+            case .plain:
+                return "Clean up this dictation: fix grammar and punctuation, remove filler words and false starts, keep the speaker's own voice and wording otherwise. \(rule)"
+            }
+        }
+    }
+
+    @Published var isRecording = false
+    @Published var transcript = ""
+    @Published var polished = ""
+    @Published var isPolishing = false
+    @Published var tone: Tone = .professional
+    @Published var error: String?
+
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-AU"))
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let engine = AVAudioEngine()
+
+    // MARK: recording
+
+    func start() {
+        guard !isRecording else { return }
+        error = nil
+        transcript = ""
+        polished = ""
+
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            Task { @MainActor in
+                guard status == .authorized else {
+                    self?.error = "Speech recognition isn't allowed — Settings, Chappy, Speech Recognition."
+                    return
+                }
+                self?.beginEngine()
+            }
+        }
+    }
+
+    private func beginEngine() {
+        // Hand the microphone over cleanly — Standby must not be holding it.
+        if ChappyStandby.shared.isListening { ChappyStandby.shared.handOff() }
+
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .measurement,
+                                 options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
+        try? session.setActive(true, options: .notifyOthersOnDeactivation)
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        // On-device where the phone supports it: the words never leave.
+        if recognizer?.supportsOnDeviceRecognition == true {
+            req.requiresOnDeviceRecognition = true
+        }
+        request = req
+
+        let node = engine.inputNode
+        let format = node.outputFormat(forBus: 0)
+        guard format.sampleRate > 0 else {
+            error = "The microphone wasn't ready — try again in a second."
+            return
+        }
+        node.removeTap(onBus: 0)
+        node.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            req.append(buffer)
+        }
+        engine.prepare()
+        do { try engine.start() } catch {
+            self.error = "Couldn't start the microphone."
+            return
+        }
+        isRecording = true
+        ChappyEarcon.shared.tap()
+
+        task = recognizer?.recognitionTask(with: req) { [weak self] result, err in
+            Task { @MainActor in
+                guard let self else { return }
+                if let r = result {
+                    self.transcript = r.bestTranscription.formattedString
+                }
+                if err != nil || (result?.isFinal ?? false) {
+                    if self.isRecording { self.stop(andPolish: true) }
+                }
+            }
+        }
+    }
+
+    func stop(andPolish: Bool) {
+        guard isRecording else { return }
+        isRecording = false
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        request?.endAudio()
+        task?.cancel()
+        request = nil
+        task = nil
+        ChappyEarcon.shared.done()
+        // Give Standby its ear back.
+        ChappyStandby.shared.resumeAfterHandOff()
+        if andPolish, transcript.count > 3 {
+            Task { await polish() }
+        }
+    }
+
+    // MARK: the polish
+
+    func polish() async {
+        let raw = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.count > 3 else { return }
+        isPolishing = true
+        defer { isPolishing = false }
+
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else {
+            // No key, no drama: cleaned-up-by-hand is better than nothing.
+            polished = Self.localTidy(raw)
+            error = "Polished offline — no API key for the full rewrite."
+            return
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 40
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "contents": [["role": "user", "parts": [["text": "\(tone.prompt)\n\nTRANSCRIPT:\n\(raw)"]]]],
+            "generationConfig": ["temperature": 0.2, "maxOutputTokens": 1400]
+        ] as [String: Any])
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let t = parts.first?["text"] as? String
+        else {
+            polished = Self.localTidy(raw)
+            error = "Couldn't reach the rewriter — here's the tidied transcript."
+            return
+        }
+        polished = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        error = nil
+    }
+
+    /// The offline fallback: capitalise sentences, strip the ums. Not
+    /// clever, but it never leaves you with nothing.
+    static func localTidy(_ s: String) -> String {
+        var t = s
+        for filler in [" um ", " uh ", " erm ", " you know ", " like, "] {
+            t = t.replacingOccurrences(of: filler, with: " ", options: .caseInsensitive)
+        }
+        t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = t.first else { return t }
+        t = String(first).uppercased() + t.dropFirst()
+        if !t.hasSuffix(".") && !t.hasSuffix("!") && !t.hasSuffix("?") { t += "." }
+        return t
+    }
+
+    // MARK: keeping it
+
+    func copyToClipboard() {
+        UIPasteboard.general.string = polished.isEmpty ? transcript : polished
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    /// Files it in memory AND writes a .txt you can open from Files.
+    @discardableResult
+    func save() -> URL? {
+        let text = polished.isEmpty ? transcript : polished
+        guard !text.isEmpty else { return nil }
+        let title = String(text.split(separator: "\n").first?.prefix(60) ?? "Dictated note")
+        _ = ChappyMemory.shared.remember(.note,
+            title: String(title),
+            body: text + (transcript == text ? "" : "\n\n— raw —\n" + transcript),
+            tags: ["dictation", tone.rawValue],
+            source: "dictate")
+
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd-HHmm"
+        let name = "Chappy-\(tone.rawValue)-\(df.string(from: Date())).txt"
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(name)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        return url
+    }
+}
+
+extension Notification.Name {
+    /// BUILD 157 — open Dictate, already recording.
+    static let chappyOpenDictate = Notification.Name("chappyOpenDictate")
+    /// BUILD 158 — open the saved-places list.
+    static let chappyOpenPlaces = Notification.Name("chappyOpenPlaces")
 }
