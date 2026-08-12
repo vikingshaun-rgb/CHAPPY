@@ -6252,7 +6252,7 @@ struct DictateView: View {
                 wave = true
                 if autoStart && !dictate.isRecording { dictate.start() }
             }
-            .sheet(item: $shareURL) { url in ShareSheet(items: [url]) }
+            .sheet(item: $shareURL) { url in ChappyShareSheet(items: [url]) }
         }
     }
 
@@ -6474,14 +6474,17 @@ struct DictateView: View {
     }
 }
 
-/// Minimal share-sheet bridge so a saved .txt can go anywhere iOS goes.
-struct ShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
-}
+// BUILD 161 — NO SHARE SHEET DECLARED HERE ON PURPOSE.
+//
+// I wrote one called `ShareSheet`, which collided with the `ShareSheet(photo:)`
+// PhotoPreviewView has shipped for months — and that one clash broke BOTH
+// files. Renaming it to ChappyShareSheet then collided with the identical
+// ChappyShareSheet already living in LiveTranslateView.
+//
+// So: no third copy. DictateView uses the existing ChappyShareSheet from
+// LiveTranslateView.swift — same `items: [Any]` shape, already in the target.
+// The lesson, written down so the next module doesn't repeat it: grep the
+// project for a type name before declaring it.
 
 extension URL: Identifiable {
     public var id: String { absoluteString }
