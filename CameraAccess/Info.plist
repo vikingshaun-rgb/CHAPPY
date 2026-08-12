@@ -20,6 +20,8 @@
 	<string>Chappy</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleURLTypes</key>
@@ -39,12 +41,21 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>130</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSApplicationCategoryType</key>
 	<string></string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>comgooglemaps</string>
+		<!-- BUILD 167: canOpenURL returns false for any scheme not listed
+		     here, so without these Chappy can never tell whether Outlook,
+		     Grab, Uber or Gojek are installed. -->
+		<string>ms-outlook</string>
+		<string>googlegmail</string>
+		<string>grab</string>
+		<string>uber</string>
+		<string>gojek</string>
+		<string>ubereats</string>
 	</array>
 	<key>MWDAT</key>
 	<dict>
