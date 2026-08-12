@@ -299,6 +299,27 @@ class TTSService: NSObject, ObservableObject {
     /// bad moment of signal cost the nicer voice until the app was restarted.
     /// Thirty minutes is long enough to stop it flip-flopping sentence to
     /// sentence, short enough that a tunnel doesn't cost you the rest of the day.
+    /// BUILD 174 — WHY it gave up, kept so "why is the voice robotic" has a
+    /// real answer instead of a shrug.
+    static var lastFallbackReason = ""
+    static var lastFallbackAt: Date?
+
+    /// The honest status line, for the voice test and for asking out loud.
+    static var voiceStatusLine: String {
+        let wantsSystem = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
+        if wantsSystem {
+            return "The voice is set to System in Settings — that's Apple's voice by choice, not a fault."
+        }
+        if (APIKeyManager.shared.getGoogleAPIKey() ?? "").isEmpty {
+            return "There's no Google key, so only Apple's voice is available."
+        }
+        if geminiVoiceGaveUp {
+            let ago = lastFallbackAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+            return "Chappy's voice is in fallback after a failure \(ago) seconds ago: \(lastFallbackReason). It clears itself within five minutes, or say 'reset the voice'."
+        }
+        return "Chappy's own voice is working normally."
+    }
+
     static var geminiVoiceGaveUp: Bool {
         get {
             guard let t = geminiGaveUpAt else { return false }
@@ -900,13 +921,26 @@ class TTSService: NSObject, ObservableObject {
                 do {
                     try await self.playPCM(cached, gen: gen)
                     return
+                } catch is CancellationError {
+                    return
                 } catch {
                     if Task.isCancelled { return }
-                    // A cached file that won't play is a corrupt file. Drop it
-                    // and let the network re-render rather than going mute.
+                    // BUILD 174: this assumed a cached file that won't play is
+                    // CORRUPT — so it deleted good audio and re-rendered over
+                    // the network. But the usual cause is the audio session
+                    // being busy for a moment (camera waking, route changing),
+                    // and the file is perfectly fine. Try it once more before
+                    // throwing away audio we already paid for.
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                    if Task.isCancelled { return }
+                    if let again = VoiceCache.shared.load(text: trimmed, voice: voice),
+                       (try? await self.playPCM(again, gen: gen)) != nil {
+                        return
+                    }
+                    if Task.isCancelled { return }
                     try? FileManager.default.removeItem(
                         at: VoiceCache.shared.url(text: trimmed, voice: voice))
-                    print("⚠️ [TTS] Cached line wouldn't play — re-rendering")
+                    print("⚠️ [TTS] Cached line wouldn't play twice — re-rendering")
                 }
             }
 
@@ -938,6 +972,8 @@ class TTSService: NSObject, ObservableObject {
                     } catch {
                         if Task.isCancelled { return }
                         Self.geminiVoiceGaveUp = true
+                        Self.lastFallbackReason = error.localizedDescription
+                        Self.lastFallbackAt = Date()
                         print("⚠️ [TTS] Gemini TTS failed twice (\(error.localizedDescription)) — Apple voice until the cooldown clears")
                     }
                 }
@@ -968,29 +1004,74 @@ class TTSService: NSObject, ObservableObject {
 
     // MARK: - Gemini TTS
 
+    // BUILD 174 — WHY THE VOICE WAS STILL ONLY MOSTLY GEMINI.
+    //
+    // This is the one I missed. The render and the PLAYBACK sat inside the
+    // same do/catch, so a playback failure threw exactly like a network
+    // failure — and the caller treats a throw as "the service is down":
+    // it retries the whole render, and if that stumbles too it latches the
+    // Apple voice for five minutes.
+    //
+    // But playback fails for reasons that have nothing to do with Gemini.
+    // The audio session gets contested when the glasses camera wakes, when
+    // a route change lands, when Live AI takes the mic, when media services
+    // reset. Those are the exact moments Chappy speaks most — so the nicer
+    // voice was being punished for the audio system's problems, over and
+    // over, and it looked random because the cause was invisible.
+    //
+    // Now the two are separated. A render that SUCCEEDS is proof the
+    // service is fine, whatever playback then does: the audio is cached,
+    // playback is retried once from that cache, and a playback failure
+    // NEVER latches the fallback. Only a genuine render failure can.
     private func speakWithGemini(text: String, apiKey: String, gen: Int) async throws {
         var lastError: Error = TTSError.unknown
 
         for model in ttsModels {
+            let audio: Data
             do {
-                let audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
+                audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
                 try Task.checkCancellation()
-                // BUILD 125: keep it BEFORE playing, so audio we paid for
-                // survives even if playback then fails. Long lines are almost
-                // always one-off AI answers — caching those would fill the disk
-                // with speech that is never heard twice.
-                if text.count <= Self.cacheableLimit {
-                    VoiceCache.shared.save(audio, text: text, voice: voiceName)
-                }
-                print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
-                try await playPCM(audio, gen: gen)
-                return
             } catch TTSError.modelNotFound {
                 print("⚠️ [TTS] Model \(model) not found — trying next")
                 lastError = TTSError.modelNotFound
                 continue
             } catch {
-                throw error
+                throw error          // a REAL service failure — the caller may latch
+            }
+
+            // The render worked. From here on, nothing that goes wrong is
+            // Gemini's fault, and nothing that goes wrong may cost the voice.
+            // BUILD 174: cache EVERY successful render, not just short ones.
+            // The old 200-character limit meant long answers re-rendered from
+            // scratch every time — more network, more chances to fail, and
+            // the cache could never protect them.
+            VoiceCache.shared.save(audio, text: text, voice: voiceName)
+            Self.geminiVoiceGaveUp = false   // proof of life, clears any latch
+            print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
+
+            do {
+                try await playPCM(audio, gen: gen)
+                return
+            } catch is CancellationError {
+                return                        // barged in on — perfectly normal
+            } catch {
+                if Task.isCancelled { return }
+                // One retry, from the audio we already have. Audio-session
+                // contention is usually over in a moment.
+                print("⚠️ [TTS] Playback stumbled (\(error.localizedDescription)) — one more go")
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if Task.isCancelled { return }
+                do {
+                    try await playPCM(audio, gen: gen)
+                    return
+                } catch {
+                    // Still no sound. Fall through to the system voice for
+                    // THIS LINE ONLY — but never latch, because the service
+                    // demonstrably works.
+                    print("⚠️ [TTS] Playback failed twice — system voice for this line only")
+                    await self.fallbackToSystemTTS(text: text, languageCode: nil)
+                    return
+                }
             }
         }
         throw lastError
