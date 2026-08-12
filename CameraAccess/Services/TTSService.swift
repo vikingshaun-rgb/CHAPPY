@@ -730,6 +730,101 @@ class TTSService: NSObject, ObservableObject {
         }
     }
 
+    // =================================================================
+    // BUILD 158 — SPEAKING LONG ANSWERS WITHOUT THE WAIT
+    // =================================================================
+    //
+    //   Gemini renders audio at roughly 25 tokens a second, so a
+    //   paragraph-length answer takes fifteen to twenty seconds to
+    //   generate before a single word can play. Quick Vision showed the
+    //   text instantly and then sat in silence — which felt broken even
+    //   though nothing was.
+    //
+    //   Every streaming assistant solves this the same way: don't render
+    //   the paragraph, render the FIRST SENTENCE. It comes back in about
+    //   two seconds and starts playing while sentence two renders behind
+    //   it. Same voice, same quality, first word roughly nine times
+    //   sooner.
+    //
+    //   Short lines (one sentence, under ~140 characters) go straight
+    //   down the normal path — chunking them would only add overhead.
+
+    func speakLong(_ text: String, languageCode: String? = nil) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let chunks = Self.sentenceChunks(trimmed)
+        guard chunks.count > 1 else {
+            speak(trimmed, languageCode: languageCode)
+            return
+        }
+        // First chunk out loud immediately; the rest queue behind it.
+        speak(chunks[0], languageCode: languageCode)
+        let rest = Array(chunks.dropFirst())
+        // Warm them in the cache so each one plays from disk the moment
+        // the previous finishes — the queue below then never waits.
+        prerenderNow(rest)
+        Task { @MainActor in
+            for chunk in rest {
+                // Wait for the current line to finish, with a hard ceiling
+                // so a stuck player can never freeze the rest of the answer.
+                var waited = 0
+                while self.isSpeaking && waited < 600 {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    waited += 1
+                }
+                if Task.isCancelled { return }
+                self.speak(chunk, languageCode: languageCode)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    /// Like prerender, but without the eight-second politeness delay —
+    /// used when the lines are about to be spoken in the next breath.
+    private func prerenderNow(_ lines: [String]) {
+        let voice = voiceName
+        guard voice != "System" else { return }
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty else { return }
+        let missing = lines.filter { !VoiceCache.shared.has(text: $0, voice: voice) }
+        guard !missing.isEmpty else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            for line in missing {
+                if Self.geminiVoiceGaveUp { break }
+                do {
+                    let audio = try await self.requestGeminiAudio(
+                        text: line, model: self.ttsModels[0], apiKey: key)
+                    VoiceCache.shared.save(audio, text: line, voice: voice)
+                    CostMeter.shared.addTTSChars(line.count)
+                } catch { break }
+            }
+        }
+    }
+
+    /// Split on sentence ends, then glue the short ones together — a
+    /// three-word sentence on its own costs a whole round trip for
+    /// nothing. Target is roughly 140 characters a chunk.
+    static func sentenceChunks(_ text: String, target: Int = 140) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var sentence = ""
+        for ch in text {
+            sentence.append(ch)
+            if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
+                let s = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+                sentence = ""
+                guard !s.isEmpty else { continue }
+                if current.isEmpty { current = s }
+                else if current.count + s.count + 1 <= target { current += " " + s }
+                else { out.append(current); current = s }
+            }
+        }
+        let tail = (current + " " + sentence).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { out.append(tail) }
+        return out.filter { !$0.isEmpty }
+    }
+
     /// - Parameters:
     ///   - languageCode: AUDIT P1. The short-line fast path bypassed the
     ///     Gemini call, and with it the language handling — a short Indonesian
