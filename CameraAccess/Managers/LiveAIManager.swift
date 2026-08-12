@@ -3697,10 +3697,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         // So: say what it is, put it on screen, don't pretend. Same pattern
         // as the flight-status fallback. Personal questions ("what time is
         // my flight") are handled far above this and never reach here.
+        // BUILD 169: open() is called with the explicit options/completion
+        // form throughout. Inside an async function the bare open(url) form
+        // resolves to UIApplication's ASYNC overload, which is what "async
+        // but not marked with await" was complaining about — and it only
+        // shows up in the handful of call sites that happen to sit in async
+        // code. Spelling it out removes the ambiguity everywhere at once.
         if Self.looksLikeEventTimeQuestion(c) {
             let q = c.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
             if let u = URL(string: "https://www.google.com/search?q=\(q)") {
-                UIApplication.shared.open(u)
+                UIApplication.shared.open(u, options: [:], completionHandler: nil)
             }
             speak("I don't have live listings for that, so it's on screen.")
             return
@@ -5425,7 +5431,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             .filter(\.isNumber) // AUDIT FIX: "+61 412..." never resolved on wa.me
         if !contact.isEmpty, let lat = snap.latitude, let lon = snap.longitude,
            let u = URL(string: "https://wa.me/\(contact)?text=EMERGENCY%20-%20I%20need%20help.%20My%20location:%20https://maps.google.com/?q=\(lat),\(lon)") {
-            UIApplication.shared.open(u)
+            UIApplication.shared.open(u, options: [:], completionHandler: nil)
             line += " A WhatsApp message with your location is open - press send."
         }
         ChappyHaptics.shared.offRoute()
@@ -11872,12 +11878,12 @@ final class ChappyMail: ObservableObject {
         if preferOutlook,
            let ol = URL(string: "ms-outlook://compose?to=\(enc(to))&subject=\(enc(subject))&body=\(enc(body))"),
            UIApplication.shared.canOpenURL(ol) {
-            UIApplication.shared.open(ol)
+            UIApplication.shared.open(ol, options: [:], completionHandler: nil)
             return true
         }
         guard let u = URL(string: "mailto:\(enc(to))?subject=\(enc(subject))&body=\(enc(body))")
         else { return false }
-        UIApplication.shared.open(u)
+        UIApplication.shared.open(u, options: [:], completionHandler: nil)
         return true
     }
 
@@ -11896,7 +11902,7 @@ final class ChappyMail: ObservableObject {
         guard let u = URL(string: "mailto:\(to)?subject=\(subj)&body=\(b)") else {
             return "Couldn't build that reply."
         }
-        UIApplication.shared.open(u)
+        UIApplication.shared.open(u, options: [:], completionHandler: nil)
         return m.isText
             ? "Reply's ready on screen - one tap sends the text."
             : "Reply's ready on screen - one tap sends it."
@@ -12379,7 +12385,7 @@ final class ChappyFlights: ObservableObject {
     private func screenFallback(_ f: TrackedFlight) -> String {
         let q = "\(f.number) flight status".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? f.number
         if let u = URL(string: "https://www.google.com/search?q=\(q)") {
-            UIApplication.shared.open(u)
+            UIApplication.shared.open(u, options: [:], completionHandler: nil)
         }
         return "Couldn't reach the status service - it's on screen instead."
     }
@@ -12835,7 +12841,7 @@ final class ChappyRide: ObservableObject {
         UIApplication.shared.open(u, options: [:]) { ok in
             if !ok {
                 DispatchQueue.main.async {
-                    if let w = URL(string: fallback) { UIApplication.shared.open(w) }
+                    if let w = URL(string: fallback) { UIApplication.shared.open(w, options: [:], completionHandler: nil) }
                 }
             }
         }
