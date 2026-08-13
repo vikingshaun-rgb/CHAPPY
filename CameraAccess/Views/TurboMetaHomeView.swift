@@ -567,6 +567,18 @@ struct TurboMetaHomeView: View {
     }
 
     /// BUILD 158 — how many places, and how many still need a name.
+    /// BUILD 191: this was an immediately-invoked closure inline in the
+    /// tile's `detail:` argument — a filter, a count and a nested ternary
+    /// dropped into the middle of a view body that already had thirty
+    /// tiles in it. The type checker gave up on the whole body. Hoisted,
+    /// exactly like placesDetailLine below it, which is the pattern that
+    /// existed for this reason.
+    private var flightsDetailLine: String {
+        let n = ChappyWatch.shared.watches.filter { $0.kind == .route }.count
+        if n == 0 { return "Segments, bags, price journal" }
+        return "\(n) route\(n == 1 ? "" : "s") watched"
+    }
+
     private var placesDetailLine: String {
         let all = TripRecorder.shared.spots
         guard !all.isEmpty else { return "Everywhere you've pinned — tap Remember to add" }
@@ -1021,11 +1033,7 @@ struct TurboMetaHomeView: View {
                             // stores — so it could read "3 routes watched" and
                             // then show you nothing.
                             ChappyTile(icon: "airplane", title: "Flights",
-                                       detail: {
-                                            let n = ChappyWatch.shared.watches.filter { $0.kind == .route }.count
-                                            return n == 0 ? "Segments, bags, price journal"
-                                                          : "\(n) route\(n == 1 ? "" : "s") watched"
-                                       }(),
+                                       detail: flightsDetailLine,
                                        tint: Color(red: 0.30, green: 0.75, blue: 1.0)) {
                                 showFlights = true
                             }
@@ -10188,7 +10196,7 @@ struct LegEditorSheet: View {
                     Stepper("Nights: \(leg?.nights ?? 0)", value: bind(\.nights, 1), in: 1...90)
                 }
 
-                Section("Getting here") {
+                Section {
                     Picker("How", selection: bind(\.arrival, ChappyTravel.Arrival.flight)) {
                         ForEach(ChappyTravel.Arrival.allCases) { a in
                             Label(a.label, systemImage: a.icon).tag(a)
@@ -10202,11 +10210,13 @@ struct LegEditorSheet: View {
                             .multilineTextAlignment(.trailing)
                     }
                     TextField("Flight number, bus company…", text: bind(\.arrivalNote, ""))
+                } header: {
+                    Text("Getting here")
                 } footer: {
                     Text("Total for the whole party.")
                 }
 
-                Section("Where you sleep") {
+                Section {
                     TextField("Place name (optional)", text: bind(\.stayName, ""))
                     HStack {
                         Text("Per night")
@@ -10223,6 +10233,8 @@ struct LegEditorSheet: View {
                         ForEach(ChappyFX.common.filter { $0 != (trip?.homeCurrency ?? "") },
                                 id: \.self) { Text($0).tag($0) }
                     }
+                } header: {
+                    Text("Where you sleep")
                 } footer: {
                     Text("Quote it in whatever the listing says — rupiah, baht, dollars. Chappy converts it into the trip's currency for the total.")
                 }
@@ -10864,7 +10876,7 @@ struct TripPlannerSheet: View {
                     }
                 }
 
-                Section("Budget") {
+                Section {
                     Toggle("Work to a ceiling", isOn: $useBudget)
                     if useBudget {
                         HStack {
@@ -10875,6 +10887,8 @@ struct TripPlannerSheet: View {
                                 .multilineTextAlignment(.trailing)
                         }
                     }
+                } header: {
+                    Text("Budget")
                 } footer: {
                     Text(useBudget
                          ? "The whole trip for everyone, not each. It builds the plan to fit, and tells you if it can't."
@@ -12775,19 +12789,23 @@ struct ChappyBookingEditor: View {
                     }
                     Toggle("Already paid", isOn: $booking.paid)
                 }
-                Section("Dates") {
+                Section {
                     Toggle("Has a start date", isOn: $hasStart)
                     if hasStart {
                         DatePicker("Starts", selection: $start, displayedComponents: .date)
                     }
+                } header: {
+                    Text("Dates")
                 } footer: {
                     Text("Used to sort the file and to put the booking on the right day of the itinerary.")
                 }
-                Section("Free cancellation") {
+                Section {
                     Toggle("Refundable until a date", isOn: $hasCancel)
                     if hasCancel {
                         DatePicker("Until", selection: $cancel, displayedComponents: .date)
                     }
+                } header: {
+                    Text("Free cancellation")
                 } footer: {
                     Text("The most valuable field on this screen. Chappy reminds you seven days and two days before the deadline — a refundable booking you forgot to cancel is a non-refundable booking with extra steps, and it costs more than every hidden fee in the report put together.")
                 }
@@ -12949,7 +12967,7 @@ struct ChappyOnwardSheet: View {
                         }
                     }
                 }
-                Section("How") {
+                Section {
                     Picker("Method", selection: $method) {
                         ForEach(ChappyOnward.Method.allCases) { m in
                             Text(m.label).tag(m)
@@ -12959,14 +12977,18 @@ struct ChappyOnwardSheet: View {
                         .font(.caption).foregroundColor(.secondary)
                     Text("Cost: \(method.cost)")
                         .font(.caption).foregroundColor(.secondary)
+                } header: {
+                    Text("How")
                 } footer: {
                     Text(ChappyOnward.neverGenerate)
                 }
-                Section("The booking") {
+                Section {
                     TextField("PNR / confirmation", text: $reference)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.characters)
                     DatePicker("Valid until", selection: $validUntil)
+                } header: {
+                    Text("The booking")
                 } footer: {
                     Text("A temporary reservation cancels itself after about 48 hours, so it's only proof on the day you fly. Chappy checks the date against your arrival and warns you if it lapses first — which is the specific way this goes wrong.")
                 }

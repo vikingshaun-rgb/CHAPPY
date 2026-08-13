@@ -2516,7 +2516,7 @@ struct TravelKeysView: View {
                 Text("Passport expiry, who you fly with, who's coming. Chappy plans for this person rather than a generic Australian — and it checks the six-month passport rule on every trip, which is what actually stops people at the check-in desk.")
             }
 
-            Section("Home currency") {
+            Section {
                 Picker("Everything is priced in", selection: Binding(
                     get: { fx.home },
                     set: { fx.home = $0 }
@@ -2525,11 +2525,13 @@ struct TravelKeysView: View {
                         Text("\(c) — \(ChappyFX.names[c] ?? c)").tag(c)
                     }
                 }
+            } header: {
+                Text("Home currency")
             } footer: {
                 Text("Trip totals, the converter and every report land in this currency. You can still price an individual hotel in rupiah or baht — Chappy converts it.")
             }
 
-            Section("Tripadvisor content key") {
+            Section {
                 SecureField("Paste the key", text: $key)
                 Button("Save") {
                     let k = key.trimmingCharacters(in: .whitespaces)
@@ -2541,12 +2543,14 @@ struct TravelKeysView: View {
                 if !status.isEmpty {
                     Text(status).font(.footnote).foregroundColor(.secondary)
                 }
+            } header: {
+                Text("Tripadvisor content key")
             } footer: {
                 Text("Free at tripadvisor.com/developers — sign up, create a key, paste it here. 5,000 calls a month, which is far more than a person can use. A card is required for overage but you will not reach it. WITHOUT this the Travel Desk still works: places come from Apple Maps, you just don't get star ratings and review counts.")
             }
 
             // BUILD 183 — THE SECOND OPINION.
-            Section("Google ratings") {
+            Section {
                 SecureField("Google Maps API key", text: $gkey)
                 Button("Save") {
                     let k = gkey.trimmingCharacters(in: .whitespaces)
@@ -2581,6 +2585,8 @@ struct TravelKeysView: View {
                     }
                     .padding(.vertical, 2)
                 }
+            } header: {
+                Text("Google ratings")
             } footer: {
                 Text("Optional, and it changes what the places list is worth. Google covers the gym, the ice bath, the dive shop and the warung down the lane — none of which Tripadvisor has heard of — and rates them by who actually goes. Where the two disagree by more than half a star, Chappy says so: higher on Google means locals love it and travellers don't, and the reverse is a tourist trap. Console.cloud.google.com, enable Places API (New), 5,000 free lookups a month.\n\nGoogle ratings appear in the APP only, never in the emailed report. Their licence permits storing exactly one thing — the place ID — and a saved document is storage. The report carries Tripadvisor, which does permit it. That split is deliberate.")
             }
@@ -2616,7 +2622,7 @@ struct AudioPolicyView: View {
 
     var body: some View {
         Form {
-            Section("While Chappy is open") {
+            Section {
                 Picker("Your music", selection: $policy) {
                     Text("Dips only while Chappy talks").tag("speaking")
                     Text("Never touch it").tag("never")
@@ -2629,6 +2635,8 @@ struct AudioPolicyView: View {
                     // Take effect now, not at the next spoken line.
                     ChappyAudio.apply(.listening)
                 }
+            } header: {
+                Text("While Chappy is open")
             } footer: {
                 Text(footerText)
             }
@@ -2714,7 +2722,7 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var youSection: some View {
         Group {
-            Section("You") {
+            Section {
                 TextField("Name", text: binding(\.name))
                 TextField("Home city", text: binding(\.homeCity))
                 TextField("Home airport code (optional, e.g. BNE)", text: binding(\.homeAirport))
@@ -2722,6 +2730,8 @@ struct TravellerProfileView: View {
                     .autocorrectionDisabled()
                 TextField("Passport nationality", text: binding(\.nationality))
                 TextField("Second passport, if you have one", text: binding(\.secondPassport))
+            } header: {
+                Text("You")
             } footer: {
                 Text("A second passport is worth entering even if you never use it — it often gives a longer stay or a cheaper visa than the one you'd reach for.")
             }
@@ -2731,7 +2741,7 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var passportSection: some View {
         Group {
-            Section("Passport expiry") {
+            Section {
                 Toggle("I know my expiry date", isOn: $hasExpiry)
                 if hasExpiry {
                     DatePicker("Expires", selection: $expiry, displayedComponents: .date)
@@ -2745,6 +2755,8 @@ struct TravellerProfileView: View {
                         .font(.footnote)
                         .foregroundColor(v.level == "HIGH" ? .red : (v.level == "MEDIUM" ? .orange : .green))
                 }
+            } header: {
+                Text("Passport expiry")
             } footer: {
                 Text("Most of Asia wants six months' validity from the day you ARRIVE, and the airline enforces it at check-in because they're liable for carrying you. Chappy checks every trip against the date you'd land, not today.")
             }
@@ -2754,13 +2766,15 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var partySection: some View {
         Group {
-            Section("Who's coming") {
+            Section {
                 Stepper("Adults: \(store.data.adults)", value: binding(\.adults), in: 1...9)
                 Stepper("Children: \(store.data.children)", value: binding(\.children), in: 0...9)
                 Stepper("Infants: \(store.data.infants)", value: binding(\.infants), in: 0...4)
                 Toggle("Travelling with a pet", isOn: binding(\.travellingWithPet))
                 TextField("Accessibility requirements", text: binding(\.accessibility), axis: .vertical)
                     .lineLimit(1...3)
+            } header: {
+                Text("Who's coming")
             } footer: {
                 Text("Accessibility is treated as a requirement, not a preference — it's checked against every stay, transfer and activity Chappy suggests.")
             }
@@ -2770,7 +2784,7 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var flyingSection: some View {
         Group {
-            Section("How you fly") {
+            Section {
                 Picker("Usual cabin", selection: binding(\.cabinPreference)) {
                     ForEach(cabins, id: \.self) { Text($0).tag($0) }
                 }
@@ -2780,6 +2794,8 @@ struct TravellerProfileView: View {
                           "Qantas, Singapore Airlines")
                 listField("Frequent flyer & status", $loyaltyText, \.frequentFlyer,
                           "Qantas Frequent Flyer — Gold")
+            } header: {
+                Text("How you fly")
             } footer: {
                 Text("Status changes the maths. A fare that keeps you Gold can be worth paying more for, and Chappy will say so rather than just showing you the cheapest number.")
             }
@@ -2789,12 +2805,14 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var stayingSection: some View {
         Group {
-            Section("Where you stay, what you carry") {
+            Section {
                 listField("Preferred hotel chains", $chainText, \.preferredChains, "Accor, Marriott")
                 listField("Hotel loyalty & status", $hotelText, \.hotelLoyalty,
                           "Accor Plus, Marriott Titanium")
                 listField("Card travel benefits", $cardText, \.cardBenefits,
                           "Amex Platinum — lounge, travel insurance, rental excess")
+            } header: {
+                Text("Where you stay, what you carry")
             } footer: {
                 Text("Card benefits matter because they stop you buying things twice. If your card already covers travel insurance and rental excess, Chappy shouldn't be recommending you buy them.")
             }
@@ -2804,7 +2822,7 @@ struct TravellerProfileView: View {
 
     @ViewBuilder private var tripSection: some View {
         Group {
-            Section("What kind of trip") {
+            Section {
                 Picker("Style", selection: binding(\.styleLevel)) {
                     ForEach(styles, id: \.self) { Text($0).tag($0) }
                 }
@@ -2813,6 +2831,8 @@ struct TravellerProfileView: View {
                 listField("Interests", $interestText, \.interests,
                           "diving, food, hiking, recovery")
                 listField("Already been to", $visitedText, \.visited, "Bali, Thailand, Japan")
+            } header: {
+                Text("What kind of trip")
             } footer: {
                 Text("\"Already been to\" stops Chappy selling you places you know as if they were discoveries — it goes deeper or goes elsewhere instead.")
             }
