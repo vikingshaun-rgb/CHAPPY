@@ -58,6 +58,29 @@ struct TurboMetaApp: App {
           ChappyTimers.shared.restoreAfterLaunch()  // re-arm spoken timers
           ChappyPulse.shared.start()                // ambient memory dial
           ChappyPhotoIngest.shared.start()          // wi-fi monitor for ingest
+          // BUILD 175: bring the audio path up quietly before the first
+          // spoken line needs it, so launch never sounds robotic.
+          TTSService.shared.primeVoicePath()
+          // BUILD 182: rates were only ever fetched when a currency or
+          // travel screen was opened. Until then every conversion silently
+          // failed and the cost engine fell back to un-converted numbers —
+          // rupiah added to dollars, spoken aloud and put in the brief.
+          Task { await ChappyFX.shared.refresh() }
+          ChappyGlance.write()   // the widget was only ever written by the flight poller
+          // BUILD 189: the price journal. Runs on launch, checks only the
+          // watches that are actually due (a fare weekly, a visa rule
+          // monthly), and stays quiet unless something moved. A watch
+          // that pings every week gets muted in a fortnight, and then it
+          // is worth nothing at all.
+          Task {
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            await ChappyWatch.shared.run()
+          }
+          // BUILD 190: the watch only ever ran when the app was opened,
+          // so a week without opening it was a week of nothing checked.
+          ChappyProactive.shared.onBackgroundWake = {
+            await ChappyWatch.shared.run()
+          }
         }
         // Show error alerts for view model failures
         .alert("Error", isPresented: $wearablesViewModel.showError) {
