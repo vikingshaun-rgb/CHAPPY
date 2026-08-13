@@ -1538,7 +1538,35 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     /// Called on app launch and on every return to the foreground. Safe to call
     /// as often as you like — every failure mode exits quietly.
+    /// BUILD 213 — THE DIAGNOSTIC.
+    ///
+    /// Two guesses, two builds, still crashing on startup. I am not
+    /// making a third. This one answers the question instead of
+    /// assuming it.
+    ///
+    /// The ear does not arm itself in this build. Everything the ear
+    /// touches — the audio session, the recogniser, installTap — is the
+    /// only machinery in Chappy that can kill the process uncatchably,
+    /// so removing it from the launch path splits the problem cleanly
+    /// in two:
+    ///
+    ///   opens fine  ->  it IS the ear, and I know exactly where
+    ///   still dies  ->  it is NOT the ear, and everything I have
+    ///                   fixed this week was aimed at the wrong thing
+    ///
+    /// Either answer is worth more than another fix that might work.
+    /// Turn the ear back on in Settings, or say nothing and it stays
+    /// off — this build is for finding out, not for using.
+    static var earArmsItself: Bool {
+        get { UserDefaults.standard.object(forKey: "chappy_auto_arm") as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_auto_arm") }
+    }
+
     func autoArmIfWanted(reason: String) {
+        guard Self.earArmsItself else {
+            print("🔬 [Standby] Auto-arm OFF for this diagnostic build (\(reason))")
+            return
+        }
         guard autoArmEnabled else { return }
         guard !userTurnedOff else { return }
         guard !starting else { return }
