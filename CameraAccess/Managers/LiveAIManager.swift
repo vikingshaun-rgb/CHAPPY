@@ -28586,20 +28586,49 @@ enum ChappySlots {
 /// second source of truth; it is the same truth, read from the side.
 enum ChappyProfileLite {
 
-    static var data: ChappyProfile.Profile {
+    /// ARCHIVE FIX 2 (204) — ITS OWN STRUCT, ON PURPOSE.
+    ///
+    /// The first attempt decoded into ChappyProfile.Profile, which is
+    /// nested inside a @MainActor class. Whether a nested type inherits
+    /// that isolation is exactly the ambiguity that produced eight
+    /// errors in build 191, and depending on which way the compiler
+    /// reads it, every access through that type is either fine or an
+    /// error. Arguing about the rule is not worth another archive cycle.
+    ///
+    /// So: a plain struct of our own, isolated to nothing, decoding the
+    /// same JSON. Every field Optional — the synthesised init(from:)
+    /// throws on a missing key even when a default is written, which is
+    /// the Codable trap this project has been caught by before, and a
+    /// profile saved by an older build will be missing keys.
+    struct Lite: Codable {
+        var adults: Int?
+        var children: Int?
+        var homeAirport: String?
+        var homeCity: String?
+        var nationality: String?
+        var cabinPreference: String?
+        var styleLevel: String?
+        var dietary: String?
+        var preferredAirlines: [String]?
+    }
+
+    /// Decoded fresh each time. It is a few hundred bytes of JSON read
+    /// once per interview, not per keystroke — and a cache here would be
+    /// a second source of truth, which is the thing this exists to avoid.
+    static var data: Lite {
         guard let d = UserDefaults.standard.data(forKey: "chappy_traveller_profile"),
-              let p = try? JSONDecoder().decode(ChappyProfile.Profile.self, from: d)
-        else { return ChappyProfile.Profile() }
+              let p = try? JSONDecoder().decode(Lite.self, from: d)
+        else { return Lite() }
         return p
     }
 
     static var party: Int {
         let p = data
-        return max(1, p.adults + p.children)
+        return max(1, (p.adults ?? 2) + (p.children ?? 0))
     }
 
-    static var homeAirport: String { data.homeAirport }
-    static var homeCity: String { data.homeCity }
+    static var homeAirport: String { data.homeAirport ?? "" }
+    static var homeCity: String { data.homeCity ?? "" }
 
     /// The same key ChappyFX.home reads and writes.
     static var homeCurrency: String {
@@ -29102,7 +29131,7 @@ final class ChappyFlow {
             if slot.optional {
                 values[slot.id] = ""          // offered once, never chased
                 return advance(t)
-            }3
+            }
             if misses >= 3 {
                 cancel()
                 return .cancelled("Let's come back to that one.")
@@ -29356,19 +29385,19 @@ final class ChappyFlow {
             case .homeCurrency:
                 values[slot.id] = ChappyProfileLite.homeCurrency
             case .cabin:
-                let v = ChappyProfileLite.data.cabinPreference
+                let v = ChappyProfileLite.data.cabinPreference ?? ""
                 if !v.isEmpty { values[slot.id] = v }
             case .style:
-                let v = ChappyProfileLite.data.styleLevel
+                let v = ChappyProfileLite.data.styleLevel ?? ""
                 if !v.isEmpty { values[slot.id] = v }
             case .diet:
-                let v = ChappyProfileLite.data.dietary
+                let v = ChappyProfileLite.data.dietary ?? ""
                 if !v.isEmpty { values[slot.id] = v }
             case .airlines:
-                let v = ChappyProfileLite.data.preferredAirlines
+                let v = ChappyProfileLite.data.preferredAirlines ?? []
                 if !v.isEmpty { values[slot.id] = v.joined(separator: ", ") }
             case .nationality:
-                let v = ChappyProfileLite.data.nationality
+                let v = ChappyProfileLite.data.nationality ?? ""
                 if !v.isEmpty { values[slot.id] = v }
             }
         }
