@@ -681,20 +681,25 @@ struct TurboMetaHomeView: View {
     // instead of one enormous one. The modifiers still apply in the
     // same order to the same view; nothing about the screen changes.
     // ================================================================
-    private var homeStack: some View {
-            ZStack {
-                // THE FACE (Phase 4.9): dark-first, one accent, big targets.
-                // Re-skin only — every action fires the exact same wiring
-                // as the old grid (no-breakage law).
-                LinearGradient(
-                    colors: [theme.bgTop, theme.bgBottom],
-                    startPoint: .top, endPoint: .bottom
-                )
-                .ignoresSafeArea()
+    // ================================================================
+    // BUILD 193 — BREAK UP THE BODY, NOT JUST THE MODIFIERS.
+    //
+    // 192 split the forty-five-modifier chain and the checker still
+    // gave up, because the chain was only half of it. The ZStack held
+    // a ScrollView holding a VStack with ten children, two of them
+    // LazyVGrids of thirty-odd tiles, every tile carrying closures,
+    // ternaries and colour expressions. ViewBuilder's ten-argument
+    // buildBlock had to infer all of that in ONE constraint system.
+    //
+    // Each child is now its own `some View` property. An opaque type
+    // is a wall the solver cannot see through: it solves each block
+    // alone, then treats it as one settled type when it assembles the
+    // VStack. Same views, same order, same modifiers — the screen is
+    // byte-for-byte what it was.
+    // ================================================================
 
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        // ORB HEADER — glows when Chappy is live
+    /// BUILD 193: The avatar, its listening pulse and the greeting line.
+    private var orbHeader: some View {
                         VStack(spacing: 8) {
                             // THE AVATAR — Chappy's living face. Eight styles,
                             // theme-matched by default, chosen in Settings →
@@ -737,16 +742,22 @@ struct TurboMetaHomeView: View {
                                 .foregroundColor(theme.textSecondary)
                         }
                         .padding(.top, 18)
+    }
 
-                        // STATUS STRIP
+    /// BUILD 193: The thin row of state chips under the header.
+    private var statusStrip: some View {
                         HStack(spacing: 8) {
                             StatusChip(label: "Glasses", on: streamViewModel.hasActiveDevice)
                             StatusChip(label: "Camera", on: streamViewModel.streamingStatus == .streaming)
                             StatusChip(label: "Live AI", on: liveAIManager.isRunning)
                             StatusChip(label: "Standby", on: standby.isListening)
                         }
+    }
 
-                        // NAVIGATION CARD — appears only while navigating
+    /// BUILD 193: The turn-by-turn card. Only on screen while navigating, so it is
+    /// a bare `if` and needs @ViewBuilder.
+    @ViewBuilder
+    private var navCard: some View {
                         if navEngine.isNavigating {
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack(spacing: 12) {
@@ -800,8 +811,10 @@ struct TurboMetaHomeView: View {
                                 NavMapSheet(navEngine: navEngine)
                             }
                         }
+    }
 
-                        // THE FOUR MODES
+    /// BUILD 193: The four big mode buttons.
+    private var modeStack: some View {
                         VStack(spacing: 12) {
                             HStack(spacing: 12) {
                                 ModeTile(title: "Talk",
@@ -857,11 +870,10 @@ struct TurboMetaHomeView: View {
                                 }
                             }
                         }
+    }
 
-                        // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
-                        // cramped single row. Seven actions never fitted
-                        // across one line on a phone; now they breathe, each
-                        // in its own colour, and Ear On lights up when live.
+    /// BUILD 193: The small three-across action grid — Ear On and friends.
+    private var actionGrid: some View {
                         LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
                                             GridItem(.flexible(), spacing: 9),
                                             GridItem(.flexible(), spacing: 9),
@@ -927,8 +939,10 @@ struct TurboMetaHomeView: View {
                                 }
                             }
                         }
+    }
 
-                        // TODAY — journal glance
+    /// BUILD 193: Today's journal counts. Tap opens the Diary.
+    private var journalRow: some View {
                         HStack {
                             Image(systemName: "book.closed.fill")
                                 .foregroundColor(theme.textSecondary)
@@ -940,19 +954,12 @@ struct TurboMetaHomeView: View {
                         .padding(12)
                         .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
                         .id(journalTick) // refresh counts when Remember fires
+    }
 
-                        // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
-                        //
-                        // Every ping, warn time and flight alert in Chappy
-                        // goes through iOS notifications. If permission was
-                        // never granted — or was granted once and later
-                        // switched off, or Focus is eating them — the app has
-                        // no way to tell you and everything just silently
-                        // stops. That is indistinguishable from "the feature
-                        // is broken", which is exactly how it felt.
-                        //
-                        // So: check on every appearance, and if they're off,
-                        // SAY SO, right here, with the button that fixes it.
+    /// BUILD 193: BUILD 163's "your notifications are off" banner — a bare `if`,
+    /// so it needs @ViewBuilder too.
+    @ViewBuilder
+    private var notifBanner: some View {
                         if notifsOff {
                             Button {
                                 // BUILD 172: the doctor first — it shows WHY,
@@ -984,26 +991,12 @@ struct TurboMetaHomeView: View {
                             .buttonStyle(ChappyPressStyle())
                             .padding(.horizontal, 16)
                         }
+    }
 
-                        // BUILD 140 — THE GLANCE. The day, on the home screen,
-                        // before you've opened anything: next events, next
-                        // reminders, one line of counts. Tap = the full Diary.
-                        todayGlanceCard.chappyScrollFX()
-
-                        // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
-                        // voice-only in 134 and nobody could find it. Three
-                        // buttons now: look at the thing, tap the verb.
-                        readerCard.chappyScrollFX()
-
-                        // BUILD 157 — THE TILE GRID. Nine identical grey rows
-                        // became a two-column grid of colour-coded tiles, each
-                        // with its own hue, glowing icon chip and gradient
-                        // edge. Apple's Control Center and Samsung's One UI
-                        // both proved the same thing: the eye finds a colour
-                        // faster than it reads a word, and a grid halves the
-                        // scroll. RTMP / Screen Stream / LeanEat moved behind
-                        // the "advanced tools" switch in Settings — they were
-                        // leftovers from the app this was built on.
+    /// BUILD 193: The two-column colour-coded tile grid — the largest single
+    /// expression on the screen, and the main reason the type
+    /// checker was timing out.
+    private var tileGrid: some View {
                         LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
                                             GridItem(.flexible(), spacing: 11)],
                                   spacing: 11) {
@@ -1121,6 +1114,76 @@ struct TurboMetaHomeView: View {
                             }
                         }
                         .padding(.bottom, 30)
+    }
+
+    private var homeStack: some View {
+            ZStack {
+                // THE FACE (Phase 4.9): dark-first, one accent, big targets.
+                // Re-skin only — every action fires the exact same wiring
+                // as the old grid (no-breakage law).
+                LinearGradient(
+                    colors: [theme.bgTop, theme.bgBottom],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .ignoresSafeArea()
+
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        // ORB HEADER — glows when Chappy is live
+                        orbHeader
+
+                        // STATUS STRIP
+                        statusStrip
+
+                        // NAVIGATION CARD — appears only while navigating
+                        navCard
+
+                        // THE FOUR MODES
+                        modeStack
+
+                        // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
+                        // cramped single row. Seven actions never fitted
+                        // across one line on a phone; now they breathe, each
+                        // in its own colour, and Ear On lights up when live.
+                        actionGrid
+
+                        // TODAY — journal glance
+                        journalRow
+
+                        // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
+                        //
+                        // Every ping, warn time and flight alert in Chappy
+                        // goes through iOS notifications. If permission was
+                        // never granted — or was granted once and later
+                        // switched off, or Focus is eating them — the app has
+                        // no way to tell you and everything just silently
+                        // stops. That is indistinguishable from "the feature
+                        // is broken", which is exactly how it felt.
+                        //
+                        // So: check on every appearance, and if they're off,
+                        // SAY SO, right here, with the button that fixes it.
+                        notifBanner
+
+                        // BUILD 140 — THE GLANCE. The day, on the home screen,
+                        // before you've opened anything: next events, next
+                        // reminders, one line of counts. Tap = the full Diary.
+                        todayGlanceCard.chappyScrollFX()
+
+                        // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
+                        // voice-only in 134 and nobody could find it. Three
+                        // buttons now: look at the thing, tap the verb.
+                        readerCard.chappyScrollFX()
+
+                        // BUILD 157 — THE TILE GRID. Nine identical grey rows
+                        // became a two-column grid of colour-coded tiles, each
+                        // with its own hue, glowing icon chip and gradient
+                        // edge. Apple's Control Center and Samsung's One UI
+                        // both proved the same thing: the eye finds a colour
+                        // faster than it reads a word, and a grid halves the
+                        // scroll. RTMP / Screen Stream / LeanEat moved behind
+                        // the "advanced tools" switch in Settings — they were
+                        // leftovers from the app this was built on.
+                        tileGrid
                     }
                     .padding(.horizontal, 18)
                 }
