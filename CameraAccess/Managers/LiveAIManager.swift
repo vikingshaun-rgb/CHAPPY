@@ -607,6 +607,11 @@ class LiveAIManager: ObservableObject {
     static let shared = LiveAIManager()
 
     @Published var isRunning = false
+    /// BUILD 191: the re-entrancy guard below was written and never
+    /// declared — isRunning is only set several lines into start(), and a
+    /// second call arriving inside that window started a second session
+    /// over the top of the first. Two sessions, one set of glasses.
+    private var isStartingSession = false
     @Published var isConnected = false
     @Published var errorMessage: String?
 
@@ -15259,9 +15264,9 @@ final class ChappyFX: ObservableObject {
 
     /// Currencies with no minor unit — printing "850000.00 IDR" is wrong
     /// and printing "Rp 850,000" is what the price tag says.
-    static let zeroDecimal: Set<String> = ["IDR", "VND", "JPY", "KRW", "LAK", "KHR", "MMK"]
+    nonisolated static let zeroDecimal: Set<String> = ["IDR", "VND", "JPY", "KRW", "LAK", "KHR", "MMK"]
 
-    static let symbols: [String: String] = [
+    nonisolated static let symbols: [String: String] = [
         "AUD": "$", "USD": "US$", "EUR": "€", "GBP": "£", "NZD": "NZ$",
         "SGD": "S$", "IDR": "Rp", "THB": "฿", "MYR": "RM", "VND": "₫",
         "PHP": "₱", "JPY": "¥", "KRW": "₩", "INR": "₹", "HKD": "HK$",
@@ -15347,7 +15352,12 @@ final class ChappyFX: ObservableObject {
     }
 
     /// Money as a person writes it. No cents on currencies that have none.
-    static func money(_ amount: Double, _ code: String) -> String {
+    /// BUILD 191: `nonisolated` because ChappyWatch.Watch.adviceLine and
+    /// Hit.verdict are nested structs — which do not inherit isolation —
+    /// and every one of them formats money. The function reads two
+    /// immutable static tables and allocates a formatter. There is
+    /// nothing here to protect.
+    nonisolated static func money(_ amount: Double, _ code: String) -> String {
         let c = code.uppercased()
         let sym = symbols[c] ?? (c + " ")
         let f = NumberFormatter()
@@ -18463,7 +18473,11 @@ extension ChappyTravel {
 // On headphones or through the glasses that cannot happen at all.
 // =====================================================================
 
-@MainActor
+// BUILD 191: was @MainActor, and TTSService reaches it from nonisolated
+// synchronous callbacks — an audio-engine completion handler cannot hop
+// actors. Nothing in here touches UI or published state; it configures
+// AVAudioSession, which is fine off the main actor. The isolation bought
+// nothing and cost three call sites.
 enum ChappyAudio {
 
     enum Profile { case listening, speaking, conversation }
@@ -21995,7 +22009,11 @@ extension ChappyTravel {
 // wrong precision for navigation, which is not what this is for.
 // =====================================================================
 
-@MainActor
+// BUILD 191: nested types do NOT inherit actor isolation from their
+// enclosing type. ChappyTravel.Hop is therefore nonisolated, and its
+// `line` property calls ChappyPorts.durationLine — which failed to
+// compile against a MainActor class. This is a static, immutable lookup
+// table with no mutable state at all; it has no business being isolated.
 final class ChappyPorts {
 
     struct Airport: Identifiable, Hashable {
