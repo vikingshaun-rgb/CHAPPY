@@ -597,6 +597,16 @@ struct TurboMetaHomeView: View {
     @State private var pulseOn = false          // BUILD 149: listening rings
     @State private var showCommands = false     // BUILD 149: what can I say
     @State private var showFlights = false      // BUILD 150: the flight deck
+    /// BUILD 199: which section of the home screen is open. Travel by
+    /// default — it is September, and everything else can wait behind
+    /// one tap.
+    ///
+    /// ARCHIVE FIX (203): this was inserted next to a `showBudget`
+    /// state that turned out to belong to TravelDeskView, nine thousand
+    /// lines further down — so it compiled as a property of the wrong
+    /// struct and the home screen could not see it. Anchoring on a name
+    /// that exists in two structs is a bad anchor.
+    @State private var openGroup = "travel"
     @State private var showAtlas = false        // BUILD 156: the travel atlas
     @State private var atlasTarget: String?
     @State private var atlasLayer: ChappyAtlas.Layer?
@@ -9927,9 +9937,6 @@ struct TravelDeskView: View {
     @State private var showNewTrip = false
     @State private var showTripFile = false
     @State private var showFlights = false
-    /// BUILD 199: which section is open. Travel by default — it is
-    /// September, and everything else can wait behind one tap.
-    @State private var openGroup = "travel"
     @State private var showBudget = false
     @State private var newName = ""
     @State private var newPlace = ""
