@@ -28568,6 +28568,45 @@ enum ChappySlots {
 // needs and what it is called. The screen behind it stays exactly as it
 // was — the reliable specialist worker, unchanged.
 //
+/// ARCHIVE FIX (203) — READING THE PROFILE FROM OFF THE MAIN ACTOR.
+///
+/// ChappyProfile and ChappyFX are both @MainActor ObservableObjects,
+/// and ChappyFlow is not — it runs inside the router, which is
+/// deliberately nonisolated so a spoken command never waits on the UI.
+/// So every prefill was a main-actor read from a nonisolated context:
+/// eight compile errors, and the same root cause as the eight that
+/// broke build 191.
+///
+/// The fix is not to isolate the flow — hopping to the main actor to
+/// look up a home airport would be absurd. Both objects persist to
+/// UserDefaults, and UserDefaults is thread-safe. `Profile` is a nested
+/// struct and therefore already nonisolated, so it decodes freely.
+///
+/// This reads the SAME keys the isolated versions write. It is not a
+/// second source of truth; it is the same truth, read from the side.
+enum ChappyProfileLite {
+
+    static var data: ChappyProfile.Profile {
+        guard let d = UserDefaults.standard.data(forKey: "chappy_traveller_profile"),
+              let p = try? JSONDecoder().decode(ChappyProfile.Profile.self, from: d)
+        else { return ChappyProfile.Profile() }
+        return p
+    }
+
+    static var party: Int {
+        let p = data
+        return max(1, p.adults + p.children)
+    }
+
+    static var homeAirport: String { data.homeAirport }
+    static var homeCity: String { data.homeCity }
+
+    /// The same key ChappyFX.home reads and writes.
+    static var homeCurrency: String {
+        UserDefaults.standard.string(forKey: "chappy_fx_home") ?? "AUD"
+    }
+}
+
 struct ChappySlot {
     let id: String
     /// Asked out loud, so it has to sound like a person. "Where are you
@@ -29102,7 +29141,7 @@ final class ChappyFlow {
         if c.contains("one more") || c.contains("another one") || c.contains("one less")
             || c.hasPrefix("make it ") || c.hasPrefix("change it to ") {
             if let partySlot = t.slots.first(where: { $0.kind == .count }) {
-                let current = Int(values[partySlot.id] ?? "") ?? ChappyProfile.shared.party
+                let current = Int(values[partySlot.id] ?? "") ?? ChappyProfileLite.party
                 var updated: Int?
                 if c.contains("one more") || c.contains("another one") { updated = current + 1 }
                 if c.contains("one less"), current > 1 { updated = current - 1 }
@@ -29305,30 +29344,31 @@ final class ChappyFlow {
             switch slot.prefill {
             case .none: break
             case .homeAirport:
-                let p = ChappyProfile.shared
-                if !p.homeAirport.isEmpty { values[slot.id] = p.homeAirport }
-                else if !p.homeCity.isEmpty,
-                        let a = ChappyPorts.resolve(place: p.homeCity) { values[slot.id] = a.iata }
+                let air = ChappyProfileLite.homeAirport
+                let city = ChappyProfileLite.homeCity
+                if !air.isEmpty { values[slot.id] = air }
+                else if !city.isEmpty,
+                        let a = ChappyPorts.resolve(place: city) { values[slot.id] = a.iata }
             case .party:
-                values[slot.id] = String(ChappyProfile.shared.party)
+                values[slot.id] = String(ChappyProfileLite.party)
             case .oneWay:
                 values[slot.id] = "yes"
             case .homeCurrency:
-                values[slot.id] = ChappyFX.shared.home
+                values[slot.id] = ChappyProfileLite.homeCurrency
             case .cabin:
-                let v = ChappyProfile.shared.data.cabinPreference
+                let v = ChappyProfileLite.data.cabinPreference
                 if !v.isEmpty { values[slot.id] = v }
             case .style:
-                let v = ChappyProfile.shared.data.styleLevel
+                let v = ChappyProfileLite.data.styleLevel
                 if !v.isEmpty { values[slot.id] = v }
             case .diet:
-                let v = ChappyProfile.shared.data.dietary
+                let v = ChappyProfileLite.data.dietary
                 if !v.isEmpty { values[slot.id] = v }
             case .airlines:
-                let v = ChappyProfile.shared.data.preferredAirlines
+                let v = ChappyProfileLite.data.preferredAirlines
                 if !v.isEmpty { values[slot.id] = v.joined(separator: ", ") }
             case .nationality:
-                let v = ChappyProfile.shared.data.nationality
+                let v = ChappyProfileLite.data.nationality
                 if !v.isEmpty { values[slot.id] = v }
             }
         }
