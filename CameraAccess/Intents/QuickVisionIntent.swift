@@ -157,6 +157,22 @@ private func formatResult(_ manager: QuickVisionManager) -> some IntentResult & 
 @available(iOS 16.0, *)
 struct TurboMetaShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
+        // BUILD 202 — one entry, seventeen tools. The provider is capped
+        // at ten and nine below are already spent on the vision modes, so
+        // a parameterised phrase does the work of seventeen: Siri matches
+        // "Chappy flights", "Chappy visas", "Chappy somewhere to eat"
+        // against the enum's own display names.
+        AppShortcut(
+            intent: ChappyToolIntent(),
+            phrases: [
+                "\(.applicationName) \(\.$tool)",
+                "Open \(\.$tool) in \(.applicationName)",
+                "Ask \(.applicationName) for \(\.$tool)"
+            ],
+            shortTitle: "Chappy tool",
+            systemImageName: "square.grid.2x2.fill"
+        )
+
         // Default vision
         AppShortcut(
             intent: QuickVisionIntent(),
