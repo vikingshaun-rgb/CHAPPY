@@ -194,10 +194,17 @@ final class ChappyProactive: NSObject, ObservableObject {
         catch { print("🔔 [Proactive] submit failed: \(error.localizedDescription)") }
     }
 
+    /// BUILD 190: anything else that wants a background wake-up hangs
+    /// off this rather than registering its own. iOS grants a finite
+    /// amount of background time per app and splitting it across two
+    /// task identifiers means each gets woken less often.
+    var onBackgroundWake: (() async -> Void)?
+
     private func handleBackgroundRefresh(_ task: BGAppRefreshTask) {
         scheduleBackgroundTask()   // always re-arm first
         let work = Task { @MainActor in
             await runDuePass(reason: "background")
+            await onBackgroundWake?()
             task.setTaskCompleted(success: true)
         }
         task.expirationHandler = { work.cancel() }

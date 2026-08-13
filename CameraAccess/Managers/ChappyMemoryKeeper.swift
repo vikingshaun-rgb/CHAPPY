@@ -86,13 +86,41 @@ final class ChappyMemoryKeeper: ObservableObject {
 
     /// The profile as a block for a system prompt. Bounded by construction.
     /// Returns "" when there is nothing yet, so callers can append blindly.
+    // BUILD 182 — ONE PROFILE, EVERY BRAIN.
+    //
+    // This block is already read by the conversation brain and by the
+    // proactive pass, which makes it the one place worth widening. The
+    // travel intake collected thirteen durable facts — how he travels,
+    // whether he works on the road, whether he rides a scooter, what he
+    // can't eat — and until now they were read by exactly two travel
+    // prompts and by nothing else in the app. "I don't eat pork" was
+    // known to the trip planner and to no other part of Chappy.
+    //
+    // Appending it here means every brain that already asks who he is
+    // gets it, at about two hundred tokens, with no new plumbing.
     func profileBlock() -> String {
         let live = facts.filter {
             Date().timeIntervalSince($0.lastConfirmed) < staleDays * 86_400
         }
-        guard !live.isEmpty else { return "" }
+        let travel = ChappyIntake.shared.brief
+        // BUILD 184: the spoken assistant was working from learned facts
+        // and the trip interview, and had never been told who he is.
+        let who = ChappyProfile.shared.brief
+        let stamp = ChappyBorder.shared.currentCountry.map { country -> String in
+            if let left = ChappyBorder.shared.daysLeft {
+                return "He is currently in \(country), with \(left) days left on his stay."
+            }
+            return "He is currently in \(country)."
+        } ?? ""
 
-        var out = "WHAT YOU KNOW ABOUT HIM (learned over time — use it when it changes the answer, don't recite it):\n"
+        guard !live.isEmpty || !travel.isEmpty || !stamp.isEmpty || !who.isEmpty else { return "" }
+
+        var out = ""
+        if !who.isEmpty { out += who + "\n\n" }
+        if !stamp.isEmpty { out += stamp + "\n" }
+        if !travel.isEmpty { out += travel + "\n\n" }
+        guard !live.isEmpty else { return out }
+        out += "WHAT YOU KNOW ABOUT HIM (learned over time — use it when it changes the answer, don't recite it):\n"
         var used = out.count
         for f in live.sorted(by: { $0.lastConfirmed > $1.lastConfirmed }) {
             let line = "— \(f.text)\n"

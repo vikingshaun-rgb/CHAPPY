@@ -1336,6 +1336,31 @@ final class ChappyStandby: NSObject, ObservableObject {
         // BUILD 135: what iOS actually hears an Australian say. "Chatty" is
         // the recogniser's favourite mishearing of the name.
         "chatty", "chattie", "chappé", "japi", "chubby",
+        // BUILD 175 — "HEY CHAPPY".
+        //
+        // The bare name already matched inside "hey chappy", because the
+        // matcher searches for the name ANYWHERE in the sentence. What did
+        // NOT work was the recognition itself: run "hey" straight into
+        // "chappy" at speaking pace and iOS regularly transcribes the pair as
+        // a single unfamiliar word, and an unfamiliar word matches nothing.
+        // These are the blends it actually produces. Listed as whole phrases
+        // wherever possible so they can't fire on their own.
+        "hey chappy", "hey chappie", "hey chapy", "hey chatty",
+        "hey choppy", "hey jappy", "hey shappy", "hey chubby",
+        "heychappy", "haychappy", "a chappy", "hi chappy", "hey chap",
+        "ok chappy", "okay chappy", "hey chappa", "hey chappy's",
+    ]
+
+    /// BUILD 175 — what the recogniser is TOLD to expect.
+    ///
+    /// Contextual strings are the cheapest accuracy win in the whole app, and
+    /// two-word phrases carry far more weight there than the single tokens
+    /// above: telling iOS to expect the literal phrase "hey Chappy" makes it
+    /// transcribe the pair correctly instead of guessing at one blurred word.
+    /// These go in FIRST, before the saved places and the brands, because the
+    /// hint list is capped at 100 and the name is what must never be missed.
+    private static let wakePhraseHints = [
+        "hey Chappy", "Hey Chappy", "OK Chappy", "Chappy",
     ]
 
     // MARK: Language intelligence (country-aware translation)
@@ -1685,9 +1710,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         // Translate and Live AI still take the glasses when you actually want
         // them to — those are deliberate, foreground acts. This one is ambient,
         // and ambient features should not quietly disable your other assistant.
-        try? session.setCategory(.playAndRecord, mode: .spokenAudio,
-                                 options: [.duckOthers, .defaultToSpeaker, .allowBluetoothA2DP])
-        try? session.setActive(true)
+        // BUILD 180 — THIS LINE IS WHY YOUR MUSIC WAS QUIET.
+        //
+        // .duckOthers holds every other app's audio down for as long as
+        // the session is active, and the wake-word ear keeps it active the
+        // whole time Chappy is open. .spokenAudio made it worse — that mode
+        // is designed to suppress other audio. Between them, opening Chappy
+        // turned your music down and closing it turned it back up, exactly
+        // as reported. Now the ear listens without demanding silence, and
+        // the duck happens only while Chappy is speaking.
+        ChappyAudio.apply(.listening)
         // Prefer the phone's own mic explicitly — A2DP alone still lets iOS
         // pick a headset input on some routes.
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
@@ -1864,11 +1896,15 @@ final class ChappyStandby: NSObject, ObservableObject {
         let session = AVAudioSession.sharedInstance()
         // Re-applying an identical configuration is itself a route event and
         // buys nothing — only touch the session if it actually differs.
-        if session.category != .playAndRecord || session.mode != .spokenAudio {
-            try? session.setCategory(.playAndRecord, mode: .spokenAudio,
-                                     options: [.duckOthers, .allowBluetooth, .defaultToSpeaker])
+        // BUILD 180: the ear REBUILD carried its own copy of the ducking
+        // config, so even after the arm path was fixed a single route change
+        // or liveness sweep would quietly put the duck back and the music
+        // would go quiet again for no visible reason. One profile, one place.
+        if session.category != .playAndRecord || session.mode != .default {
+            ChappyAudio.apply(.listening)
+        } else {
+            try? session.setActive(true)
         }
-        try? session.setActive(true)
 
         if startRecognition() { return }
 
@@ -3004,7 +3040,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         // CONTEXTUAL STRINGS — words to expect. This is the single cheapest
         // accuracy win available: his own assistant's name, every place he has
         // already saved, and the brands he actually says out loud.
-        var hints = Self.wakeWords
+        // BUILD 175: the name and "hey Chappy" lead, so they can never be
+        // pushed past the 100-entry cap by a long list of saved places.
+        var hints = Self.wakePhraseHints
+        hints += Self.wakeWords
         hints += TripRecorder.shared.spots.suffix(40).map { $0.name }
         hints += Self.brandHints
         req.contextualStrings = Array(hints.prefix(100))
@@ -3845,6 +3884,99 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             return
         }
+        // ==============================================================
+        // BUILD 177 — THE WEATHER STATION, SPOKEN PROPERLY.
+        //
+        // 173 built every instrument and then left most of them unreachable
+        // by voice: you could SEE the wind, the UV, the humidity and the
+        // sunset, but the only things you could ASK for were "the weather",
+        // "will it rain" and "the week". On glasses, a dial you cannot ask
+        // about does not exist.
+        // ==============================================================
+        if c.contains("how windy") || c.contains("the wind") || c.contains("wind like")
+            || c.contains("is it windy") || c.contains("wind speed") {
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                guard let n = ChappyWeather.shared.now else {
+                    TTSService.shared.speak("No weather yet - give it a second."); return
+                }
+                var line = "Wind's \(Int(n.windKmh.rounded())) k p h from the \(ChappyWeather.compass(n.windDeg))"
+                if n.gustKmh > n.windKmh + 8 { line += ", gusting \(Int(n.gustKmh.rounded()))" }
+                line += "."
+                if n.windKmh >= 40 { line += " That's strong - watch the doors and the umbrella." }
+                else if n.windKmh < 8 { line += " Basically still." }
+                TTSService.shared.speak(line)
+            }
+            return
+        }
+        if c.contains("how hot") || c.contains("how cold") || c.contains("feel like")
+            || c.contains("humidity") || c.contains("humid") || c.contains("muggy")
+            || c.contains("sticky") {
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                guard let n = ChappyWeather.shared.now else {
+                    TTSService.shared.speak("No weather yet."); return
+                }
+                var line = "\(Int(n.tempC.rounded())) degrees, feels like \(Int(n.feelsC.rounded())), "
+                line += "humidity \(n.humidity) per cent."
+                if n.humidity >= 80 && n.tempC >= 27 { line += " It'll feel heavy out there." }
+                TTSService.shared.speak(line)
+            }
+            return
+        }
+        if c.contains("sunset") || c.contains("sunrise") || c.contains("how long till dark")
+            || c.contains("when does it get dark") || c.contains("daylight left") {
+            Task { @MainActor in
+                if ChappyWeather.shared.days.isEmpty { await ChappyWeather.shared.loadHere() }
+                guard let d = ChappyWeather.shared.days.first else {
+                    TTSService.shared.speak("No sun times yet."); return
+                }
+                let f = DateFormatter(); f.dateFormat = "h:mm a"
+                var line = ""
+                if let up = d.sunrise { line += "Sunrise \(f.string(from: up)). " }
+                if let down = d.sunset {
+                    line += "Sunset \(f.string(from: down))."
+                    let mins = Int(down.timeIntervalSince(Date()) / 60)
+                    if mins > 0 && mins < 240 {
+                        line += mins < 60 ? " That's \(mins) minutes of light left."
+                                          : " About \(mins / 60) hours of light left."
+                    }
+                }
+                TTSService.shared.speak(line.isEmpty ? "No sun times for today." : line)
+            }
+            return
+        }
+        if c.contains("uv") || c.contains("sunburn") || c.contains("do i need sunscreen")
+            || c.contains("need sunscreen") {
+            Task { @MainActor in
+                if ChappyWeather.shared.now == nil { await ChappyWeather.shared.loadHere() }
+                guard let n = ChappyWeather.shared.now else {
+                    TTSService.shared.speak("No weather yet."); return
+                }
+                var line = "U V is \(Int(n.uv.rounded())), \(ChappyWeather.uvWord(n.uv))."
+                if n.uv >= 8 { line += " Sunscreen and a hat, and stay off the beach in the middle of the day." }
+                else if n.uv >= 6 { line += " Worth putting sunscreen on." }
+                else if n.uv < 3 { line += " You'll be fine without." }
+                TTSService.shared.speak(line)
+            }
+            return
+        }
+        if c.contains("weather in ") || c.contains("weather at ") {
+            let after = c.range(of: "weather in ") ?? c.range(of: "weather at ")
+            if let r = after {
+                let place = String(c[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+                    .split(separator: " ").prefix(4).joined(separator: " ")
+                if !place.isEmpty, ChappyTravel.monthMentioned(in: c) == nil {
+                    speak("Checking \(place).")
+                    Task { @MainActor in
+                        await ChappyWeather.shared.loadPlace(place)
+                        TTSService.shared.speakLong(ChappyWeather.shared.spokenFull())
+                    }
+                    return
+                }
+            }
+        }
         if c.contains("will it rain") || c.contains("is it going to rain")
             || c.contains("any rain") || c.contains("do i need an umbrella")
             || c.contains("rain today") || c.contains("rain coming") {
@@ -4137,6 +4269,318 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             return
         }
+        // ==============================================================
+        // BUILD 177 — THE WEB, FROM STANDBY.
+        //
+        // Chappy could already search three ways and not one was
+        // reachable with the phone in a pocket. This is the door.
+        // ==============================================================
+        if let q = ChappySearch.questionIn(c), q.count > 2 {
+            speak("Having a look.")
+            Task { await ChappySearch.shared.ask(q) }
+            NotificationCenter.default.post(name: .chappyOpenSearch, object: nil)
+            return
+        }
+
+        // BUILD 177 — MONEY, OUT LOUD.
+        // "How much is eight hundred thousand rupiah" is the single most
+        // asked question of a trip and it had no answer anywhere.
+        if let money = ChappyFX.shared.answerSpoken(c) {
+            speak(money); return
+        }
+        if c.contains("exchange rate") || c.contains("converter")
+            || c.contains("currency converter") || c.contains("open currency") {
+            NotificationCenter.default.post(name: .chappyOpenFX, object: nil)
+            speak("Converter's up."); return
+        }
+
+        if c.contains("show me the options") || c.contains("the other options")
+            || c.contains("compare the options") || c.contains("other plans")
+            || c.contains("what were the options") || c.contains("show the options") {
+            if ChappyTravel.shared.pendingOptions.isEmpty {
+                speak("I haven't built options yet. Say: plan me two weeks in Bali.")
+            } else {
+                NotificationCenter.default.post(name: .chappyOpenOptions, object: nil)
+                speak("Here they are - lean, balanced and comfortable.")
+            }
+            return
+        }
+        // THE INTAKE. Asked once, remembered forever, read by every plan.
+        if c.contains("how i travel") || c.contains("travel profile")
+            || c.contains("ask me about") || c.contains("interview me")
+            || c.contains("set up my travel") || c.contains("travel questions") {
+            NotificationCenter.default.post(name: .chappyOpenIntake, object: nil)
+            if let q = ChappyIntake.shared.nextSpokenQuestion() {
+                speak("Let's sort that out. " + q)
+                ChappyIntake.shared.showing = true
+            } else {
+                speak("I already know how you travel. Say 'redo my travel profile' if it's changed.")
+            }
+            return
+        }
+        if c.contains("redo my travel profile") || c.contains("reset my travel profile") {
+            ChappyIntake.shared.reset()
+            ChappyIntake.shared.showing = true
+            NotificationCenter.default.post(name: .chappyOpenIntake, object: nil)
+            speak("Cleared. " + (ChappyIntake.shared.nextSpokenQuestion() ?? ""))
+            return
+        }
+        // While the interview is running, everything he says is an answer.
+        if ChappyIntake.shared.showing, !ChappyIntake.shared.isComplete {
+            if c.contains("stop") || c.contains("later") || c.contains("enough") {
+                ChappyIntake.shared.showing = false
+                speak("Fine - I'll use what I've got.")
+                return
+            }
+            if let next = ChappyIntake.shared.acceptSpoken(c) {
+                if ChappyIntake.shared.isComplete { ChappyIntake.shared.showing = false }
+                speak(next)
+                return
+            }
+        }
+
+        // ==============================================================
+        // BUILD 181 — ARGUING WITH THE PLAN.
+        //
+        // This is the difference between a form and an agent. He says
+        // what is wrong in plain words and it rebuilds against that,
+        // and what he pushed back on is remembered.
+        // ==============================================================
+        if ChappyTravel.shared.active != nil, let gripe = ChappyTravel.pushBack(in: c) {
+            speak("Right - reworking it.")
+            Task { @MainActor in
+                guard let t = ChappyTravel.shared.active else { return }
+                await ChappyTravel.shared.revise(t, saying: gripe)
+            }
+            NotificationCenter.default.post(name: .chappyOpenTravel, object: nil)
+            return
+        }
+        // BUILD 178: the TRIP atlas, which is a different thing from the
+        // travel-journal atlas built in 156 — and the 156 route matched
+        // "atlas" first, so this one was unreachable by voice entirely.
+        // Checked before it.
+        if c.contains("trip atlas") || c.contains("map of my trip") || c.contains("map of the trip")
+            || c.contains("show me the trip on a map") || c.contains("trip map")
+            || c.contains("map my trip") {
+            NotificationCenter.default.post(name: .chappyOpenAtlasMap, object: nil)
+            speak("Here's the trip."); return
+        }
+
+        // ==============================================================
+        // BUILD 178 — VISAS, OUT LOUD.
+        //
+        // Answers instantly from the baked table, then offers the live
+        // check — because the shape of a visa is stable and the RULES
+        // are not, and conflating the two is how you end up certain and
+        // wrong at a check-in desk.
+        // ==============================================================
+        if c.contains("check the visa properly") || c.contains("check my visa properly")
+            || c.contains("look up the visa") || c.contains("check the visas")
+            || c.contains("proper visa check") || c.contains("verify the visa") {
+            let named = ChappyVisa.country(from: c)
+            speak("Checking the current rules. Give me a moment.")
+            Task { @MainActor in
+                if let country = named {
+                    if let l = await ChappyVisa.shared.deepCheck(country: country, force: true) {
+                        TTSService.shared.speakLong(l.summary + " " + l.howTo)
+                    } else {
+                        TTSService.shared.speak(ChappyVisa.shared.error ?? "That check didn't come back.")
+                    }
+                } else if let t = ChappyTravel.shared.active {
+                    await ChappyVisa.shared.checkWholeTrip(t)
+                    TTSService.shared.speakLong(ChappyVisa.shared.spokenTripCheck(t))
+                } else {
+                    TTSService.shared.speak("Which country?")
+                }
+            }
+            NotificationCenter.default.post(name: .chappyOpenVisa, object: nil)
+            return
+        }
+        if c.contains("visa for the trip") || c.contains("visas for the trip")
+            || c.contains("visa check") || c.contains("am i ok on visas")
+            || c.contains("are my visas ok") || c.contains("visa situation") {
+            if let t = ChappyTravel.shared.active {
+                speak(ChappyVisa.shared.spokenTripCheck(t))
+                NotificationCenter.default.post(name: .chappyOpenVisa, object: nil)
+            } else {
+                speak("No trip planned yet, so there's nothing to check against.")
+            }
+            return
+        }
+        if c.contains("do i need a visa") || c.contains("visa for ")
+            || c.contains("visa requirements")
+            // BUILD 182: "how long can I stay HERE" is about the stamp he is
+            // on, which the border watcher answers. Only the country form
+            // belongs to this branch.
+            || (c.contains("how long can i stay") && !c.contains("here"))
+            || c.contains("how many days can i stay") {
+            if let country = ChappyVisa.country(from: c) {
+                speak(ChappyVisa.shared.spoken(country))
+                // Warm the live answer in the background so the screen has
+                // it by the time he opens it.
+                Task { @MainActor in _ = await ChappyVisa.shared.deepCheck(country: country) }
+            } else if let t = ChappyTravel.shared.active {
+                speak(ChappyVisa.shared.spokenTripCheck(t))
+            } else {
+                speak("Which country? Say: do I need a visa for Vietnam.")
+            }
+            return
+        }
+        // BUILD 182 — THE STAMP YOU ARE ACTUALLY ON.
+        if c.contains("how long have i got") || c.contains("how many days do i have")
+            || c.contains("days left on my visa") || c.contains("how long can i stay here")
+            || c.contains("when does my visa run out") || c.contains("my visa expire")
+            || c.contains("days left here") {
+            speak(ChappyBorder.shared.spokenStatus); return
+        }
+        if c.contains("i arrived in ") || c.contains("i landed in ")
+            || c.contains("i got into ") || c.contains("start my visa") {
+            var place = ""
+            for lead in ["i arrived in ", "i landed in ", "i got into ", "start my visa in "] {
+                if let r = c.range(of: lead) {
+                    place = String(c[r.upperBound...])
+                        .trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+                        .split(separator: " ").prefix(3).joined(separator: " ")
+                    break
+                }
+            }
+            if place.isEmpty { speak("Arrived where?"); return }
+            // "yesterday" / "on Tuesday" — the day matters, because it is
+            // day one of the count.
+            let day = ChappyTrail.dayMentioned(in: c) ?? Date()
+            speak(ChappyBorder.shared.declare(country: place, entered: day))
+            return
+        }
+        if c.contains("open visa") || c.contains("visa module") || c.contains("visa screen")
+            || c.contains("show me the visas") {
+            NotificationCenter.default.post(name: .chappyOpenVisa, object: nil)
+            speak("Visas."); return
+        }
+
+        // ==============================================================
+        // BUILD 177 — THE AI TRAVEL AGENT, BY VOICE.
+        //
+        // "Plan me two weeks in Vietnam in October for two on four grand"
+        // and a whole costed itinerary comes back. This is the one command
+        // that makes the difference between a form and an agent.
+        // ==============================================================
+        if (c.contains("plan me") || c.contains("plan a trip to") || c.contains("plan my trip")
+            || c.contains("plan ") && c.contains(" weeks in ")
+            || c.contains("build me a trip") || c.contains("sort me a trip")),
+           let ask = ChappyTravel.planRequest(from: c) {
+            speak("Right - building that now. Give me a minute, I'm pricing it properly.")
+            Task { await ChappyTravel.shared.aiPlan(ask) }
+            NotificationCenter.default.post(name: .chappyOpenTravel, object: nil)
+            return
+        }
+
+        // ==============================================================
+        // BUILD 177 — THE TRAVEL DESK.
+        // ==============================================================
+        if c.contains("travel desk") || c.contains("open travel")
+            || c.contains("my trips") || c.contains("trip planner")
+            || c.contains("plan a trip") || c.contains("open trips") {
+            NotificationCenter.default.post(name: .chappyOpenTravel, object: nil)
+            speak("Travel desk."); return
+        }
+        if c.contains("what's the trip costing") || c.contains("whats the trip costing")
+            || c.contains("how much is the trip") || c.contains("what's my trip costing")
+            || c.contains("trip cost") || c.contains("cost of the trip")
+            || c.contains("how much will the trip") {
+            if let t = ChappyTravel.shared.active {
+                speak(ChappyTravel.shared.spokenCost(t))
+            } else {
+                speak("No trip on the go yet. Say: plan a trip, and I'll start one.")
+            }
+            return
+        }
+        if c.contains("break that down") || c.contains("cost breakdown")
+            || c.contains("what's it going on") || c.contains("where's the money going") {
+            if let t = ChappyTravel.shared.active {
+                speak(ChappyTravel.shared.spokenBreakdown(t))
+            } else { speak("No trip to break down yet.") }
+            return
+        }
+        if c.contains("what's the plan") || c.contains("whats the plan")
+            || c.contains("the itinerary") || c.contains("my itinerary")
+            || c.contains("run through the trip") {
+            if let t = ChappyTravel.shared.active {
+                speak(ChappyTravel.shared.spokenItinerary(t))
+            } else { speak("No trip planned yet.") }
+            return
+        }
+        if c.contains("email me the plan") || c.contains("email the trip")
+            || c.contains("email me the trip") || c.contains("send me the itinerary")
+            || c.contains("email the itinerary") {
+            if let t = ChappyTravel.shared.active {
+                _ = ChappyTravel.shared.emailReport(t)
+                speak("Trip's in a draft - one tap sends it.")
+            } else { speak("Nothing to email yet.") }
+            return
+        }
+        // "add five nights in Ubud" — the one command that builds a trip
+        // by voice, so a plan can start on a footpath rather than at a desk.
+        if (c.contains("nights in ") || c.contains("night in ")),
+           c.contains("add ") || c.contains("then ") {
+            let words = c.split(separator: " ").map(String.init)
+            var nights = 3
+            for (i, w) in words.enumerated() where w == "nights" || w == "night" {
+                if i > 0 {
+                    let n = words[i - 1]
+                    nights = Int(n) ?? ChappyTravel.spokenNumber(n) ?? 3
+                }
+            }
+            if let r = c.range(of: "nights in ") ?? c.range(of: "night in ") {
+                let place = String(c[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+                    .split(separator: " ").prefix(4).joined(separator: " ")
+                if !place.isEmpty {
+                    let trip = ChappyTravel.shared.active
+                        ?? ChappyTravel.shared.newTrip(named: place.capitalized)
+                    ChappyTravel.shared.addLeg(to: trip.id, place: place.capitalized, nights: nights)
+                    speak("\(nights) nights in \(place). Say 'what's the trip costing' when you want the number.")
+                    return
+                }
+            }
+        }
+        // "what's Bali like in September" — climate, not forecast.
+        if (c.contains(" like in ") || c.contains("weather in ")),
+           ChappyTravel.monthMentioned(in: c) != nil,
+           let month = ChappyTravel.monthMentioned(in: c) {
+            let place = ChappyTravel.placeBefore(month: month, in: c)
+            if !place.isEmpty {
+                speak("Let me look that up.")
+                Task { @MainActor in
+                    guard let marks = try? await CLGeocoder().geocodeAddressString(place),
+                          let loc = marks.first?.location else {
+                        TTSService.shared.speak("I couldn't place \(place) on the map.")
+                        return
+                    }
+                    await ChappySeason.shared.load(lat: loc.coordinate.latitude,
+                                                   lon: loc.coordinate.longitude, month: month)
+                    if let n = ChappySeason.shared.normals(lat: loc.coordinate.latitude,
+                                                           lon: loc.coordinate.longitude, month: month) {
+                        TTSService.shared.speak(ChappySeason.shared.spoken(place: place.capitalized, month: month, n: n))
+                    } else {
+                        TTSService.shared.speak("No climate records came back for \(place).")
+                    }
+                }
+                return
+            }
+        }
+
+        // BUILD 176 — ASK WHAT'S LEFT BEFORE YOU NEED IT.
+        // The flight lookups run on a 100-a-month allowance with no
+        // overage: past the limit the calls just fail. Answered in flight
+        // DAYS rather than raw calls, because "sixty-one left" tells you
+        // nothing and "about seven more flight days" is a decision.
+        if c.contains("flight check") || c.contains("flight checks")
+            || c.contains("flight budget") || c.contains("flight calls")
+            || c.contains("flight lookups") || c.contains("flight quota")
+            || c.contains("flight allowance")
+            || c.contains("how many flight") {
+            speak(ChappyFlightBudget.shared.spokenLine); return
+        }
         if c.contains("flight deals") || c.contains("any deals on flights")
             || c.contains("cheapest flights") || c.contains("how are my flights looking") {
             speak(ChappyFlights.shared.spokenDeals()); return
@@ -4146,7 +4590,12 @@ final class ChappyStandby: NSObject, ObservableObject {
                 speak("Which flight? Give me the number, like Q F five two."); return
             }
             let day = ChappyTrail.dayMentioned(in: c) ?? Date()
-            speak(ChappyFlights.shared.track(number: num, date: day))
+            var reply = ChappyFlights.shared.track(number: num, date: day)
+            // BUILD 176: warn BEFORE the trip, not standing at the gate.
+            if let w = ChappyFlightBudget.shared.preTripWarning {
+                reply += " " + w
+            }
+            speak(reply)
             return
         }
         if c.contains("how's my flight") || c.contains("hows my flight")
@@ -6201,6 +6650,10 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
                 self?.snapshot.suburb = p.subLocality
                 self?.snapshot.city = p.locality
                 self?.snapshot.country = p.country
+                // BUILD 182: the border watcher rides the geocode that
+                // already runs, rather than starting a second location
+                // manager. Crossing into a country starts its visa clock.
+                Task { @MainActor in ChappyBorder.shared.noticed(country: p.country) }
                 self?.snapshot.countryCode = p.isoCountryCode
                 print("🧭 [Context] Located: \(p.locality ?? "?"), \(p.country ?? "?")")
             }
@@ -9674,9 +10127,48 @@ final class ChappyReminders: NSObject, ObservableObject {
         if let agenda = ChappyCalendar.shared.agendaLine() {
             parts.append("In the diary: \(agenda)")
         }
-        let s = ContextEngine.shared.snapshot
-        if let w = s.weather, let temp = s.temperatureC {
-            parts.append("\(Int(temp.rounded())) degrees, \(w).")
+        // BUILD 177 — THE BRIEF GETS THE WEATHER STATION.
+        //
+        // This said "24 degrees, cloudy" and stopped, which is the least
+        // useful weather sentence available: it tells you nothing about
+        // whether to take a jacket, an umbrella or sunscreen. The Weather
+        // Station from 173 already knew the day's high and low, when the
+        // rain is coming and how fierce the sun will be, and the brief was
+        // not asking it a single question.
+        if let day = ChappyWeather.shared.days.first {
+            var w = "Today: \(Int(day.maxC.rounded())) degrees, down to \(Int(day.minC.rounded()))"
+            w += ", \(ChappyWeather.describe(day.code))."
+            if day.rainChance >= 40 {
+                w += " \(day.rainChance) per cent chance of rain"
+                if day.rainMm >= 5 { w += ", and enough of it to matter" }
+                w += " - take something."
+            }
+            if day.uvMax >= 8 { w += " U V hits \(Int(day.uvMax.rounded())) - sunscreen." }
+            if day.windMaxKmh >= 40 { w += " Windy, up to \(Int(day.windMaxKmh.rounded())) k p h." }
+            parts.append(w)
+        } else {
+            let s = ContextEngine.shared.snapshot
+            if let w = s.weather, let temp = s.temperatureC {
+                parts.append("\(Int(temp.rounded())) degrees, \(w).")
+            }
+            // Nothing loaded yet — fetch quietly so tomorrow's brief has it.
+            Task { @MainActor in await ChappyWeather.shared.loadHere() }
+        }
+        // BUILD 177 — THE TRIP, IN THE BRIEF.
+        //
+        // A trip planned in the Travel Desk was invisible to the one thing
+        // he actually listens to every morning. It speaks from 21 days out
+        // — close enough that there is still time to act, far enough back
+        // that it isn't a countdown you tune out. Silent otherwise.
+        if let trip = ChappyTravel.shared.briefLine() { parts.append(trip) }
+        // BUILD 178: a visa overrun is the one travel fact worth putting in
+        // front of him unprompted — everything else on a trip can be fixed
+        // late, and that one cannot.
+        if let t = ChappyTravel.shared.active,
+           let bad = ChappyVisa.shared.positions(for: t).first(where: { $0.over }),
+           let start = t.start, start > Date(),
+           (Calendar.current.dateComponents([.day], from: Date(), to: start).day ?? 99) <= 60 {
+            parts.append("Visa problem: \(bad.nights) nights in \(bad.country) but you get \(bad.allowance).")
         }
         // VISA — the highest-stakes recurring fact in a full-time traveller's
         // life, and the easiest to lose track of.
@@ -9705,8 +10197,10 @@ final class ChappyReminders: NSObject, ObservableObject {
             guard let expiry = cal.date(byAdding: .day, value: days, to: entered),
                   let warn = cal.date(byAdding: .day, value: -d, to: expiry),
                   warn > Date() else { continue }
+            // BUILD 182: its own source, so trip editing can never sweep
+            // away the live in-country countdown.
             add(title: "Visa for \(country) expires in \(d) day\(d == 1 ? "" : "s")",
-                at: warn, escalate: d <= 3, source: "visa")
+                at: warn, escalate: d <= 3, source: "visa-stamp")
         }
         ChappyMemory.shared.remember(.note,
             title: "Entered \(country) on a \(days)-day visa",
@@ -12340,6 +12834,132 @@ final class MiniIMAP {
 //   departure reminder, and the flight as a diary presence. Live status
 //   hands off to a search with the flight number pre-filled — the honest
 //   free option until a status API earns its keep.
+// =================================================================
+// BUILD 176 — THE FLIGHT BUDGET.
+//
+// AviationStack's free plan is 100 calls a month with NO overage: at
+// 100 the calls do not get billed, they simply start failing. So the
+// failure mode was never a surprise invoice — it was Chappy going
+// quiet on gate and delay information at the exact moment it matters,
+// standing in an airport, with nothing on screen to say why.
+//
+// Nothing in the app counted. The 8-a-day cap stopped one flight day
+// running away, but four flight days in a month plus a few manual
+// "where's my flight" asks and you are at the wall with no warning.
+//
+// So: count every call, know what is left, say so before a trip
+// rather than after. Resets itself on the 1st. Costs nothing and
+// needs no new account.
+// =================================================================
+
+@MainActor
+final class ChappyFlightBudget: ObservableObject {
+    static let shared = ChappyFlightBudget()
+
+    private let usedKey  = "chappy_flight_calls_used"
+    private let monthKey = "chappy_flight_calls_month"
+    private let limitKey = "chappy_flight_calls_limit"
+
+    /// The plan's monthly allowance. 100 is AviationStack's free tier;
+    /// editable in Settings so upgrading is a number change, not a build.
+    var limit: Int {
+        get {
+            let v = UserDefaults.standard.integer(forKey: limitKey)
+            return v > 0 ? v : 100
+        }
+        set {
+            UserDefaults.standard.set(max(1, newValue), forKey: limitKey)
+            objectWillChange.send()
+        }
+    }
+
+    /// "2026-08" — the billing month as AviationStack counts it.
+    private var currentMonth: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM"
+        return f.string(from: Date())
+    }
+
+    /// Rolling the month over is done on READ, not on a timer. A timer
+    /// that has to survive the app being killed on the 31st is a timer
+    /// that eventually does not, and the wearer would see a stale count
+    /// forever without ever knowing to doubt it.
+    private func rollIfNeeded() {
+        let stored = UserDefaults.standard.string(forKey: monthKey)
+        guard stored != currentMonth else { return }
+        UserDefaults.standard.set(currentMonth, forKey: monthKey)
+        UserDefaults.standard.set(0, forKey: usedKey)
+        print("✈️ [Budget] New month — flight call count reset to 0")
+    }
+
+    var used: Int {
+        rollIfNeeded()
+        return UserDefaults.standard.integer(forKey: usedKey)
+    }
+
+    var remaining: Int { max(0, limit - used) }
+    var fraction: Double { limit > 0 ? min(1, Double(used) / Double(limit)) : 1 }
+
+    /// A full flight day costs at most 8 (the hard cap in armFlightDayWatch).
+    static let costOfAFlightDay = 8
+    var flightDaysLeft: Int { remaining / Self.costOfAFlightDay }
+
+    /// When the allowance comes back.
+    var resetsOn: Date {
+        let cal = Calendar.current
+        let start = cal.date(from: cal.dateComponents([.year, .month], from: Date())) ?? Date()
+        return cal.date(byAdding: .month, value: 1, to: start) ?? Date()
+    }
+
+    var daysUntilReset: Int {
+        max(0, Calendar.current.dateComponents([.day], from: Date(), to: resetsOn).day ?? 0)
+    }
+
+    /// Called once per outgoing AviationStack request, whether or not it
+    /// comes back — a call that times out was still spent.
+    func record(_ n: Int = 1) {
+        rollIfNeeded()
+        let now = UserDefaults.standard.integer(forKey: usedKey) + n
+        UserDefaults.standard.set(now, forKey: usedKey)
+        objectWillChange.send()
+        if now == limit - 10 || now == limit - 3 {
+            print("⚠️ [Budget] Flight calls running low: \(now)/\(limit)")
+        }
+    }
+
+    /// The gate every caller checks BEFORE spending. Returns false when
+    /// the allowance is gone, so Chappy hands off to the screen instead
+    /// of firing calls that can only fail.
+    func canSpend(_ n: Int = 1) -> Bool { remaining >= n }
+
+    /// Said out loud, and shown in Settings. Deliberately in flight days
+    /// rather than raw calls — "sixty-one left" means nothing, "about
+    /// seven more flight days" is a decision you can act on.
+    var spokenLine: String {
+        let u = used, l = limit
+        if u >= l {
+            return "You've used all \(l) flight checks for this month. They come back in \(daysUntilReset) days. Until then I'll put flight status on screen instead of reading it out."
+        }
+        let days = flightDaysLeft
+        var line = "You've used \(u) of your \(l) flight checks this month."
+        if days >= 1 {
+            line += " That's enough for about \(days) more flight \(days == 1 ? "day" : "days")."
+        } else {
+            line += " That's not quite a full flight day left — they reset in \(daysUntilReset) days."
+        }
+        return line
+    }
+
+    /// Warn BEFORE a trip, not during one. Nil when there's nothing to say.
+    var preTripWarning: String? {
+        guard remaining < Self.costOfAFlightDay * 2 else { return nil }
+        if remaining < Self.costOfAFlightDay {
+            return "Heads up - you're nearly out of flight checks for this month, so I may not be able to track this one all the way. They reset in \(daysUntilReset) days."
+        }
+        return "That'll use most of your remaining flight checks for the month."
+    }
+}
+
 @MainActor
 final class ChappyFlights: ObservableObject {
 
@@ -12674,16 +13294,48 @@ final class ChappyFlights: ObservableObject {
     /// One AviationStack call → one snapshot. Nil on any failure — callers
     /// fall back to the screen handoff or stay quiet.
     private func fetchSnapshot(_ f: TrackedFlight) async -> FlightSnapshot? {
-        guard let key = APIKeyManager.shared.getAviationStackKey(),
-              let url = URL(string: "http://api.aviationstack.com/v1/flights?access_key=\(key)&flight_iata=\(f.number)&limit=1")
-        else { return nil }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 15
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let arr = json["data"] as? [[String: Any]], let flight = arr.first
-        else { return nil }
+        guard let key = APIKeyManager.shared.getAviationStackKey() else { return nil }
+
+        // BUILD 176: never fire a call the plan can't pay for. At the limit
+        // AviationStack doesn't bill, it just refuses — so spending here
+        // would only produce a silent failure the wearer can't diagnose.
+        guard ChappyFlightBudget.shared.canSpend() else {
+            print("✈️ [Budget] Monthly flight calls spent — skipping the lookup")
+            return nil
+        }
+
+        // BUILD 176: HTTPS FIRST. This was plain http, which is why
+        // NSAllowsArbitraryLoads had to stay switched on for it. The free
+        // plan does include HTTPS (it's ticked on the dashboard), so try
+        // the encrypted endpoint and only drop to http if that specific
+        // plan genuinely refuses it.
+        for scheme in ["https", "http"] {
+            guard let url = URL(string: "\(scheme)://api.aviationstack.com/v1/flights?access_key=\(key)&flight_iata=\(f.number)&limit=1")
+            else { continue }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 15
+            // Counted whether or not it comes back: a call that times out
+            // was still spent at the other end.
+            ChappyFlightBudget.shared.record()
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let arr = json["data"] as? [[String: Any]], let flight = arr.first
+            else {
+                if scheme == "https" {
+                    print("✈️ [Flights] HTTPS refused — falling back to http once")
+                    continue
+                }
+                return nil
+            }
+            return Self.parseSnapshot(flight)
+        }
+        return nil
+    }
+
+    /// BUILD 176: lifted out of fetchSnapshot unchanged so the https/http
+    /// retry above doesn't have to duplicate a line of it.
+    private static func parseSnapshot(_ flight: [String: Any]) -> FlightSnapshot? {
         let dep = flight["departure"] as? [String: Any] ?? [:]
         let arr2 = flight["arrival"] as? [String: Any] ?? [:]
         var s = FlightSnapshot(status: (flight["flight_status"] as? String) ?? "unknown")
@@ -14049,6 +14701,10 @@ final class ChappyDictate: NSObject, ObservableObject {
     func stop(andPolish: Bool) {
         guard isRecording else { return }
         isRecording = false
+        // BUILD 180: dictation is a deliberate act, so ducking THROUGH it is
+        // right — but it has to hand the music back when it finishes, or the
+        // duck outlives the recording.
+        ChappyAudio.releaseAfterSpeech()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         request?.endAudio()
@@ -14168,6 +14824,16 @@ extension Notification.Name {
     static let chappyOpenDictate = Notification.Name("chappyOpenDictate")
     /// BUILD 173 — the weather station and the brief studio.
     static let chappyOpenWeather = Notification.Name("chappyOpenWeather")
+    /// BUILD 177 — the Travel Desk, the converter and the web look-up.
+    static let chappyOpenTravel = Notification.Name("chappyOpenTravel")
+    /// BUILD 178 — the visa desk and the trip atlas.
+    static let chappyOpenVisa = Notification.Name("chappyOpenVisa")
+    /// BUILD 181 — the three options, and the intake interview.
+    static let chappyOpenOptions = Notification.Name("chappyOpenOptions")
+    static let chappyOpenIntake = Notification.Name("chappyOpenIntake")
+    static let chappyOpenAtlasMap = Notification.Name("chappyOpenAtlasMap")
+    static let chappyOpenSearch = Notification.Name("chappyOpenSearch")
+    static let chappyOpenFX = Notification.Name("chappyOpenFX")
     static let chappyOpenBriefs = Notification.Name("chappyOpenBriefs")
     /// BUILD 172 — open the notification diagnostic screen.
     static let chappyOpenNotifDoctor = Notification.Name("chappyOpenNotifDoctor")
@@ -14511,5 +15177,12137 @@ final class ChappyWeather: ObservableObject {
         case ..<11: return "very high"
         default: return "extreme"
         }
+    }
+}
+
+// =====================================================================
+// BUILD 177 — CHAPPY FX. Money, in the currency you actually think in.
+//
+// Every number in the Travel Desk is meaningless until it's in dollars.
+// A hotel at 850,000 rupiah, a taxi at 180 baht and a flight at 240
+// Singapore dollars cannot be added together, and doing that arithmetic
+// in your head at an airport is exactly when you get it wrong.
+//
+// open.er-api.com is free, needs no key and no account, covers 160+
+// currencies including the ones ECB doesn't publish (Vietnamese dong,
+// Lao kip), and updates daily — which is the right resolution for
+// planning a trip. Rates are cached to disk, so the converter works on
+// a plane with the radio off using yesterday's numbers rather than
+// refusing to answer.
+// =====================================================================
+
+@MainActor
+final class ChappyFX: ObservableObject {
+    static let shared = ChappyFX()
+
+    /// Rates expressed as: 1 unit of `base` = rates[code] units of code.
+    @Published private(set) var rates: [String: Double] = [:]
+    @Published private(set) var fetchedAt: Date?
+    @Published private(set) var loading = false
+    @Published private(set) var error: String?
+
+    private let ratesKey = "chappy_fx_rates"
+    private let stampKey = "chappy_fx_at"
+
+    /// The currency he thinks in. Everything is reported in this.
+    var home: String {
+        get { UserDefaults.standard.string(forKey: "chappy_fx_home") ?? "AUD" }
+        set {
+            UserDefaults.standard.set(newValue.uppercased(), forKey: "chappy_fx_home")
+            // Drop the old table THE MOMENT the base changes. Waiting for the
+            // refresh to land means a window where every conversion is wrong
+            // and nothing says so — and if the refresh fails, that window
+            // never closes.
+            rates = [:]
+            fetchedAt = nil
+            UserDefaults.standard.removeObject(forKey: ratesKey)
+            objectWillChange.send()
+            Task { await refresh(force: true) }
+        }
+    }
+
+    /// The ones a traveller in this part of the world actually meets.
+    static let common = ["AUD", "USD", "EUR", "GBP", "NZD", "SGD", "IDR", "THB",
+                         "MYR", "VND", "PHP", "JPY", "KRW", "INR", "HKD", "TWD",
+                         "LAK", "KHR", "MMK", "CNY", "AED", "CHF", "CAD"]
+
+    /// Spoken and written names, so "how much is that in rupiah" works and
+    /// the report doesn't read like a bank statement.
+    static let names: [String: String] = [
+        "AUD": "Australian dollars", "USD": "US dollars", "EUR": "euro",
+        "GBP": "pounds", "NZD": "New Zealand dollars", "SGD": "Singapore dollars",
+        "IDR": "rupiah", "THB": "baht", "MYR": "ringgit", "VND": "dong",
+        "PHP": "pesos", "JPY": "yen", "KRW": "won", "INR": "rupees",
+        "HKD": "Hong Kong dollars", "TWD": "Taiwan dollars", "LAK": "kip",
+        "KHR": "riel", "MMK": "kyat", "CNY": "yuan", "AED": "dirham",
+        "CHF": "francs", "CAD": "Canadian dollars"
+    ]
+
+    /// Spoken aliases → code. "rupiah", "baht", "quid" all have to land.
+    static let spokenAliases: [String: String] = [
+        "dollars": "AUD", "dollar": "AUD", "aussie dollars": "AUD", "aud": "AUD",
+        "us dollars": "USD", "american dollars": "USD", "usd": "USD", "greenback": "USD",
+        "euro": "EUR", "euros": "EUR", "pounds": "GBP", "quid": "GBP", "sterling": "GBP",
+        "rupiah": "IDR", "idr": "IDR", "baht": "THB", "thb": "THB",
+        "ringgit": "MYR", "dong": "VND", "vnd": "VND", "pesos": "PHP", "peso": "PHP",
+        "yen": "JPY", "won": "KRW", "rupees": "INR", "rupee": "INR",
+        "singapore dollars": "SGD", "sing dollars": "SGD", "sgd": "SGD",
+        "kip": "LAK", "riel": "KHR", "kyat": "MMK", "yuan": "CNY", "rmb": "CNY",
+        "new zealand dollars": "NZD", "kiwi dollars": "NZD",
+        "hong kong dollars": "HKD", "dirham": "AED", "francs": "CHF"
+    ]
+
+    /// Currencies with no minor unit — printing "850000.00 IDR" is wrong
+    /// and printing "Rp 850,000" is what the price tag says.
+    static let zeroDecimal: Set<String> = ["IDR", "VND", "JPY", "KRW", "LAK", "KHR", "MMK"]
+
+    static let symbols: [String: String] = [
+        "AUD": "$", "USD": "US$", "EUR": "€", "GBP": "£", "NZD": "NZ$",
+        "SGD": "S$", "IDR": "Rp", "THB": "฿", "MYR": "RM", "VND": "₫",
+        "PHP": "₱", "JPY": "¥", "KRW": "₩", "INR": "₹", "HKD": "HK$",
+        "TWD": "NT$", "LAK": "₭", "KHR": "៛", "MMK": "K", "CNY": "¥",
+        "AED": "AED ", "CHF": "CHF ", "CAD": "C$"
+    ]
+
+    private init() { loadCache() }
+
+    // MARK: rates
+
+    /// AUDIT: the cache stored the TABLE but never the currency it was
+    /// computed against. Change home from dollars to baht on a plane, let
+    /// the refresh fail, and every conversion in the app silently reports
+    /// dollar-scaled numbers as baht — with no staleness warning, because
+    /// the timestamp was still fresh. A wrong number is worse than none,
+    /// which is this class's own stated rule. So the base is stored with
+    /// the table, and a mismatch empties it.
+    private let baseKey = "chappy_fx_base"
+
+    private func loadCache() {
+        let d = UserDefaults.standard
+        guard (d.string(forKey: baseKey) ?? "") == home else {
+            rates = [:]; fetchedAt = nil
+            return
+        }
+        if let raw = d.dictionary(forKey: ratesKey) as? [String: Double] { rates = raw }
+        if let t = d.object(forKey: stampKey) as? Date { fetchedAt = t }
+    }
+
+    /// Refresh unless we already have today's. Costs nothing and needs no key.
+    func refresh(force: Bool = false) async {
+        if !force, let t = fetchedAt, Date().timeIntervalSince(t) < 12 * 3600, !rates.isEmpty { return }
+        loading = true
+        defer { loading = false }
+        let base = home
+        for host in ["https://open.er-api.com/v6/latest/\(base)",
+                     "https://api.frankfurter.app/latest?from=\(base)"] {
+            guard let url = URL(string: host) else { continue }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 12
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            // The two services name the payload differently; take whichever landed.
+            let table = (json["rates"] as? [String: Double]) ?? (json["conversion_rates"] as? [String: Double])
+            guard let table, !table.isEmpty else { continue }
+            rates = table
+            fetchedAt = Date()
+            error = nil
+            UserDefaults.standard.set(table, forKey: ratesKey)
+            UserDefaults.standard.set(fetchedAt, forKey: stampKey)
+            UserDefaults.standard.set(base, forKey: baseKey)
+            print("💱 [FX] \(table.count) rates against \(base)")
+            return
+        }
+        if rates.isEmpty { error = "Couldn't reach a rates service, and nothing is cached yet." }
+    }
+
+    var isStale: Bool {
+        guard let t = fetchedAt else { return true }
+        return Date().timeIntervalSince(t) > 48 * 3600
+    }
+
+    // MARK: conversion
+
+    /// Convert between any two currencies via the home base. Returns nil
+    /// rather than a wrong number when a rate genuinely isn't known — a
+    /// silently wrong conversion is worse than no conversion.
+    func convert(_ amount: Double, from: String, to: String) -> Double? {
+        let f = from.uppercased(), t = to.uppercased()
+        if f == t { return amount }
+        let base = home.uppercased()
+        // amount in base units
+        let inBase: Double
+        if f == base { inBase = amount }
+        else if let r = rates[f], r != 0 { inBase = amount / r }
+        else { return nil }
+        if t == base { return inBase }
+        guard let r2 = rates[t] else { return nil }
+        return inBase * r2
+    }
+
+    /// Money as a person writes it. No cents on currencies that have none.
+    static func money(_ amount: Double, _ code: String) -> String {
+        let c = code.uppercased()
+        let sym = symbols[c] ?? (c + " ")
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.groupingSeparator = ","
+        f.maximumFractionDigits = zeroDecimal.contains(c) ? 0 : (abs(amount) >= 1000 ? 0 : 2)
+        f.minimumFractionDigits = 0
+        let n = f.string(from: NSNumber(value: amount)) ?? String(Int(amount))
+        return sym + n
+    }
+
+    /// Money as a person SAYS it. "Eight hundred and fifty thousand rupiah"
+    /// is unlistenable; "about eight hundred and fifty thousand rupiah,
+    /// call it eighty dollars" is what a friend would tell you.
+    func spokenMoney(_ amount: Double, _ code: String) -> String {
+        let c = code.uppercased()
+        let name = Self.names[c] ?? c
+        let rounded: String
+        if Self.zeroDecimal.contains(c) {
+            if amount >= 1_000_000 { rounded = String(format: "%.1f million", amount / 1_000_000) }
+            else if amount >= 1000 { rounded = "\(Int((amount / 1000).rounded())) thousand" }
+            else { rounded = "\(Int(amount.rounded()))" }
+        } else {
+            rounded = amount >= 100 ? "\(Int(amount.rounded()))" : String(format: "%.2f", amount)
+        }
+        var line = "\(rounded) \(name)"
+        if c != home, let inHome = convert(amount, from: c, to: home) {
+            line += ", about \(Self.money(inHome, home))"
+        }
+        return line
+    }
+
+    /// "how much is 850000 rupiah" — pull the number and both currencies
+    /// out of an ordinary spoken sentence.
+    func answerSpoken(_ raw: String) -> String? {
+        let c = raw.lowercased()
+        guard c.contains("how much") || c.contains("convert") || c.contains("in dollars")
+                || c.contains("worth") || c.contains("exchange rate") || c.contains("what's the rate")
+        else { return nil }
+
+        // The number: first run of digits, commas and dots.
+        var digits = ""
+        var seen = false
+        for ch in c {
+            if ch.isNumber || (seen && (ch == "," || ch == ".")) { digits.append(ch); seen = true }
+            else if seen { break }
+        }
+        let cleaned = digits.replacingOccurrences(of: ",", with: "")
+        var amount = Double(cleaned) ?? 0
+        // "half a million rupiah", "2 million dong"
+        if c.contains("million") { amount *= 1_000_000 }
+        else if c.contains("thousand") || c.contains(" k ") { amount *= 1000 }
+        // AUDIT: this used to return a NAG here, and a non-nil return means
+        // "I handled it" to the router. So "how much is the trip costing"
+        // and "how much will the trip cost" — both real, shipped commands
+        // sitting further down — were answered with "give me an amount as
+        // well" and never reached. A converter with no number in it is not
+        // a conversion question; hand it back.
+        guard amount > 0 else { return nil }
+
+        // Which currencies were named? Longest alias first so "singapore
+        // dollars" never gets swallowed by "dollars".
+        var found: [String] = []
+        for alias in Self.spokenAliases.keys.sorted(by: { $0.count > $1.count }) {
+            if c.contains(alias), let code = Self.spokenAliases[alias], !found.contains(code) {
+                found.append(code)
+            }
+        }
+        let from = found.first ?? home
+        let to = found.count > 1 ? found[1] : home
+        guard let out = convert(amount, from: from, to: to) else {
+            return "I don't have a rate for that pair yet - open the converter once on wifi and I'll keep it."
+        }
+        var line = "\(Self.money(amount, from)) is about \(Self.money(out, to))."
+        if isStale { line += " Those rates are a couple of days old." }
+        return line
+    }
+}
+
+// =====================================================================
+// BUILD 177 — CHAPPY TRAVEL DESK.
+//
+// THE HONEST FOUNDATION, because it decides the whole shape of this.
+//
+// You cannot book from here, and neither can anyone else working alone.
+// Airbnb closed its public API in 2019 — partner-only, no prices, no
+// availability. Facebook Marketplace has never had one. Booking.com,
+// Agoda, Trip.com, Klook and Traveloka all gate their APIs behind an
+// approved commercial agreement. Kiwi moved Tequila to partner approval.
+// Amadeus decommissioned its self-service portal outright in July 2026.
+// The booking rails are CONTRACTUAL, not technical, and no key exists
+// that would change that.
+//
+// So the Travel Desk is built the way the best software in this category
+// is actually built — TripIt, Wanderlog, Kayak's planner all do exactly
+// this. Chappy is the PLANNER, the COSTER and the ROUTER. It does the
+// thinking, holds the whole trip in one place, prices it honestly, and
+// hands off with the dates, the place and the party size already filled
+// in. Same pattern as the Grab module, which works.
+//
+// Every link is a plain https:// universal link. If the app is on the
+// phone, iOS opens the app; if not, the site. No URL schemes, so nothing
+// here needs another plist change.
+// =====================================================================
+
+@MainActor
+final class ChappyTravel: ObservableObject {
+    static let shared = ChappyTravel()
+
+    // MARK: - models
+
+    enum Arrival: String, Codable, CaseIterable, Identifiable {
+        case flight, bus, train, ferry, taxi, grab, car, walk, none
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .flight: return "Flight"
+            case .bus:    return "Bus"
+            case .train:  return "Train"
+            case .ferry:  return "Ferry / boat"
+            case .taxi:   return "Taxi"
+            case .grab:   return "Grab / Gojek"
+            case .car:    return "Car"
+            case .walk:   return "Walk"
+            case .none:   return "Starting point"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .flight: return "airplane"
+            case .bus:    return "bus.fill"
+            case .train:  return "tram.fill"
+            case .ferry:  return "ferry.fill"
+            case .taxi:   return "car.fill"
+            case .grab:   return "car.circle.fill"
+            case .car:    return "steeringwheel"
+            case .walk:   return "figure.walk"
+            case .none:   return "house.fill"
+            }
+        }
+        /// A sane starting number so a new leg is never blank. Rough
+        /// South-East Asia / Australia figures in AUD, deliberately
+        /// conservative — you edit them, they're a starting point.
+        var typicalAUD: Double {
+            switch self {
+            case .flight: return 220
+            case .bus:    return 25
+            case .train:  return 40
+            case .ferry:  return 35
+            case .taxi:   return 30
+            case .grab:   return 12
+            case .car:    return 60
+            case .walk:   return 0
+            case .none:   return 0
+            }
+        }
+    }
+
+    // BUILD 181 — THE BAND, AND WHY IT ISN'T A LIVE PRICE FEED.
+    //
+    // Nobody sells a solo developer live travel prices: Amadeus is
+    // decommissioned, Kiwi is partner-only, Google Flights and Skyscanner
+    // have no public API. So Chappy will not pretend to put a live market
+    // number beside yours.
+    //
+    // What it CAN do — and what actually answers "am I getting a deal" —
+    // is search for what a thing costs in that place in that month and
+    // return the low, the normal and the tourist-tax end. Your number is
+    // then graded against that. It's honest about being a searched
+    // typical range rather than a quote, and it's the version that's
+    // useful, because the real question is never "what's the cheapest
+    // seat right now", it's "am I about to overpay".
+    struct Band: Codable, Hashable {
+        var low: Double
+        var typical: Double
+        var high: Double
+
+        var isUsable: Bool { high > 0 && low <= high }
+    }
+
+    enum Grade: String {
+        case great, good, fair, high, unknown
+
+        var label: String {
+            switch self {
+            case .great:   return "GREAT"
+            case .good:    return "GOOD"
+            case .fair:    return "FAIR"
+            case .high:    return "HIGH"
+            case .unknown: return ""
+            }
+        }
+        /// Green, green-ish, amber, red. Chosen to survive both themes and
+        /// to still read on a printed page.
+        var hex: String {
+            switch self {
+            case .great:   return "#1c9c5a"
+            case .good:    return "#4aa03c"
+            case .fair:    return "#c98a12"
+            case .high:    return "#c0392b"
+            case .unknown: return "#7a8794"
+            }
+        }
+        var isTrouble: Bool { self == .high }
+    }
+
+    /// Grade a real number against what things actually go for.
+    static func grade(_ actual: Double, _ band: Band?) -> Grade {
+        guard let b = band, b.isUsable, actual > 0 else { return .unknown }
+        if actual <= b.low { return .great }
+        if actual <= (b.low + b.typical) / 2 { return .good }
+        if actual <= b.high { return .fair }
+        return .high
+    }
+
+    /// The flights answer, searched rather than guessed — and honest that
+    /// it is a RANGE, because a single number for a fare four months out
+    /// is a number that will be wrong.
+    struct FlightBrief: Codable {
+        var route: String = ""            // "Brisbane to Denpasar"
+        var low: Double = 0               // return, per person, home currency
+        var high: Double = 0
+        var airlines: String = ""
+        var peakNote: String = ""         // "school holidays — book early"
+        var advice: String = ""
+        var searchedAt: Date = Date()
+
+        var isUsable: Bool { high > 0 }
+    }
+
+    struct Extra: Codable, Identifiable, Hashable {
+        var id: UUID = UUID()
+        var label: String
+        var amount: Double
+        var perPerson: Bool = true
+    }
+
+    struct Leg: Codable, Identifiable {
+        var id: UUID = UUID()
+        var place: String                 // "Ubud"
+        var country: String = ""          // "Indonesia"
+        var lat: Double = 0
+        var lon: Double = 0
+        var arrive: Date = Date()
+        var nights: Int = 3
+
+        // How you GET here, and what that costs (total for the party).
+        var arrival: Arrival = .flight
+        var arrivalCost: Double = 0
+        var arrivalNote: String = ""      // "QF52", "night bus from Kuta"
+
+        // Where you sleep. Rate is PER NIGHT for the whole party.
+        var stayName: String = ""
+        var nightlyRate: Double = 0
+        var stayCurrency: String = ""     // blank = the trip's home currency
+
+        // The day-to-day, per person per day.
+        var foodPerDay: Double = 0
+        var groundPerDay: Double = 0      // local taxis, Grab, scooters
+        var activitiesTotal: Double = 0   // whole party, whole leg
+
+        var notes: String = ""
+        var shortlist: [String] = []      // saved restaurants / attractions
+
+        // BUILD 181 — WHAT THIS SHOULD COST, SO A NUMBER MEANS SOMETHING.
+        //
+        // Every one of these is OPTIONAL, and that is not laziness: Swift's
+        // synthesised Codable throws on a missing key for a non-optional
+        // property even when it has a default, so adding a plain `var` here
+        // would make every trip already saved on the phone fail to decode
+        // and silently vanish. Optionals decode as nil. Never add a
+        // non-optional field to a persisted model.
+        //
+        // The bands come from the planner, which searches for what things
+        // actually cost in THIS place in THIS month. They are what turns
+        // "Rp 1,450,000" from a number into "that's a good price".
+        var localCurrency: String?        // "IDR" — derived from the country
+        var stayBand: Band?               // per night, whole party
+        var arrivalBand: Band?            // this hop, whole party
+        var foodBand: Band?               // per person per day
+        var groundBand: Band?             // per person per day
+        var scooterPerDay: Double?        // in local currency
+        var scooterBand: Band?
+
+        var hasCoord: Bool { lat != 0 || lon != 0 }
+        var depart: Date {
+            Calendar.current.date(byAdding: .day, value: max(0, nights), to: arrive) ?? arrive
+        }
+    }
+
+    struct Trip: Codable, Identifiable {
+        // BUILD 184: Optional, like every other field added to a persisted
+        // model — a non-optional would make every saved trip fail to
+        // decode. nil means "return", which is what every existing trip
+        // already assumed.
+        var oneWay: Bool?
+        var id: UUID = UUID()
+        var name: String = "New trip"
+        var party: Int = 1
+        var homeCurrency: String = "AUD"
+        var bufferPct: Double = 10        // the "things happen" line
+        var extras: [Extra] = []
+        var legs: [Leg] = []
+        var createdAt: Date = Date()
+
+        // BUILD 181 — same optional rule as above, same reason.
+        var shape: String?                // "lean" | "balanced" | "comfortable"
+        var flights: FlightBrief?
+        /// What he has already turned down, so a re-plan never offers it
+        /// back. An agent that forgets you said no is one you stop talking to.
+        var rejected: [String]?
+        var summary: String?
+
+        var nights: Int { legs.reduce(0) { $0 + max(0, $1.nights) } }
+        var days: Int { max(1, nights) }
+        var start: Date? { legs.map(\.arrive).min() }
+        var end: Date? { legs.map(\.depart).max() }
+
+        var dateLine: String {
+            guard let s = start, let e = end else { return "No dates yet" }
+            let f = DateFormatter(); f.dateFormat = "d MMM"
+            let y = DateFormatter(); y.dateFormat = "d MMM yyyy"
+            return "\(f.string(from: s)) – \(y.string(from: e))"
+        }
+    }
+
+    /// Every number the report and the bars are built from. Computed, never
+    /// stored — a stored total is a total that goes stale the moment you
+    /// change a night.
+    struct Costing {
+        var arrival = 0.0        // flights, buses, trains, ferries between legs
+        var stay = 0.0
+        var food = 0.0
+        var ground = 0.0
+        var activities = 0.0
+        var extras = 0.0
+        var subtotal: Double { arrival + stay + food + ground + activities + extras }
+        var buffer = 0.0
+        var total: Double { subtotal + buffer }
+        var perPerson = 0.0
+        var perDay = 0.0
+        /// True when a conversion was missing and a local figure had to be
+        /// counted as if it were the home currency. The total is WRONG when
+        /// this is set, and everything showing it has to say so.
+        var hasUnconverted = false
+
+        /// Swift has no key paths into tuple elements, so a list the UI can
+        /// drive needs real identity. Zero lines are dropped — a breakdown
+        /// listing "Buffer $0" is noise.
+        struct Line: Identifiable {
+            var id: String { label }
+            var label: String
+            var icon: String
+            var amount: Double
+        }
+
+        var lines: [Line] {
+            [Line(label: "Getting there", icon: "airplane", amount: arrival),
+             Line(label: "Accommodation", icon: "bed.double.fill", amount: stay),
+             Line(label: "Food", icon: "fork.knife", amount: food),
+             Line(label: "Getting around", icon: "car.fill", amount: ground),
+             Line(label: "Things to do", icon: "ticket.fill", amount: activities),
+             Line(label: "Visas, insurance, extras", icon: "doc.text.fill", amount: extras),
+             Line(label: "Buffer", icon: "shield.fill", amount: buffer)]
+                .filter { $0.amount > 0 }
+        }
+    }
+
+    // MARK: - state
+
+    @Published private(set) var trips: [Trip] = []
+    @Published var activeID: UUID?
+    /// BUILD 177: the AI planner runs for up to a minute and a half — a
+    /// screen that just sits there is a screen you assume has crashed.
+    @Published var planning = false
+    @Published var planError: String?
+    /// BUILD 183: the full report researches, ranks and renders. It takes
+    /// the better part of a minute, and a share button that does nothing
+    /// visible for a minute is a share button people press four times.
+    @Published var buildingReport = false
+    @Published var reportStage = ""
+    /// BUILD 181: the three shapes, held until one is chosen. Not stored —
+    /// an option you never picked is not a trip, and filling his trip list
+    /// with rejected drafts would be its own kind of mess.
+    @Published var pendingOptions: [Trip] = []
+
+    var active: Trip? {
+        get { trips.first { $0.id == activeID } ?? trips.first }
+        set {
+            guard let newValue, let i = trips.firstIndex(where: { $0.id == newValue.id }) else { return }
+            trips[i] = newValue
+            save()
+        }
+    }
+
+    private init() { load() }
+
+    // MARK: - persistence
+
+    /// The planner builds a trip from outside the editing methods, so it
+    /// needs a way in that doesn't mean making the whole store public.
+    func savePublic() { save() }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(trips) {
+            UserDefaults.standard.set(d, forKey: "chappy_trips")
+        }
+        if let a = activeID?.uuidString {
+            UserDefaults.standard.set(a, forKey: "chappy_trip_active")
+        }
+    }
+
+    private func load() {
+        if let d = UserDefaults.standard.data(forKey: "chappy_trips"),
+           let t = try? JSONDecoder().decode([Trip].self, from: d) { trips = t }
+        if let s = UserDefaults.standard.string(forKey: "chappy_trip_active") {
+            activeID = UUID(uuidString: s)
+        }
+        if activeID == nil { activeID = trips.first?.id }
+    }
+
+    // MARK: - editing
+
+    @discardableResult
+    func newTrip(named: String) -> Trip {
+        var t = Trip(name: named.isEmpty ? "New trip" : named)
+        t.homeCurrency = ChappyFX.shared.home
+        trips.insert(t, at: 0)
+        activeID = t.id
+        save()
+        return t
+    }
+
+    func deleteTrip(_ id: UUID) {
+        // BUILD 182: take the reminders with it. A deleted trip that still
+        // tells you to pack is the most confusing thing the app could do.
+        clearArmed(for: id)
+        trips.removeAll { $0.id == id }
+        if activeID == id { activeID = trips.first?.id }
+        save()
+    }
+
+    func update(_ trip: Trip) {
+        guard let i = trips.firstIndex(where: { $0.id == trip.id }) else { return }
+        trips[i] = trip
+        save()
+    }
+
+    /// Add a leg and give it sensible starting numbers, because a screen
+    /// of zeroes teaches you nothing and a rough total you can correct is
+    /// worth far more than a blank form you never fill in.
+    @discardableResult
+    func addLeg(to tripID: UUID, place: String, nights: Int = 3,
+                arrival: Arrival = .flight) -> Leg? {
+        guard let i = trips.firstIndex(where: { $0.id == tripID }) else { return nil }
+        var leg = Leg(place: place, nights: max(1, nights))
+        leg.arrival = arrival
+        leg.arrivalCost = arrival.typicalAUD * Double(trips[i].party)
+        leg.nightlyRate = 90
+        leg.foodPerDay = 45
+        leg.groundPerDay = 15
+        // Start where the last leg finished, so the dates chain themselves.
+        leg.arrive = trips[i].legs.last?.depart ?? Date().addingTimeInterval(30 * 86400)
+        trips[i].legs.append(leg)
+        save()
+        Task { @MainActor in
+            await self.locate(legID: leg.id, in: tripID)
+            self.stampCurrencies(tripID)
+            // BUILD 182: a trip built by hand deserves the same countdowns
+            // as one built by the planner. This was armed only on the AI
+            // path, so "add five nights in Ubud" produced a trip with no
+            // passport check, no visa lead time and no flight watch.
+            self.wireUp(tripID)
+        }
+        return leg
+    }
+
+    func removeLeg(_ legID: UUID, from tripID: UUID) {
+        guard let i = trips.firstIndex(where: { $0.id == tripID }) else { return }
+        trips[i].legs.removeAll { $0.id == legID }
+        rechainDates(tripIndex: i)
+        save()
+        wireUp(tripID)   // BUILD 182: dates moved, so the countdowns must too
+    }
+
+    func moveLeg(from source: IndexSet, to dest: Int, in tripID: UUID) {
+        guard let i = trips.firstIndex(where: { $0.id == tripID }) else { return }
+        trips[i].legs.move(fromOffsets: source, toOffset: dest)
+        rechainDates(tripIndex: i)
+        save()
+    }
+
+    /// Legs run back to back. Change the nights in Ubud and everything
+    /// after it shifts — which is what actually happens on a trip, and
+    /// having to re-type six dates by hand is why people stop using
+    /// planners after the second leg.
+    private func rechainDates(tripIndex i: Int) {
+        guard !trips[i].legs.isEmpty else { return }
+        var cursor = trips[i].legs[0].arrive
+        for j in trips[i].legs.indices {
+            trips[i].legs[j].arrive = cursor
+            cursor = trips[i].legs[j].depart
+        }
+    }
+
+    func rechain(_ tripID: UUID) {
+        guard let i = trips.firstIndex(where: { $0.id == tripID }) else { return }
+        rechainDates(tripIndex: i)
+        save()
+    }
+
+    /// Put a leg on the map. Free, keyless, on-device geocoder.
+    func locate(legID: UUID, in tripID: UUID) async {
+        guard let ti = trips.firstIndex(where: { $0.id == tripID }),
+              let li = trips[ti].legs.firstIndex(where: { $0.id == legID }),
+              !trips[ti].legs[li].hasCoord else { return }
+        let query = trips[ti].legs[li].place
+        guard !query.isEmpty else { return }
+        let marks = try? await CLGeocoder().geocodeAddressString(query)
+        guard let m = marks?.first, let loc = m.location else { return }
+        guard let ti2 = trips.firstIndex(where: { $0.id == tripID }),
+              let li2 = trips[ti2].legs.firstIndex(where: { $0.id == legID }) else { return }
+        trips[ti2].legs[li2].lat = loc.coordinate.latitude
+        trips[ti2].legs[li2].lon = loc.coordinate.longitude
+        if let c = m.country { trips[ti2].legs[li2].country = c }
+        save()
+    }
+}
+
+// MARK: - Chappy Travel: the money
+
+extension ChappyTravel {
+
+    /// The whole trip, in the home currency, computed fresh every time.
+    ///
+    /// The convention matters and is stated once here so the UI and the
+    /// report can't drift apart: arrivalCost, nightlyRate and
+    /// activitiesTotal are for the WHOLE PARTY. foodPerDay and
+    /// groundPerDay are PER PERSON PER DAY, because that is how anyone
+    /// actually estimates them ("forty a day for food") and multiplying
+    /// in your head is where the mistake gets made.
+    func cost(_ trip: Trip) -> Costing {
+        var c = Costing()
+        let heads = Double(max(1, trip.party))
+        let fx = ChappyFX.shared
+        // BUILD 182: every `?? raw` below is a SILENT failure — a missing
+        // rate means a rupiah figure gets added to a dollar total and
+        // reported as dollars. That wrong number is then spoken and put in
+        // the morning brief, where he cannot sanity-check it. Record when
+        // it happens so the UI and the report can say so.
+        var unconverted = false
+
+        for leg in trip.legs {
+            let nights = Double(max(0, leg.nights))
+            let days = max(1, nights)
+
+            // A leg priced in local money is converted; a blank currency
+            // means it was already entered in the trip's own currency.
+            let legCur = leg.stayCurrency.isEmpty ? trip.homeCurrency : leg.stayCurrency
+            let stayConv = fx.convert(leg.nightlyRate * nights, from: legCur, to: trip.homeCurrency)
+            if stayConv == nil, legCur != trip.homeCurrency { unconverted = true }
+            let stay = stayConv ?? (leg.nightlyRate * nights)
+
+            // BUILD 181: food, ground and the scooter are quoted in the
+            // leg's own money too, so they get converted exactly like the
+            // room does. Adding rupiah to dollars was the bug waiting to
+            // happen the moment local pricing arrived.
+            let food = fx.convert(leg.foodPerDay * days * heads, from: legCur, to: trip.homeCurrency)
+                ?? (leg.foodPerDay * days * heads)
+            let ground = fx.convert(leg.groundPerDay * days * heads, from: legCur, to: trip.homeCurrency)
+                ?? (leg.groundPerDay * days * heads)
+            let acts = fx.convert(leg.activitiesTotal, from: legCur, to: trip.homeCurrency)
+                ?? leg.activitiesTotal
+            // A scooter is hired per DAY for the trip, not per person — two
+            // people on one bike is the normal case, so it scales with
+            // riders rather than heads.
+            var scoot = 0.0
+            if let perDay = leg.scooterPerDay, perDay > 0 {
+                let bikes = Double(max(1, Int(ceil(heads / 2))))
+                scoot = fx.convert(perDay * days * bikes, from: legCur, to: trip.homeCurrency)
+                    ?? (perDay * days * bikes)
+            }
+
+            c.arrival    += leg.arrivalCost
+            c.stay       += stay
+            c.food       += food
+            c.ground     += ground + scoot
+            c.activities += acts
+        }
+
+        for e in trip.extras {
+            c.extras += e.perPerson ? e.amount * heads : e.amount
+        }
+
+        c.buffer = c.subtotal * max(0, trip.bufferPct) / 100
+        c.perPerson = c.total / heads
+        c.perDay = c.total / Double(max(1, trip.days))
+        c.hasUnconverted = unconverted
+        if unconverted {
+            // AUDIT: this fired a FORCED refresh, and cost() is called during
+            // view construction — so offline, every single re-render of the
+            // Travel Desk launched another pair of network requests, without
+            // limit. The un-forced call respects the twelve-hour throttle and
+            // is a no-op once rates are in.
+            print("\u{26A0}\u{FE0F} [Travel] No FX rate - some figures are still in local money")
+            Task { await ChappyFX.shared.refresh() }
+        }
+        return c
+    }
+
+    /// The one-line answer to "what's this trip costing me".
+    func spokenCost(_ trip: Trip) -> String {
+        let c = cost(trip)
+        let cur = trip.homeCurrency
+        guard c.total > 0 else {
+            return "\(trip.name) has no numbers in it yet. Add a leg and I'll price it."
+        }
+        var line = "\(trip.name): about \(ChappyFX.money(c.total, cur)) all up"
+        if trip.party > 1 {
+            line += ", which is \(ChappyFX.money(c.perPerson, cur)) each"
+        }
+        line += ". That's \(trip.nights) nights across \(trip.legs.count) "
+        line += trip.legs.count == 1 ? "place" : "places"
+        line += ", around \(ChappyFX.money(c.perDay, cur)) a day."
+        if c.buffer > 0 {
+            line += " There's \(ChappyFX.money(c.buffer, cur)) of buffer in that."
+        }
+        return line
+    }
+
+    /// The breakdown, spoken. Biggest line first, because that's the one
+    /// worth arguing with.
+    func spokenBreakdown(_ trip: Trip) -> String {
+        let c = cost(trip)
+        let cur = trip.homeCurrency
+        let sorted = c.lines.sorted { $0.amount > $1.amount }
+        guard !sorted.isEmpty else { return "Nothing costed yet." }
+        let parts = sorted.prefix(4).map { "\($0.label.lowercased()) \(ChappyFX.money($0.amount, cur))" }
+        return "Biggest first: " + parts.joined(separator: ", ")
+            + ". Total \(ChappyFX.money(c.total, cur))."
+    }
+
+    /// "How many nights in Ubud" / "what's the plan".
+    func spokenItinerary(_ trip: Trip) -> String {
+        guard !trip.legs.isEmpty else { return "\(trip.name) has no legs yet. Say: add five nights in Ubud." }
+        let f = DateFormatter(); f.dateFormat = "d MMMM"
+        let parts = trip.legs.map { leg in
+            "\(leg.nights) \(leg.nights == 1 ? "night" : "nights") in \(leg.place) from \(f.string(from: leg.arrive))"
+        }
+        return "\(trip.name): " + parts.joined(separator: ", then ") + "."
+    }
+}
+
+// MARK: - Chappy Travel: the handoff
+
+extension ChappyTravel {
+
+    enum Booking: String, CaseIterable, Identifiable {
+        case airbnb, booking, agoda, tripcom, hostelworld, traveloka
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .airbnb:      return "Airbnb"
+            case .booking:     return "Booking.com"
+            case .agoda:       return "Agoda"
+            case .tripcom:     return "Trip.com"
+            case .hostelworld: return "Hostelworld"
+            case .traveloka:   return "Traveloka"
+            }
+        }
+        /// Which ones are worth showing where. Traveloka and Agoda are the
+        /// ones locals actually use across Indonesia, Thailand and Vietnam
+        /// and they routinely undercut the western sites on the same room.
+        var asiaFirst: Bool {
+            self == .agoda || self == .traveloka || self == .tripcom
+        }
+    }
+
+    enum Ground: String, CaseIterable, Identifiable {
+        case rome2rio, twelvego, grab, gojek, uber, klook
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .rome2rio: return "Every way there"
+            case .twelvego: return "Buses, trains, ferries"
+            case .grab:     return "Grab"
+            case .gojek:    return "Gojek"
+            case .uber:     return "Uber"
+            case .klook:    return "Tours & tickets"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .rome2rio: return "arrow.triangle.swap"
+            case .twelvego: return "tram.fill"
+            case .grab:     return "car.circle.fill"
+            case .gojek:    return "scooter"
+            case .uber:     return "car.fill"
+            case .klook:    return "ticket.fill"
+            }
+        }
+    }
+
+    /// BUILD 179: also used by the Google links below.
+    fileprivate static func enc(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+    }
+
+    private static func ymd(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: d)
+    }
+
+    /// A search URL with the dates, the place and the party already in it.
+    ///
+    /// Deliberately plain https, never a custom URL scheme. iOS treats
+    /// these as universal links: if the app is installed it opens the app
+    /// on the right screen, and if it isn't you get the site. That means
+    /// no LSApplicationQueriesSchemes entry, no plist edit, and nothing
+    /// that can quietly stop working when a vendor renames a scheme.
+    func bookingURL(_ site: Booking, leg: Leg, trip: Trip) -> URL? {
+        let place = Self.enc(leg.place)
+        let inD = Self.ymd(leg.arrive)
+        let outD = Self.ymd(leg.depart)
+        let adults = max(1, trip.party)
+        let s: String
+        switch site {
+        case .airbnb:
+            s = "https://www.airbnb.com/s/\(place)/homes?checkin=\(inD)&checkout=\(outD)&adults=\(adults)"
+        case .booking:
+            s = "https://www.booking.com/searchresults.html?ss=\(place)&checkin=\(inD)&checkout=\(outD)&group_adults=\(adults)&no_rooms=1"
+        case .agoda:
+            s = "https://www.agoda.com/search?text=\(place)&checkIn=\(inD)&los=\(max(1, leg.nights))&adults=\(adults)"
+        case .tripcom:
+            s = "https://www.trip.com/hotels/list?keyword=\(place)&checkin=\(inD)&checkout=\(outD)&adult=\(adults)"
+        case .hostelworld:
+            s = "https://www.hostelworld.com/search?search_keywords=\(place)&date_from=\(inD)&date_to=\(outD)&number_of_guests=\(adults)"
+        case .traveloka:
+            s = "https://www.traveloka.com/en-en/hotel/search?spec=\(inD).\(max(1, leg.nights)).1.\(adults)&geoName=\(place)"
+        }
+        return URL(string: s)
+    }
+
+    /// Getting from the previous leg to this one, by whatever moves.
+    /// Rome2Rio is the honest one here: it answers "bus, train, ferry,
+    /// flight or drive" for anywhere on earth in one page, which is the
+    /// actual question when you're deciding how to get from Ubud to
+    /// Amed. 12Go is the one that then SELLS you the South-East Asian
+    /// bus, train and ferry ticket.
+    func groundURL(_ svc: Ground, leg: Leg, from previous: Leg?, trip: Trip) -> URL? {
+        let to = Self.enc(leg.place)
+        let from = Self.enc(previous?.place ?? "")
+        let s: String
+        switch svc {
+        case .rome2rio:
+            s = previous == nil
+                ? "https://www.rome2rio.com/s/\(to)"
+                : "https://www.rome2rio.com/s/\(from)/\(to)"
+        case .twelvego:
+            s = previous == nil
+                ? "https://12go.asia/en/travel/\(to)"
+                : "https://12go.asia/en/travel/\(from)/\(to)"
+        case .grab:
+            s = "https://www.grab.com/"
+        case .gojek:
+            s = "https://www.gojek.com/"
+        case .uber:
+            s = "https://m.uber.com/looking?dropoff[formatted_address]=\(to)"
+        case .klook:
+            s = "https://www.klook.com/search/?query=\(to)"
+        }
+        return URL(string: s)
+    }
+
+    /// Flights for a leg — routed through the search that actually shows
+    /// a whole month at once, because "when is it cheapest" beats "what
+    /// does it cost on the 14th" when the dates are still soft.
+    func flightSearchURL(leg: Leg, from previous: Leg?, trip: Trip) -> URL? {
+        let to = Self.enc(leg.place)
+        let from = Self.enc(previous?.place ?? "")
+        let d = Self.ymd(leg.arrive)
+        let s = previous == nil
+            ? "https://www.google.com/travel/flights?q=\(Self.enc("flights to \(leg.place) on \(d)"))"
+            : "https://www.google.com/travel/flights?q=\(Self.enc("flights from \(previous?.place ?? "") to \(leg.place) on \(d)"))"
+        _ = from
+        _ = to
+        return URL(string: s)
+    }
+
+    @discardableResult
+    func open(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        return true
+    }
+}
+
+// =====================================================================
+// BUILD 177 — WHAT IT'S ACTUALLY LIKE THERE, THEN.
+//
+// The Weather Station answers "what is it doing now" and "what will it
+// do this week". Planning asks a completely different question: "what
+// is Ubud like in September" — and a seven-day forecast cannot answer
+// that for a trip four months out. Pretending it can is worse than
+// saying nothing.
+//
+// Open-Meteo's ARCHIVE is free, keyless and unlimited for this: pull the
+// same calendar month from the last three years and average it. Three
+// years is enough to see the pattern and few enough calls to be instant.
+// The honest label matters — it says "based on the last three years",
+// never "the forecast".
+// =====================================================================
+
+@MainActor
+final class ChappySeason: ObservableObject {
+    static let shared = ChappySeason()
+
+    struct Normals {
+        var maxC = 0.0
+        var minC = 0.0
+        var rainMmPerDay = 0.0
+        var wetDays = 0          // days in the month with over 1mm
+        var totalDays = 0
+        var years: [Int] = []
+
+        var wetShare: Double { totalDays > 0 ? Double(wetDays) / Double(totalDays) : 0 }
+
+        /// The sentence a person actually wants.
+        var verdict: String {
+            let share = wetShare
+            if share >= 0.65 { return "properly wet - expect rain most days" }
+            if share >= 0.40 { return "showery - rain about every other day" }
+            if share >= 0.20 { return "the odd shower, mostly fine" }
+            return "dry"
+        }
+    }
+
+    @Published private(set) var cache: [String: Normals] = [:]
+    @Published private(set) var loading: Set<String> = []
+
+    private func key(_ lat: Double, _ lon: Double, _ month: Int) -> String {
+        String(format: "%.2f_%.2f_%02d", lat, lon, month)
+    }
+
+    func normals(lat: Double, lon: Double, month: Int) -> Normals? {
+        cache[key(lat, lon, month)]
+    }
+
+    /// Fetch three years of the same month. Silent on failure — a missing
+    /// climate line just doesn't render; it never blocks the trip.
+    func load(lat: Double, lon: Double, month: Int) async {
+        let k = key(lat, lon, month)
+        guard cache[k] == nil, !loading.contains(k), lat != 0 || lon != 0 else { return }
+        loading.insert(k)
+        defer { loading.remove(k) }
+
+        let cal = Calendar(identifier: .gregorian)
+        let thisYear = cal.component(.year, from: Date())
+        var maxes: [Double] = [], mins: [Double] = [], rains: [Double] = []
+        var wet = 0, total = 0, used: [Int] = []
+
+        for back in 1...3 {
+            let y = thisYear - back
+            var comps = DateComponents(); comps.year = y; comps.month = month; comps.day = 1
+            guard let first = cal.date(from: comps),
+                  let range = cal.range(of: .day, in: .month, for: first),
+                  let last = cal.date(bySetting: .day, value: range.count, of: first)
+            else { continue }
+            let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX")
+            let s = "https://archive-api.open-meteo.com/v1/archive?latitude=\(lat)&longitude=\(lon)"
+                + "&start_date=\(f.string(from: first))&end_date=\(f.string(from: last))"
+                + "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto"
+            guard let url = URL(string: s) else { continue }
+            var req = URLRequest(url: url); req.timeoutInterval = 20
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let daily = json["daily"] as? [String: Any]
+            else { continue }
+            let hi = (daily["temperature_2m_max"] as? [Double?])?.compactMap { $0 } ?? []
+            let lo = (daily["temperature_2m_min"] as? [Double?])?.compactMap { $0 } ?? []
+            let pr = (daily["precipitation_sum"] as? [Double?])?.compactMap { $0 } ?? []
+            guard !hi.isEmpty else { continue }
+            maxes += hi; mins += lo; rains += pr
+            wet += pr.filter { $0 > 1.0 }.count
+            total += pr.count
+            used.append(y)
+        }
+
+        guard !maxes.isEmpty else { return }
+        var n = Normals()
+        n.maxC = maxes.reduce(0, +) / Double(maxes.count)
+        n.minC = mins.isEmpty ? 0 : mins.reduce(0, +) / Double(mins.count)
+        n.rainMmPerDay = rains.isEmpty ? 0 : rains.reduce(0, +) / Double(rains.count)
+        n.wetDays = wet
+        n.totalDays = total
+        n.years = used
+        cache[k] = n
+    }
+
+    /// Spoken, for "what's the weather like in Bali in September".
+    func spoken(place: String, month: Int, n: Normals) -> String {
+        let f = DateFormatter()
+        let name = f.monthSymbols[max(0, min(11, month - 1))]
+        return "\(place) in \(name) averages \(Int(n.maxC.rounded())) degrees by day and "
+            + "\(Int(n.minC.rounded())) overnight, and it's \(n.verdict). "
+            + "That's from the last three years, not a forecast."
+    }
+}
+
+// =====================================================================
+// BUILD 177 — CHAPPY PLACES. Where to eat, what to see.
+//
+// TripAdvisor's Content API is the one open door in travel: 5,000 calls
+// a month free, sign up yourself in five minutes, no company and no
+// partnership. It gives real places with real ratings and review counts
+// — which is the whole point, because a list of restaurants without
+// ratings is just a phone book.
+//
+// But the module must not be USELESS until he signs up, so with no key
+// it falls back to MKLocalSearch, which is free, keyless, on-device and
+// already used elsewhere in Chappy. You lose the ratings, you keep the
+// places. Every screen says which source it used rather than quietly
+// showing a thinner list.
+//
+// Attribution is a condition of the TripAdvisor licence, so anything
+// sourced from them is labelled as theirs, in the app and in the report.
+// =====================================================================
+
+@MainActor
+final class ChappyPlaces: ObservableObject {
+    static let shared = ChappyPlaces()
+
+    /// Bumped on every search so a superseded request knows to keep its
+    /// hands off the published state when it finally lands.
+    private var searchToken: UInt64 = 0
+
+    enum Kind: String, CaseIterable, Identifiable {
+        // BUILD 183: three categories was a restaurant finder. These are the
+        // things a traveller actually hunts for, and the ones Google covers
+        // far better than Tripadvisor does — a warung, a gym and an ice bath
+        // are simply not in Tripadvisor's world.
+        case restaurants, cheapEats, attractions, hotels
+        case massage, recovery, gyms, beachClubs, dive
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .restaurants: return "Eat"
+            case .cheapEats:   return "Cheap eats"
+            case .attractions: return "See & do"
+            case .hotels:      return "Stay"
+            case .massage:     return "Massage & spa"
+            case .recovery:    return "Recovery"
+            case .gyms:        return "Gyms & training"
+            case .beachClubs:  return "Beach clubs"
+            case .dive:        return "Diving"
+            }
+        }
+        /// The categories worth showing per leg, in the order they matter.
+        static var bestOf: [Kind] {
+            [.restaurants, .cheapEats, .massage, .recovery, .gyms, .beachClubs, .attractions, .dive]
+        }
+        /// What to actually ask Google. Written the way a person searches,
+        /// because Places text search is a language model, not a taxonomy.
+        var googleQuery: String {
+            switch self {
+            case .restaurants: return "best restaurants"
+            case .cheapEats:   return "cheap local food warung street food"
+            case .attractions: return "top attractions and things to do"
+            case .hotels:      return "hotels"
+            case .massage:     return "massage and spa"
+            case .recovery:    return "ice bath sauna recovery physio stretch"
+            case .gyms:        return "gym fitness yoga muay thai"
+            case .beachClubs:  return "beach club"
+            case .dive:        return "dive shop scuba diving"
+            }
+        }
+        var icon2: String {
+            switch self {
+            case .restaurants: return "fork.knife"
+            case .cheapEats:   return "takeoutbag.and.cup.and.straw.fill"
+            case .attractions: return "camera.fill"
+            case .hotels:      return "bed.double.fill"
+            case .massage:     return "hands.sparkles.fill"
+            case .recovery:    return "snowflake"
+            case .gyms:        return "figure.strengthtraining.traditional"
+            case .beachClubs:  return "beach.umbrella.fill"
+            case .dive:        return "water.waves"
+            }
+        }
+        var icon: String { icon2 }
+        /// Tripadvisor only knows four categories. Anything else maps to the
+        /// closest thing it has, and the Google result is what carries that
+        /// row — which is precisely why both sources exist.
+        var taCategory: String {
+            switch self {
+            case .restaurants, .cheapEats: return "restaurants"
+            case .hotels:                  return "hotels"
+            default:                       return "attractions"
+            }
+        }
+        var appleQuery: String {
+            switch self {
+            case .restaurants: return "restaurants"
+            case .cheapEats:   return "local food"
+            case .attractions: return "attractions landmarks"
+            case .hotels:      return "hotels"
+            case .massage:     return "massage spa"
+            case .recovery:    return "sauna recovery"
+            case .gyms:        return "gym fitness"
+            case .beachClubs:  return "beach club"
+            case .dive:        return "dive shop"
+            }
+        }
+    }
+
+    struct Spot: Identifiable, Hashable {
+        var id: String
+        var name: String
+        var kind: Kind
+        var rating: Double?          // Tripadvisor, nil when Apple supplied it
+        var reviews: Int?
+        var address: String = ""
+        var lat: Double = 0
+        var lon: Double = 0
+        var fromTripAdvisor = false
+
+        // BUILD 183 — THE SECOND OPINION.
+        var googleID: String?
+        var googleRating: Double?
+        var googleCount: Int?
+        var googleURL: String?
+        var priceLevel: String = ""
+        var openNow: Bool?
+
+        var hasBoth: Bool { rating != nil && googleRating != nil }
+
+        /// A place at 4.7 on Google and 3.9 on Tripadvisor is loved by
+        /// locals and disappointing to travellers. Reversed, it is a
+        /// tourist trap the locals ignore. Neither number says that on its
+        /// own, and half a star of noise is not a signal — the gap has to
+        /// be big enough to mean something.
+        var divergence: Double? {
+            guard let g = googleRating, let t = rating else { return nil }
+            return g - t
+        }
+
+        var divergenceNote: String? {
+            guard let d = divergence, abs(d) >= 0.6 else { return nil }
+            return d > 0
+                ? "Locals rate it higher than travellers do"
+                : "Travellers rate it higher than locals do"
+        }
+
+        /// Rating weighted by how many people actually rated it. A 5.0 from
+        /// eleven people is not better than a 4.6 from six thousand, and
+        /// sorting by raw stars puts every new place with three reviews on
+        /// top of everything worth eating at.
+        var confidenceScore: Double {
+            var best = 0.0, weight = 0.0
+            if let g = googleRating, let n = googleCount {
+                let w = min(1.0, log10(Double(max(1, n))) / 3.5)
+                best += g * w; weight += w
+            }
+            if let t = rating {
+                let n = reviews ?? 0
+                let w = min(1.0, log10(Double(max(1, n))) / 3.0)
+                best += t * w; weight += w
+            }
+            return weight > 0 ? best / weight : 0
+        }
+
+        var ratingLine: String? {
+            var bits: [String] = []
+            if let g = googleRating {
+                var b = "G " + String(format: "%.1f", g)
+                if let n = googleCount, n > 0 { b += " (\(n.formatted()))" }
+                bits.append(b)
+            }
+            if let t = rating {
+                var b = "TA " + String(format: "%.1f", t)
+                if let n = reviews, n > 0 { b += " (\(n.formatted()))" }
+                bits.append(b)
+            }
+            guard !bits.isEmpty else { return nil }
+            if !priceLevel.isEmpty { bits.append(priceLevel) }
+            return bits.joined(separator: "  ·  ")
+        }
+    }
+
+    @Published private(set) var results: [Spot] = []
+    @Published private(set) var loading = false
+    @Published private(set) var sourceNote = ""
+    @Published private(set) var error: String?
+
+    var hasTripAdvisorKey: Bool {
+        !(UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? "").isEmpty
+    }
+
+    private var taKey: String {
+        UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? ""
+    }
+
+    /// Search around a leg. TripAdvisor if a key is set, Apple otherwise.
+    /// BUILD 183 — BOTH OPINIONS, LIVE.
+    ///
+    /// This used to be Tripadvisor-or-Apple, first one to answer wins.
+    /// The problem with one source is not accuracy, it is coverage and
+    /// blind spots: Tripadvisor is excellent on restaurants a traveller
+    /// would find and has essentially never heard of the gym, the ice
+    /// bath, the dive shop or the warung down the lane. Google has all
+    /// of those and rates them by who actually goes.
+    ///
+    /// So both, merged on the name, ranked by rating weighted by review
+    /// count — and where the two disagree by more than half a star, the
+    /// row says so, because THAT is the most useful thing on the screen.
+    /// A 4.7 on Google and a 3.9 on Tripadvisor is a place locals love
+    /// and travellers don't; reversed, it is a tourist trap. Neither
+    /// number tells you that alone.
+    ///
+    /// In-app only. This never reaches the emailed report — see
+    /// reportBestOf for why that is a licence requirement, not taste.
+    /// AUDIT: the chip row made switching category one tap apart, and this
+    /// was not reentrancy-aware. A superseded request still ran to
+    /// completion against the shared singleton: it wrote an empty result,
+    /// set "Nothing found", and its defer cleared `loading` that the NEW
+    /// request had just set. The screen said nothing was there while the
+    /// thing it was looking for was still in flight.
+    func search(near lat: Double, lon: Double, place: String, kind: Kind) async {
+        searchToken &+= 1
+        let token = searchToken
+        loading = true
+        error = nil
+        defer { if token == searchToken { loading = false } }
+
+        let merged = await bestOf(kind, place: place, lat: lat, lon: lon, limit: 14)
+        guard token == searchToken else { return }
+        results = merged.spots
+        if results.isEmpty {
+            error = "Nothing found around \(place)."
+            sourceNote = hasTripAdvisorKey || ChappyGooglePlaces.shared.isConfigured
+                ? "Nothing came back for this one."
+                : "Apple Maps only. Add a free Tripadvisor key in Settings for ratings and reviews."
+            return
+        }
+
+        var note = "From \(merged.source)"
+        // AUDIT: ChappyGooglePlaces set an error for a refused key, a
+        // disabled Places API and an exhausted quota — and NOTHING read it.
+        // A bad key produced a quietly thinner list and no explanation,
+        // which is the exact failure the meter was added to prevent.
+        if let ge = ChappyGooglePlaces.shared.error, !ge.isEmpty {
+            note += " · " + ge
+        }
+        if ChappyGooglePlaces.shared.isConfigured {
+            note += " · \(ChappyGooglePlaces.shared.meterLine)"
+        } else if hasTripAdvisorKey {
+            note += ". Add a Google Maps key in Settings for the second opinion."
+        } else {
+            note += ". Add a free Tripadvisor key in Settings for ratings and reviews."
+        }
+        sourceNote = note
+    }
+
+    // MARK: TripAdvisor Content API
+
+    private func tripAdvisor(lat: Double, lon: Double, place: String, kind: Kind) async -> [Spot]? {
+        let key = taKey
+        guard !key.isEmpty else { return nil }
+        let latLon = (lat != 0 || lon != 0) ? "&latLong=\(lat)%2C\(lon)" : ""
+        let q = place.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? place
+        let s = "https://api.content.tripadvisor.com/api/v1/location/search?key=\(key)"
+            + "&searchQuery=\(q)&category=\(kind.taCategory)\(latLon)&language=en"
+        guard let url = URL(string: s) else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "accept")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return nil }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            error = code == 401 || code == 403
+                ? "Tripadvisor refused the key — check it in Settings."
+                : "Tripadvisor returned \(code)."
+            return nil
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = json["data"] as? [[String: Any]] else { return nil }
+        return arr.compactMap { row in
+            guard let id = row["location_id"] as? String,
+                  let name = row["name"] as? String else { return nil }
+            var s = Spot(id: id, name: name, kind: kind)
+            s.fromTripAdvisor = true
+            if let addr = row["address_obj"] as? [String: Any] {
+                s.address = (addr["address_string"] as? String) ?? ""
+            }
+            if let r = row["rating"] as? Double { s.rating = r }
+            else if let rs = row["rating"] as? String { s.rating = Double(rs) }
+            if let n = row["num_reviews"] as? Int { s.reviews = n }
+            else if let ns = row["num_reviews"] as? String { s.reviews = Int(ns) }
+            // AUDIT: these were never read. Tripadvisor sends them as
+            // strings, every spot sat at 0,0, and legMap drops a spot with
+            // no coordinate — so build 183's map pins drew nothing. The
+            // feature looked built and rendered an empty map.
+            if let la = row["latitude"] as? Double { s.lat = la }
+            else if let ls = row["latitude"] as? String, let la = Double(ls) { s.lat = la }
+            if let lo = row["longitude"] as? Double { s.lon = lo }
+            else if let os = row["longitude"] as? String, let lo = Double(os) { s.lon = lo }
+            return s
+        }
+    }
+
+    // MARK: Apple fallback — free, keyless, already in the app
+
+    private func apple(lat: Double, lon: Double, place: String, kind: Kind) async -> [Spot] {
+        let req = MKLocalSearch.Request()
+        req.naturalLanguageQuery = "\(kind.appleQuery) in \(place)"
+        if lat != 0 || lon != 0 {
+            req.region = MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                latitudinalMeters: 20000, longitudinalMeters: 20000)
+        }
+        guard let resp = try? await MKLocalSearch(request: req).start() else { return [] }
+        return resp.mapItems.prefix(25).compactMap { item in
+            guard let name = item.name else { return nil }
+            var s = Spot(id: name + String(item.placemark.coordinate.latitude), name: name, kind: kind)
+            s.lat = item.placemark.coordinate.latitude
+            s.lon = item.placemark.coordinate.longitude
+            s.address = [item.placemark.thoroughfare, item.placemark.locality]
+                .compactMap { $0 }.joined(separator: ", ")
+            return s
+        }
+    }
+
+    /// Spoken shortlist — the top few, with ratings when we have them.
+    func spokenTop(_ n: Int = 3) -> String {
+        guard !results.isEmpty else { return "Nothing found there yet." }
+        let top = results.prefix(n).map { s -> String in
+            if let r = s.rating { return "\(s.name), \(String(format: "%.1f", r)) stars" }
+            return s.name
+        }
+        return top.joined(separator: "; ") + "."
+    }
+}
+
+// =====================================================================
+// BUILD 177 — CHAPPY SEARCH. The web, from standby.
+//
+// Chappy could already search the web three separate ways, and not one
+// of them was reachable with the phone in a pocket:
+//   * Live AI runs with Google Search grounding switched on — but only
+//     inside a live session you have to start first.
+//   * Quick Vision carries web search, capped at two uses — but only
+//     attached to a photo.
+//   * deep_research reaches the Claude brain — but only when the LIVE
+//     model decides to call it.
+//
+// So "Chappy, look up whether the ferry runs on Sundays" did nothing at
+// all. The capability was there; the door wasn't. This is the door.
+//
+// Same brain as deep_research, same daily cap, and it keeps the SOURCES
+// — spoken answers are worthless if you can't check them, and a travel
+// answer you can't verify is one you shouldn't act on.
+// =====================================================================
+
+@MainActor
+final class ChappySearch: ObservableObject {
+    static let shared = ChappySearch()
+
+    struct Source: Identifiable, Hashable {
+        var id: String { url }
+        var title: String
+        var url: String
+        var host: String {
+            URL(string: url)?.host?.replacingOccurrences(of: "www.", with: "") ?? url
+        }
+    }
+
+    struct Answer: Identifiable {
+        var id = UUID()
+        var question: String
+        var text: String
+        var sources: [Source]
+        var at: Date = Date()
+    }
+
+    @Published private(set) var history: [Answer] = []
+    @Published private(set) var busy = false
+    @Published private(set) var error: String?
+    @Published var lastQuestion = ""
+
+    private init() {}
+
+    /// The same per-day cap deep_research uses, and the same counter, so
+    /// a talkative afternoon can't be billed twice through two doors.
+    private var usedToday: Int {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        return UserDefaults.standard.integer(forKey: "chappy_research_" + f.string(from: Date()))
+    }
+
+    private func spend() {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let k = "chappy_research_" + f.string(from: Date())
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: k) + 1, forKey: k)
+    }
+
+    var remainingToday: Int { max(0, 15 - usedToday) }
+
+    /// Ask the web. Returns a speakable answer; sources land in `history`.
+    @discardableResult
+    func ask(_ question: String, speak: Bool = true) async -> String {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return "Look up what?" }
+        guard usedToday < 15 else {
+            let line = "That's fifteen web look-ups today, which is my daily limit. I can still answer from what I know, or ask again tomorrow."
+            if speak { TTSService.shared.speak(line) }
+            return line
+        }
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            let line = "No research key is set, so I can't reach the web from here."
+            if speak { TTSService.shared.speak(line) }
+            return line
+        }
+
+        busy = true
+        lastQuestion = q
+        error = nil
+        defer { busy = false }
+        spend()
+        CostMeter.shared.addResearch()
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 90
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": 1200,
+            "system": "You are Chappy's web look-up. Context: \(ContextEngine.shared.contextHeader()) "
+                + "Answer in plain SPOKEN sentences - no markdown, no bullet points, no headings, under 150 words. "
+                + "Lead with the answer. Use web search for anything current: prices, opening hours, whether "
+                + "something still runs, visa rules, what's on. If sources disagree, say so.",
+            "messages": [["role": "user", "content": q]],
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 4]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]]
+        else {
+            let line = "The look-up didn't come back this time."
+            error = line
+            if speak { TTSService.shared.speak(line) }
+            return line
+        }
+
+        var text = ""
+        var sources: [Source] = []
+        for block in content {
+            let type = block["type"] as? String
+            if type == "text", let t = block["text"] as? String {
+                text += t
+                // Citations ride along with the text blocks.
+                if let cites = block["citations"] as? [[String: Any]] {
+                    for c in cites {
+                        guard let u = c["url"] as? String else { continue }
+                        let t = (c["title"] as? String) ?? u
+                        if !sources.contains(where: { $0.url == u }) {
+                            sources.append(Source(title: t, url: u))
+                        }
+                    }
+                }
+            } else if type == "web_search_tool_result",
+                      let rows = block["content"] as? [[String: Any]] {
+                for r in rows {
+                    guard let u = r["url"] as? String else { continue }
+                    let t = (r["title"] as? String) ?? u
+                    if !sources.contains(where: { $0.url == u }) {
+                        sources.append(Source(title: t, url: u))
+                    }
+                }
+            }
+        }
+
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            let line = "That came back empty - try asking it a different way."
+            error = line
+            if speak { TTSService.shared.speak(line) }
+            return line
+        }
+
+        history.insert(Answer(question: q, text: clean, sources: sources), at: 0)
+        if history.count > 40 { history.removeLast(history.count - 40) }
+        if speak { TTSService.shared.speakLong(clean) }
+        return clean
+    }
+
+    /// Pull the actual question out of "chappy look up whether..." so the
+    /// brain isn't handed the command words as part of the query.
+    static func questionIn(_ raw: String) -> String? {
+        let c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let leads = ["look up", "search the web for", "search the web", "search for",
+                     "google", "web search", "look this up", "find out",
+                     "what does the internet say about", "research"]
+        // AUDIT: this searched a LOWERCASED copy and then used the index it
+        // got back to slice the ORIGINAL. String indices are not portable
+        // between strings — with any character whose lowercase form is a
+        // different byte length the slice is wrong, and past the end it is
+        // a hard crash. Search the real string, case-insensitively.
+        for lead in leads.sorted(by: { $0.count > $1.count }) {
+            if let r = c.range(of: lead, options: .caseInsensitive) {
+                let tail = String(c[r.upperBound...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,:-\u{2014}"))
+                return tail.isEmpty ? nil : tail
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Chappy Travel: the report
+
+extension ChappyTravel {
+
+    /// A real document: itinerary, costs, weather and live booking links,
+    /// as one self-contained HTML file with nothing loaded from the net.
+    /// It opens on any phone or laptop, prints, and survives being
+    /// forwarded to whoever you're travelling with.
+    func reportHTML(_ trip: Trip) -> String {
+        let c = cost(trip)
+        let cur = trip.homeCurrency
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM yyyy"
+        let esc: (String) -> String = { s in
+            s.replacingOccurrences(of: "&", with: "&amp;")
+             .replacingOccurrences(of: "<", with: "&lt;")
+             .replacingOccurrences(of: ">", with: "&gt;")
+        }
+
+        var h = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>\(esc(trip.name))</title><style>
+        *{box-sizing:border-box}
+        body{margin:0;padding:28px 20px;font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+             color:#12181f;background:#f4f6f8;-webkit-text-size-adjust:100%}
+        .wrap{max-width:760px;margin:0 auto}
+        h1{font-size:30px;margin:0 0 4px;letter-spacing:-.5px}
+        .sub{color:#5b6672;margin:0 0 26px;font-size:15px}
+        .card{background:#fff;border-radius:16px;padding:20px;margin:0 0 16px;
+              box-shadow:0 1px 3px rgba(0,0,0,.07)}
+        h2{font-size:12px;letter-spacing:1.3px;text-transform:uppercase;color:#7a8794;margin:0 0 14px}
+        .big{font-size:34px;font-weight:700;letter-spacing:-1px;margin:0}
+        .split{color:#5b6672;font-size:15px;margin:4px 0 0}
+        table{width:100%;border-collapse:collapse}
+        td{padding:9px 0;border-bottom:1px solid #eef1f4;vertical-align:top}
+        tr:last-child td{border-bottom:none}
+        td.r{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+        .leg{border-left:3px solid #2e7cf6;padding-left:14px;margin:0 0 20px}
+        .leg h3{margin:0 0 3px;font-size:19px}
+        .when{color:var(--dim);font-size:13px;margin:0 0 8px}
+        .meta{color:var(--dim);font-size:13px;margin:3px 0}
+        .links a{display:inline-block;margin:6px 6px 0 0;padding:7px 13px;background:#eef4ff;
+                 color:#1b5fd0;border-radius:9px;text-decoration:none;font-size:13.5px;font-weight:600}
+        .note{color:var(--faint);font-size:12.5px;margin-top:22px;line-height:1.5}
+        .links a.g{background:#e8f0fe;color:#1a73e8}
+        .pill{display:inline-block;background:#eef1f4;color:#42505e;border-radius:20px;
+              padding:3px 11px;font-size:12.5px;margin:0 5px 5px 0}
+        </style></head><body><div class="wrap">
+        """
+
+        h += "<h1>\(esc(trip.name))</h1>"
+        h += "<p class=\"sub\">\(esc(trip.dateLine)) &middot; \(trip.nights) nights &middot; "
+        h += "\(trip.party) \(trip.party == 1 ? "traveller" : "travellers")</p>"
+
+        // ---- the money, first, because it's what you open this for
+        h += "<div class=\"card\"><h2>What it costs</h2>"
+        h += "<p class=\"big\">\(ChappyFX.money(c.total, cur))</p>"
+        var split = "\(ChappyFX.money(c.perDay, cur)) a day"
+        if trip.party > 1 { split = "\(ChappyFX.money(c.perPerson, cur)) each &middot; " + split }
+        h += "<p class=\"split\">\(split)</p><table>"
+        for line in c.lines {
+            h += "<tr><td>\(esc(line.label))</td><td class=\"r\">\(ChappyFX.money(line.amount, cur))</td></tr>"
+        }
+        h += "</table></div>"
+
+        // ---- the trip itself
+        h += "<div class=\"card\"><h2>The plan</h2>"
+        for (i, leg) in trip.legs.enumerated() {
+            let prev = i > 0 ? trip.legs[i - 1] : nil
+            h += "<div class=\"leg\"><h3>\(esc(leg.place))"
+            if !leg.country.isEmpty { h += "<span style=\"color:#7a8794;font-weight:400\">, \(esc(leg.country))</span>" }
+            h += "</h3>"
+            h += "<p class=\"when\">\(f.string(from: leg.arrive)) &rarr; \(f.string(from: leg.depart)) &middot; "
+            h += "\(leg.nights) \(leg.nights == 1 ? "night" : "nights")</p>"
+
+            if leg.arrival != .none {
+                var a = "\(leg.arrival.label)"
+                if !leg.arrivalNote.isEmpty { a += " — \(leg.arrivalNote)" }
+                if leg.arrivalCost > 0 { a += " · \(ChappyFX.money(leg.arrivalCost, cur))" }
+                h += "<p class=\"meta\">\(esc(a))</p>"
+            }
+            if !leg.stayName.isEmpty || leg.nightlyRate > 0 {
+                let curL = leg.stayCurrency.isEmpty ? cur : leg.stayCurrency
+                var st = leg.stayName.isEmpty ? "Accommodation" : leg.stayName
+                if leg.nightlyRate > 0 { st += " · \(ChappyFX.money(leg.nightlyRate, curL)) a night" }
+                h += "<p class=\"meta\">\(esc(st))</p>"
+            }
+
+            // seasonal weather, if we managed to fetch it
+            let month = Calendar.current.component(.month, from: leg.arrive)
+            if leg.hasCoord,
+               let n = ChappySeason.shared.normals(lat: leg.lat, lon: leg.lon, month: month) {
+                h += "<p class=\"meta\">Typically \(Int(n.maxC.rounded()))&deg; / \(Int(n.minC.rounded()))&deg;"
+                h += " and \(esc(n.verdict)) at this time of year</p>"
+            }
+
+            if !leg.shortlist.isEmpty {
+                h += "<p class=\"meta\">"
+                for s in leg.shortlist.prefix(12) { h += "<span class=\"pill\">\(esc(s))</span>" }
+                h += "</p>"
+            }
+            if !leg.notes.isEmpty { h += "<p class=\"meta\">\(esc(leg.notes))</p>" }
+
+            // live handoff links, dates already in them
+            h += "<p class=\"links\">"
+            for site in Booking.allCases {
+                if let u = bookingURL(site, leg: leg, trip: trip) {
+                    h += "<a href=\"\(u.absoluteString)\">\(site.label)</a>"
+                }
+            }
+            if let r2r = groundURL(.rome2rio, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(r2r.absoluteString)\">How to get there</a>"
+            }
+            if let tg = groundURL(.twelvego, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(tg.absoluteString)\">Bus / train / ferry</a>"
+            }
+            if let k = groundURL(.klook, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(k.absoluteString)\">Tours &amp; tickets</a>"
+            }
+            // BUILD 179 - GOOGLE, ON EVERY LEG OF THE PRINTED PLAN.
+            // A document you email is read on a phone, and the only
+            // useful thing to do with a place name on a phone is open
+            // it in the map you actually navigate with.
+            if let g = googlePlaceURL(leg) {
+                h += "<a href=\"\(g.absoluteString)\" class=\"g\">Open in Google Maps</a>"
+            }
+            if let gd = googleDirectionsURL(to: leg, from: prev) {
+                h += "<a href=\"\(gd.absoluteString)\" class=\"g\">Directions</a>"
+            }
+            h += "</p></div>"
+        }
+        h += "</div>"
+
+        if !trip.extras.isEmpty {
+            h += "<div class=\"card\"><h2>Extras</h2><table>"
+            for e in trip.extras {
+                let amt = e.perPerson ? e.amount * Double(max(1, trip.party)) : e.amount
+                h += "<tr><td>\(esc(e.label))\(e.perPerson ? " <span style=\"color:#7a8794\">(each)</span>" : "")</td>"
+                h += "<td class=\"r\">\(ChappyFX.money(amt, cur))</td></tr>"
+            }
+            h += "</table></div>"
+        }
+
+        // BUILD 178: visas in the document, not only on a screen.
+        h += visaHTML(trip)
+
+        h += "<p class=\"note\">Prepared by Chappy on \(f.string(from: Date())). "
+        h += "Costs are estimates you set, not quotes — the booking links carry your dates and party size "
+        h += "through to each site, where the real prices live. "
+        if !ChappyFX.shared.rates.isEmpty, let at = ChappyFX.shared.fetchedAt {
+            h += "Currency rates as at \(f.string(from: at)). "
+        }
+        if trip.legs.contains(where: { $0.hasCoord }) {
+            h += "Seasonal weather is the average of the last three years, not a forecast. "
+        }
+        if ChappyPlaces.shared.hasTripAdvisorKey {
+            h += "Ratings and reviews provided by Tripadvisor."
+        }
+        h += "</p></div></body></html>"
+        return h
+    }
+
+    /// The same trip as plain text, for the body of an email. mailto:
+    /// cannot carry HTML — that's an iOS rule, not a Chappy limit — so
+    /// the readable version goes in the body and the HTML file rides
+    /// along as an attachment through the share sheet.
+    func reportText(_ trip: Trip) -> String {
+        let c = cost(trip)
+        let cur = trip.homeCurrency
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM"
+        var s = "\(trip.name)\n\(trip.dateLine) · \(trip.nights) nights · \(trip.party) travelling\n\n"
+        s += "WHAT IT COSTS\n\(ChappyFX.money(c.total, cur)) total"
+        if trip.party > 1 { s += " · \(ChappyFX.money(c.perPerson, cur)) each" }
+        s += " · \(ChappyFX.money(c.perDay, cur)) a day\n"
+        for line in c.lines {
+            s += "  \(line.label): \(ChappyFX.money(line.amount, cur))\n"
+        }
+        s += "\nTHE PLAN\n"
+        for leg in trip.legs {
+            s += "\(leg.place) — \(f.string(from: leg.arrive)) to \(f.string(from: leg.depart)), \(leg.nights) nights\n"
+            if leg.arrival != .none {
+                s += "  \(leg.arrival.label)"
+                if !leg.arrivalNote.isEmpty { s += " (\(leg.arrivalNote))" }
+                if leg.arrivalCost > 0 { s += " \(ChappyFX.money(leg.arrivalCost, cur))" }
+                s += "\n"
+            }
+            if leg.nightlyRate > 0 {
+                let curL = leg.stayCurrency.isEmpty ? cur : leg.stayCurrency
+                s += "  Stay: \(ChappyFX.money(leg.nightlyRate, curL))/night"
+                if !leg.stayName.isEmpty { s += " — \(leg.stayName)" }
+                s += "\n"
+            }
+            if !leg.shortlist.isEmpty { s += "  Shortlist: \(leg.shortlist.prefix(8).joined(separator: ", "))\n" }
+            if !leg.notes.isEmpty { s += "  \(leg.notes)\n" }
+        }
+        // BUILD 179: a plain-text body can't carry a map, so it carries
+        // the link to one. This is the version most people read.
+        if let g = googleTripURL(trip) {
+            s += "\nThe whole route on Google Maps:\n\(g.absoluteString)\n"
+        }
+        s += "\nEstimates you set, not quotes. The attached version has the map and live booking links."
+        return s
+    }
+
+    /// Write the HTML somewhere the share sheet can reach it.
+    func writeReport(_ trip: Trip) -> URL? {
+        let safe = trip.name.replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (safe.isEmpty ? "Trip" : safe) + ".html"
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return nil }
+        let url = dir.appendingPathComponent(name)
+        do {
+            try reportHTML(trip).data(using: .utf8)?.write(to: url)
+            return url
+        } catch {
+            print("⚠️ [Travel] Couldn't write the report: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Hand the trip to the mail app. One tap sends — iOS never lets an
+    /// app send mail on its own, and it never will.
+    @discardableResult
+    func emailReport(_ trip: Trip, to: String = "") -> Bool {
+        ChappyMail.compose(to: to,
+                           subject: "\(trip.name) — \(trip.dateLine)",
+                           body: reportText(trip),
+                           preferOutlook: ChappyMail.hasOutlook)
+    }
+}
+
+// MARK: - Chappy Travel: understanding an ordinary sentence
+
+extension ChappyTravel {
+
+    /// "five" → 5. People say numbers, they don't spell them, and the
+    /// recogniser hands back words as often as digits.
+    static func spokenNumber(_ w: String) -> Int? {
+        let table = ["one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                     "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+                     "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+                     "nineteen": 19, "twenty": 20, "thirty": 30, "a": 1, "an": 1,
+                     "couple": 2, "few": 3]
+        return table[w.lowercased()]
+    }
+
+    /// Which month was named, as 1–12. Handles the short forms because
+    /// "sept" is what people say.
+    static func monthMentioned(in raw: String) -> Int? {
+        let c = " " + raw.lowercased() + " "
+        let months = ["january", "february", "march", "april", "may", "june", "july",
+                      "august", "september", "october", "november", "december"]
+        for (i, m) in months.enumerated() {
+            if c.contains(m) { return i + 1 }
+        }
+        let short = ["jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+                     "aug": 8, "sept": 9, "sep": 9, "oct": 10, "nov": 11, "dec": 12]
+        for (k, v) in short where c.contains(" \(k) ") || c.contains(" \(k)?") { return v }
+        return nil
+    }
+
+    /// Pull the place out of "what's Bali like in September" — everything
+    /// between the question opener and the month, trimmed of the filler.
+    static func placeBefore(month: Int, in raw: String) -> String {
+        var c = raw.lowercased()
+        let f = DateFormatter()
+        let full = f.monthSymbols[max(0, min(11, month - 1))].lowercased()
+        for cut in [" in \(full)", " in \(full.prefix(3))", full] {
+            if let r = c.range(of: String(cut)) { c = String(c[..<r.lowerBound]) }
+        }
+        for lead in ["what's the weather", "whats the weather", "what is the weather",
+                     "weather in", "what's", "whats", "what is", "how's", "hows",
+                     "how is", "tell me about", "the weather"] {
+            if let r = c.range(of: lead) { c = String(c[r.upperBound...]) }
+        }
+        c = c.replacingOccurrences(of: " like", with: "")
+             .replacingOccurrences(of: " going to be", with: "")
+             .trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+        // Drop a leading article the recogniser loves to add.
+        for a in ["the ", "in ", "a "] where c.hasPrefix(a) { c = String(c.dropFirst(a.count)) }
+        return c.split(separator: " ").prefix(4).joined(separator: " ")
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE AI TRAVEL AGENT.
+//
+// Everything above is a very good spreadsheet with a map on it. This is
+// the part that makes it an agent: say what you want and a whole costed
+// itinerary comes back, ready to edit.
+//
+// It runs on the Claude brain with live web search, so the numbers are
+// current rather than remembered, and it is told to price in the local
+// currency and to be honest about what it isn't sure of. Crucially it
+// returns STRUCTURED legs, not prose — a paragraph of advice you then
+// have to re-type into a form is not an agent, it's a brochure.
+//
+// It also reads what Chappy already knows about him: the places he has
+// saved, the trips he has taken, the budget he set. A planner that
+// ignores everything you have ever told it is a search box.
+// =====================================================================
+
+extension ChappyTravel {
+
+    struct PlanRequest {
+        var destination: String
+        var nights: Int
+        var party: Int
+        var budget: Double?          // in home currency, whole party
+        var month: Int?
+        var style: String            // "relaxed", "surfing and food", ...
+    }
+
+    /// What Chappy already knows, folded in so the plan is HIS trip.
+    private func personalContext() -> String {
+        var bits: [String] = []
+        // BUILD 184: the planner has been planning for a generic
+        // Australian. This is the difference between "a good hotel" and
+        // "a hotel that takes your loyalty number and has a desk you can
+        // actually work at".
+        let profile = ChappyProfile.shared.brief
+        if !profile.isEmpty { bits.append(profile) }
+        let saved = TripRecorder.shared.spots.suffix(25).map(\.name).filter { !$0.isEmpty }
+        if !saved.isEmpty {
+            bits.append("Places he has saved before: \(saved.joined(separator: ", ")).")
+        }
+        let past = trips.filter { $0.id != activeID }.prefix(4).map(\.name)
+        if !past.isEmpty {
+            bits.append("Trips he has planned before: \(past.joined(separator: ", ")).")
+        }
+        let likes = ChappyMemory.shared.recent
+            .filter { $0.kind == .note || $0.kind == .place }
+            .prefix(12)
+            .map(\.title)
+            .filter { !$0.isEmpty }
+        if !likes.isEmpty {
+            bits.append("Recent notes of his: \(likes.prefix(8).joined(separator: "; ")).")
+        }
+        return bits.joined(separator: " ")
+    }
+
+    /// Ask the brain for a real itinerary and build it into a trip.
+    /// Returns a spoken line either way — it never fails silently.
+    /// BUILD 181: one-shot planning, for the voice command. It now builds
+    /// all three shapes and adopts the balanced one, and the options screen
+    /// opens behind it so the other two are a tap away rather than lost.
+    /// The old body duplicated the whole request pipeline; there is one
+    /// pipeline now, and this is a caller of it.
+    @discardableResult
+    func aiPlan(_ r: PlanRequest, speak shouldSpeak: Bool = true) async -> String {
+        let options = await planOptions(r)
+        guard !options.isEmpty else {
+            let line = planError ?? "The planner didn't come back. Try again in a moment."
+            if shouldSpeak { TTSService.shared.speak(line) }
+            return line
+        }
+        pendingOptions = options
+        let chosen = options.first(where: { $0.shape == "balanced" }) ?? options[0]
+        adopt(chosen)
+
+        let home = ChappyFX.shared.home
+        let c = cost(chosen)
+        var line = chosen.summary?.isEmpty == false
+            ? chosen.summary!
+            : "\(chosen.name) is planned: \(chosen.legs.count) places, \(chosen.nights) nights."
+        line += " That comes to about \(ChappyFX.money(c.total, home))"
+        if let b = r.budget {
+            line += c.total <= b
+                ? ", inside your \(ChappyFX.money(b, home))."
+                : ", over your \(ChappyFX.money(b, home)) - say 'too expensive' and I'll trim it."
+        } else { line += "." }
+        if options.count > 1 {
+            let others = options.filter { $0.id != chosen.id }
+                .map { "\(Shape(rawValue: $0.shape ?? "")?.label ?? "another") \(ChappyFX.money(cost($0).total, home))" }
+            line += " I built two others: " + others.joined(separator: ", ")
+                  + ". Say 'show me the options' to compare, or just tell me what's wrong with this one."
+        }
+        if shouldSpeak { TTSService.shared.speakLong(line) }
+        return line
+    }
+
+    // MARK: parsing the plan
+
+    struct PlanLeg {
+        var place = ""; var nights = 3; var arrival = "flight"
+        var arrivalCost = 0.0; var arrivalNote = ""; var stayName = ""
+        var nightlyRate = 0.0; var foodPerDay = 0.0; var groundPerDay = 0.0
+        var activitiesTotal = 0.0; var notes = ""; var shortlist: [String] = []
+        // BUILD 181 — the searched typical ranges, in LOCAL money, so a
+        // number can be graded instead of just displayed.
+        var localCurrency = ""
+        var stayBand: Band?
+        var arrivalBand: Band?
+        var foodBand: Band?
+        var groundBand: Band?
+        var scooterPerDay = 0.0
+        var scooterBand: Band?
+    }
+
+    struct Plan {
+        var legs: [PlanLeg] = []
+        var extras: [(String, Double)] = []
+        var summary = ""
+        var flights: FlightBrief?
+    }
+
+    /// Models add a code fence or a sentence of throat-clearing no matter
+    /// how firmly you tell them not to, so find the JSON rather than
+    /// trusting the whole reply to be JSON.
+    static func parsePlan(_ raw: String) -> Plan? {
+        // AUDIT: nothing guaranteed open < close. Model prose containing a
+        // stray "}" before the first "{" made this a hard crash on
+        // untrusted network output — the worst place to have one.
+        guard let open = raw.firstIndex(of: "{"),
+              let close = raw.lastIndex(of: "}"),
+              open < close else { return nil }
+        let slice = String(raw[open...close])
+        guard let data = slice.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let legs = json["legs"] as? [[String: Any]], !legs.isEmpty else { return nil }
+
+        func d(_ any: Any?) -> Double {
+            if let v = any as? Double { return v }
+            if let v = any as? Int { return Double(v) }
+            if let v = any as? String { return Double(v.filter { $0.isNumber || $0 == "." }) ?? 0 }
+            return 0
+        }
+
+        var p = Plan()
+        for row in legs {
+            var l = PlanLeg()
+            l.place = (row["place"] as? String) ?? ""
+            guard !l.place.isEmpty else { continue }
+            l.nights = (row["nights"] as? Int) ?? Int(d(row["nights"])) 
+            if l.nights < 1 { l.nights = 1 }
+            l.arrival = (row["arrival"] as? String) ?? "flight"
+            l.arrivalCost = d(row["arrivalCost"])
+            l.arrivalNote = (row["arrivalNote"] as? String) ?? ""
+            l.stayName = (row["stayName"] as? String) ?? ""
+            l.nightlyRate = d(row["nightlyRate"])
+            l.foodPerDay = d(row["foodPerDay"])
+            l.groundPerDay = d(row["groundPerDay"])
+            l.activitiesTotal = d(row["activitiesTotal"])
+            l.notes = (row["notes"] as? String) ?? ""
+            l.shortlist = (row["shortlist"] as? [String]) ?? []
+            l.localCurrency = ((row["currency"] as? String) ?? "").uppercased()
+            l.scooterPerDay = d(row["scooterPerDay"])
+            func band(_ key: String) -> Band? {
+                guard let b = row[key] as? [String: Any] else { return nil }
+                let x = Band(low: d(b["low"]), typical: d(b["typical"]), high: d(b["high"]))
+                return x.isUsable ? x : nil
+            }
+            l.stayBand = band("stayBand")
+            l.arrivalBand = band("arrivalBand")
+            l.foodBand = band("foodBand")
+            l.groundBand = band("groundBand")
+            l.scooterBand = band("scooterBand")
+            p.legs.append(l)
+        }
+        guard !p.legs.isEmpty else { return nil }
+        for e in (json["extras"] as? [[String: Any]]) ?? [] {
+            guard let label = e["label"] as? String else { continue }
+            p.extras.append((label, d(e["amount"])))
+        }
+        p.summary = (json["summary"] as? String) ?? ""
+        if let f = json["flights"] as? [String: Any] {
+            var fb = FlightBrief()
+            fb.route = (f["route"] as? String) ?? ""
+            fb.low = d(f["low"])
+            fb.high = d(f["high"])
+            fb.airlines = (f["airlines"] as? String) ?? ""
+            fb.peakNote = (f["peakNote"] as? String) ?? ""
+            fb.advice = (f["advice"] as? String) ?? ""
+            fb.searchedAt = Date()
+            if fb.isUsable { p.flights = fb }
+        }
+        return p
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE TRIP THAT REMINDS YOU.
+//
+// A plan you have to remember to act on is a plan you act on late. The
+// things that actually go wrong on a trip are never the itinerary — they
+// are the visa you needed six weeks out, the insurance you meant to buy,
+// the passport with five months left on it, and the check-in that opened
+// while you were asleep.
+//
+// These ride on the reminder engine that already exists, so they appear
+// in the same place as everything else and are snoozed the same way.
+// Nothing here is a new notification system; it's the trip finally
+// talking to the one Chappy already has.
+// =====================================================================
+
+extension ChappyTravel {
+
+    func armTripReminders(_ trip: Trip) {
+        guard let start = trip.start, start > Date() else { return }
+        let cal = Calendar.current
+        let r = ChappyReminders.shared
+        let name = trip.name
+
+        // Far out: the things with lead times you cannot compress.
+        let plan: [(days: Int, title: String, escalate: Bool)] = [
+            (56, "\(name): check your passport has 6 months on it, and look up the visa rules", false),
+            (42, "\(name): book the flights if you haven't — prices only go one way from here", false),
+            (28, "\(name): travel insurance, and check what your vaccinations need", false),
+            (14, "\(name): book the first few nights so you land somewhere known", false),
+            (7,  "\(name) in a week — money sorted, cards told you're travelling?", false),
+            (2,  "\(name) in two days. Start packing, charge everything.", true),
+            (1,  "\(name) tomorrow. Check in opens about now.", true),
+        ]
+
+        for step in plan {
+            guard let when = cal.date(byAdding: .day, value: -step.days, to: start),
+                  when > Date() else { continue }
+            // Land them at a civilised hour rather than whenever the trip
+            // happens to start — a 4am packing reminder helps nobody.
+            var c = cal.dateComponents([.year, .month, .day], from: when)
+            c.hour = 9; c.minute = 0
+            guard let at = cal.date(from: c), at > Date() else { continue }
+            r.add(title: step.title, at: at, escalate: step.escalate, source: "trip")
+        }
+        print("🧳 [Travel] Reminders armed for \(name)")
+    }
+
+    /// The line the morning brief gets when a trip is coming. Nil most
+    /// days — a brief that mentions a trip four months out every single
+    /// morning is a brief you stop listening to. It starts talking at 21
+    /// days, which is when there is still time to do something.
+    func briefLine() -> String? {
+        guard let trip = trips
+            .filter({ ($0.start ?? .distantPast) > Date() })
+            .min(by: { ($0.start ?? .distantFuture) < ($1.start ?? .distantFuture) }),
+              let start = trip.start else { return nil }
+        let days = Calendar.current.dateComponents([.day], from: Date(), to: start).day ?? 0
+        guard days <= 21 else { return nil }
+
+        var line: String
+        switch days {
+        case 0:     line = "\(trip.name) is today."
+        case 1:     line = "\(trip.name) is tomorrow."
+        default:    line = "\(trip.name) in \(days) days."
+        }
+
+        // What it's actually like there, if we know — the single most
+        // useful thing to hear three weeks out, because it's what you pack.
+        if let first = trip.legs.first, first.hasCoord {
+            let m = Calendar.current.component(.month, from: first.arrive)
+            if let n = ChappySeason.shared.normals(lat: first.lat, lon: first.lon, month: m) {
+                line += " \(first.place) runs about \(Int(n.maxC.rounded())) degrees and it's \(n.verdict)."
+            }
+        }
+        if days <= 7 {
+            let c = cost(trip)
+            if c.total > 0 {
+                line += " Budgeted at \(ChappyFX.money(c.total, trip.homeCurrency))."
+            }
+        }
+        return line
+    }
+}
+
+// MARK: - Chappy Travel: hearing a plan request
+
+extension ChappyTravel {
+
+    /// "plan me two weeks in Vietnam in October for two of us on four grand"
+    /// → a PlanRequest. Deliberately forgiving: everything except the
+    /// destination has a sensible default, because a request that fails
+    /// because you didn't say how many nights is a request that fails.
+    static func planRequest(from raw: String) -> PlanRequest? {
+        let c = raw.lowercased()
+
+        // --- where ---
+        var place = ""
+        for lead in [" weeks in ", " week in ", " nights in ", " days in ",
+                     "plan me a trip to ", "plan a trip to ", "plan my trip to ",
+                     "build me a trip to ", "sort me a trip to ", "trip to ", " to "] {
+            if let r = c.range(of: lead) {
+                place = String(c[r.upperBound...])
+                break
+            }
+        }
+        // Cut the tail off at the next clause — "vietnam in october for two"
+        for stop in [" in ", " for ", " on ", " with ", " under ", " around ", " budget"] {
+            if let r = place.range(of: stop) { place = String(place[..<r.lowerBound]) }
+        }
+        place = place.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+        guard !place.isEmpty, place.count > 2 else { return nil }
+
+        // --- how long ---
+        var nights = 10
+        let words = c.split(separator: " ").map(String.init)
+        for (i, w) in words.enumerated() where i > 0 {
+            let before = words[i - 1]
+            guard let n = Int(before) ?? spokenNumber(before) else { continue }
+            if w.hasPrefix("week") { nights = n * 7 }
+            else if w.hasPrefix("night") || w.hasPrefix("day") { nights = n }
+        }
+        nights = max(1, min(90, nights))
+
+        // --- how many of us ---
+        var party = 1
+        if c.contains(" for two") || c.contains("two of us") || c.contains("both of us")
+            || c.contains(" for 2") { party = 2 }
+        else if let r = c.range(of: " for ") {
+            let tail = String(c[r.upperBound...]).split(separator: " ").first.map(String.init) ?? ""
+            if let n = Int(tail) ?? spokenNumber(tail), n >= 1, n <= 12 { party = n }
+        }
+
+        // --- how much ---
+        var budget: Double?
+        for marker in ["under ", "budget of ", "on ", "around ", "about "] {
+            guard let r = c.range(of: marker) else { continue }
+            let tail = String(c[r.upperBound...])
+            var digits = ""
+            var seen = false
+            for ch in tail {
+                if ch.isNumber || (seen && (ch == "," || ch == ".")) { digits.append(ch); seen = true }
+                else if seen { break }
+                else if ch == "$" { continue }
+                else if !digits.isEmpty { break }
+            }
+            guard var v = Double(digits.replacingOccurrences(of: ",", with: "")), v > 0 else { continue }
+            // "four grand", "3k", "five thousand"
+            if tail.contains("grand") || tail.contains(" k") || tail.contains("thousand") {
+                if v < 1000 { v *= 1000 }
+            }
+            if v >= 200 { budget = v; break }
+        }
+        if budget == nil, c.contains("grand") {
+            for (i, w) in words.enumerated() where w.contains("grand") && i > 0 {
+                if let n = Int(words[i-1]) ?? spokenNumber(words[i-1]) { budget = Double(n) * 1000 }
+            }
+        }
+
+        // --- what kind of trip ---
+        var style = ""
+        for s in ["surfing", "diving", "hiking", "food", "beaches", "temples", "relaxed",
+                  "budget", "luxury", "backpacking", "family", "quiet", "nightlife",
+                  "photography", "motorbike", "island hopping"] where c.contains(s) {
+            style += style.isEmpty ? s : ", " + s
+        }
+
+        return PlanRequest(destination: place.capitalized,
+                           nights: nights,
+                           party: party,
+                           budget: budget,
+                           month: monthMentioned(in: c),
+                           style: style)
+    }
+}
+
+// =====================================================================
+// BUILD 178 — CHAPPY VISA.
+//
+// This is the highest-stakes module in the app, so it is built around
+// one rule: NEVER SOUND CERTAIN ABOUT SOMETHING THAT CHANGES.
+//
+// Visa rules move constantly — Indonesia has changed its on-arrival
+// terms three times in recent years — and a confidently wrong answer at
+// a check-in desk is worse than no app at all. So there are three
+// layers, and they are kept visibly separate:
+//
+//   1. THE SHAPE. A baked table: does an Australian passport get in
+//      visa-free, on arrival, on an e-visa, or does it need an embassy,
+//      and roughly how many days. Instant, offline, works on a plane.
+//      Labelled INDICATIVE everywhere it appears, because that is what
+//      it is.
+//   2. THE RULES. The Claude brain with live web search, asked about
+//      THIS trip — current cost, whether it extends, onward ticket,
+//      passport validity, whether remote work is a problem. Cached 14
+//      days per country because these are not minute-by-minute facts,
+//      and every answer carries its sources.
+//   3. THE OFFICIAL SOURCE. A link to Smartraveller and the country's
+//      own immigration site, on every single answer. Chappy is a
+//      briefing, not an authority, and it says so.
+//
+// And it does the thing nobody does: reads the trip as a SEQUENCE.
+// Thirty days on arrival in Indonesia is fine until your itinerary
+// adds up to forty-five, and then it is a problem you want to find at
+// the planning table rather than at immigration.
+// =====================================================================
+
+@MainActor
+final class ChappyVisa: ObservableObject {
+    static let shared = ChappyVisa()
+
+    /// Live answers, keyed by country, cached to disk for a fortnight.
+    @Published private(set) var live: [String: Live] = [:]
+    /// Which countries are being checked right now, so the UI can show it
+    /// per row rather than throwing one spinner over the whole screen.
+    @Published private(set) var checking: Set<String> = []
+    @Published var error: String?
+
+    private init() { loadLive() }
+
+    private func saveLive() {
+        if let d = try? JSONEncoder().encode(live) {
+            UserDefaults.standard.set(d, forKey: "chappy_visa_live")
+        }
+    }
+
+    private func loadLive() {
+        guard let d = UserDefaults.standard.data(forKey: "chappy_visa_live"),
+              let l = try? JSONDecoder().decode([String: Live].self, from: d) else { return }
+        live = l
+    }
+
+    /// Throw away everything older than a fortnight, so a stale answer can
+    /// never be presented as a current one just because it is on disk.
+    func pruneStale() {
+        let before = live.count
+        live = live.filter { !$0.value.isStale }
+        if live.count != before { saveLive() }
+    }
+
+    // MARK: the shape
+
+    enum Shape: String, Codable {
+        case visaFree, visaOnArrival, eVisa, eta, embassy, notAllowed, unknown
+
+        var label: String {
+            switch self {
+            case .visaFree:      return "Visa-free"
+            case .visaOnArrival: return "Visa on arrival"
+            case .eVisa:         return "e-Visa, before you fly"
+            case .eta:           return "Travel authorisation, before you fly"
+            case .embassy:       return "Embassy application"
+            case .notAllowed:    return "Not admitted"
+            case .unknown:       return "Not in my table"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .visaFree:      return "checkmark.seal.fill"
+            case .visaOnArrival: return "airplane.arrival"
+            case .eVisa, .eta:   return "globe.asia.australia.fill"
+            case .embassy:       return "building.columns.fill"
+            case .notAllowed:    return "xmark.octagon.fill"
+            case .unknown:       return "questionmark.circle"
+            }
+        }
+        /// How much runway you need before you fly. Drives the reminders.
+        var leadDays: Int {
+            switch self {
+            case .visaFree, .visaOnArrival: return 14
+            case .eta:                      return 21
+            case .eVisa:                    return 35
+            case .embassy:                  return 70
+            case .notAllowed, .unknown:     return 70
+            }
+        }
+        var needsActionBeforeFlying: Bool {
+            self == .eVisa || self == .eta || self == .embassy
+        }
+    }
+
+    struct Rule: Codable {
+        var shape: Shape
+        var days: Int          // 0 when the shape makes days meaningless
+        var note: String = ""
+    }
+
+    /// THE BAKED TABLE — an Australian passport, reviewed August 2026.
+    ///
+    /// Deliberately NOT the full 199-country matrix. This is the list a
+    /// traveller from Brisbane actually uses, and a short accurate table
+    /// beats a long one nobody maintains. Anything not here falls through
+    /// to the live check rather than guessing.
+    ///
+    /// Every one of these is a STARTING POINT. The live check is what
+    /// gets quoted at a border.
+    static let auPassport: [String: Rule] = [
+        // South-East Asia — where he actually is
+        "Indonesia":    Rule(shape: .visaOnArrival, days: 30, note: "Extendable once by another 30 days, in country. Longer stays need a different visa class applied for before you fly."),
+        "Thailand":     Rule(shape: .visaFree, days: 60, note: "Extendable in country at an immigration office."),
+        "Vietnam":      Rule(shape: .eVisa, days: 90, note: "Apply online before flying. Single and multiple entry available."),
+        "Malaysia":     Rule(shape: .visaFree, days: 90, note: "Digital arrival card required before landing."),
+        "Singapore":    Rule(shape: .visaFree, days: 90, note: "Electronic arrival card required within three days of arrival."),
+        "Philippines":  Rule(shape: .visaFree, days: 30, note: "Extendable in country. Onward ticket is genuinely checked at check-in."),
+        "Cambodia":     Rule(shape: .visaOnArrival, days: 30, note: "e-Visa also available and usually smoother than the airport queue."),
+        "Laos":         Rule(shape: .visaOnArrival, days: 30),
+        "Myanmar":      Rule(shape: .eVisa, days: 28, note: "Check current safety advice before booking anything."),
+        "Brunei":       Rule(shape: .visaFree, days: 30),
+        "Timor-Leste":  Rule(shape: .visaOnArrival, days: 30),
+        // The rest of Asia
+        "Japan":        Rule(shape: .visaFree, days: 90),
+        "South Korea":  Rule(shape: .eta, days: 90, note: "K-ETA required before boarding."),
+        "Taiwan":       Rule(shape: .visaFree, days: 90),
+        "Hong Kong":    Rule(shape: .visaFree, days: 90),
+        "China":        Rule(shape: .embassy, days: 30, note: "Rules for Australians change often — check before you plan around it."),
+        "India":        Rule(shape: .eVisa, days: 30, note: "Apply online well ahead; processing is not instant."),
+        "Sri Lanka":    Rule(shape: .eta, days: 30),
+        "Nepal":        Rule(shape: .visaOnArrival, days: 90),
+        "Maldives":     Rule(shape: .visaOnArrival, days: 30),
+        "United Arab Emirates": Rule(shape: .visaFree, days: 30),
+        // Pacific and home region
+        "New Zealand":  Rule(shape: .visaFree, days: 90, note: "Trans-Tasman arrangement. NZeTA still required."),
+        "Fiji":         Rule(shape: .visaFree, days: 120),
+        "Vanuatu":      Rule(shape: .visaFree, days: 30),
+        "Papua New Guinea": Rule(shape: .eVisa, days: 60),
+        "Samoa":        Rule(shape: .visaFree, days: 60),
+        "Tonga":        Rule(shape: .visaFree, days: 31),
+        "Cook Islands": Rule(shape: .visaFree, days: 31),
+        "New Caledonia": Rule(shape: .visaFree, days: 90),
+        // Further afield
+        "United Kingdom": Rule(shape: .eta, days: 180, note: "UK ETA required before boarding."),
+        "Ireland":      Rule(shape: .visaFree, days: 90),
+        "United States": Rule(shape: .eta, days: 90, note: "ESTA required before boarding, and it is checked."),
+        "Canada":       Rule(shape: .eta, days: 180, note: "eTA required before boarding."),
+        "France":       Rule(shape: .visaFree, days: 90, note: "Schengen: 90 days in any rolling 180 across the whole zone, not per country."),
+        "Germany":      Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Italy":        Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Spain":        Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Portugal":     Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Netherlands":  Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Greece":       Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Switzerland":  Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Croatia":      Rule(shape: .visaFree, days: 90, note: "Schengen: 90 in any rolling 180 across the whole zone."),
+        "Turkey":       Rule(shape: .visaFree, days: 90),
+        "Morocco":      Rule(shape: .visaFree, days: 90),
+        "Egypt":        Rule(shape: .visaOnArrival, days: 30),
+        "South Africa": Rule(shape: .visaFree, days: 90),
+        "Kenya":        Rule(shape: .eta, days: 90),
+        "Tanzania":     Rule(shape: .visaOnArrival, days: 90),
+        "Brazil":       Rule(shape: .visaFree, days: 90),
+        "Argentina":    Rule(shape: .visaFree, days: 90),
+        "Chile":        Rule(shape: .visaFree, days: 90),
+        "Peru":         Rule(shape: .visaFree, days: 183),
+        "Mexico":       Rule(shape: .visaFree, days: 180),
+    ]
+
+    /// The Schengen zone is one allowance, not twenty-nine — the single
+    /// most expensive misunderstanding available to an Australian in
+    /// Europe, and the reason the trip check has to be able to group
+    /// countries rather than count them one at a time.
+    static let schengen: Set<String> = [
+        "Austria", "Belgium", "Croatia", "Czechia", "Czech Republic", "Denmark",
+        "Estonia", "Finland", "France", "Germany", "Greece", "Hungary", "Iceland",
+        "Italy", "Latvia", "Liechtenstein", "Lithuania", "Luxembourg", "Malta",
+        "Netherlands", "Norway", "Poland", "Portugal", "Slovakia", "Slovenia",
+        "Spain", "Sweden", "Switzerland", "Bulgaria", "Romania"
+    ]
+
+    /// Loose spellings, so what the recogniser hears still lands.
+    static let aliases: [String: String] = [
+        "bali": "Indonesia", "lombok": "Indonesia", "java": "Indonesia",
+        "jakarta": "Indonesia", "ubud": "Indonesia", "canggu": "Indonesia",
+        "gili": "Indonesia", "flores": "Indonesia", "sumatra": "Indonesia",
+        "phuket": "Thailand", "bangkok": "Thailand", "chiang mai": "Thailand",
+        "koh samui": "Thailand", "krabi": "Thailand",
+        "hanoi": "Vietnam", "saigon": "Vietnam", "ho chi minh": "Vietnam",
+        "da nang": "Vietnam", "hoi an": "Vietnam", "viet nam": "Vietnam",
+        "kl": "Malaysia", "kuala lumpur": "Malaysia", "penang": "Malaysia",
+        "borneo": "Malaysia", "manila": "Philippines", "cebu": "Philippines",
+        "palawan": "Philippines", "siargao": "Philippines", "boracay": "Philippines",
+        "the philippines": "Philippines", "phillipines": "Philippines",
+        "phnom penh": "Cambodia", "siem reap": "Cambodia", "angkor": "Cambodia",
+        "vientiane": "Laos", "luang prabang": "Laos",
+        "tokyo": "Japan", "osaka": "Japan", "kyoto": "Japan",
+        "seoul": "South Korea", "korea": "South Korea",
+        "taipei": "Taiwan", "dubai": "United Arab Emirates", "uae": "United Arab Emirates",
+        "nz": "New Zealand", "aotearoa": "New Zealand",
+        "uk": "United Kingdom", "england": "United Kingdom", "scotland": "United Kingdom",
+        "britain": "United Kingdom", "wales": "United Kingdom",
+        "usa": "United States", "us": "United States", "america": "United States",
+        "the states": "United States", "bali indonesia": "Indonesia",
+    ]
+
+    /// Schengen members that aren't in the baked table above. Without
+    /// these, country(from:) can't resolve "Austria" at all, so an Austrian
+    /// leg never reaches the Schengen bucket and shows as unknown with no
+    /// allowance — silently hiding the one European limit that matters.
+    static let otherKnownCountries: Set<String> = [
+        "Austria", "Belgium", "Czechia", "Czech Republic", "Denmark", "Estonia",
+        "Finland", "Hungary", "Iceland", "Latvia", "Liechtenstein", "Lithuania",
+        "Luxembourg", "Malta", "Norway", "Poland", "Slovakia", "Slovenia",
+        "Sweden", "Bulgaria", "Romania"
+    ]
+
+    /// AUDIT: this used bare `contains`, which is catastrophic on short
+    /// aliases. "Australia" contains "us" and resolved to the United
+    /// States. So did "Austria" — which then also missed the Schengen
+    /// bucket. "Auckland" contains "kl" and resolved to Malaysia. And the
+    /// dictionary-key loop returned whichever key iteration happened to
+    /// reach first, so the same input could resolve differently on
+    /// different launches.
+    ///
+    /// Now: whole-word matching only, and sorted keys so it is
+    /// deterministic. "bali" still matches inside "flights to bali in
+    /// september"; "us" no longer matches inside "australia".
+    static func country(from raw: String) -> String? {
+        let c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !c.isEmpty else { return nil }
+        if auPassport[c] != nil { return c }
+        if otherKnownCountries.contains(c) { return c }
+
+        let lower = c.lowercased()
+        if let a = aliases[lower] { return a }
+        for key in auPassport.keys.sorted() where key.lowercased() == lower { return key }
+        for key in otherKnownCountries.sorted() where key.lowercased() == lower { return key }
+
+        // Whole-word containment: pad both sides so a match has to sit on
+        // word boundaries. Longest alias first, so "singapore" beats "sing"
+        // and "ho chi minh" beats "minh".
+        let padded = " " + lower.replacingOccurrences(of: ",", with: " ")
+            .replacingOccurrences(of: ".", with: " ") + " "
+        for alias in aliases.keys.sorted(by: { $0.count > $1.count })
+        where padded.contains(" " + alias + " ") {
+            return aliases[alias]
+        }
+        for key in (auPassport.keys.sorted() + otherKnownCountries.sorted())
+            .sorted(by: { $0.count > $1.count })
+        where padded.contains(" " + key.lowercased() + " ") {
+            return key
+        }
+        return nil
+    }
+
+    func rule(for country: String) -> Rule? {
+        guard let c = Self.country(from: country) else { return nil }
+        return Self.auPassport[c]
+    }
+
+    /// Official sources. Smartraveller is the Australian government's own
+    /// advice and is the correct thing to point an Australian at; the
+    /// second link is the country's own immigration service, because
+    /// Smartraveller summarises and immigration decides.
+    static func smartravellerURL(_ country: String) -> URL? {
+        let slug = country.lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "'", with: "")
+        return URL(string: "https://www.smartraveller.gov.au/destinations/\(slug)")
+    }
+
+    static func officialSearchURL(_ country: String) -> URL? {
+        let q = "\(country) official immigration visa requirements Australian passport"
+            .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        return URL(string: "https://www.google.com/search?q=\(q)")
+    }
+}
+
+// MARK: - Chappy Visa: the live rules
+
+extension ChappyVisa {
+
+    /// What the brain came back with. Cached, sourced, and dated — an
+    /// undated visa answer is a liability.
+    struct Live: Codable, Identifiable {
+        var id: String { country }
+        var country: String
+        var summary: String        // spoken, plain sentences
+        var cost: String
+        var howTo: String
+        var extendable: String
+        var onwardTicket: String
+        var passportValidity: String
+        var remoteWork: String
+        var sources: [String]
+        var checkedAt: Date
+
+        var isStale: Bool { Date().timeIntervalSince(checkedAt) > 14 * 86400 }
+        var ageLine: String {
+            let d = Int(Date().timeIntervalSince(checkedAt) / 86400)
+            if d < 1 { return "Checked today" }
+            if d == 1 { return "Checked yesterday" }
+            return "Checked \(d) days ago"
+        }
+    }
+
+    /// The live check. One country, framed around the actual stay, cached
+    /// a fortnight because visa rules are not minute-by-minute facts and
+    /// burning the research budget on the same country six times in a day
+    /// helps nobody.
+    @discardableResult
+    func deepCheck(country raw: String, nights: Int = 0,
+                   purpose: String = "tourism", force: Bool = false) async -> Live? {
+        guard let country = Self.country(from: raw) ?? (raw.isEmpty ? nil : raw) else { return nil }
+        if !force, let cached = live[country], !cached.isStale { return cached }
+
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            error = "No research key is set, so I can only give you the indicative table."
+            return nil
+        }
+        checking.insert(country)
+        defer { checking.remove(country) }
+
+        let stay = nights > 0 ? "They plan to stay about \(nights) nights." : ""
+        let prompt = """
+        An AUSTRALIAN passport holder is travelling to \(country) for \(purpose). \(stay)
+
+        Search the web for the CURRENT rules — these change often, so do not answer from memory.
+        Prefer the destination's own immigration authority and the Australian government's
+        Smartraveller. If sources disagree, say so rather than picking one.
+
+        Reply with ONLY this JSON, no prose and no code fence:
+        {"summary":"two or three plain spoken sentences: what they get, for how long, and the one thing most likely to catch them out",
+        "cost":"what it costs and in what currency, or 'free'",
+        "howTo":"where and how to apply or get it, in one sentence",
+        "extendable":"can it be extended in country, how many times, roughly what it costs",
+        "onwardTicket":"is proof of onward travel actually required or checked",
+        "passportValidity":"how many months of passport validity is required, and blank pages if relevant",
+        "remoteWork":"honestly: is working remotely for a foreign employer on this visa permitted, tolerated, or a problem",
+        "sources":["url","url"]}
+
+        No markdown. Speakable sentences. If you are not confident about something, say you are not.
+        """
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 100
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": 2000,
+            "system": "You are Chappy's visa desk. You answer with JSON only. Accuracy matters more "
+                + "than confidence here: a wrong visa answer strands someone at an airport. Never "
+                + "state a rule you have not just verified with a search.",
+            "messages": [["role": "user", "content": prompt]],
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 5]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        CostMeter.shared.addResearch()
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else {
+            error = "Couldn't reach the visa desk just now."
+            return nil
+        }
+        var text = ""
+        var found: [String] = []
+        for block in content {
+            let type = block["type"] as? String
+            if type == "text", let t = block["text"] as? String { text += t }
+            else if type == "web_search_tool_result", let rows = block["content"] as? [[String: Any]] {
+                for r in rows {
+                    if let u = r["url"] as? String, !found.contains(u) { found.append(u) }
+                }
+            }
+        }
+        guard let open = text.firstIndex(of: "{"), let close = text.lastIndex(of: "}"),
+              open < close,
+              let d = String(text[open...close]).data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let summary = obj["summary"] as? String, !summary.isEmpty else {
+            error = "The visa desk answered in a shape I couldn't read."
+            return nil
+        }
+
+        var sources = (obj["sources"] as? [String]) ?? []
+        for u in found where !sources.contains(u) { sources.append(u) }
+
+        let l = Live(country: country,
+                     summary: summary,
+                     cost: (obj["cost"] as? String) ?? "",
+                     howTo: (obj["howTo"] as? String) ?? "",
+                     extendable: (obj["extendable"] as? String) ?? "",
+                     onwardTicket: (obj["onwardTicket"] as? String) ?? "",
+                     passportValidity: (obj["passportValidity"] as? String) ?? "",
+                     remoteWork: (obj["remoteWork"] as? String) ?? "",
+                     sources: Array(sources.prefix(6)),
+                     checkedAt: Date())
+        live[country] = l
+        error = nil
+        saveLive()
+        ChappyMemory.shared.remember(.note,
+            title: "Visa check: \(country)",
+            body: summary,
+            tags: ["visa", country.lowercased(), "travel"],
+            source: "visa")
+        return l
+    }
+}
+
+// MARK: - Chappy Visa: reading the trip as a sequence
+
+extension ChappyVisa {
+
+    /// One country's position across a whole itinerary. The point of this
+    /// type is the SEQUENCE: thirty days on arrival is fine right up until
+    /// your legs add up to forty-five.
+    struct Position: Identifiable {
+        var id: String { country }
+        var country: String
+        var nights: Int
+        var allowance: Int
+        var shape: Shape
+        var legs: [String]
+        var firstArrival: Date?
+        var schengenGroup = false
+        /// How many separate times the trip enters this country. Matters
+        /// because each entry costs an extra counted DAY.
+        var entries: Int = 1
+
+        /// AUDIT: this compared NIGHTS against the allowance, and immigration
+        /// counts DAYS OF PRESENCE. Arrive on the 1st and stay 30 nights and
+        /// you leave on the 31st — you were in the country on 31 days, and a
+        /// 30-day visa on arrival has been overstayed by one. The old code
+        /// called that "0 days spare, fine" and armed no warning. Each
+        /// separate entry adds its own arrival day.
+        var days: Int { nights + max(1, entries) }
+
+        var over: Bool { allowance > 0 && days > allowance }
+        var tight: Bool { allowance > 0 && !over && days > allowance - 3 }
+
+        var verdict: String {
+            if allowance <= 0 { return "No day limit in my table — check it." }
+            if over { return "OVER by \(days - allowance) days" }
+            if tight { return "Cutting it fine — \(allowance - days) days spare" }
+            return "\(allowance - days) days spare"
+        }
+    }
+
+    /// Walk the trip, group by country (and treat Schengen as one country,
+    /// because it is one allowance and pretending otherwise is the most
+    /// expensive mistake an Australian can make in Europe).
+    func positions(for trip: ChappyTravel.Trip) -> [Position] {
+        var order: [String] = []
+        var byCountry: [String: Position] = [:]
+
+        var previousBucket = ""
+        for leg in trip.legs {
+            // The country on the leg if the geocoder found one, otherwise
+            // work it out from the place name. Try BOTH — a leg can carry a
+            // country the geocoder wrote and a place name that resolves,
+            // and either alone loses cases the other catches.
+            let resolved = Self.country(from: leg.country) ?? Self.country(from: leg.place)
+            let name = resolved ?? (leg.country.isEmpty ? leg.place : leg.country)
+            // AUDIT: Schengen was tested against the RESOLVED name only, and
+            // most of the zone couldn't resolve at all. Test the raw country
+            // too, so a leg the geocoder labelled "Austria" buckets even if
+            // nothing else matched.
+            let isSchengen = Self.schengen.contains(name)
+                || Self.schengen.contains(leg.country)
+                || (resolved.map { Self.schengen.contains($0) } ?? false)
+            let bucket = isSchengen ? "Schengen area" : name
+
+            if byCountry[bucket] == nil {
+                order.append(bucket)
+                let r = isSchengen
+                    ? Rule(shape: .visaFree, days: 90,
+                           note: "90 days in any rolling 180 across the whole zone.")
+                    : (resolved.flatMap { Self.auPassport[$0] } ?? Rule(shape: .unknown, days: 0))
+                byCountry[bucket] = Position(country: bucket, nights: 0,
+                                             allowance: r.days, shape: r.shape,
+                                             legs: [], firstArrival: leg.arrive,
+                                             schengenGroup: isSchengen)
+            }
+            byCountry[bucket]?.nights += max(0, leg.nights)
+            byCountry[bucket]?.legs.append(leg.place)
+            // A country re-entered later in the trip costs another arrival
+            // day. Only counts when the itinerary actually left and came back.
+            if previousBucket != bucket, byCountry[bucket]?.legs.count ?? 0 > 1 {
+                byCountry[bucket]?.entries += 1
+            }
+            previousBucket = bucket
+            if let existing = byCountry[bucket]?.firstArrival, leg.arrive < existing {
+                byCountry[bucket]?.firstArrival = leg.arrive
+            }
+        }
+        return order.compactMap { byCountry[$0] }
+    }
+
+    /// The whole-trip verdict, spoken. Leads with the problem if there is
+    /// one, because that is the only part anyone needs to hear twice.
+    func spokenTripCheck(_ trip: ChappyTravel.Trip) -> String {
+        let pos = positions(for: trip)
+        guard !pos.isEmpty else { return "No countries on that trip yet." }
+
+        let trouble = pos.filter { $0.over }
+        let tight = pos.filter { $0.tight }
+        let action = pos.filter { $0.shape.needsActionBeforeFlying }
+
+        var out: [String] = []
+        // AUDIT: this spoke only the FIRST overrun and silently dropped any
+        // others — on a two-country problem you'd fix one and fly into the
+        // second.
+        for p in trouble {
+            out.append("Problem: that's \(p.days) days in \(p.country) but an Australian passport "
+                     + "gets \(p.allowance). \(p.days - p.allowance) over. "
+                     + "Either extend in country, do a border run, or apply for a longer visa before you fly.")
+        }
+        for t in tight {
+            out.append("\(t.country) is tight — \(t.days) of \(t.allowance) days.")
+        }
+        for a in action {
+            out.append("\(a.country) needs a \(a.shape.label.lowercased()) sorted before you board, "
+                     + "not at the airport.")
+        }
+        if out.isEmpty {
+            let names = pos.map { "\($0.country) \($0.days) days" }
+            out.append("Visas look fine: " + names.joined(separator: ", ")
+                     + ". All inside what an Australian passport gets.")
+        }
+        out.append("That's my indicative table — I'll check the live rules before you go.")
+        return out.joined(separator: " ")
+    }
+
+    /// One country, spoken, straight away and offline.
+    func spoken(_ raw: String) -> String {
+        guard let country = Self.country(from: raw) else {
+            return "\(raw) isn't in my table. Ask me to check it properly and I'll look up the current rules."
+        }
+        guard let r = Self.auPassport[country] else {
+            return "I don't have \(country) baked in. Ask me to check it properly."
+        }
+        var line = "\(country): an Australian passport gets \(r.shape.label.lowercased())"
+        if r.days > 0 { line += " for \(r.days) days" }
+        line += "."
+        if !r.note.isEmpty { line += " \(r.note)" }
+        if r.shape.needsActionBeforeFlying {
+            line += " Sort that before you fly - it is not something you can fix at the airport."
+        }
+        if let l = live[country] {
+            line += " \(l.summary)"
+        } else {
+            line += " That's indicative — say 'check the visa properly' and I'll look up the live rules."
+        }
+        return line
+    }
+}
+
+// MARK: - Chappy Visa: state, memory and the reminders
+
+extension ChappyVisa {
+
+    /// Arm the paperwork, per country, with the runway each shape actually
+    /// needs. An embassy visa found three days before a flight is not a
+    /// reminder, it's a cancelled trip — so an embassy country gets ten
+    /// weeks and an on-arrival country gets a fortnight.
+    func armReminders(for trip: ChappyTravel.Trip) {
+        guard let start = trip.start, start > Date() else { return }
+        let cal = Calendar.current
+        let r = ChappyReminders.shared
+
+        for p in positions(for: trip) {
+            guard p.shape != .unknown else { continue }
+            let lead = p.shape.leadDays
+            guard let when = cal.date(byAdding: .day, value: -lead, to: p.firstArrival ?? start)
+            else { continue }
+            var comps = cal.dateComponents([.year, .month, .day], from: when)
+            comps.hour = 9; comps.minute = 0
+            guard let at = cal.date(from: comps), at > Date() else { continue }
+
+            let title: String
+            switch p.shape {
+            case .embassy:
+                title = "\(p.country) visa: embassy application — start it now, these take weeks"
+            case .eVisa:
+                title = "\(p.country) e-visa: apply online now, don't leave it"
+            case .eta:
+                title = "\(p.country): travel authorisation needed before you board"
+            case .visaOnArrival:
+                title = "\(p.country): visa on arrival — have the fee and an onward ticket ready"
+            case .visaFree:
+                title = "\(p.country): visa-free, but check your passport has six months on it"
+            default:
+                title = "\(p.country): check the visa rules"
+            }
+            r.add(title: title, at: at,
+                  escalate: p.shape == .embassy || p.shape == .eVisa,
+                  source: "visa")
+        }
+
+        // The one that strands people, and it is never the visa itself.
+        if let sixMonths = cal.date(byAdding: .day, value: -60, to: start), sixMonths > Date() {
+            var c = cal.dateComponents([.year, .month, .day], from: sixMonths)
+            c.hour = 9; c.minute = 0
+            if let at = cal.date(from: c), at > Date() {
+                r.add(title: "\(trip.name): passport needs 6 months validity past your return date — check it",
+                      at: at, escalate: false, source: "visa")
+            }
+        }
+
+        // And the overrun, if there is one — flagged early enough to fix.
+        for p in positions(for: trip) where p.over {
+            guard let when = cal.date(byAdding: .day, value: -45, to: p.firstArrival ?? start),
+                  when > Date() else { continue }
+            var c = cal.dateComponents([.year, .month, .day], from: when)
+            c.hour = 9; c.minute = 0
+            guard let at = cal.date(from: c) else { continue }
+            r.add(title: "\(p.country): your plan is \(p.days) days but you get \(p.allowance) — extension, border run or a different visa",
+                  at: at, escalate: true, source: "visa")
+        }
+        print("🛂 [Visa] Reminders armed for \(trip.name)")
+    }
+
+    /// Check every country on a trip, one after the other, with a breath
+    /// between so a six-leg itinerary doesn't fire six searches at once.
+    func checkWholeTrip(_ trip: ChappyTravel.Trip) async {
+        for p in positions(for: trip) where !p.schengenGroup {
+            _ = await deepCheck(country: p.country, nights: p.nights)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+    }
+}
+
+// =====================================================================
+// BUILD 178 — THE MAP, IN THE EMAIL.
+//
+// The 177 report described the legs and had no map in it at all, which
+// for a travel document is the wrong way round: the map is the thing
+// someone looks at first and the thing they remember.
+//
+// MKMapSnapshotter renders a real map image on the device — free, no
+// key, no network beyond the tiles — and the pins and the route are
+// drawn on top with the same hue ramp the interactive atlas uses, so
+// the printed trip and the one on screen are recognisably the same
+// trip. It goes into the HTML as a base64 data URL, which means the
+// report stays ONE self-contained file: no broken images when it's
+// forwarded, and it still opens with no signal.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// Same ramp as the atlas — cool at the start, warm at the end.
+    static func legHue(_ i: Int, of total: Int) -> UIColor {
+        let n = max(1, total - 1)
+        let t = Double(min(i, n)) / Double(n)
+        return UIColor(hue: CGFloat((200.0 - 180.0 * t) / 360.0),
+                       saturation: 0.85, brightness: 0.95, alpha: 1)
+    }
+
+    /// Render the trip to a PNG. Nil when there is nothing to draw or the
+    /// snapshotter refuses — the report then simply has no map rather
+    /// than a broken one.
+    func mapImage(_ trip: Trip, size: CGSize = CGSize(width: 900, height: 560)) async -> UIImage? {
+        let placed = trip.legs.filter(\.hasCoord)
+        guard !placed.isEmpty else { return nil }
+
+        let lats = placed.map(\.lat), lons = placed.map(\.lon)
+        guard let minLa = lats.min(), let maxLa = lats.max(),
+              let minLo = lons.min(), let maxLo = lons.max() else { return nil }
+
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLa + maxLa) / 2,
+                                           longitude: (minLo + maxLo) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max(0.5, (maxLa - minLa) * 1.8),
+                                   longitudeDelta: max(0.5, (maxLo - minLo) * 1.8)))
+        options.size = size
+        options.scale = 2
+        options.mapType = .standard
+        options.showsBuildings = false
+
+        guard let snap = try? await MKMapSnapshotter(options: options).start() else { return nil }
+
+        // AUDIT: the default renderer format uses the SCREEN scale, so on a
+        // 3x phone this upscaled a 2x snapshot into a 2700-pixel-wide PNG
+        // and then base64'd it into an email. Match the snapshot instead.
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 2
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        return renderer.image { ctx in
+            snap.image.draw(at: .zero)
+            let cg = ctx.cgContext
+
+            // The route first, so the pins sit on top of it.
+            let points = placed.map {
+                snap.point(for: CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon))
+            }
+            for i in 1..<max(1, points.count) {
+                let colour = Self.legHue(i, of: placed.count)
+                cg.setStrokeColor(colour.withAlphaComponent(0.9).cgColor)
+                cg.setLineWidth(4)
+                cg.setLineCap(.round)
+                switch placed[i].arrival {
+                case .flight: cg.setLineDash(phase: 0, lengths: [11, 7])
+                case .ferry:  cg.setLineDash(phase: 0, lengths: [2, 7])
+                default:      cg.setLineDash(phase: 0, lengths: [])
+                }
+                cg.move(to: points[i - 1])
+                cg.addLine(to: points[i])
+                cg.strokePath()
+            }
+            cg.setLineDash(phase: 0, lengths: [])
+
+            // Then the numbered pins, and the place names beside them.
+            for (i, p) in points.enumerated() {
+                let r: CGFloat = 17
+                let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
+                cg.setFillColor(Self.legHue(i, of: placed.count).cgColor)
+                cg.fillEllipse(in: rect)
+                cg.setStrokeColor(UIColor.white.cgColor)
+                cg.setLineWidth(3)
+                cg.strokeEllipse(in: rect)
+
+                let num = "\(i + 1)" as NSString
+                let numAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 17, weight: .heavy),
+                    .foregroundColor: UIColor.black.withAlphaComponent(0.8)
+                ]
+                let ns = num.size(withAttributes: numAttrs)
+                num.draw(at: CGPoint(x: p.x - ns.width / 2, y: p.y - ns.height / 2),
+                         withAttributes: numAttrs)
+
+                let label = placed[i].place as NSString
+                let labelAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 15, weight: .bold),
+                    .foregroundColor: UIColor.white
+                ]
+                let ls = label.size(withAttributes: labelAttrs)
+                let box = CGRect(x: p.x - ls.width / 2 - 6, y: p.y + r + 3,
+                                 width: ls.width + 12, height: ls.height + 4)
+                cg.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+                UIBezierPath(roundedRect: box, cornerRadius: 6).fill()
+                label.draw(at: CGPoint(x: box.minX + 6, y: box.minY + 2),
+                           withAttributes: labelAttrs)
+            }
+        }
+    }
+
+    /// The report, with the map baked into it. Async because the snapshot
+    /// is — the synchronous reportHTML stays for anything that can't wait.
+    func reportHTMLWithMap(_ trip: Trip) async -> String {
+        var html = reportHTML(trip)
+        guard let img = await mapImage(trip),
+              let png = img.pngData() else { return html }
+        let b64 = png.base64EncodedString()
+        let route = googleTripURL(trip)?.absoluteString ?? ""
+        // BUILD 179: the picture is the door. Tap the map in the email and
+        // the whole route opens in Google Maps, every stop in order, on
+        // whatever phone is holding the document.
+        let opener = route.isEmpty ? "" :
+            "<div style=\"padding:11px 16px;font-size:14px;color:#1a73e8;"
+            + "font-weight:600;background:#e8f0fe\">Open this route in Google Maps &rarr;</div>"
+        let openTag = route.isEmpty ? "" : "<a href=\"\(route)\" style=\"display:block;text-decoration:none\">"
+        let closeTag = route.isEmpty ? "" : "</a>"
+        let block = """
+        <div class="card" style="padding:0;overflow:hidden">
+        \(openTag)<img src="data:image/png;base64,\(b64)" style="width:100%;display:block" alt="Trip map">\(opener)\(closeTag)
+        </div>
+        """
+        // Straight under the title, above the money — it's the first thing
+        // anyone looks at, so it goes where the eye lands.
+        if let r = html.range(of: "<div class=\"card\"><h2>What it costs</h2>") {
+            html.replaceSubrange(r, with: block + "<div class=\"card\"><h2>What it costs</h2>")
+        }
+        return html
+    }
+
+    /// Write the report WITH the map. Falls back to the plain one if the
+    /// snapshot fails, so sharing never breaks because of a map.
+    func writeReportWithMap(_ trip: Trip) async -> URL? {
+        let safe = trip.name.replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (safe.isEmpty ? "Trip" : safe) + ".html"
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return nil }
+        let url = dir.appendingPathComponent(name)
+        // BUILD 183: the dark document — dated maps with the shortlist on
+        // them, zoom panels, the argument for the trip, deal hunt,
+        // conversion meter, stress test and where it leads. reportFullHTML
+        // stays as the fallback for anything that can't wait for research.
+        let extras = await buildExtras(for: trip)
+        let html = await reportHTML183(trip, extras: extras)
+        do {
+            try html.data(using: .utf8)?.write(to: url)
+            return url
+        } catch {
+            print("⚠️ [Travel] Couldn't write the report: \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
+
+// MARK: - The visa section of the report
+
+extension ChappyTravel {
+
+    /// Visas belong in the emailed document, not just on a screen — the
+    /// person you forward this to is often the one who has to organise
+    /// their own.
+    func visaHTML(_ trip: Trip) -> String {
+        let pos = ChappyVisa.shared.positions(for: trip)
+        guard !pos.isEmpty else { return "" }
+        let esc: (String) -> String = { s in
+            s.replacingOccurrences(of: "&", with: "&amp;")
+             .replacingOccurrences(of: "<", with: "&lt;")
+             .replacingOccurrences(of: ">", with: "&gt;")
+        }
+        // The one place in this document where "researched" is not good
+        // enough on its own, and the report should say so rather than
+        // looking as certain as the exchange rate does.
+        var h = "<div class=\"card\"><h2>Visas — Australian passport"
+        h += ChappyTravel.stampHTML(ChappyStamp(.researched, source: "immigration sources",
+                                                note: "confirm against the government site before you fly"))
+        h += "</h2><table>"
+        for p in pos {
+            let state = p.over ? "OVER by \(p.days - p.allowance) days"
+                               : (p.allowance > 0 ? "\(p.allowance - p.days) days spare" : "check")
+            h += "<tr><td><strong>\(esc(p.country))</strong><br>"
+            h += "<span style=\"color:var(--dim);font-size:13px\">\(esc(p.shape.label))"
+            if p.allowance > 0 { h += " &middot; \(p.allowance) days allowed" }
+            h += "</span>"
+            if let l = ChappyVisa.shared.live[p.country] {
+                h += "<br><span style=\"color:var(--dim);font-size:13px\">\(esc(l.summary))</span>"
+                if !l.cost.isEmpty {
+                    h += "<br><span style=\"color:var(--faint);font-size:12.5px\">Cost: \(esc(l.cost))</span>"
+                }
+                h += "<br><span style=\"color:var(--faint);font-size:12px\">\(esc(l.ageLine))</span>"
+            }
+            h += "</td><td class=\"r\" style=\"color:\(p.over ? "var(--bad)" : "var(--acc)")\">"
+            h += "\(p.days) days<br><span style=\"font-weight:400;font-size:13px\">\(esc(state))</span>"
+            h += "</td></tr>"
+        }
+        h += "</table><p style=\"color:var(--faint);font-size:12px;margin:14px 0 0\">"
+        h += "Indicative for an Australian passport. Visa rules change without notice — confirm with "
+        h += "Smartraveller and the country's own immigration service before you fly.</p></div>"
+        return h
+    }
+}
+
+// =====================================================================
+// BUILD 179 — GOOGLE MAPS, FROM EVERY PIN.
+//
+// The atlas is MapKit because that was the right call for the BUILD:
+// no package to add, no second API key to enable, nothing that can
+// break an archive at 11pm. But MapKit being the canvas has nothing to
+// do with where you LAND when you tap a place — and for actually
+// getting somewhere in Asia, Google is what has the businesses, the
+// opening hours, the reviews and the transit legs.
+//
+// So: MapKit draws it, Google opens it. Every pin, every leg, and the
+// map in the emailed report.
+//
+// All of these are plain https links, which iOS treats as universal
+// links: the Google Maps app opens if it's installed, the website if
+// it isn't. No comgooglemaps:// scheme, so no plist entry, and nothing
+// that silently stops working when a vendor renames a scheme.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// One place, on Google. Coordinates when we have them — a name alone
+    /// finds the wrong Ubud often enough to matter — with the name still
+    /// passed so the pin comes up labelled rather than as a bare dot.
+    func googlePlaceURL(_ leg: Leg) -> URL? {
+        let name = Self.enc(leg.place)
+        if leg.hasCoord {
+            // Coordinates, not the name — "Ubud" alone finds the wrong one
+            // often enough to matter, and a pin in the wrong country is
+            // worse than no pin.
+            return URL(string: "https://www.google.com/maps/search/?api=1"
+                       + "&query=\(leg.lat)%2C\(leg.lon)")
+        }
+        return URL(string: "https://www.google.com/maps/search/?api=1&query=\(name)")
+    }
+
+    /// A named place near a leg — a shortlisted restaurant, an attraction.
+    /// The leg name rides along so "Locavore" finds the one in Ubud.
+    func googleSearchURL(_ what: String, near leg: Leg) -> URL? {
+        let q = Self.enc("\(what) \(leg.place)")
+        if leg.hasCoord {
+            return URL(string: "https://www.google.com/maps/search/\(q)/@\(leg.lat),\(leg.lon),14z")
+        }
+        return URL(string: "https://www.google.com/maps/search/?api=1&query=\(q)")
+    }
+
+    /// Google's travel modes. A flight has no driving route, so those fall
+    /// back to transit rather than offering a fourteen-hour drive across
+    /// the Java Sea — which is what a naive mapping does.
+    private static func googleMode(_ a: Arrival) -> String {
+        switch a {
+        case .bus, .train, .ferry, .flight: return "transit"
+        case .taxi, .grab, .car:            return "driving"
+        case .walk:                         return "walking"
+        case .none:                         return "driving"
+        }
+    }
+
+    /// Getting from the last leg to this one, on Google, in the right mode.
+    func googleDirectionsURL(to leg: Leg, from previous: Leg?) -> URL? {
+        let dest = leg.hasCoord ? "\(leg.lat),\(leg.lon)" : leg.place
+        var s = "https://www.google.com/maps/dir/?api=1&destination=\(Self.enc(dest))"
+        if let p = previous {
+            let origin = p.hasCoord ? "\(p.lat),\(p.lon)" : p.place
+            s += "&origin=\(Self.enc(origin))"
+        }
+        s += "&travelmode=\(Self.googleMode(leg.arrival))"
+        return URL(string: s)
+    }
+
+    /// THE WHOLE TRIP, as one Google route. This is the link that goes on
+    /// the map image in the report: tap the picture, get the real thing,
+    /// every stop in order, on the device you're holding.
+    ///
+    /// Google takes at most nine waypoints between the ends, so a longer
+    /// itinerary is trimmed evenly rather than truncated — losing the
+    /// middle of a trip is worse than losing its resolution.
+    func googleTripURL(_ trip: Trip) -> URL? {
+        let placed = trip.legs.filter { $0.hasCoord || !$0.place.isEmpty }
+        guard placed.count >= 1 else { return nil }
+        func point(_ l: Leg) -> String {
+            l.hasCoord ? "\(l.lat),\(l.lon)" : l.place
+        }
+        guard let first = placed.first, let last = placed.last else { return nil }
+        if placed.count == 1 {
+            return URL(string: "https://www.google.com/maps/search/?api=1&query=\(Self.enc(point(first)))")
+        }
+        var middle = Array(placed.dropFirst().dropLast())
+        if middle.count > 9 {
+            // Keep the shape: take every nth so the route still reads as
+            // the same journey.
+            let step = Double(middle.count) / 9.0
+            middle = (0..<9).map { middle[min(middle.count - 1, Int(Double($0) * step))] }
+        }
+        var s = "https://www.google.com/maps/dir/?api=1"
+        s += "&origin=\(Self.enc(point(first)))"
+        s += "&destination=\(Self.enc(point(last)))"
+        if !middle.isEmpty {
+            s += "&waypoints=" + middle.map { Self.enc(point($0)) }.joined(separator: "%7C")
+        }
+        // The dominant mode across the trip decides the route type — a trip
+        // that is mostly flights is a transit route, one that is mostly
+        // taxis is a driving one.
+        let modes = placed.dropFirst().map { Self.googleMode($0.arrival) }
+        let dominant = modes.reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
+            .max(by: { $0.value < $1.value })?.key ?? "driving"
+        s += "&travelmode=\(dominant)"
+        return URL(string: s)
+    }
+}
+
+// =====================================================================
+// BUILD 180 — WHY YOUR MUSIC WENT QUIET.
+//
+// "When Chappy's open, Apple Music dulls. Close Chappy and it's full
+// volume again. Meta doesn't do this."
+//
+// That is not a bug in the sense of something going wrong — it is
+// exactly what the code asked iOS to do, and it asked for it in two
+// places, permanently:
+//
+//   ChappyStandby, arming the wake-word ear:
+//       setCategory(.playAndRecord, mode: .spokenAudio,
+//                   options: [.duckOthers, ...])
+//       setActive(true)
+//
+//   TTSService, before every spoken line:
+//       setCategory(.playAndRecord, mode: .voiceChat,
+//                   options: [.duckOthers, ...])
+//
+// .duckOthers means "hold every other app's audio down for as long as
+// my session is active". Chappy's session is active CONTINUOUSLY,
+// because the wake word is genuinely listening the whole time the app
+// is open. So the duck never lifts. And .spokenAudio makes it worse —
+// that mode exists for audiobook apps and is designed to suppress other
+// audio, so the ear was asking for it twice over.
+//
+// WHY META DOESN'T DO THIS, since that's the fair question: "Hey Meta"
+// is not running on your phone. It runs on the glasses' own always-on
+// audio chip, and the phone app only opens a recording session at the
+// moment you actually invoke it. It has nothing to duck with, because
+// most of the time it is not listening on the phone at all. Chappy's
+// wake word runs on the phone with a live microphone tap — that is what
+// makes it work with the phone in your pocket and no glasses, and it is
+// also what put an active audio session in front of your music.
+//
+// So the fix is not to stop listening. It is to stop DEMANDING silence
+// while listening, and to duck only in the seconds Chappy is actually
+// talking — which is the behaviour every good assistant has.
+//
+//   LISTENING  — .default + .mixWithOthers. Music plays at full volume
+//                and the ear still hears you.
+//   SPEAKING   — .duckOthers, for the length of the line, then straight
+//                back to listening. Music dips, Chappy talks, music
+//                returns. That dip is the point.
+//   CONVERSATION — Live AI and Translate keep .voiceChat and the duck,
+//                because during a real conversation you do want the
+//                music out of the way, and .voiceChat is what gives
+//                those two hardware echo cancellation.
+//
+// And it's a setting, because "never touch my music" is a legitimate
+// preference and one honest trade-off comes with it: with music at full
+// volume out of the phone's own speaker, the microphone can hear it,
+// and a lyric can occasionally sound enough like the name to wake him.
+// On headphones or through the glasses that cannot happen at all.
+// =====================================================================
+
+@MainActor
+enum ChappyAudio {
+
+    enum Profile { case listening, speaking, conversation }
+
+    /// "speaking" (default) · "never" · "always"
+    static var policy: String {
+        get { UserDefaults.standard.string(forKey: "chappy_duck_policy") ?? "speaking" }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_duck_policy") }
+    }
+
+    static var policyLine: String {
+        switch policy {
+        case "never":  return "Chappy never touches your music — it talks over the top."
+        case "always": return "Your music stays down the whole time Chappy is open."
+        default:       return "Your music dips only while Chappy is actually speaking."
+        }
+    }
+
+    /// Set by Live AI, Translate and the realtime services while they own
+    /// the route. Nothing else is allowed to reconfigure underneath a live
+    /// conversation — that was already the rule, it just wasn't written
+    /// anywhere a second module could see it.
+    static var conversationActive = false
+
+    @discardableResult
+    static func apply(_ profile: Profile) -> Bool {
+        let s = AVAudioSession.sharedInstance()
+        // A live conversation owns the session outright.
+        if conversationActive, profile != .conversation { return false }
+
+        var opts: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+        let mode: AVAudioSession.Mode
+        let p = policy
+
+        switch profile {
+        case .listening:
+            // NOT .spokenAudio. That mode is built to suppress other audio,
+            // which is the opposite of what an ambient ear should do.
+            mode = .default
+            if p == "always" { opts.insert(.duckOthers) } else { opts.insert(.mixWithOthers) }
+
+        case .speaking:
+            mode = .default
+            if p == "never" { opts.insert(.mixWithOthers) } else { opts.insert(.duckOthers) }
+
+        case .conversation:
+            // .allowBluetooth (HFP) only here — Standby deliberately leaves
+            // the glasses' mic alone so "Hey Meta" keeps working.
+            mode = .voiceChat
+            opts.insert(.allowBluetooth)
+            if p == "never" { opts.insert(.mixWithOthers) } else { opts.insert(.duckOthers) }
+        }
+
+        do {
+            try s.setCategory(.playAndRecord, mode: mode, options: opts)
+            try s.setActive(true)
+            return true
+        } catch {
+            print("⚠️ [Audio] Couldn't apply the \(profile) profile: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Back to listening after a spoken line. Safe to call from anywhere —
+    /// it declines while a conversation owns the route, and it never
+    /// deactivates the session, because deactivating it would pull the
+    /// microphone out from under the wake word.
+    static func releaseAfterSpeech() {
+        guard !conversationActive else { return }
+        guard policy != "always" else { return }
+        apply(.listening)
+    }
+}
+
+// =====================================================================
+// BUILD 181 — LOCAL FIRST, DOLLARS BESIDE IT.
+//
+// The app converted everything into the home currency and HID the local
+// number, which is backwards. Standing in a shop in Ubud, the number on
+// the price tag is rupiah; the dollar figure is the sanity check. So on
+// a price the local number leads and the dollars sit in brackets.
+//
+// On the TRIP TOTAL it inverts, deliberately: "Rp 65,300,000" tells you
+// nothing about whether you can afford to go, and "$6,240" tells you
+// immediately. Two different questions, two different orders.
+//
+// Two rules that matter more than they look:
+//   * No cents on currencies that don't have any. "Rp 1,450,000.00" is
+//     not a price anyone has ever written down.
+//   * If a rate genuinely isn't known, show the local figure ALONE. A
+//     converted guess is worse than one honest number, and this class
+//     already refuses to invent rates elsewhere.
+// =====================================================================
+
+extension ChappyFX {
+
+    /// A price, the way it's written on the thing you're buying.
+    /// "Rp 1,450,000 ($138)"
+    static func pair(_ amount: Double, local: String, home: String) -> String {
+        let l = local.uppercased(), h = home.uppercased()
+        guard amount != 0 else { return money(0, h) }
+        guard l != h, !l.isEmpty else { return money(amount, h) }
+        let localPart = money(amount, l)
+        guard let converted = shared.convert(amount, from: l, to: h) else {
+            // No rate — say the true thing rather than a converted guess.
+            return localPart
+        }
+        return "\(localPart) (\(money(converted, h)))"
+    }
+
+    /// A total, where the dollars are the decision and the local figure is
+    /// the context. "$6,240 · Rp 65,300,000"
+    static func totalPair(_ amount: Double, home: String, local: String) -> String {
+        let l = local.uppercased(), h = home.uppercased()
+        guard l != h, !l.isEmpty else { return money(amount, h) }
+        guard let converted = shared.convert(amount, from: h, to: l) else {
+            return money(amount, h)
+        }
+        return "\(money(amount, h)) · \(money(converted, l))"
+    }
+
+    /// Spoken. Rounded hard, because "one million four hundred and fifty
+    /// thousand rupiah" is unlistenable and "about one and a half million
+    /// rupiah, call it a hundred and forty dollars" is what a friend says.
+    static func spokenPair(_ amount: Double, local: String, home: String) -> String {
+        let l = local.uppercased(), h = home.uppercased()
+        guard l != h, !l.isEmpty else { return shared.spokenMoney(amount, h) }
+        var line = shared.spokenMoney(amount, l)
+        if line.contains("about") == false,
+           let c = shared.convert(amount, from: l, to: h) {
+            line += ", call it \(money(c, h))"
+        }
+        return line
+    }
+
+    /// Which money you'd actually be handed change in. Derived from the
+    /// country so nobody has to set it, overridable per leg for the dive
+    /// shop that quotes in US dollars — which happens constantly in Asia.
+    static let currencyByCountry: [String: String] = [
+        "Indonesia": "IDR", "Thailand": "THB", "Vietnam": "VND",
+        "Malaysia": "MYR", "Singapore": "SGD", "Philippines": "PHP",
+        "Cambodia": "KHR", "Laos": "LAK", "Myanmar": "MMK",
+        "Brunei": "BND", "Timor-Leste": "USD",
+        "Japan": "JPY", "South Korea": "KRW", "Taiwan": "TWD",
+        "Hong Kong": "HKD", "China": "CNY", "India": "INR",
+        "Sri Lanka": "LKR", "Nepal": "NPR", "Maldives": "MVR",
+        "United Arab Emirates": "AED",
+        "New Zealand": "NZD", "Fiji": "FJD", "Vanuatu": "VUV",
+        "Papua New Guinea": "PGK", "Samoa": "WST", "Tonga": "TOP",
+        "United Kingdom": "GBP", "Ireland": "EUR", "United States": "USD",
+        "Canada": "CAD", "Turkey": "TRY", "Morocco": "MAD", "Egypt": "EGP",
+        "South Africa": "ZAR", "Kenya": "KES", "Tanzania": "TZS",
+        "Brazil": "BRL", "Argentina": "ARS", "Chile": "CLP",
+        "Peru": "PEN", "Mexico": "MXN", "Australia": "AUD",
+    ]
+
+    static func currency(forCountry country: String) -> String? {
+        if let c = currencyByCountry[country] { return c }
+        if ChappyVisa.schengen.contains(country) { return "EUR" }
+        return nil
+    }
+}
+
+extension ChappyTravel {
+
+    /// The money a leg is actually priced in. The leg's own setting wins,
+    /// then the country, then the trip's currency.
+    func localCurrency(for leg: Leg, in trip: Trip) -> String {
+        // AUDIT: this used to fall back to the leg's COUNTRY, which meant the
+        // screen and the costing could disagree. A leg added by hand carries
+        // home-currency defaults (90 a night) with no currency set; the
+        // moment geocoding wrote "Indonesia" onto it, the row rendered
+        // "Rp 90 ($0.01) a night" while the total still counted $90.
+        //
+        // A currency is only local if something SAID so. Never infer it from
+        // geography, because the number was typed before the geography was
+        // known.
+        if let c = leg.localCurrency, !c.isEmpty { return c }
+        if !leg.stayCurrency.isEmpty { return leg.stayCurrency }
+        return trip.homeCurrency
+    }
+
+    /// What a leg's country would suggest — for OFFERING a currency in the
+    /// editor, never for interpreting a number that already exists.
+    func suggestedCurrency(for leg: Leg) -> String? {
+        let country = ChappyVisa.country(from: leg.country) ?? ChappyVisa.country(from: leg.place)
+        return country.flatMap { ChappyFX.currency(forCountry: $0) }
+    }
+
+    /// Fill in the local currency for any leg that doesn't have one yet.
+    /// Runs after geocoding, when the country is finally known.
+    func stampCurrencies(_ tripID: UUID) {
+        guard let i = trips.firstIndex(where: { $0.id == tripID }) else { return }
+        var changed = false
+        for j in trips[i].legs.indices where (trips[i].legs[j].localCurrency ?? "").isEmpty {
+            // Only stamp a leg whose prices were ALREADY quoted locally —
+            // stayCurrency is what the planner sets when it returns local
+            // figures. Stamping a hand-added leg would relabel dollars as
+            // rupiah, which is the exact bug this guard exists to stop.
+            let quoted = trips[i].legs[j].stayCurrency
+            guard !quoted.isEmpty, quoted != trips[i].homeCurrency else { continue }
+            trips[i].legs[j].localCurrency = quoted
+            changed = true
+        }
+        if changed { save() }
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THE INTAKE. What a real agent asks before quoting anything.
+//
+// Until now the planner took a form: destination, nights, party, month,
+// budget, a few style chips. That is not an agent, it's a search box
+// with extra steps.
+//
+// A real agent asks the things that CHANGE THE PLAN and that you would
+// never think to type. The scooter question is the perfect example: in
+// Bali it is the difference between nine dollars a day and sixty-five,
+// and it decides where you can sensibly base yourself. Nobody types
+// "also I'd like a scooter" into a destination field.
+//
+// Two design rules:
+//   * ASKED ONCE. These answers are about HIM, not about one trip, so
+//     they persist and every future plan reads them. It's why the second
+//     trip you plan comes out much better than the first.
+//   * FOLLOW-UPS THAT MATTER. Say scooter and it asks about the
+//     international licence — because Bali police check, and your travel
+//     insurance is void without one. That is the difference between a
+//     questionnaire and someone who knows the job.
+// =====================================================================
+
+@MainActor
+final class ChappyIntake: ObservableObject {
+    static let shared = ChappyIntake()
+
+    enum Kind: String, Codable { case choice, multi, number, text, yesno }
+
+    struct Question: Identifiable {
+        var id: String
+        var prompt: String          // asked out loud, exactly as written
+        var short: String           // the label on screen
+        var kind: Kind
+        var options: [String] = []
+        var unit: String = ""
+        var why: String = ""        // shown small: why this changes the plan
+        /// Only ask this if another answer makes it relevant.
+        var onlyIf: (key: String, contains: String)?
+    }
+
+    static let questions: [Question] = [
+        Question(id: "pace", prompt: "How much moving around before it stops being a holiday?",
+                 short: "Pace", kind: .choice,
+                 options: ["Settle in one or two places", "A few bases, unhurried",
+                           "Keep moving, see a lot"],
+                 why: "Decides how many legs and how long each one runs."),
+
+        // BUILD 190: the question that decides eight other things —
+        // whether there's a flight home in the plan, what the bags cost,
+        // what the price journal is even pricing, and whether you can be
+        // boarded at all.
+        Question(id: "shape", prompt: "Are you coming back, or moving on?",
+                 short: "Coming back?", kind: .choice,
+                 options: ["One-way — I'll decide later", "Return, dates set", "Not sure yet"],
+                 why: "One-way changes the fare, the bags, and whether you need an onward ticket to board."),
+
+        Question(id: "dates", prompt: "Are your dates fixed, or can they move?",
+                 short: "Dates", kind: .choice,
+                 options: ["Fixed", "Give or take a few days", "Wide open"],
+                 why: "Flexible dates are worth hundreds on flights."),
+
+        Question(id: "stay", prompt: "Where do you like to sleep? Hostels, homestays, hotels or villas?",
+                 short: "Where you stay", kind: .multi,
+                 options: ["Hostel", "Homestay / guesthouse", "Hotel", "Villa / private", "Resort"],
+                 why: "Sets the nightly band the whole budget is built on."),
+
+        Question(id: "transport", prompt: "Getting around: scooter, hire car, private driver, or public and taxis?",
+                 short: "Getting around", kind: .multi,
+                 options: ["Scooter", "Hire car", "Private driver", "Taxis / Grab", "Buses and trains"],
+                 why: "In Bali this is the difference between nine dollars a day and sixty-five."),
+
+        Question(id: "licence", prompt: "Do you carry an international driving permit?",
+                 short: "International licence", kind: .yesno,
+                 why: "Police check it, and without one your travel insurance won't pay a scooter claim.",
+                 onlyIf: (key: "transport", contains: "Scooter")),
+
+        Question(id: "work", prompt: "Do you need to work while you're away?",
+                 short: "Working", kind: .yesno,
+                 why: "Turns internet, power and a desk into hard requirements rather than nice-to-haves."),
+
+        Question(id: "callhours", prompt: "Do you need to be on calls with Australia?",
+                 short: "Calls home", kind: .yesno,
+                 why: "Timezone overlap then decides which countries actually work.",
+                 onlyIf: (key: "work", contains: "Yes")),
+
+        Question(id: "activities", prompt: "What are you actually going for? Diving, surfing, hiking, food, temples, nothing at all?",
+                 short: "What you're going for", kind: .multi,
+                 options: ["Diving", "Snorkelling", "Surfing", "Hiking", "Food", "Temples & culture",
+                           "Photography", "Nightlife", "Doing nothing"],
+                 why: "Decides which towns are worth nights and which are worth a day."),
+
+        Question(id: "gear", prompt: "Carrying gear? A board, dive kit, a camera setup?",
+                 short: "Gear", kind: .multi,
+                 options: ["Surfboard", "Dive gear", "Camera kit", "Laptop only", "Nothing bulky"],
+                 why: "Changes baggage costs, and rules out some boats and buses.",
+                 onlyIf: (key: "activities", contains: "")),
+
+        Question(id: "early", prompt: "Early riser, or is a sunrise hike never happening?",
+                 short: "Mornings", kind: .choice,
+                 options: ["Up at dawn", "Normal", "Never before nine"],
+                 why: "Half the good things in Asia happen before eight and after five."),
+
+        Question(id: "drink", prompt: "Do you drink? It changes the daily budget more than people expect.",
+                 short: "Drinking", kind: .choice,
+                 options: ["Barely", "A few", "Yes, properly"],
+                 why: "Alcohol is taxed hard in Indonesia and it moves the food line a long way."),
+
+        Question(id: "diet", prompt: "Anything you can't eat?",
+                 short: "Food", kind: .text,
+                 why: "Goes into the restaurant shortlist rather than being found out at a table."),
+
+        Question(id: "musts", prompt: "One thing you'd be annoyed to come home without doing?",
+                 short: "Non-negotiable", kind: .text,
+                 why: "The plan gets built around this rather than fitting it in."),
+    ]
+
+    @Published private(set) var answers: [String: String] = [:]
+    @Published var showing = false
+
+    private init() { load() }
+
+    private func load() {
+        if let d = UserDefaults.standard.dictionary(forKey: "chappy_intake") as? [String: String] {
+            answers = d
+        }
+    }
+
+    private func save() {
+        UserDefaults.standard.set(answers, forKey: "chappy_intake")
+    }
+
+    func set(_ key: String, _ value: String) {
+        answers[key] = value
+        save()
+    }
+
+    func toggleMulti(_ key: String, _ value: String) {
+        var parts = (answers[key] ?? "").split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if let i = parts.firstIndex(of: value) { parts.remove(at: i) } else { parts.append(value) }
+        answers[key] = parts.joined(separator: ", ")
+        save()
+    }
+
+    func has(_ key: String, _ value: String) -> Bool {
+        (answers[key] ?? "").contains(value)
+    }
+
+    /// Which questions are live right now — a follow-up only appears once
+    /// the answer that triggers it exists.
+    var live: [Question] {
+        Self.questions.filter { q in
+            guard let cond = q.onlyIf else { return true }
+            let given = answers[cond.key] ?? ""
+            if cond.contains.isEmpty { return !given.isEmpty }
+            return given.contains(cond.contains)
+        }
+    }
+
+    var unanswered: [Question] {
+        live.filter { (answers[$0.id] ?? "").isEmpty }
+    }
+
+    var isComplete: Bool { unanswered.isEmpty }
+
+    var progress: Double {
+        let l = live.count
+        guard l > 0 else { return 1 }
+        return Double(l - unanswered.count) / Double(l)
+    }
+
+    /// Everything he has told us, written for the planner. This is the
+    /// paragraph that makes a plan HIS rather than a generic itinerary.
+    var brief: String {
+        guard !answers.isEmpty else { return "" }
+        var bits: [String] = []
+        for q in live {
+            let a = answers[q.id] ?? ""
+            guard !a.isEmpty else { continue }
+            bits.append("\(q.short): \(a)")
+        }
+        guard !bits.isEmpty else { return "" }
+        var s = "WHAT HE HAS TOLD ME ABOUT HOW HE TRAVELS — build the plan around this, "
+        s += "and do not offer things he has ruled out. " + bits.joined(separator: ". ") + "."
+        if has("transport", "Scooter") {
+            s += " He rides a scooter, so price scooter hire per day as its own line and "
+            s += "prefer areas where that is the sensible way to get around."
+            if answers["licence"] == "No" {
+                s += " He does NOT have an international driving permit — say so plainly, "
+                s += "because it invalidates insurance and police do check."
+            }
+        }
+        if answers["work"] == "Yes" {
+            s += " He works while travelling: internet speed, a desk and reliable power are "
+            s += "requirements, not preferences."
+            if answers["callhours"] == "Yes" {
+                s += " He needs calls with Australia, so favour timezones within about three "
+                s += "hours of Brisbane and say the overlap for each place."
+            }
+        }
+        return s
+    }
+
+    /// Spoken, for the voice version of the interview.
+    func nextSpokenQuestion() -> String? {
+        guard let q = unanswered.first else { return nil }
+        var line = q.prompt
+        if q.kind == .choice || q.kind == .multi, !q.options.isEmpty {
+            line += " " + q.options.prefix(4).joined(separator: ", ") + "?"
+        }
+        return line
+    }
+
+    /// Take a spoken answer for the question currently on the table.
+    /// Deliberately forgiving — matching a word inside a sentence beats
+    /// making someone repeat an exact phrase at a machine.
+    @discardableResult
+    func acceptSpoken(_ raw: String) -> String? {
+        guard let q = unanswered.first else { return nil }
+        let c = raw.lowercased()
+        switch q.kind {
+        case .yesno:
+            if c.contains("yes") || c.contains("yeah") || c.contains("yep") || c.contains("i do") {
+                set(q.id, "Yes")
+            } else if c.contains("no") || c.contains("nope") || c.contains("don't") {
+                set(q.id, "No")
+            } else { return "Just yes or no for that one." }
+        case .choice, .multi:
+            var hits: [String] = []
+            for o in q.options {
+                let first = o.lowercased().split(separator: " ").first.map(String.init) ?? o.lowercased()
+                if c.contains(o.lowercased()) || (first.count > 3 && c.contains(first)) { hits.append(o) }
+            }
+            guard !hits.isEmpty else {
+                return "I didn't catch that. " + q.options.prefix(4).joined(separator: ", ") + "?"
+            }
+            set(q.id, q.kind == .multi ? hits.joined(separator: ", ") : hits[0])
+        case .text, .number:
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard t.count > 1 else { return "Say a bit more." }
+            set(q.id, t)
+        }
+        return nextSpokenQuestion() ?? "That's everything. I know how you travel now — say 'plan me a trip' whenever you like."
+    }
+
+    func reset() {
+        answers = [:]
+        save()
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THREE OPTIONS, AND ARGUING WITH THEM.
+//
+// One plan is a quote. Three plans is a conversation, and a conversation
+// is what a travel agent actually is: it proposes, you push back, it
+// adjusts. That loop is the whole difference, and it's what has been
+// missing since 177.
+//
+// LEAN / BALANCED / COMFORTABLE are the same trip in three shapes, not
+// three different trips — same region, same length, same reasons for
+// going. Comparing them is only useful if the only thing that changed
+// is how much you're spending and what that buys.
+//
+// And the push-back is in plain words: "too expensive", "keep it under
+// six grand for two months", "spend more on the villa and less on
+// flights", "cut a leg", "no hostels". Whatever he turns down is
+// REMEMBERED, because an agent that offers back the thing you just
+// rejected is one you stop talking to.
+// =====================================================================
+
+extension ChappyTravel {
+
+    enum Shape: String, CaseIterable, Identifiable {
+        case lean, balanced, comfortable
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .lean:        return "Lean"
+            case .balanced:    return "Balanced"
+            case .comfortable: return "Comfortable"
+            }
+        }
+        var blurb: String {
+            switch self {
+            case .lean:        return "Cheaper areas, homestays, scooters, slower transport"
+            case .balanced:    return "The recommended middle — good areas, decent rooms"
+            case .comfortable: return "Better locations, private drivers, fewer moves"
+            }
+        }
+        var brief: String {
+            switch self {
+            case .lean:
+                return "LEAN: the cheapest version that is still genuinely good. Homestays and "
+                     + "guesthouses, cheaper neighbourhoods a little out of the centre, scooters "
+                     + "and local transport, street and warung food. Not miserable — just not paying "
+                     + "the tourist premium."
+            case .balanced:
+                return "BALANCED: what you would actually recommend to a friend. Well-located "
+                     + "rooms without being resorts, a mix of eating out and cheap local food, "
+                     + "a private driver for the long transfers only."
+            case .comfortable:
+                return "COMFORTABLE: better locations and better rooms, private drivers rather "
+                     + "than public transport, fewer moves and longer stays. Not luxury — the "
+                     + "version where nothing is a hassle."
+            }
+        }
+    }
+
+    /// The one prompt both the planner and the re-planner are built from,
+    /// so a revised plan can never come back in a different shape from the
+    /// original — which is the classic way a "revise" feature quietly
+    /// destroys everything the user had already fixed by hand.
+    private func planJSONSpec(_ home: String) -> String {
+        """
+        Reply with ONLY a JSON object, no prose and no code fence:
+        {"legs":[{"place":"Ubud","nights":4,"arrival":"flight|bus|train|ferry|taxi|grab|car|walk|none",
+        "arrivalCost":220,"arrivalNote":"why/what","stayName":"area or a real place",
+        "currency":"IDR",
+        "nightlyRate":1450000,"foodPerDay":450000,"groundPerDay":150000,"activitiesTotal":1800000,
+        "scooterPerDay":90000,
+        "stayBand":{"low":1200000,"typical":1800000,"high":2600000},
+        "arrivalBand":{"low":180,"typical":240,"high":340},
+        "foodBand":{"low":300000,"typical":500000,"high":900000},
+        "groundBand":{"low":100000,"typical":180000,"high":320000},
+        "scooterBand":{"low":70000,"typical":110000,"high":180000},
+        "notes":"one useful sentence","shortlist":["a place to eat","a thing to see"]}],
+        "extras":[{"label":"Visa on arrival","amount":50}],
+        "flights":{"route":"Brisbane to Denpasar","low":880,"high":1400,
+        "airlines":"who actually flies it","peakNote":"is this a peak period and why",
+        "advice":"one sentence on when to book"},
+        "summary":"two sentences, spoken, no markdown"}
+
+        MONEY RULES, follow exactly:
+        * Each leg's nightlyRate, foodPerDay, groundPerDay, activitiesTotal, scooterPerDay AND
+          all of that leg's bands are in that leg's LOCAL currency, named in "currency".
+          Rupiah for Indonesia, baht for Thailand, dong for Vietnam. Real local prices, not
+          converted ones — a villa is advertised at 1,450,000 rupiah, not at 138 dollars.
+        * arrivalCost, arrivalBand, extras and the flights figures are in \(home).
+        * arrivalCost, nightlyRate and activitiesTotal are for the WHOLE PARTY.
+          foodPerDay and groundPerDay are PER PERSON PER DAY.
+        * The BANDS are what that thing actually costs in that place in that month — low is a
+          good price, typical is what most people pay, high is the tourist price. SEARCH for
+          these. They are the whole point: they are what lets him see whether a number is a
+          deal instead of just a number. Never invent them; omit a band you could not verify.
+        * The FIRST leg's arrival is the flight in from Australia.
+        Be realistic, not optimistic — a number he blows through is worse than one that looks high.
+        """
+    }
+
+    /// Build a trip in memory WITHOUT storing it. Options have to exist
+    /// side by side before one is chosen, and the old code inserted as it
+    /// built, which made that impossible.
+    private func assemble(_ plan: Plan, _ r: PlanRequest, shape: Shape) -> Trip {
+        var trip = Trip(name: r.destination.capitalized)
+        trip.party = max(1, r.party)
+        trip.homeCurrency = ChappyFX.shared.home
+        trip.shape = shape.rawValue
+        trip.summary = plan.summary
+        trip.flights = plan.flights
+
+        var start = Date().addingTimeInterval(45 * 86400)
+        if let m = r.month {
+            let cal = Calendar.current
+            var comps = cal.dateComponents([.year], from: Date())
+            comps.month = m; comps.day = 1
+            if let d = cal.date(from: comps) {
+                start = d < Date() ? (cal.date(byAdding: .year, value: 1, to: d) ?? d) : d
+            }
+        }
+        var cursor = start
+        for row in plan.legs {
+            var leg = Leg(place: row.place, nights: max(1, row.nights))
+            leg.arrive = cursor
+            leg.arrival = Arrival(rawValue: row.arrival) ?? .flight
+            leg.arrivalCost = row.arrivalCost
+            leg.arrivalNote = row.arrivalNote
+            leg.stayName = row.stayName
+            leg.nightlyRate = row.nightlyRate
+            leg.foodPerDay = row.foodPerDay
+            leg.groundPerDay = row.groundPerDay
+            leg.activitiesTotal = row.activitiesTotal
+            leg.notes = row.notes
+            leg.shortlist = row.shortlist
+            // These two must ALWAYS move together: localCurrency is what
+            // the screen prints, stayCurrency is what the cost engine
+            // converts by. If they ever disagree the app shows one number
+            // and totals another.
+            if !row.localCurrency.isEmpty, row.localCurrency != trip.homeCurrency {
+                leg.localCurrency = row.localCurrency
+                leg.stayCurrency = row.localCurrency
+            }
+            leg.stayBand = row.stayBand
+            leg.arrivalBand = row.arrivalBand
+            leg.foodBand = row.foodBand
+            leg.groundBand = row.groundBand
+            leg.scooterBand = row.scooterBand
+            if row.scooterPerDay > 0 { leg.scooterPerDay = row.scooterPerDay }
+            trip.legs.append(leg)
+            cursor = leg.depart
+        }
+        trip.extras = plan.extras.map { Extra(label: $0.0, amount: $0.1, perPerson: true) }
+        trip.rejected = active?.rejected
+        return trip
+    }
+
+    /// One call to the brain. Shared by the planner, the options and the
+    /// re-planner so the JSON contract only exists once.
+    private func askPlanner(_ instruction: String) async -> Plan? {
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            planError = "No planning key is set."
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 150
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": 6000,
+            "system": "You are Chappy's travel agent. Context: \(ContextEngine.shared.contextHeader()) "
+                + "You answer with JSON only. Never wrap it in a code fence. Never add commentary.",
+            "messages": [["role": "user", "content": instruction]],
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": 6]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        CostMeter.shared.addResearch()
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else { return nil }
+        let raw = content.compactMap { ($0["type"] as? String) == "text" ? ($0["text"] as? String) : nil }
+            .joined(separator: "\n")
+        return Self.parsePlan(raw)
+    }
+
+    private func planPrompt(_ r: PlanRequest, shape: Shape) -> String {
+        let home = ChappyFX.shared.home
+        let monthName: String = {
+            guard let m = r.month else { return "" }
+            let f = DateFormatter()
+            return " in " + f.monthSymbols[max(0, min(11, m - 1))]
+        }()
+        let budgetLine = r.budget.map {
+            "Hard ceiling: the whole trip must come in under \(ChappyFX.money($0, home)) for the whole party. "
+                + "Do NOT reach the number by thinning the trip until it fits — if the destination genuinely "
+                + "costs more than this, say so plainly and name a cheaper country where the same money is "
+                + "comfortable rather than tight."
+        } ?? "No fixed budget — aim at good value rather than cheapest."
+        var no = ""
+        if let rejected = active?.rejected, !rejected.isEmpty {
+            no = "\nHE HAS ALREADY TURNED THESE DOWN, do not offer them again: "
+               + rejected.joined(separator: "; ") + "."
+        }
+        return """
+        Plan a \(r.nights)-night trip to \(r.destination)\(monthName) for \(r.party) \
+        \(r.party == 1 ? "person" : "people"). Style: \(r.style.isEmpty ? "a good mix, not rushed" : r.style).
+        \(budgetLine)
+        \(shape.brief)
+        \(ChappyIntake.shared.brief)
+        \(personalContext())\(no)
+
+        Split it into legs — separate places to base yourself, not day trips. Fewer, longer legs
+        beat a new town every night. Use web search for CURRENT prices and for how people actually
+        get between these places.
+
+        \(planJSONSpec(home))
+        """
+    }
+
+    /// THREE SHAPES, IN PARALLEL. Same region, same length, same reasons
+    /// for going — the only thing that changes is what you're spending and
+    /// what it buys. That is the only comparison worth putting on a screen.
+    func planOptions(_ r: PlanRequest) async -> [Trip] {
+        planning = true
+        planError = nil
+        defer { planning = false }
+
+        var out: [Trip] = []
+        await withTaskGroup(of: (Shape, Plan?).self) { group in
+            for shape in Shape.allCases {
+                group.addTask { @MainActor [weak self] in
+                    guard let self else { return (shape, nil) }
+                    return (shape, await self.askPlanner(self.planPrompt(r, shape: shape)))
+                }
+            }
+            for await (shape, plan) in group {
+                guard let plan else { continue }
+                out.append(assemble(plan, r, shape: shape))
+            }
+        }
+        out.sort { a, b in
+            let order: [String: Int] = ["lean": 0, "balanced": 1, "comfortable": 2]
+            return (order[a.shape ?? ""] ?? 9) < (order[b.shape ?? ""] ?? 9)
+        }
+        if out.isEmpty { planError = "The planner didn't come back. Try again in a moment." }
+        return out
+    }
+
+    /// Store a chosen option and wire everything that hangs off a trip.
+    @discardableResult
+    func adopt(_ trip: Trip) -> Trip {
+        // AUDIT: the voice path already adopts the balanced option, and then
+        // tapping "use this one" on a different option adopted again — two
+        // trips called Bali and no way to tell which was live. Adopting a
+        // sibling REPLACES the one already taken from the same set.
+        if let siblingIDs = pendingOptions.first.map({ _ in Set(pendingOptions.map(\.id)) }),
+           let existing = trips.firstIndex(where: { siblingIDs.contains($0.id) }) {
+            trips[existing] = trip
+        } else {
+            trips.insert(trip, at: 0)
+        }
+        activeID = trip.id
+        pendingOptions = pendingOptions.map { $0.id == trip.id ? trip : $0 }
+        save()
+        Task { @MainActor in
+            for leg in trip.legs { await locate(legID: leg.id, in: trip.id) }
+            stampCurrencies(trip.id)
+            // BUILD 182: one place that arms EVERYTHING a real trip needs —
+            // reminders, visa lead times and the flight-day watch.
+            wireUp(trip.id)
+            guard let fresh = trips.first(where: { $0.id == trip.id }) else { return }
+            await ChappyVisa.shared.checkWholeTrip(fresh)
+        }
+        ChappyMemory.shared.remember(.note,
+            title: "Planned \(trip.name) — \(trip.nights) nights",
+            body: trip.summary ?? "",
+            tags: ["trip", "travel", trip.name.lowercased()],
+            source: "travel")
+        return trip
+    }
+
+    /// ARGUE WITH IT. "Too expensive." "Keep it under six grand for two
+    /// months." "Spend more on the villa and less on flights." "Cut a leg."
+    ///
+    /// The current plan goes back with his sentence, and what he pushed
+    /// back on is remembered so the next version never re-offers it.
+    @discardableResult
+    func revise(_ trip: Trip, saying: String, speak shouldSpeak: Bool = true) async -> String {
+        let said = saying.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !said.isEmpty else { return "Tell me what to change." }
+        planning = true
+        planError = nil
+        defer { planning = false }
+
+        let home = ChappyFX.shared.home
+        let c = cost(trip)
+        var current = "THE CURRENT PLAN, which you are revising rather than replacing:\n"
+        current += "\(trip.name), \(trip.nights) nights, \(trip.party) travelling, "
+        current += "total \(ChappyFX.money(c.total, home)).\n"
+        for leg in trip.legs {
+            let cur = leg.stayCurrency.isEmpty ? home : leg.stayCurrency
+            current += "- \(leg.place): \(leg.nights) nights, arrive by \(leg.arrival.rawValue) "
+            current += "(\(ChappyFX.money(leg.arrivalCost, home))), stay \(ChappyFX.money(leg.nightlyRate, cur))/night"
+            if !leg.stayName.isEmpty { current += " at \(leg.stayName)" }
+            current += ".\n"
+        }
+
+        let prompt = """
+        \(current)
+        HE HAS SAID: "\(said)"
+
+        Revise the plan to do what he asked. Keep everything he did NOT complain about — same
+        region, same reasons for going, same legs unless the change requires otherwise. Do not
+        quietly restructure the trip. If what he asked for is not possible within the length or
+        the destination, get as close as you can and say so in the summary.
+
+        \(ChappyIntake.shared.brief)
+
+        \(planJSONSpec(home))
+        """
+
+        guard let plan = await askPlanner(prompt) else {
+            let line = "That didn't come back. Try saying it again."
+            planError = line
+            if shouldSpeak { TTSService.shared.speak(line) }
+            return line
+        }
+
+        var r = PlanRequest(destination: trip.name, nights: trip.nights,
+                            party: trip.party, budget: nil, month: nil, style: "")
+        if let start = trip.start { r.month = Calendar.current.component(.month, from: start) }
+        var revised = assemble(plan, r, shape: Shape(rawValue: trip.shape ?? "") ?? .balanced)
+        // AUDIT: assemble() builds a FRESH trip, which quietly threw away
+        // everything he had set by hand — the buffer percentage, the home
+        // currency, the creation date — and rebuilt the dates from the 1st
+        // of the month, so a trip leaving on the 18th came back leaving on
+        // the 1st and every leg after it moved. A revision revises.
+        revised.name = trip.name
+        revised.bufferPct = trip.bufferPct
+        revised.homeCurrency = trip.homeCurrency
+        revised.createdAt = trip.createdAt
+        revised.party = trip.party
+        if let originalStart = trip.start, !revised.legs.isEmpty {
+            revised.legs[0].arrive = originalStart
+            var cursor = originalStart
+            for j in revised.legs.indices {
+                revised.legs[j].arrive = cursor
+                cursor = revised.legs[j].depart
+            }
+        }
+        // Remember the push-back itself, so a later re-plan doesn't undo it.
+        var rejected = trip.rejected ?? []
+        if !rejected.contains(said) { rejected.append(said) }
+        revised.rejected = Array(rejected.suffix(12))
+
+        // Replace in place — he chose this trip, and a revision that spawns
+        // a second copy leaves him with two and no idea which is live.
+        if let i = trips.firstIndex(where: { $0.id == trip.id }) {
+            revised.id = trip.id
+            trips[i] = revised
+            save()
+            Task { @MainActor in
+                for leg in revised.legs { await locate(legID: leg.id, in: revised.id) }
+                stampCurrencies(revised.id)
+                // BUILD 182: a revision moves the dates. Without this the
+                // old passport, packing and check-in reminders keep firing
+                // on dates he no longer flies on — worse than none, because
+                // he'd trust them.
+                wireUp(revised.id)
+            }
+        } else {
+            adopt(revised)
+        }
+
+        let after = cost(revised)
+        var line = plan.summary.isEmpty ? "Done." : plan.summary
+        line += " That's \(ChappyFX.money(after.total, home))"
+        let delta = after.total - c.total
+        if abs(delta) > 20 {
+            line += delta < 0
+                ? ", down \(ChappyFX.money(-delta, home))."
+                : ", up \(ChappyFX.money(delta, home))."
+        } else { line += "." }
+        if shouldSpeak { TTSService.shared.speakLong(line) }
+        return line
+    }
+}
+
+// MARK: - Chappy Travel: hearing a complaint
+
+extension ChappyTravel {
+
+    /// Is this sentence a push-back on the plan rather than a new command?
+    ///
+    /// Deliberately narrow. "Too expensive" has to rework the trip, but
+    /// half the things a person says in a day contain the word "cheaper",
+    /// and a router that hears every one of them as a re-plan is worse
+    /// than one that hears none. So: an explicit complaint word, OR a
+    /// budget instruction with a number in it.
+    static func pushBack(in raw: String) -> String? {
+        let c = raw.lowercased()
+
+        // Never treat a question as an instruction.
+        if c.hasPrefix("what") || c.hasPrefix("how much") || c.hasPrefix("when")
+            || c.hasPrefix("where") || c.hasPrefix("who") { return nil }
+
+        // AUDIT: this fired on "more places" and swallowed the saved-places
+        // command, and on "I don't want spicy food" — which is an answer to
+        // the diet question — turning both into a full re-plan with the API
+        // spend that carries. A complaint about the plan has to MENTION the
+        // plan, unless it is one of the few phrases that can't mean anything
+        // else.
+        let unmistakable = ["too expensive", "too dear", "too pricey",
+                            "cut a leg", "drop a leg", "too many stops"]
+        if unmistakable.contains(where: { c.contains($0) }) { return raw }
+
+        let aboutTheTrip = ["trip", "plan", "itinerary", "leg", "legs", "nights",
+                            "flight", "flights", "hotel", "villa", "room", "rooms",
+                            "budget", "stay", "stops", "route"]
+        guard aboutTheTrip.contains(where: { c.contains($0) }) else { return nil }
+
+        let gripes = [
+            "too expensive", "too dear", "too pricey", "that's too much",
+            "thats too much", "way too much", "cheaper", "bring it down",
+            "trim it", "cut it back", "cut a leg", "drop a leg", "too many stops",
+            "too rushed", "too slow", "too long in", "not long enough in",
+            "no hostels", "no hostel", "nicer rooms", "better rooms",
+            "spend more on", "spend less on", "swap", "somewhere else instead",
+            "make it longer", "make it shorter", "fewer places", "more places",
+            "i'd rather", "id rather", "don't want", "dont want",
+            "less flying", "less driving", "closer together",
+        ]
+        for g in gripes where c.contains(g) { return raw }
+
+        // "keep it under six grand", "around four thousand for two months"
+        let budgetish = ["keep it under", "keep it below", "under ", "budget of",
+                         "no more than", "max of", "around "]
+        if budgetish.contains(where: { c.contains($0) }) {
+            let hasNumber = c.rangeOfCharacter(from: .decimalDigits) != nil
+                || c.contains("grand") || c.contains("thousand")
+            let moneyish = c.contains("$") || c.contains("grand") || c.contains("thousand")
+                || c.contains("dollar") || c.contains("budget") || c.contains("spend")
+            if hasNumber && moneyish { return raw }
+        }
+        return nil
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THE REPORT MAP YOU CAN ACTUALLY TAP.
+//
+// 178 put a map in the report and it was a flat picture. What was
+// wanted — and what the Atlas already looks like on the phone — is the
+// full-detail dark map with towns, roads and parks, where tapping a pin
+// opens that place and tapping the boat line opens the ferry booking.
+//
+// A live pan-and-zoom map inside an emailed document needs a mapping
+// library and tiles fetched when it opens: it breaks "works on a
+// plane", and most mail clients strip the JavaScript anyway. So the
+// answer is an IMAGE MAP — render the real thing at high detail, then
+// lay HTML hotspots over the pins and over each route segment. Every
+// link works, the file stays self-contained, and it opens with no
+// signal.
+//
+// Plus a street-level render inside every leg card, because "zoom" in a
+// document means showing the streets around where you're staying, not
+// a gesture the format can't support.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// Where each leg landed in the rendered image, so HTML hotspots can
+    /// be positioned over it. Points are in CSS pixels of the displayed
+    /// image, not device pixels.
+    struct MapHit {
+        var legIndex: Int
+        var x: Double
+        var y: Double
+    }
+
+    /// Render the trip map AND report where the pins ended up.
+    ///
+    /// Dark, high detail, points of interest on — the same look as the
+    /// Atlas on the phone, because a report that doesn't resemble the app
+    /// feels like it came from somewhere else.
+    func mapImageWithHits(_ trip: Trip,
+                          size: CGSize = CGSize(width: 1000, height: 620))
+        async -> (image: UIImage, hits: [MapHit])? {
+
+        let placed = trip.legs.enumerated().filter { $0.element.hasCoord }
+        guard !placed.isEmpty else { return nil }
+
+        let lats = placed.map { $0.element.lat }, lons = placed.map { $0.element.lon }
+        guard let minLa = lats.min(), let maxLa = lats.max(),
+              let minLo = lons.min(), let maxLo = lons.max() else { return nil }
+
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLa + maxLa) / 2,
+                                           longitude: (minLo + maxLo) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max(0.35, (maxLa - minLa) * 1.9),
+                                   longitudeDelta: max(0.35, (maxLo - minLo) * 1.9)))
+        options.size = size
+        options.scale = 2
+        options.mapType = .standard
+        options.showsBuildings = true
+        options.pointOfInterestFilter = .includingAll
+        // Dark, to match the Atlas.
+        options.traitCollection = UITraitCollection(userInterfaceStyle: .dark)
+
+        guard let snap = try? await MKMapSnapshotter(options: options).start() else { return nil }
+
+        var hits: [MapHit] = []
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 2
+        let image = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+            snap.image.draw(at: .zero)
+            let cg = ctx.cgContext
+            let points = placed.map {
+                snap.point(for: CLLocationCoordinate2D(latitude: $0.element.lat,
+                                                       longitude: $0.element.lon))
+            }
+            for i in 1..<max(1, points.count) {
+                let colour = Self.legHue(placed[i].offset, of: max(1, trip.legs.count))
+                cg.setStrokeColor(colour.withAlphaComponent(0.95).cgColor)
+                cg.setLineWidth(5)
+                cg.setLineCap(.round)
+                switch placed[i].element.arrival {
+                case .flight: cg.setLineDash(phase: 0, lengths: [13, 8])
+                case .ferry:  cg.setLineDash(phase: 0, lengths: [3, 8])
+                default:      cg.setLineDash(phase: 0, lengths: [])
+                }
+                cg.move(to: points[i - 1])
+                cg.addLine(to: points[i])
+                cg.strokePath()
+            }
+            cg.setLineDash(phase: 0, lengths: [])
+
+            for (i, p) in points.enumerated() {
+                hits.append(MapHit(legIndex: placed[i].offset, x: p.x, y: p.y))
+                let r: CGFloat = 19
+                let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
+                cg.setFillColor(Self.legHue(placed[i].offset, of: max(1, trip.legs.count)).cgColor)
+                cg.fillEllipse(in: rect)
+                cg.setStrokeColor(UIColor.white.cgColor)
+                cg.setLineWidth(3.5)
+                cg.strokeEllipse(in: rect)
+
+                let num = "\(placed[i].offset + 1)" as NSString
+                let na: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 19, weight: .heavy),
+                    .foregroundColor: UIColor.black.withAlphaComponent(0.82)
+                ]
+                let ns = num.size(withAttributes: na)
+                num.draw(at: CGPoint(x: p.x - ns.width / 2, y: p.y - ns.height / 2), withAttributes: na)
+
+                let label = placed[i].element.place as NSString
+                let la: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 16, weight: .bold),
+                    .foregroundColor: UIColor.white
+                ]
+                let ls = label.size(withAttributes: la)
+                let box = CGRect(x: p.x - ls.width / 2 - 7, y: p.y + r + 4,
+                                 width: ls.width + 14, height: ls.height + 5)
+                cg.setFillColor(UIColor.black.withAlphaComponent(0.68).cgColor)
+                UIBezierPath(roundedRect: box, cornerRadius: 7).fill()
+                label.draw(at: CGPoint(x: box.minX + 7, y: box.minY + 2), withAttributes: la)
+            }
+        }
+        return (image, hits)
+    }
+
+    /// A street-level render for one leg — the "zoom" a document can
+    /// honestly provide.
+    func streetImage(_ leg: Leg, size: CGSize = CGSize(width: 640, height: 230)) async -> UIImage? {
+        guard leg.hasCoord else { return nil }
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon),
+            latitudinalMeters: 2200, longitudinalMeters: 2200)
+        options.size = size
+        options.scale = 2
+        options.mapType = .standard
+        options.showsBuildings = true
+        options.pointOfInterestFilter = .includingAll
+        options.traitCollection = UITraitCollection(userInterfaceStyle: .dark)
+        guard let snap = try? await MKMapSnapshotter(options: options).start() else { return nil }
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 2
+        return UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+            snap.image.draw(at: .zero)
+            let cg = ctx.cgContext
+            let p = snap.point(for: CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon))
+            let r: CGFloat = 13
+            cg.setFillColor(UIColor.systemOrange.cgColor)
+            cg.fillEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+            cg.setStrokeColor(UIColor.white.cgColor)
+            cg.setLineWidth(3)
+            cg.strokeEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+        }
+    }
+}
+
+
+// =====================================================================
+// BUILD 181 — THE REPORT, REBUILT.
+//
+// Everything the plan knows, in one self-contained file: the tappable
+// map, a street-level map per leg, local prices with dollars beside
+// them, a deal grade on every line, the flights brief, visas, and every
+// booking link live.
+//
+// The hotspots are percentage-positioned overlays rather than an HTML
+// <map>/<area>, because <area> coordinates are in image pixels and do
+// NOT scale with CSS — on a phone, where the image is displayed at
+// whatever width fits, every hotspot would land in the wrong place. A
+// percentage overlay scales exactly with the picture.
+// =====================================================================
+
+extension ChappyTravel {
+
+    private static func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    private func gradeSpan(_ value: Double, _ band: Band?, _ cur: String) -> String {
+        let g = Self.grade(value, band)
+        guard g != .unknown, let b = band else { return "" }
+        var out = "<span class=\"grade\" style=\"background:\(g.hex)1f;color:\(g.hex)\">\(g.label)</span>"
+        out += "<span class=\"band\">typical \(ChappyFX.money(b.low, cur))\u{2013}\(ChappyFX.money(b.high, cur))</span>"
+        return out
+    }
+
+    /// The whole document. Async because the maps are rendered.
+    func reportFullHTML(_ trip: Trip) async -> String {
+        let c = cost(trip)
+        let home = trip.homeCurrency
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM yyyy"
+        let short = DateFormatter(); short.dateFormat = "d MMM"
+        let E = Self.esc
+
+        var h = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>\(E(trip.name))</title><style>
+        *{box-sizing:border-box}
+        body{margin:0;padding:26px 18px;font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+             color:#12181f;background:#f4f6f8;-webkit-text-size-adjust:100%}
+        .wrap{max-width:780px;margin:0 auto}
+        h1{font-size:30px;margin:0 0 4px;letter-spacing:-.5px}
+        .sub{color:#5b6672;margin:0 0 24px;font-size:15px}
+        .card{background:#fff;border-radius:16px;padding:20px;margin:0 0 16px;
+              box-shadow:0 1px 3px rgba(0,0,0,.07)}
+        h2{font-size:12px;letter-spacing:1.3px;text-transform:uppercase;color:#7a8794;margin:0 0 14px}
+        .big{font-size:34px;font-weight:700;letter-spacing:-1px;margin:0}
+        .split{color:#5b6672;font-size:15px;margin:4px 0 0}
+        table{width:100%;border-collapse:collapse}
+        td{padding:9px 0;border-bottom:1px solid #eef1f4;vertical-align:top}
+        tr:last-child td{border-bottom:none}
+        td.r{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+        .leg{border-left:3px solid #2e7cf6;padding-left:14px;margin:0 0 22px}
+        .leg h3{margin:0 0 3px;font-size:19px}
+        .when{color:var(--dim);font-size:13px;margin:0 0 8px}
+        .meta{color:var(--dim);font-size:13px;margin:4px 0}
+        .aud{color:#7a8794}
+        .grade{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.6px;
+               padding:2px 7px;border-radius:20px;margin-left:7px;vertical-align:1px}
+        .band{color:#8b95a1;font-size:12px;margin-left:6px}
+        .links a{display:inline-block;margin:6px 6px 0 0;padding:7px 13px;background:#eef4ff;
+                 color:#1b5fd0;border-radius:9px;text-decoration:none;font-size:13.5px;font-weight:600}
+        .links a.g{background:#e8f0fe;color:#1a73e8}
+        .note{color:var(--faint);font-size:12.5px;margin-top:22px;line-height:1.5}
+        .pill{display:inline-block;background:#eef1f4;color:#42505e;border-radius:20px;
+              padding:3px 11px;font-size:12.5px;margin:0 5px 5px 0}
+        .mapwrap{position:relative;line-height:0}
+        .mapwrap img{width:100%;display:block}
+        .hot{position:absolute;transform:translate(-50%,-50%);border-radius:50%;
+             width:9%;padding-bottom:9%;height:0}
+        .hop{position:absolute;transform:translate(-50%,-50%);text-decoration:none;
+             background:rgba(0,0,0,.72);color:#fff;font-size:11px;font-weight:700;
+             padding:4px 9px;border-radius:20px;white-space:nowrap;line-height:1.2;
+             border:1px solid rgba(255,255,255,.35)}
+        .street{border-radius:12px;overflow:hidden;margin:10px 0;display:block;line-height:0}
+        .street img{width:100%;display:block}
+        </style></head><body><div class="wrap">
+        """
+
+        h += "<h1>\(E(trip.name))</h1>"
+        var sub = "\(E(trip.dateLine)) &middot; \(trip.nights) nights &middot; "
+        sub += "\(trip.party) \(trip.party == 1 ? "traveller" : "travellers")"
+        if let shape = trip.shape, let sh = Shape(rawValue: shape) {
+            sub += " &middot; \(sh.label)"
+        }
+        h += "<p class=\"sub\">\(sub)</p>"
+
+        // ------------------------------------------------ the tappable map
+        // AUDIT: a full-page PNG plus one per leg made a six-leg report
+        // several megabytes, which mail servers bounce. JPEG at 0.72 is
+        // visually identical for a map and roughly a tenth the size.
+        if let (img, hits) = await mapImageWithHits(trip),
+           let png = img.jpegData(compressionQuality: 0.72) {
+            let w = img.size.width, ht = img.size.height
+            h += "<div class=\"card\" style=\"padding:0;overflow:hidden\"><div class=\"mapwrap\">"
+            h += "<img src=\"data:image/jpeg;base64,\(png.base64EncodedString())\" alt=\"Trip map\">"
+
+            // A hotspot over every pin.
+            for hit in hits {
+                guard hit.legIndex < trip.legs.count else { continue }
+                let leg = trip.legs[hit.legIndex]
+                guard let u = googlePlaceURL(leg) else { continue }
+                let x = hit.x / w * 100, y = hit.y / ht * 100
+                h += "<a class=\"hot\" href=\"\(u.absoluteString)\" "
+                h += "title=\"\(E(leg.place))\" style=\"left:\(String(format: "%.2f", x))%;"
+                h += "top:\(String(format: "%.2f", y))%\"></a>"
+            }
+
+            // A labelled pill on each hop, sitting on the line. Deliberately
+            // VISIBLE rather than an invisible rotated strip: a thin diagonal
+            // hotspot is close to untappable on a phone, and an affordance
+            // nobody can see is one nobody uses.
+            for i in 1..<max(1, hits.count) {
+                let idx = hits[i].legIndex
+                guard idx < trip.legs.count else { continue }
+                let leg = trip.legs[idx]
+                let prev = idx > 0 ? trip.legs[idx - 1] : nil
+                let mx = (hits[i - 1].x + hits[i].x) / 2 / w * 100
+                let my = (hits[i - 1].y + hits[i].y) / 2 / ht * 100
+                let url: URL?
+                let label: String
+                switch leg.arrival {
+                case .flight:
+                    url = flightSearchURL(leg: leg, from: prev, trip: trip); label = "\u{2708} Flights"
+                case .ferry:
+                    url = groundURL(.twelvego, leg: leg, from: prev, trip: trip); label = "\u{26F4} Boat"
+                case .bus, .train:
+                    url = groundURL(.twelvego, leg: leg, from: prev, trip: trip); label = "\u{1F686} Book"
+                default:
+                    url = googleDirectionsURL(to: leg, from: prev); label = "\u{1F697} Route"
+                }
+                guard let u = url else { continue }
+                h += "<a class=\"hop\" href=\"\(u.absoluteString)\" "
+                h += "style=\"left:\(String(format: "%.2f", mx))%;top:\(String(format: "%.2f", my))%\">"
+                h += "\(label)</a>"
+            }
+            h += "</div>"
+            if let route = googleTripURL(trip) {
+                h += "<div style=\"padding:11px 16px;font-size:14px;background:#e8f0fe\">"
+                h += "<a href=\"\(route.absoluteString)\" style=\"color:#1a73e8;font-weight:600;"
+                h += "text-decoration:none\">Open the whole route in Google Maps &rarr;</a>"
+                h += "<span style=\"color:#5b6672;font-size:12.5px\"> &middot; tap any pin or the "
+                h += "labels on the lines</span></div>"
+            }
+            h += "</div>"
+        }
+
+        // ------------------------------------------------ money
+        h += "<div class=\"card\"><h2>What it costs</h2>"
+        h += "<p class=\"big\">\(ChappyFX.money(c.total, home))</p>"
+        var split = "\(ChappyFX.money(c.perDay, home)) a day"
+        if trip.party > 1 { split = "\(ChappyFX.money(c.perPerson, home)) each &middot; " + split }
+        if let first = trip.legs.first {
+            let local = localCurrency(for: first, in: trip)
+            if local != home, let inLocal = ChappyFX.shared.convert(c.total, from: home, to: local) {
+                split += " &middot; \(ChappyFX.money(inLocal, local))"
+            }
+        }
+        h += "<p class=\"split\">\(split)</p><table>"
+        for line in c.lines {
+            h += "<tr><td>\(E(line.label))</td><td class=\"r\">\(ChappyFX.money(line.amount, home))</td></tr>"
+        }
+        h += "</table></div>"
+
+        // ------------------------------------------------ flights
+        if let fl = trip.flights, fl.isUsable {
+            h += "<div class=\"card\"><h2>Flights</h2>"
+            if !fl.route.isEmpty { h += "<p class=\"meta\"><strong>\(E(fl.route))</strong></p>" }
+            h += "<p class=\"big\" style=\"font-size:26px\">\(ChappyFX.money(fl.low, home))"
+            h += " \u{2013} \(ChappyFX.money(fl.high, home))</p>"
+            h += "<p class=\"split\">return, per person, for these dates</p>"
+            if !fl.airlines.isEmpty { h += "<p class=\"meta\">Who flies it: \(E(fl.airlines))</p>" }
+            if !fl.peakNote.isEmpty { h += "<p class=\"meta\">\(E(fl.peakNote))</p>" }
+            if !fl.advice.isEmpty { h += "<p class=\"meta\">\(E(fl.advice))</p>" }
+            if let first = trip.legs.first,
+               let u = flightSearchURL(leg: first, from: nil, trip: trip) {
+                h += "<p class=\"links\"><a href=\"\(u.absoluteString)\" class=\"g\">"
+                h += "Search these flights</a></p>"
+            }
+            h += "<p style=\"color:var(--faint);font-size:12px;margin:12px 0 0\">A searched range, not a "
+            h += "quote \u{2014} nobody sells live fares to an app like this. It is what the route "
+            h += "actually goes for at this time of year.</p></div>"
+        }
+
+        // ------------------------------------------------ the plan
+        h += "<div class=\"card\"><h2>The plan</h2>"
+        for (i, leg) in trip.legs.enumerated() {
+            let prev = i > 0 ? trip.legs[i - 1] : nil
+            let cur = localCurrency(for: leg, in: trip)
+            let hue = Self.legHue(i, of: max(1, trip.legs.count))
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            hue.getRed(&r, green: &g, blue: &b, alpha: &a)
+            let hex = String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+
+            h += "<div class=\"leg\" style=\"border-left-color:\(hex)\"><h3>\(i + 1). \(E(leg.place))"
+            if !leg.country.isEmpty {
+                h += "<span style=\"color:#7a8794;font-weight:400\">, \(E(leg.country))</span>"
+            }
+            h += "</h3>"
+            h += "<p class=\"when\">\(short.string(from: leg.arrive)) &rarr; "
+            h += "\(short.string(from: leg.depart)) &middot; \(leg.nights) "
+            h += "\(leg.nights == 1 ? "night" : "nights")</p>"
+
+            // street-level map, which is what "zoom" means in a document
+            // Street maps for the first six legs only. Past that the file
+            // grows faster than the document gets more useful, and a report
+            // an email server refuses is worth nothing.
+            if i < 6, let street = await streetImage(leg),
+               let jpg = street.jpegData(compressionQuality: 0.7),
+               let u = googlePlaceURL(leg) {
+                h += "<a class=\"street\" href=\"\(u.absoluteString)\">"
+                h += "<img src=\"data:image/jpeg;base64,\(jpg.base64EncodedString())\" "
+                h += "alt=\"\(E(leg.place))\"></a>"
+            }
+
+            if leg.arrival != .none {
+                h += "<p class=\"meta\">\(E(leg.arrival.label))"
+                if !leg.arrivalNote.isEmpty { h += " &mdash; \(E(leg.arrivalNote))" }
+                if leg.arrivalCost > 0 {
+                    h += " &middot; \(ChappyFX.money(leg.arrivalCost, home))"
+                    h += gradeSpan(leg.arrivalCost, leg.arrivalBand, home)
+                }
+                h += "</p>"
+            }
+            if leg.nightlyRate > 0 {
+                h += "<p class=\"meta\">"
+                h += leg.stayName.isEmpty ? "Accommodation" : E(leg.stayName)
+                h += " &middot; \(E(ChappyFX.pair(leg.nightlyRate, local: cur, home: home))) a night"
+                h += gradeSpan(leg.nightlyRate, leg.stayBand, cur)
+                h += "</p>"
+            }
+            if let sc = leg.scooterPerDay, sc > 0 {
+                h += "<p class=\"meta\">Scooter &middot; "
+                h += "\(E(ChappyFX.pair(sc, local: cur, home: home))) a day"
+                h += gradeSpan(sc, leg.scooterBand, cur)
+                h += "</p>"
+            }
+            if leg.foodPerDay > 0 {
+                h += "<p class=\"meta\">Food &middot; "
+                h += "\(E(ChappyFX.pair(leg.foodPerDay, local: cur, home: home))) each per day"
+                h += gradeSpan(leg.foodPerDay, leg.foodBand, cur)
+                h += "</p>"
+            }
+
+            let month = Calendar.current.component(.month, from: leg.arrive)
+            if leg.hasCoord,
+               let n = ChappySeason.shared.normals(lat: leg.lat, lon: leg.lon, month: month) {
+                h += "<p class=\"meta\">Typically \(Int(n.maxC.rounded()))&deg; / "
+                h += "\(Int(n.minC.rounded()))&deg; and \(E(n.verdict)) at this time of year</p>"
+            }
+            if !leg.shortlist.isEmpty {
+                h += "<p class=\"meta\">"
+                for sName in leg.shortlist.prefix(12) {
+                    if let u = googleSearchURL(sName, near: leg) {
+                        h += "<a class=\"pill\" style=\"text-decoration:none\" "
+                        h += "href=\"\(u.absoluteString)\">\(E(sName))</a>"
+                    } else {
+                        h += "<span class=\"pill\">\(E(sName))</span>"
+                    }
+                }
+                h += "</p>"
+            }
+            if !leg.notes.isEmpty { h += "<p class=\"meta\">\(E(leg.notes))</p>" }
+
+            h += "<p class=\"links\">"
+            for site in Booking.allCases {
+                if let u = bookingURL(site, leg: leg, trip: trip) {
+                    h += "<a href=\"\(u.absoluteString)\">\(site.label)</a>"
+                }
+            }
+            if let u = groundURL(.rome2rio, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">How to get there</a>"
+            }
+            if let u = groundURL(.twelvego, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">Bus / train / ferry</a>"
+            }
+            if let u = groundURL(.klook, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">Tours &amp; tickets</a>"
+            }
+            if let u = googlePlaceURL(leg) {
+                h += "<a href=\"\(u.absoluteString)\" class=\"g\">Open in Google Maps</a>"
+            }
+            if let u = googleDirectionsURL(to: leg, from: prev) {
+                h += "<a href=\"\(u.absoluteString)\" class=\"g\">Directions</a>"
+            }
+            h += "</p></div>"
+        }
+        h += "</div>"
+
+        if !trip.extras.isEmpty {
+            h += "<div class=\"card\"><h2>Extras</h2><table>"
+            for e in trip.extras {
+                let amt = e.perPerson ? e.amount * Double(max(1, trip.party)) : e.amount
+                h += "<tr><td>\(E(e.label))"
+                if e.perPerson { h += " <span class=\"aud\">(each)</span>" }
+                h += "</td><td class=\"r\">\(ChappyFX.money(amt, home))</td></tr>"
+            }
+            h += "</table></div>"
+        }
+
+        h += visaHTML(trip)
+
+        // ------------------------------------------------ how to read it
+        h += "<div class=\"card\"><h2>How to read the prices</h2>"
+        h += "<p class=\"meta\">Local money first, \(home) beside it \u{2014} the local number is what "
+        h += "is on the price tag. The coloured tag says how the price compares with what that thing "
+        h += "actually costs there at this time of year: "
+        h += "<span class=\"grade\" style=\"background:#1c9c5a1f;color:#1c9c5a\">GREAT</span> at or under "
+        h += "the low end, <span class=\"grade\" style=\"background:#c98a121f;color:#c98a12\">FAIR</span> "
+        h += "about what everyone pays, <span class=\"grade\" style=\"background:#c0392b1f;color:#c0392b\">HIGH</span> "
+        h += "above the tourist line.</p>"
+        h += "<p class=\"meta\">Those ranges are searched, not a live price feed \u{2014} no such feed is "
+        h += "available to an app like this. They are what the thing goes for, which is the useful "
+        h += "question anyway.</p>"
+        if let at = ChappyFX.shared.fetchedAt {
+            h += "<p class=\"meta\">Converted at rates taken \(f.string(from: at)). Daily mid-market "
+            h += "\u{2014} a money changer or a card will be a little worse.</p>"
+        }
+        h += "</div>"
+
+        h += "<p class=\"note\">Prepared by Chappy on \(f.string(from: Date())). "
+        h += "Costs are estimates, not quotes \u{2014} the booking links carry your dates and party size "
+        h += "through to each site, where the real prices live. "
+        if trip.legs.contains(where: { $0.hasCoord }) {
+            h += "Seasonal weather is the average of the last three years, not a forecast. "
+        }
+        if ChappyPlaces.shared.hasTripAdvisorKey {
+            h += "Ratings and reviews provided by Tripadvisor. "
+        }
+        h += "Maps \u{00A9} Apple.</p>"
+        h += "</div></body></html>"
+        return h
+    }
+}
+
+// =====================================================================
+// BUILD 182 — THE WIRING PASS.
+//
+// An audit of the whole app found the same shape of fault a dozen times
+// over: a feature that works, sitting next to another feature that
+// works, with nothing between them. Nothing here is new on screen.
+// Everything here makes what already exists start talking.
+//
+// The worst of them: ChappyFlights and ChappyTravel shared literally no
+// references. A planned leg said "QF43" in its note and nothing parsed
+// it — so a trip with a flight in it produced ZERO tracked flights, no
+// flight-day watch, no gate or delay alerts, no Live Activity and no
+// widget line. All of that machinery was built and only a manual
+// "track flight QF52 on Thursday" ever switched it on.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// Pull a flight number out of a leg's note, if there is one.
+    /// Reuses the flights module's own parser rather than inventing a
+    /// second one that drifts from it.
+    /// AUDIT: this scanned the notes and even the accommodation name, and
+    /// the parser accepts any letters-plus-digits token — so "gate B12" or
+    /// a room called "A12" armed a bogus tracked flight and two reminders.
+    /// Only the arrival note, and only something shaped like a carrier code.
+    static func flightNumber(on leg: Leg) -> String? {
+        guard leg.arrival == .flight else { return nil }
+        guard let n = ChappyFlights.flightNumber(in: leg.arrivalNote) else { return nil }
+        let letters = n.prefix { $0.isLetter }
+        let digits = n.drop { $0.isLetter }
+        guard letters.count == 2 || letters.count == 3,
+              digits.count >= 1, digits.count <= 4,
+              digits.allSatisfy(\.isNumber) else { return nil }
+        return n.uppercased()
+    }
+
+    /// Turn the flights ON a trip into flights the app is WATCHING.
+    ///
+    /// Only the first flight of each day, and never a flight already
+    /// tracked — a six-leg trip should not produce six overlapping
+    /// flight-day watches all firing at once.
+    func armFlights(for trip: Trip) {
+        var armedDays: Set<String> = []
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        for leg in trip.legs where leg.arrival == .flight {
+            guard leg.arrive > Date() else { continue }
+            let day = f.string(from: leg.arrive)
+            guard !armedDays.contains(day) else { continue }
+            guard let number = Self.flightNumber(on: leg) else { continue }
+            armedDays.insert(day)
+            // AUDIT: track() replaces its own entry but fires two reminders
+            // every single time, so adding four legs one at a time produced
+            // eight duplicate "check in" reminders. Skip anything already
+            // being watched.
+            let already = ChappyFlights.shared.tracked.contains {
+                $0.number == number.uppercased()
+                    && Calendar.current.isDate($0.date, inSameDayAs: leg.arrive)
+            }
+            guard !already else { continue }
+            _ = ChappyFlights.shared.track(number: number, date: leg.arrive)
+            print("\u{2708}\u{FE0F} [Travel] Tracking \(number) on \(day) from the trip")
+        }
+        if !armedDays.isEmpty {
+            ChappyGlance.write()
+        }
+    }
+
+    // NOTE: no deal watch is armed here. addWatch() runs on Amadeus, and
+    // Amadeus decommissioned its self-service portal in July 2026 — the
+    // call would only ever return "needs the free Amadeus keys first",
+    // which is worse than not offering it. Price watching comes back if
+    // and when a second flight source is wired in.
+
+    /// Everything that should happen when a trip becomes real, in one
+    /// place — so it can be called from the planner, from a hand-built
+    /// trip, from an added leg and from a revision, instead of living
+    /// only inside the AI path.
+    func wireUp(_ tripID: UUID) {
+        guard let trip = trips.first(where: { $0.id == tripID }) else { return }
+        clearArmed(for: tripID)
+        armTripReminders(trip)
+        ChappyVisa.shared.armReminders(for: trip)
+        armFlights(for: trip)
+    }
+
+    /// Reminders armed for an EARLIER version of this trip have to go, or
+    /// a revision leaves you being told to pack for a date you no longer
+    /// fly on. Matched by source, which is why they were tagged.
+    func clearArmed(for tripID: UUID) {
+        guard let trip = trips.first(where: { $0.id == tripID }) else { return }
+        ChappyReminders.shared.dropTripReminders(named: trip.name)
+        // AUDIT: the visa lead-time reminders are titled by COUNTRY, not by
+        // trip name, so a trip called "Bali" never cleared its Indonesia
+        // reminders and accumulated a fresh set on every leg added.
+        for p in ChappyVisa.shared.positions(for: trip) where !p.schengenGroup {
+            ChappyReminders.shared.dropTripReminders(named: p.country)
+        }
+    }
+}
+
+extension ChappyReminders {
+
+    /// BUILD 182: drop the trip and visa scaffolding for one trip.
+    /// Deliberately narrow — anything the wearer typed himself is left
+    /// alone, and only reminders this app armed with source "trip" or
+    /// "visa" that mention this trip by name are removed.
+    /// BUILD 188: clear everything from one source. Used by the trip
+    /// file so re-saving a booking doesn't stack duplicate cancellation
+    /// warnings — the same mistake build 182 fixed for trip reminders.
+    func drop(source: String) {
+        let doomed = open.filter {
+            $0.source == source && ($0.effectiveFire ?? .distantPast) > Date()
+        }
+        for e in doomed { complete(e.id) }
+    }
+
+    func dropTripReminders(named tripName: String) {
+        let name = tripName.lowercased()
+        guard !name.isEmpty else { return }
+        // AUDIT: trips are named after the destination, so a trip called
+        // "Vietnam" matched "Visa for Vietnam expires in 3 days" — the LIVE
+        // in-country countdown, which has nothing to do with the plan.
+        // Editing the trip silently deleted the warnings the border watcher
+        // exists to produce. The countdown is tagged separately now and is
+        // never touched from here.
+        let doomed = open.filter { e in
+            (e.source == "trip" || e.source == "visa")
+                && !e.title.hasPrefix("Visa for ")
+                && e.title.lowercased().contains(name)
+                && (e.effectiveFire ?? .distantPast) > Date()
+        }
+        guard !doomed.isEmpty else { return }
+        for e in doomed { complete(e.id) }
+        print("\u{1F5D3}\u{FE0F} [Reminders] Cleared \(doomed.count) stale reminders for \(tripName)")
+    }
+}
+
+// =====================================================================
+// BUILD 182 — THE STAMP IN YOUR PASSPORT, COUNTED.
+//
+// ChappyReminders.setVisa() has existed for builds: it stores the
+// country, the allowance and the entry date, arms 14/7/3/1-day
+// warnings, and feeds visaLine() in the morning brief. It had ZERO
+// callers. Not one. So the single highest-stakes fact in a full-time
+// traveller's life — "you have nine days left on this stamp" — was
+// fully implemented and never once ran.
+//
+// The visa module built in 178 only ever reasons about PLANNED FUTURE
+// legs. Nothing looked at where you actually are.
+//
+// This watches the country in the location context. When it changes and
+// stays changed, that is a border crossing, and the clock starts.
+// Deliberately conservative: a country has to hold for two separate
+// readings before it counts, because a GPS fix near a border can flick
+// between two countries all afternoon, and starting the wrong visa
+// clock is worse than starting none.
+// =====================================================================
+
+@MainActor
+final class ChappyBorder: ObservableObject {
+    static let shared = ChappyBorder()
+
+    private let lastKey = "chappy_border_last"
+    private let pendingKey = "chappy_border_pending"
+    private let pendingAtKey = "chappy_border_pending_at"
+
+    @Published private(set) var currentCountry: String?
+
+    private init() {
+        currentCountry = UserDefaults.standard.string(forKey: lastKey)
+    }
+
+    /// Called whenever the location context learns a country.
+    func noticed(country raw: String?) {
+        guard let raw, !raw.isEmpty else { return }
+        let country = ChappyVisa.country(from: raw) ?? raw
+        let d = UserDefaults.standard
+
+        // Same as last confirmed — nothing to do.
+        if country == d.string(forKey: lastKey) {
+            d.removeObject(forKey: pendingKey)
+            return
+        }
+
+        // A candidate has to survive a second sighting at least ten minutes
+        // later. Borders are exactly where a fix is least trustworthy.
+        //
+        // AUDIT: pending lived in UserDefaults and never expired, so one
+        // spurious fix from weeks ago would pair with a single fix today and
+        // confirm instantly. A candidate older than a day is not a crossing,
+        // it's a ghost.
+        if d.string(forKey: pendingKey) == country {
+            let since = d.double(forKey: pendingAtKey)
+            let age = Date().timeIntervalSince1970 - since
+            if since > 0, age > 600, age < 86_400 {
+                confirm(country)
+                return
+            }
+            if age >= 86_400 {
+                d.set(Date().timeIntervalSince1970, forKey: pendingAtKey)
+            }
+            return
+        }
+        d.set(country, forKey: pendingKey)
+        d.set(Date().timeIntervalSince1970, forKey: pendingAtKey)
+    }
+
+    private func confirm(_ country: String) {
+        let d = UserDefaults.standard
+        let previous = d.string(forKey: lastKey)
+        d.set(country, forKey: lastKey)
+        d.removeObject(forKey: pendingKey)
+        currentCountry = country
+        print("\u{1F6C2} [Border] Now in \(country)\(previous.map { " (was \($0))" } ?? "")")
+
+        // AUDIT: the FIRST country we ever see is not an arrival — it is
+        // simply where the app was installed or reopened. Starting a visa
+        // clock dated today for someone already three weeks into a stamp is
+        // worse than starting none: it would say "30 days" and warn him
+        // three weeks late. Learn where he is, say nothing, wait for a real
+        // crossing.
+        guard previous != nil else {
+            print("\u{1F6C2} [Border] First fix — noting the country, not starting a clock")
+            return
+        }
+
+        // Home doesn't get a visa clock.
+        let home = UserDefaults.standard.string(forKey: "chappy_home_country") ?? "Australia"
+        guard country != home else {
+            ChappyReminders.shared.clearVisaCountdown()
+            return
+        }
+
+        guard let rule = ChappyVisa.auPassport[country], rule.days > 0 else {
+            ChappyMemory.shared.remember(.note,
+                title: "Arrived in \(country)",
+                tags: ["travel", country.lowercased()], source: "border")
+            return
+        }
+
+        ChappyReminders.shared.setVisa(country: country, days: rule.days)
+        ChappyMemory.shared.remember(.note,
+            title: "Entered \(country) — \(rule.days) days on a \(rule.shape.label.lowercased())",
+            tags: ["visa", "travel", country.lowercased()], source: "border")
+
+        // Say it once, quietly, because arriving somewhere is exactly when
+        // this is worth knowing and never again for a fortnight.
+        let line = "You're in \(country). That's \(rule.days) days on arrival — "
+                 + "I'll count them and warn you before it runs out."
+        TTSService.shared.speak(line)
+    }
+
+    /// He can set it himself when the app wasn't running at the border.
+    func declare(country raw: String, days: Int? = nil, entered: Date = Date()) -> String {
+        guard let country = ChappyVisa.country(from: raw) else {
+            return "I don't know \(raw). Try the country name."
+        }
+        let allowance = days ?? ChappyVisa.auPassport[country]?.days ?? 0
+        guard allowance > 0 else {
+            return "I don't have a day allowance for \(country) — tell me how many days you were given."
+        }
+        UserDefaults.standard.set(country, forKey: lastKey)
+        // AUDIT: a stale candidate left in pending could later confirm and
+        // overwrite the stamp he just told us about by hand.
+        UserDefaults.standard.removeObject(forKey: pendingKey)
+        currentCountry = country
+        ChappyReminders.shared.setVisa(country: country, days: allowance, entered: entered)
+        return "Got it — \(allowance) days in \(country) from "
+             + (Calendar.current.isDateInToday(entered) ? "today" : "then")
+             + ". I'll warn you at two weeks, one week, three days and the day before."
+    }
+
+    /// Days left on the current stamp, for the tile and the brief.
+    var daysLeft: Int? {
+        let d = UserDefaults.standard
+        let days = d.integer(forKey: "chappy_visa_days")
+        let t = d.double(forKey: "chappy_visa_entered")
+        guard days > 0, t > 0 else { return nil }
+        let entered = Date(timeIntervalSince1970: t)
+        guard let expiry = Calendar.current.date(byAdding: .day, value: days, to: entered) else { return nil }
+        return Calendar.current.dateComponents([.day], from: Date(), to: expiry).day
+    }
+
+    var spokenStatus: String {
+        guard let country = UserDefaults.standard.string(forKey: "chappy_visa_country"),
+              let left = daysLeft else {
+            return "No visa clock running. Say 'I arrived in Indonesia today' and I'll start one."
+        }
+        if left < 0 { return "Your \(country) stay ran out \(-left) days ago." }
+        if left == 0 { return "Today is your last day in \(country)." }
+        return "\(left) day\(left == 1 ? "" : "s") left on your \(country) stay."
+    }
+}
+
+extension ChappyReminders {
+    /// BUILD 182: leaving a country stops its clock.
+    func clearVisaCountdown() {
+        let d = UserDefaults.standard
+        guard d.string(forKey: "chappy_visa_country") != nil else { return }
+        d.removeObject(forKey: "chappy_visa_country")
+        d.removeObject(forKey: "chappy_visa_days")
+        d.removeObject(forKey: "chappy_visa_entered")
+        let doomed = open.filter { $0.source == "visa-stamp" }
+        for e in doomed { complete(e.id) }
+    }
+}
+
+// =====================================================================
+// BUILD 183 — GOOGLE STARS, AND WHY BOTH SOURCES ARE BETTER THAN ONE.
+//
+// Chappy's baked Maps key already has Places enabled. I built 177's
+// places layer on Tripadvisor without checking that, which was a miss.
+//
+// But it turns out the answer isn't "use Google instead" — it's use
+// both, because Google's own policy decides WHERE each one is allowed
+// to appear, and because the disagreement between them is the single
+// most useful thing two rating sources can give you.
+//
+// THREE RULES, taken from Google's Places policy, that shape all of this:
+//
+//   1. Places results shown ON A MAP must be shown on a GOOGLE map.
+//      Chappy's atlas is MapKit. So Google ratings go in LISTS, never
+//      on the atlas pins. Displaying Places data with no map at all is
+//      explicitly allowed, with the Google logo and attribution.
+//   2. Places content MUST NOT be cached or stored. Only place_id may
+//      be kept. That rules Google out of the emailed report, which is a
+//      permanent offline file — baking ratings into it is storage.
+//      Tripadvisor's terms do allow caching, so the report stays on
+//      Tripadvisor and stays legal.
+//   3. Attribution is required wherever it appears.
+//
+// So: GOOGLE LIVE IN THE APP, TRIPADVISOR IN THE REPORT. Not a
+// compromise — each one where it is actually permitted.
+//
+// AND THE PAYOFF. A place at 4.7 on Google and 3.9 on Tripadvisor is
+// loved by locals and disappoints travellers. Reversed, it is a tourist
+// trap the locals ignore. Neither number tells you that on its own.
+// =====================================================================
+
+@MainActor
+final class ChappyGooglePlaces: ObservableObject {
+    static let shared = ChappyGooglePlaces()
+
+    /// Google retired the universal $200 credit in March 2025. Place
+    /// Details Pro — the tier that carries rating and review count — runs
+    /// 5,000 free events a month and about seventeen dollars per thousand
+    /// after that. A meter, for the same reason the flight budget has one:
+    /// a silent overage is a bill you find out about later.
+    private let monthlyFree = 5000
+
+    @Published private(set) var used = 0
+    @Published private(set) var busy = false
+    @Published var error: String?
+    /// Cached rather than asked. isConfigured used to hit the keychain, and
+    /// it is read from a SwiftUI body — which meant a SecItemCopyMatching
+    /// on every keystroke in the settings field.
+    @Published private(set) var configured = false
+
+    private let usedKey = "chappy_gplaces_used"
+    private let monthKey = "chappy_gplaces_month"
+
+    private init() { rollIfNeeded(); refreshConfigured() }
+
+    private var currentMonth: String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM"
+        return f.string(from: Date())
+    }
+
+    private func rollIfNeeded() {
+        let d = UserDefaults.standard
+        if d.string(forKey: monthKey) != currentMonth {
+            d.set(currentMonth, forKey: monthKey)
+            d.set(0, forKey: usedKey)
+        }
+        used = d.integer(forKey: usedKey)
+    }
+
+    private func spend(_ n: Int) {
+        rollIfNeeded()
+        used += n
+        UserDefaults.standard.set(used, forKey: usedKey)
+    }
+
+    var remaining: Int { max(0, monthlyFree - used) }
+    var fraction: Double { min(1, Double(used) / Double(monthlyFree)) }
+
+    var meterLine: String {
+        "\(used) of \(monthlyFree) free Google lookups used this month"
+    }
+
+    var isConfigured: Bool { configured }
+
+    /// Called at launch and after any change in Settings.
+    func refreshConfigured() {
+        configured = !(APIKeyManager.shared.getMapsAPIKey() ?? "").isEmpty
+    }
+
+    // MARK: the search
+
+    /// One text search, returning the fields that matter and nothing more.
+    /// Field masking is not politeness — Google bills by the tier of the
+    /// most expensive field you ask for, so asking for photos you will
+    /// never show costs real money.
+    func search(_ query: String, near lat: Double, lon: Double,
+                radiusM: Double = 12000, limit: Int = 8) async -> [ChappyPlaces.Spot] {
+        guard let key = APIKeyManager.shared.getMapsAPIKey(), !key.isEmpty else {
+            error = "No Google Maps key set."
+            return []
+        }
+        guard remaining > 0 else {
+            error = "That's this month's free Google lookups used up. Tripadvisor still works."
+            return []
+        }
+        guard let url = URL(string: "https://places.googleapis.com/v1/places:searchText") else { return [] }
+
+        busy = true
+        defer { busy = false }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "X-Goog-Api-Key")
+        req.setValue("places.id,places.displayName,places.rating,places.userRatingCount,"
+                     + "places.priceLevel,places.formattedAddress,places.location,"
+                     + "places.googleMapsUri,places.currentOpeningHours.openNow",
+                     forHTTPHeaderField: "X-Goog-FieldMask")
+        req.timeoutInterval = 20
+        let body: [String: Any] = [
+            "textQuery": query,
+            "maxResultCount": min(20, limit),
+            "locationBias": ["circle": ["center": ["latitude": lat, "longitude": lon],
+                                        "radius": radiusM]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            error = "Couldn't reach Google."
+            return []
+        }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            error = code == 403
+                ? "Google refused the key — Places may not be enabled on it."
+                : "Google returned \(code)."
+            return []
+        }
+        spend(1)
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["places"] as? [[String: Any]] else { return [] }
+
+        error = nil
+        return rows.compactMap { row in
+            guard let id = row["id"] as? String,
+                  let dn = row["displayName"] as? [String: Any],
+                  let name = dn["text"] as? String else { return nil }
+            var s = ChappyPlaces.Spot(id: "g:" + id, name: name, kind: .restaurants)
+            s.googleID = id
+            s.googleRating = row["rating"] as? Double
+            s.googleCount = row["userRatingCount"] as? Int
+            s.priceLevel = Self.priceBand(row["priceLevel"] as? String)
+            s.address = (row["formattedAddress"] as? String) ?? ""
+            if let loc = row["location"] as? [String: Any] {
+                s.lat = (loc["latitude"] as? Double) ?? 0
+                s.lon = (loc["longitude"] as? Double) ?? 0
+            }
+            s.googleURL = row["googleMapsUri"] as? String
+            if let oh = row["currentOpeningHours"] as? [String: Any] {
+                s.openNow = oh["openNow"] as? Bool
+            }
+            return s
+        }
+    }
+
+    /// Google's price levels are enum strings; a traveller thinks in
+    /// dollar signs.
+    static func priceBand(_ raw: String?) -> String {
+        switch raw ?? "" {
+        case "PRICE_LEVEL_FREE":            return "free"
+        case "PRICE_LEVEL_INEXPENSIVE":     return "$"
+        case "PRICE_LEVEL_MODERATE":        return "$$"
+        case "PRICE_LEVEL_EXPENSIVE":       return "$$$"
+        case "PRICE_LEVEL_VERY_EXPENSIVE":  return "$$$$"
+        default:                            return ""
+        }
+    }
+
+    /// Required wherever Places content is shown. Not decoration — it is
+    /// a condition of the licence.
+    static let attribution = "Ratings and opening hours from Google"
+}
+
+// =====================================================================
+// BUILD 183 — THE BEST-OF ENGINE.
+//
+// Two sources, merged by name, ranked by rating WEIGHTED BY VOLUME.
+// That last part is the whole thing: a 5.0 from eleven people is not
+// better than a 4.6 from six thousand, and every app that sorts by raw
+// stars puts the brand-new place with three reviews above everything
+// actually worth eating at.
+//
+// Google leads because its coverage of gyms, warungs, massage places
+// and recovery studios is far deeper — Tripadvisor barely knows those
+// categories exist. Tripadvisor is then matched in on top where it has
+// something to add, which is where the divergence signal comes from.
+// =====================================================================
+
+extension ChappyPlaces {
+
+    struct BestOf: Identifiable {
+        var id: String { kind.rawValue }
+        var kind: Kind
+        var spots: [Spot]
+        var source: String
+    }
+
+    /// One category, both sources, merged and ranked.
+    func bestOf(_ kind: Kind, place: String, lat: Double, lon: Double,
+                limit: Int = 4) async -> BestOf {
+        var merged: [String: Spot] = [:]
+        var sources: [String] = []
+
+        // GOOGLE FIRST — coverage, and the categories Tripadvisor lacks.
+        if ChappyGooglePlaces.shared.isConfigured, ChappyGooglePlaces.shared.remaining > 0 {
+            let g = await ChappyGooglePlaces.shared.search(
+                "\(kind.googleQuery) in \(place)", near: lat, lon: lon, limit: 10)
+            if !g.isEmpty { sources.append("Google") }
+            for var s in g {
+                s.kind = kind
+                merged[Self.matchKey(s.name)] = s
+            }
+        }
+
+        // TRIPADVISOR SECOND — matched onto what Google found where it can,
+        // added where Google found nothing.
+        if hasTripAdvisorKey, let ta = await tripAdvisor(lat: lat, lon: lon,
+                                                         place: place, kind: kind) {
+            if !ta.isEmpty { sources.append("Tripadvisor") }
+            for t in ta {
+                let key = Self.matchKey(t.name)
+                if var existing = merged[key] {
+                    existing.rating = t.rating
+                    existing.reviews = t.reviews
+                    existing.fromTripAdvisor = true
+                    if existing.address.isEmpty { existing.address = t.address }
+                    merged[key] = existing
+                } else {
+                    var s = t
+                    s.kind = kind
+                    merged[key] = s
+                }
+            }
+        }
+
+        // NOTHING BUT APPLE — no key, no signal, but at least real places.
+        if merged.isEmpty {
+            let apple = await self.apple(lat: lat, lon: lon, place: place, kind: kind)
+            for var s in apple { s.kind = kind; merged[Self.matchKey(s.name)] = s }
+            if !apple.isEmpty { sources.append("Apple Maps") }
+        }
+
+        let ranked = merged.values
+            .sorted { $0.confidenceScore > $1.confidenceScore }
+            .prefix(limit)
+        return BestOf(kind: kind, spots: Array(ranked),
+                      source: sources.isEmpty ? "nothing found" : sources.joined(separator: " + "))
+    }
+
+    /// Every category for one leg. Sequential with a breath between, so
+    /// eight categories don't fire eight simultaneous requests at two
+    /// different vendors and trip anyone's rate limit.
+    func bestOfEverything(place: String, lat: Double, lon: Double,
+                          into store: @escaping (BestOf) -> Void) async {
+        for kind in Kind.bestOf {
+            let b = await bestOf(kind, place: place, lat: lat, lon: lon)
+            if !b.spots.isEmpty { store(b) }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+    }
+
+    /// THE REPORT'S OWN SHORTLIST — AND WHY IT IS A DIFFERENT FUNCTION.
+    ///
+    /// The report is a file. It gets saved, emailed, forwarded and opened
+    /// again in six weeks. Google's Places terms allow exactly one piece
+    /// of their data to be stored — the place_id — and nothing else: not
+    /// the name, not the rating, not the review count. Putting a Google
+    /// result in an HTML document that lives on disk is the one thing
+    /// their licence actually forbids, and "nobody will notice" is not a
+    /// engineering position.
+    ///
+    /// So the split is clean and permanent: Google is live in the app,
+    /// where it is fetched, shown and dropped; Tripadvisor and Apple are
+    /// what go in the document, because both permit it. Same ranking
+    /// logic, same categories, one source removed. The report says so in
+    /// its own footer rather than quietly showing fewer places.
+    func reportBestOf(_ kind: Kind, place: String, lat: Double, lon: Double,
+                      limit: Int = 4) async -> BestOf {
+        var merged: [String: Spot] = [:]
+        var sources: [String] = []
+
+        if hasTripAdvisorKey, let ta = await tripAdvisor(lat: lat, lon: lon,
+                                                         place: place, kind: kind) {
+            if !ta.isEmpty { sources.append("Tripadvisor") }
+            for t in ta {
+                var s = t
+                s.kind = kind
+                s.fromTripAdvisor = true
+                merged[Self.matchKey(t.name)] = s
+            }
+        }
+
+        // Apple fills the categories Tripadvisor has never heard of — a
+        // gym, an ice bath, a dive shop — with real places and no rating,
+        // which is more useful than an empty heading.
+        if merged.count < limit {
+            let apple = await self.apple(lat: lat, lon: lon, place: place, kind: kind)
+            for var s in apple {
+                let key = Self.matchKey(s.name)
+                guard merged[key] == nil else { continue }
+                s.kind = kind
+                merged[key] = s
+            }
+            if !apple.isEmpty { sources.append("Apple Maps") }
+        }
+
+        // Belt and braces: nothing Google-shaped survives into a file, even
+        // if a spot arrived here from a cached in-app lookup.
+        let ranked = merged.values
+            .map { sp -> Spot in
+                var s = sp
+                s.googleID = nil; s.googleRating = nil
+                s.googleCount = nil; s.googleURL = nil
+                return s
+            }
+            .sorted { $0.confidenceScore > $1.confidenceScore }
+            .prefix(limit)
+
+        return BestOf(kind: kind, spots: Array(ranked),
+                      source: sources.isEmpty ? "nothing found" : sources.joined(separator: " + "))
+    }
+
+    /// Every category for one leg, for the document. Sequential with a
+    /// breath between so eight categories don't fire eight simultaneous
+    /// requests and trip a rate limit mid-report.
+    func reportBestOfEverything(place: String, lat: Double, lon: Double) async -> [BestOf] {
+        var out: [BestOf] = []
+        for kind in Kind.bestOf {
+            let b = await reportBestOf(kind, place: place, lat: lat, lon: lon)
+            if !b.spots.isEmpty { out.append(b) }
+            try? await Task.sleep(nanoseconds: 220_000_000)
+        }
+        return out
+    }
+
+    /// Match "Warung Bu Mi" to "Warung Bu Mi Canggu" without matching it to
+    /// "Warung Bu Made". Case, punctuation and the town name are noise;
+    /// the rest is the name.
+    static func matchKey(_ raw: String) -> String {
+        var s = raw.lowercased()
+        for junk in ["restaurant", "cafe", "café", "warung", "the ", " bali",
+                     " canggu", " ubud", " amed", " gili", "&", ",", ".", "'", "-"] {
+            s = s.replacingOccurrences(of: junk, with: " ")
+        }
+        let key = s.split(separator: " ").joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        // AUDIT: a name made only of stripped words — "Warung Bali",
+        // "The Cafe" — reduced to the empty string, and every such place
+        // then merged into the SAME slot, inheriting a stranger's rating.
+        // An unmergeable name is better than a wrong merge.
+        return key.isEmpty ? raw.lowercased().trimmingCharacters(in: .whitespaces) : key
+    }
+}
+
+// =====================================================================
+// BUILD 183 — MAPS THAT SHOW MOVEMENT, AND ZOOM THAT MEANS SOMETHING.
+//
+// Three things the 178 renders were missing.
+//
+// TIMESTAMPS. A pin that says "Canggu" is a place. A pin that says
+// "Canggu · 5–9 Sep · 4n" is a plan, and a route line labelled
+// "16 Sep · 1h 15m" turns a picture of places into a picture of
+// movement through time. That was the whole complaint and it was fair.
+//
+// ATTRACTION PINS. The shortlist existed only as text. Rendered onto
+// the leg's own map, colour-coded by category, it becomes the thing you
+// actually look at — where the food is relative to where you sleep.
+//
+// ZOOM THAT ISN'T A LIE. Scaling a bitmap up is not zooming, it is
+// blurring. A real zoom is a SECOND SNAPSHOT of a tighter region at the
+// same pixel size — same file size, genuinely more detail, street names
+// where there were none. That is what the report's zoom panel gets.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// Category colours, matched to the app so the printed map and the
+    /// screen are recognisably the same thing.
+    static func spotColour(_ kind: ChappyPlaces.Kind) -> UIColor {
+        switch kind {
+        case .restaurants: return UIColor(red: 0.92, green: 0.42, blue: 0.24, alpha: 1)
+        case .cheapEats:   return UIColor(red: 0.95, green: 0.62, blue: 0.20, alpha: 1)
+        case .attractions: return UIColor(red: 0.51, green: 0.34, blue: 0.85, alpha: 1)
+        case .massage:     return UIColor(red: 0.90, green: 0.35, blue: 0.62, alpha: 1)
+        case .recovery:    return UIColor(red: 0.20, green: 0.72, blue: 0.78, alpha: 1)
+        case .gyms:        return UIColor(red: 0.30, green: 0.62, blue: 0.37, alpha: 1)
+        case .beachClubs:  return UIColor(red: 0.12, green: 0.61, blue: 0.84, alpha: 1)
+        case .dive:        return UIColor(red: 0.05, green: 0.54, blue: 0.71, alpha: 1)
+        case .hotels:      return UIColor(red: 0.55, green: 0.58, blue: 0.64, alpha: 1)
+        }
+    }
+
+    /// A dated label under a pin. Kept short — a map label that wraps is
+    /// a map label nobody reads.
+    static func pinCaption(_ leg: Leg) -> String {
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        return "\(f.string(from: leg.arrive))–\(f.string(from: leg.depart)) · \(leg.nights)n"
+    }
+
+    /// The label that sits on a route line: how, when, and how long.
+    static func hopCaption(_ leg: Leg) -> String {
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        let icon: String
+        switch leg.arrival {
+        case .flight: icon = "\u{2708}"
+        case .ferry:  icon = "\u{26F4}"
+        case .train:  icon = "\u{1F686}"
+        case .bus:    icon = "\u{1F68C}"
+        case .walk:   icon = "\u{1F6B6}"
+        default:      icon = "\u{1F697}"
+        }
+        return "\(icon) \(f.string(from: leg.arrive))"
+    }
+
+    /// Draw a rounded label with a dark plate — legible on any map style,
+    /// which a bare white string is not.
+    private static func plate(_ text: String, at p: CGPoint, in cg: CGContext,
+                              size: CGFloat = 15, tint: UIColor = .white) {
+        let ns = text as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: size, weight: .semibold),
+            .foregroundColor: tint
+        ]
+        let sz = ns.size(withAttributes: attrs)
+        let box = CGRect(x: p.x - sz.width / 2 - 8, y: p.y,
+                         width: sz.width + 16, height: sz.height + 6)
+        cg.setFillColor(UIColor.black.withAlphaComponent(0.74).cgColor)
+        UIBezierPath(roundedRect: box, cornerRadius: (sz.height + 6) / 2).fill()
+        cg.setStrokeColor(UIColor.white.withAlphaComponent(0.22).cgColor)
+        cg.setLineWidth(1)
+        UIBezierPath(roundedRect: box, cornerRadius: (sz.height + 6) / 2).stroke()
+        ns.draw(at: CGPoint(x: box.minX + 8, y: box.minY + 3), withAttributes: attrs)
+    }
+
+    /// A leg's own map, with the shortlist on it and the stay in the
+    /// middle. `zoomFactor` below 1 tightens the region — that is what the
+    /// report's zoom panel asks for, and it produces genuinely more
+    /// detail rather than a bigger blur.
+    func legMap(_ leg: Leg, spots: [ChappyPlaces.Spot] = [],
+                size: CGSize = CGSize(width: 760, height: 330),
+                zoomFactor: Double = 1.0) async -> UIImage? {
+        guard leg.hasCoord else { return nil }
+        let metres = 2600.0 * zoomFactor
+
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon),
+            latitudinalMeters: metres, longitudinalMeters: metres)
+        options.size = size
+        options.scale = 2
+        options.mapType = .standard
+        options.showsBuildings = true
+        options.pointOfInterestFilter = .includingAll
+        options.traitCollection = UITraitCollection(userInterfaceStyle: .dark)
+        guard let snap = try? await MKMapSnapshotter(options: options).start() else { return nil }
+
+        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = 2
+        return UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
+            snap.image.draw(at: .zero)
+            let cg = ctx.cgContext
+
+            // the shortlist, colour-coded
+            for s in spots where s.lat != 0 || s.lon != 0 {
+                let p = snap.point(for: CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon))
+                guard p.x > 8, p.y > 8, p.x < size.width - 8, p.y < size.height - 26 else { continue }
+                let r: CGFloat = 11
+                cg.setFillColor(Self.spotColour(s.kind).cgColor)
+                cg.fillEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+                cg.setStrokeColor(UIColor.white.cgColor)
+                cg.setLineWidth(2.2)
+                cg.strokeEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+                Self.plate(s.name, at: CGPoint(x: p.x, y: p.y + r + 3), in: cg, size: 12)
+            }
+
+            // where you sleep
+            let c = snap.point(for: CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon))
+            let r: CGFloat = 17
+            cg.setFillColor(UIColor.white.cgColor)
+            cg.fillEllipse(in: CGRect(x: c.x - r - 2, y: c.y - r - 2, width: r * 2 + 4, height: r * 2 + 4))
+            cg.setFillColor(UIColor(red: 0.30, green: 0.77, blue: 1.0, alpha: 1).cgColor)
+            cg.fillEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+            let bed = "\u{1F6CF}" as NSString
+            let ba: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 16)]
+            let bs = bed.size(withAttributes: ba)
+            bed.draw(at: CGPoint(x: c.x - bs.width / 2, y: c.y - bs.height / 2), withAttributes: ba)
+        }
+    }
+
+    /// The trip overview, now carrying dates on every pin and a
+    /// how-and-when label on every hop.
+    func datedTripMap(_ trip: Trip, size: CGSize = CGSize(width: 1000, height: 640),
+                      zoomFactor: Double = 1.0)
+        async -> (image: UIImage, hits: [MapHit])? {
+
+        let placed = trip.legs.enumerated().filter { $0.element.hasCoord }
+        guard !placed.isEmpty else { return nil }
+        let lats = placed.map { $0.element.lat }, lons = placed.map { $0.element.lon }
+        guard let minLa = lats.min(), let maxLa = lats.max(),
+              let minLo = lons.min(), let maxLo = lons.max() else { return nil }
+
+        let options = MKMapSnapshotter.Options()
+        options.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLa + maxLa) / 2,
+                                           longitude: (minLo + maxLo) / 2),
+            span: MKCoordinateSpan(
+                latitudeDelta: max(0.3, (maxLa - minLa) * 1.9 * zoomFactor),
+                longitudeDelta: max(0.3, (maxLo - minLo) * 1.9 * zoomFactor)))
+        options.size = size
+        options.scale = 2
+        options.mapType = .standard
+        options.showsBuildings = true
+        options.pointOfInterestFilter = .includingAll
+        options.traitCollection = UITraitCollection(userInterfaceStyle: .dark)
+        guard let snap = try? await MKMapSnapshotter(options: options).start() else { return nil }
+
+        var hits: [MapHit] = []
+        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = 2
+        let image = UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
+            snap.image.draw(at: .zero)
+            let cg = ctx.cgContext
+            let pts = placed.map {
+                snap.point(for: CLLocationCoordinate2D(latitude: $0.element.lat,
+                                                       longitude: $0.element.lon))
+            }
+            for i in 1..<max(1, pts.count) {
+                let colour = Self.legHue(placed[i].offset, of: max(1, trip.legs.count))
+                cg.setStrokeColor(UIColor.black.withAlphaComponent(0.5).cgColor)
+                cg.setLineWidth(9); cg.setLineCap(.round); cg.setLineDash(phase: 0, lengths: [])
+                cg.move(to: pts[i - 1]); cg.addLine(to: pts[i]); cg.strokePath()
+
+                cg.setStrokeColor(colour.cgColor)
+                cg.setLineWidth(5)
+                switch placed[i].element.arrival {
+                case .flight: cg.setLineDash(phase: 0, lengths: [14, 9])
+                case .ferry:  cg.setLineDash(phase: 0, lengths: [3, 9])
+                default:      cg.setLineDash(phase: 0, lengths: [])
+                }
+                cg.move(to: pts[i - 1]); cg.addLine(to: pts[i]); cg.strokePath()
+                cg.setLineDash(phase: 0, lengths: [])
+
+                // the hop label, on the line, offset up so it clears it
+                let mid = CGPoint(x: (pts[i - 1].x + pts[i].x) / 2,
+                                  y: (pts[i - 1].y + pts[i].y) / 2 - 11)
+                Self.plate(Self.hopCaption(placed[i].element), at: mid, in: cg, size: 13)
+            }
+
+            for (i, p) in pts.enumerated() {
+                hits.append(MapHit(legIndex: placed[i].offset, x: p.x, y: p.y))
+                let r: CGFloat = 19
+                cg.setFillColor(Self.legHue(placed[i].offset, of: max(1, trip.legs.count)).cgColor)
+                cg.fillEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+                cg.setStrokeColor(UIColor.white.cgColor)
+                cg.setLineWidth(3.5)
+                cg.strokeEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
+                let num = "\(placed[i].offset + 1)" as NSString
+                let na: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 19, weight: .heavy),
+                    .foregroundColor: UIColor.black.withAlphaComponent(0.82)]
+                let ns = num.size(withAttributes: na)
+                num.draw(at: CGPoint(x: p.x - ns.width / 2, y: p.y - ns.height / 2), withAttributes: na)
+
+                // BUILD 183: the dates, which is what makes it a plan
+                Self.plate("\(placed[i].element.place)  \(Self.pinCaption(placed[i].element))",
+                           at: CGPoint(x: p.x, y: p.y + r + 4), in: cg, size: 13)
+            }
+        }
+        return (image, hits)
+    }
+}
+
+// =====================================================================
+// BUILD 183 — THE REPORT, REBUILT DARK AND COMPLETE.
+//
+// Everything that makes it worth reading rather than skimming:
+// the ARGUMENT for the trip, a reason for every leg with the trade-off
+// stated, the swaps that were considered and rejected, what is on while
+// you are there, where the trip naturally leads next, the conversion
+// meter, the stress test, and every map zoomable.
+//
+// Three rules held throughout:
+//   * Say what is known and what is guessed, every time.
+//   * Tripadvisor in the document, never Google — Google's terms forbid
+//     storing Places content, and a permanent offline file is storage.
+//   * One self-contained file. It has to open on a plane.
+// =====================================================================
+
+extension ChappyTravel {
+
+    private static func e(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    /// Sections the report can carry. Assembled by the caller so a trip
+    /// with no best-of data simply omits it rather than printing an
+    /// empty heading.
+    struct ReportExtras {
+        var bestOf: [UUID: [ChappyPlaces.BestOf]] = [:]
+        /// BUILD 186, keyed by Spot.id.
+        var digests: [String: ChappyReviews.Digest] = [:]
+        var why: [UUID: (String, [String], String)] = [:]
+        var alternatives: [(String, String, String)] = []
+        var events: [(String, String, String)] = []
+        var onward: [(String, String, String, String)] = []
+        var risks: [(String, String, String, String)] = []
+        var argument: [String] = []
+    }
+
+    private var reportCSS: String {
+        """
+        *{box-sizing:border-box}
+        :root{--bg:#05070a;--card:#0e131a;--card2:#131922;--line:#1e2632;--line2:#2a3441;
+         --ink:#e8eef5;--dim:#93a2b3;--faint:#66748a;--acc:#4cc4ff;--acc2:#ffb454;
+         --good:#31c47d;--warn:#ffb454;--bad:#ff6b5e}
+        body{margin:0;background:var(--bg);color:var(--ink);
+         font:15.5px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',Roboto,sans-serif;
+         -webkit-font-smoothing:antialiased;font-feature-settings:'tnum' 1}
+        .wrap{max-width:880px;margin:0 auto;padding:0 0 60px}
+        .hero{padding:36px 22px 24px;background:
+         radial-gradient(1000px 380px at 15% -12%,rgba(76,196,255,.16),transparent 62%),
+         radial-gradient(760px 320px at 92% 0%,rgba(255,180,84,.10),transparent 60%)}
+        .kicker{font-size:10.5px;letter-spacing:2.6px;text-transform:uppercase;color:var(--acc);margin:0 0 10px;font-weight:700}
+        h1{margin:0;font-size:42px;line-height:1.03;letter-spacing:-1.4px;font-weight:700}
+        .dates{margin:11px 0 0;color:var(--dim);font-size:15px}
+        .headline{display:flex;flex-wrap:wrap;gap:28px;margin:24px 0 0}
+        .n{display:block;font-size:26px;font-weight:700;letter-spacing:-.7px}
+        .l{display:block;font-size:9.5px;letter-spacing:1.6px;text-transform:uppercase;color:var(--faint);margin-top:4px;font-weight:600}
+        .body{padding:8px 14px 0}
+        .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:19px;margin:0 0 13px}
+        h2{font-size:10.5px;letter-spacing:1.9px;text-transform:uppercase;color:var(--faint);margin:0 0 14px;font-weight:700}
+        .lede{font-size:17px;line-height:1.55;margin:0 0 11px;letter-spacing:-.2px}
+        .lede b{color:var(--acc)}
+        p.s2{color:var(--dim);font-size:14px;margin:0 0 10px}
+        .mapwrap{position:relative;line-height:0}
+        .mapwrap img{width:100%;display:block}
+        .hot{position:absolute;transform:translate(-50%,-50%);border-radius:50%;width:6.5%;padding-bottom:6.5%;height:0}
+        .tip{padding:11px 16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:12px;color:var(--dim);border-top:1px solid var(--line)}
+        .tip a{color:var(--acc);text-decoration:none;font-weight:600}
+        .total{font-size:38px;font-weight:700;letter-spacing:-1.5px;margin:0;line-height:1}
+        .totsub{color:var(--dim);font-size:14px;margin:7px 0 0}
+        .cost{display:grid;grid-template-columns:1fr auto;gap:8px;font-size:13.5px;padding:7px 0;border-bottom:1px solid var(--line)}
+        .cost:last-child{border:none}
+        .leg{margin:0 0 13px;background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden}
+        .lh{display:flex;align-items:center;gap:12px;padding:15px 17px}
+        .num{width:28px;height:28px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#05070a}
+        .lh h3{margin:0;font-size:19px;letter-spacing:-.3px}
+        .lh .when{color:var(--dim);font-size:12.5px;margin:2px 0 0}
+        .smap{position:relative;line-height:0;border-top:1px solid var(--line)}
+        .smap img{width:100%;display:block}
+        .why{padding:14px 17px;border-top:1px solid var(--line);background:var(--card2)}
+        .why .hd{font-size:14.5px;font-weight:600;margin:0 0 8px;letter-spacing:-.2px}
+        .why ul{margin:0;padding:0 0 0 16px}
+        .why li{font-size:13px;color:var(--dim);margin:0 0 5px}
+        .why .trade{font-size:12.5px;color:var(--warn);margin:9px 0 0}
+        .money{padding:10px 17px;border-top:1px solid var(--line);font-size:13.5px}
+        .mrow{display:flex;justify-content:space-between;gap:10px;padding:5px 0;align-items:baseline}
+        .mrow .k{color:var(--dim)}
+        .mrow .v{font-weight:600;white-space:nowrap}
+        .alt{color:var(--faint);font-weight:400;font-size:12px}
+        .g{font-size:9px;font-weight:800;letter-spacing:.6px;padding:2px 6px;border-radius:10px;margin-left:6px}
+        details{border-top:1px solid var(--line)}
+        summary{padding:11px 17px;font-size:13px;font-weight:600;color:var(--acc);cursor:pointer;list-style:none}
+        summary::-webkit-details-marker{display:none}
+        summary:after{content:' ▾';color:var(--faint)}
+        details[open] summary:after{content:' ▴'}
+        .dc{padding:0 17px 14px}
+        .bg{display:grid;grid-template-columns:repeat(auto-fit,minmax(225px,1fr));gap:14px}
+        .bl h4{margin:0 0 6px;font-size:10px;letter-spacing:1.3px;text-transform:uppercase;color:var(--faint)}
+        .br{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px;text-decoration:none;color:var(--ink)}
+        .br:last-child{border:none}
+        .br .rt{white-space:nowrap;color:var(--faint);font-size:11.5px}
+        .dv{color:var(--acc2);font-size:11px;display:block;margin-top:2px}
+        .acts{padding:8px 17px 14px}
+        .acts .t{font-size:9.5px;letter-spacing:1.3px;text-transform:uppercase;color:var(--faint);margin:9px 0 6px;font-weight:700}
+        .acts a{display:inline-block;margin:0 5px 5px 0;padding:6px 11px;background:rgba(76,196,255,.10);color:var(--acc);
+         border:1px solid rgba(76,196,255,.22);border-radius:8px;text-decoration:none;font-size:12.5px;font-weight:600}
+        .acts a.hunt{background:rgba(255,180,84,.10);color:var(--acc2);border-color:rgba(255,180,84,.25)}
+        .note{padding:0 17px 13px;color:var(--dim);font-size:13px}
+        .deal{display:flex;gap:11px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+        .deal:last-child{border:none}
+        .deal .i{flex:none;width:22px;text-align:center}
+        .deal b{display:block}
+        .deal span{color:var(--dim);font-size:12.5px}
+        .deal a{color:var(--acc);text-decoration:none}
+        .row2{border-bottom:1px solid var(--line);padding:13px 0}
+        .row2:last-child{border:none}
+        .rh{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:5px}
+        .rh b{font-size:15px}
+        .rh .rt{color:var(--faint);font-size:12px;white-space:nowrap}
+        .row2 p{margin:0;font-size:13px;color:var(--dim)}
+        .risk{display:flex;gap:11px;padding:11px 0;border-bottom:1px solid var(--line)}
+        .risk:last-child{border:none}
+        .rl{flex:none;width:60px;font-size:9.5px;font-weight:800;letter-spacing:.8px;padding:3px 0;text-align:center;border-radius:6px;height:fit-content}
+        .rl.LOW{color:var(--good);background:rgba(49,196,125,.12)}
+        .rl.MEDIUM{color:var(--warn);background:rgba(255,180,84,.12)}
+        .rl.HIGH{color:var(--bad);background:rgba(255,107,94,.12)}
+        .risk b{display:block;font-size:13.5px;margin-bottom:3px}
+        .risk .d{color:var(--dim);font-size:12.5px}
+        .risk .f{color:var(--acc);font-size:12.5px;margin-top:5px}
+        .fxg{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+        .fxc{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px}
+        .fxh{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+        .fxh b{font-size:13.5px}
+        .fxh .rate{color:var(--acc);font-size:12.5px;font-weight:700}
+        .fxr{display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;color:var(--dim)}
+        .fxr b{color:var(--ink);font-weight:600}
+        .wxs{display:flex;gap:4px;overflow-x:auto;padding-bottom:4px}
+        .wxd{flex:1 0 56px;min-width:56px;background:var(--card2);border:1px solid var(--line);border-radius:10px;
+         padding:7px 4px 8px;display:flex;flex-direction:column;align-items:center;gap:2px}
+        .wxd .dw{font-size:9.5px;color:var(--faint);text-transform:uppercase}
+        .wxd .dd{font-size:12.5px;font-weight:700}
+        .wxd .tt{font-size:12.5px;font-weight:700}
+        .wxd .tt i{font-style:normal;color:var(--faint);font-weight:400;margin-left:3px}
+        .zb{position:absolute;right:9px;bottom:9px;background:#0f151d;color:var(--ink);border:1px solid var(--line2);
+         border-radius:9px;padding:6px 11px;font-size:11.5px;font-weight:700;text-decoration:none;z-index:3}
+        .lb{display:none}
+        .lb:target{display:block;position:fixed;inset:0;z-index:99;background:#05070a}
+        .lb .bar{position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;padding:12px 16px;
+         background:#05070a;border-bottom:1px solid var(--line);font-size:13px;font-weight:600}
+        .lb .bar a{color:var(--acc);text-decoration:none;font-weight:700}
+        .lb .pan{overflow:auto;height:calc(100% - 48px)}
+        .lb .pan img{width:170%;max-width:none;display:block}
+        .hint2{color:var(--faint);font-weight:400;font-size:12px}
+        .foot{color:var(--faint);font-size:11.5px;line-height:1.6;padding:6px 17px 0}
+        table{width:100%;border-collapse:collapse}
+        td{padding:10px 0;border-bottom:1px solid var(--line);vertical-align:top;font-size:13.5px}
+        tr:last-child td{border-bottom:none}
+        td.r{text-align:right;white-space:nowrap;font-weight:600}
+        .spark{display:flex;align-items:flex-end;gap:3px;height:44px;margin:9px 0 3px}
+        .spark i{flex:1;border-radius:2px 2px 0 0;min-width:3px}
+        .sparkl{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint);margin:0}
+        .play{margin:0;padding:0 0 0 20px}
+        .play li{margin:0 0 11px;font-size:13px}
+        .play li b{display:block;font-size:13.5px;margin-bottom:3px}
+        .play li span{display:block;color:var(--dim);font-size:12.5px}
+        .play li a{display:inline-block;margin-top:5px;color:var(--acc);text-decoration:none;
+         font-size:12px;font-weight:600}
+        .tl{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
+        .tl:last-of-type{border:none}
+        .tick{flex:none;width:18px;color:var(--faint);font-size:13px}
+        .tl.done .tick{color:var(--good)}
+        .tl.done b{color:var(--dim);text-decoration:line-through;text-decoration-color:var(--line2)}
+        .tl.urgent .tick{color:var(--warn)}
+        .tl b{display:block;font-size:13.5px}
+        .tl .d{display:block;font-size:12.5px;color:var(--dim);margin-top:2px}
+        .daysep{font-size:10px;letter-spacing:1.8px;text-transform:uppercase;color:var(--acc);
+         font-weight:700;margin:16px 0 8px}
+        .day{border-left:2px solid var(--line2);padding:0 0 12px 13px;margin:0 0 4px}
+        .dh{display:flex;gap:10px;align-items:flex-start;margin:0 0 8px}
+        .dshape{flex:none;font-size:8.5px;font-weight:800;letter-spacing:.9px;padding:3px 7px;
+         border-radius:8px;text-transform:uppercase}
+        .dh b{display:block;font-size:13.5px}
+        .dhl{display:block;font-size:12.5px;color:var(--dim);margin-top:2px}
+        .stops{margin:0 0 6px}
+        .stop{display:flex;gap:10px;padding:6px 0;align-items:baseline}
+        .slot{flex:none;width:82px;font-size:10px;color:var(--faint);text-transform:uppercase;
+         letter-spacing:.7px;font-weight:700}
+        .stop b{font-size:13px}
+        .srt{display:block;font-size:11.5px;color:var(--faint);margin-top:1px}
+        .snote{margin:4px 0 0;font-size:11.5px;color:var(--dim)}
+        .dadvice{margin:5px 0 0;font-size:12px;color:var(--dim)}
+        .dig{margin:6px 0 2px;padding:9px 11px;background:var(--card2);border-radius:10px;
+         border:1px solid var(--line)}
+        .digline{margin:0;font-size:12.5px;color:var(--ink)}
+        .themes{display:flex;flex-wrap:wrap;gap:5px;margin:7px 0 0}
+        .th{font-size:10px;font-weight:700;padding:2px 7px;border-radius:8px}
+        .th.good{color:var(--good);background:rgba(49,196,125,.12)}
+        .th.bad{color:var(--warn);background:rgba(255,180,84,.12)}
+        .quote{margin:7px 0 0;font-size:12px;color:var(--dim);font-style:italic;
+         border-left:2px solid var(--line2);padding-left:9px}
+        .digflag{margin:6px 0 0;font-size:11.5px;color:var(--acc2)}
+        .scorehead{display:flex;gap:16px;align-items:center;margin:0 0 14px}
+        .ring{flex:none;width:76px;height:76px;border-radius:50%;display:flex;align-items:baseline;
+         justify-content:center;gap:1px;background:radial-gradient(circle at 50% 50%,var(--card) 56%,transparent 57%),
+         conic-gradient(var(--c) 0turn,var(--c) 1turn);border:1px solid var(--line2)}
+        .ring .n{font-size:26px;font-weight:800;color:var(--c);align-self:center}
+        .ring .o{font-size:10px;color:var(--faint);align-self:center}
+        .flags{margin:0 0 14px}
+        .flag{background:rgba(255,107,94,.10);border:1px solid rgba(255,107,94,.24);color:#ffb0a7;
+         border-radius:10px;padding:9px 12px;font-size:13px;margin:0 0 7px}
+        .comp{padding:9px 0;border-bottom:1px solid var(--line)}
+        .comp:last-of-type{border:none}
+        .ch{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:13.5px}
+        .ch .rt{font-size:12.5px;font-weight:700;color:var(--faint)}
+        .bar{height:4px;border-radius:3px;background:var(--card2);margin:6px 0 6px;overflow:hidden}
+        .bar i{display:block;height:100%;border-radius:3px}
+        .comp p{margin:0;font-size:12.5px;color:var(--dim)}
+        .cmp{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:11px}
+        .opt{background:var(--card2);border:1px solid var(--line);border-radius:14px;padding:13px}
+        .oh{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+        .oh b{font-size:14px}
+        .pick{font-size:8.5px;font-weight:800;letter-spacing:.9px;padding:2px 7px;border-radius:9px;
+         color:var(--good);background:rgba(49,196,125,.14)}
+        .cheap{font-size:8.5px;font-weight:800;letter-spacing:.9px;padding:2px 7px;border-radius:9px;
+         color:var(--dim);background:rgba(147,162,179,.12)}
+        .big2{font-size:32px;font-weight:800;letter-spacing:-1px;margin:0 0 8px;line-height:1}
+        .big2 span{font-size:12px;font-weight:600;color:var(--faint)}
+        .orow{display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;color:var(--dim)}
+        .orow b{color:var(--ink);font-weight:600}
+        .verdict{margin-top:15px;padding:14px;border-radius:14px;background:rgba(76,196,255,.07);
+         border:1px solid rgba(76,196,255,.20)}
+        .vt{font-size:9.5px;letter-spacing:1.6px;text-transform:uppercase;color:var(--acc);
+         margin:0 0 7px;font-weight:700}
+        .tr{display:inline-block;font-size:8.5px;font-weight:800;letter-spacing:.9px;
+         padding:2px 6px;border-radius:9px;margin-left:6px;vertical-align:1px;border:1px solid transparent}
+        .grade{display:inline-block;font-size:9px;font-weight:800;letter-spacing:.6px;
+         padding:2px 6px;border-radius:10px;margin-left:6px;vertical-align:1px}
+        .band{color:var(--faint);font-size:11px;margin-left:6px}
+        .legend{display:flex;gap:11px;flex-wrap:wrap;font-size:11.5px;color:var(--dim);margin:9px 0 0}
+        .dotc{width:9px;height:9px;border-radius:50%;display:inline-block}
+        @media print{body{background:#fff;color:#000}.zb,.hot,.lb{display:none!important}
+         .card,.leg{border-color:#ccc;background:#fff}details{display:block}}
+        """
+    }
+}
+
+// MARK: - Build 183: the report body
+
+extension ChappyTravel {
+
+    private func lightbox(_ id: String, _ title: String, _ jpg: Data) -> String {
+        """
+        <div class="lb" id="\(id)"><div class="bar"><span>\(Self.e(title)) \
+        <span class="hint2">— drag to pan</span></span><a href="#c-\(id)">Close ✕</a></div>\
+        <div class="pan"><img src="data:image/jpeg;base64,\(jpg.base64EncodedString())"></div></div>
+        """
+    }
+
+    /// THE WHOLE DOCUMENT. Async because every map is rendered on demand,
+    /// and the zoom panels are a second, tighter render rather than the
+    /// same picture blown up.
+    func reportHTML183(_ trip: Trip, extras: ReportExtras) async -> String {
+        let c = cost(trip)
+        let home = trip.homeCurrency
+        let E = Self.e
+        let full = DateFormatter(); full.dateFormat = "EEE d MMM yyyy"
+        let short = DateFormatter(); short.dateFormat = "d MMM"
+        var boxes: [String] = []
+
+        var h = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta name="color-scheme" content="dark">
+        <title>\(E(trip.name))</title><style>\(reportCSS)</style></head><body><div class="wrap">
+        """
+
+        // ---------------------------------------------------------- hero
+        h += "<div class=\"hero\"><p class=\"kicker\">Chappy · Trip plan"
+        if let sh = trip.shape.flatMap({ Shape(rawValue: $0) }) { h += " · \(sh.label)" }
+        h += "</p><h1>\(E(trip.name))</h1>"
+        h += "<p class=\"dates\">\(E(trip.dateLine)) · \(trip.nights) nights · "
+        h += "\(trip.party) travelling · Australian passport\(trip.party > 1 ? "s" : "")</p>"
+        h += "<div class=\"headline\">"
+        var stats: [(String, String)] = [(ChappyFX.money(c.total, home), "All up")]
+        if trip.party > 1 { stats.append((ChappyFX.money(c.perPerson, home), "Each")) }
+        stats.append((ChappyFX.money(c.perDay, home), "Per day"))
+        if let first = trip.legs.first {
+            let local = localCurrency(for: first, in: trip)
+            if local != home, let inLocal = ChappyFX.shared.convert(c.total, from: home, to: local) {
+                stats.append((ChappyFX.money(inLocal, local), local))
+            }
+        }
+        for (n, l) in stats {
+            h += "<div><span class=\"n\">\(n)</span><span class=\"l\">\(E(l))</span></div>"
+        }
+        h += "</div></div>"
+
+        // ---------------------------------------------------------- the map
+        if let (img, hits) = await datedTripMap(trip),
+           let jpg = img.jpegData(compressionQuality: 0.74) {
+            let w = img.size.width, ht = img.size.height
+            h += "<div class=\"mapwrap\">"
+            h += "<img src=\"data:image/jpeg;base64,\(jpg.base64EncodedString())\" alt=\"Trip map\">"
+            for hit in hits where hit.legIndex < trip.legs.count {
+                let leg = trip.legs[hit.legIndex]
+                guard let u = googlePlaceURL(leg) else { continue }
+                h += "<a class=\"hot\" href=\"\(u.absoluteString)\" title=\"\(E(leg.place))\" "
+                h += "style=\"left:\(String(format: "%.2f", hit.x / w * 100))%;"
+                h += "top:\(String(format: "%.2f", hit.y / ht * 100))%\"></a>"
+            }
+            // A REAL zoom: tighter region, same pixels, more detail.
+            if let (zi, _) = await datedTripMap(trip, size: CGSize(width: 1200, height: 800),
+                                                zoomFactor: 0.55),
+               let zjpg = zi.jpegData(compressionQuality: 0.74) {
+                boxes.append(lightbox("z-trip", trip.name, zjpg))
+                h += "<a class=\"zb\" href=\"#z-trip\">⤢ Zoom</a>"
+            }
+            h += "</div>"
+            if let route = googleTripURL(trip) {
+                h += "<div class=\"tip\"><a href=\"\(route.absoluteString)\">Whole route in Google Maps →</a>"
+                h += "<span>Dates are on every pin. Tap a pin for that place.</span></div>"
+            }
+        }
+
+        h += "<div class=\"body\">"
+
+        // ---------------------------------------------------------- the argument
+        if !extras.argument.isEmpty {
+            h += "<div class=\"card\"><h2>Why this trip</h2>"
+            for (i, para) in extras.argument.enumerated() {
+                // Model prose is the ONE place an unescaped ampersand or a
+            // stray tag corrupts the document from the top down.
+            h += i == 0 ? "<p class=\"lede\">\(E(para))</p>" : "<p class=\"s2\">\(E(para))</p>"
+            }
+            h += "</div>"
+        }
+
+        // ---------------------------------------------------------- money
+        //
+        // AUDIT: build 184 shipped a legend explaining five trust chips
+        // and then never emitted one, which reads as a broken renderer.
+        // Every card that carries a number carries its stamp now.
+        h += "<div class=\"card\"><h2>What it costs"
+        h += Self.stampHTML(ChappyStamp(.estimated, source: "planner",
+                                        note: "typical prices for these places in this month"))
+        h += "</h2>"
+        if c.hasUnconverted {
+            h += "<p class=\"s2\" style=\"color:var(--warn)\">Some prices couldn't be converted — "
+            h += "this total is off until rates load.</p>"
+        }
+        h += "<p class=\"total\">\(ChappyFX.money(c.total, home))</p>"
+        var sub = "\(ChappyFX.money(c.perDay, home)) a day"
+        if trip.party > 1 { sub = "\(ChappyFX.money(c.perPerson, home)) each · " + sub }
+        h += "<p class=\"totsub\">\(sub)</p><div style=\"margin-top:14px\">"
+        for line in c.lines {
+            h += "<div class=\"cost\"><span>\(E(line.label))</span><b>\(ChappyFX.money(line.amount, home))</b></div>"
+        }
+        h += "</div></div>"
+
+        // ---------------------------------------------------------- flights
+        if let fl = trip.flights, fl.isUsable {
+            h += "<div class=\"card\"><h2>Flights"
+            h += Self.stampHTML(ChappyStamp(.researched, at: trip.createdAt, source: "web search",
+                                            note: "a searched range, never a quote"))
+            h += "</h2>"
+            if !fl.route.isEmpty { h += "<p style=\"margin:0 0 4px;font-size:16px;font-weight:600\">\(E(fl.route))</p>" }
+            h += "<p class=\"total\" style=\"font-size:28px\">\(ChappyFX.money(fl.low, home)) – \(ChappyFX.money(fl.high, home))</p>"
+            h += "<p class=\"totsub\">\(trip.oneWay == true ? "one-way" : "return"), per person, for these dates</p>"
+            if !fl.airlines.isEmpty { h += "<div class=\"cost\"><span>Who flies it</span><span>\(E(fl.airlines))</span></div>" }
+            if !fl.peakNote.isEmpty { h += "<div class=\"cost\"><span>Timing</span><span>\(E(fl.peakNote))</span></div>" }
+            if !fl.advice.isEmpty { h += "<div class=\"cost\"><span>When to book</span><span>\(E(fl.advice))</span></div>" }
+            if let first = trip.legs.first, let u = flightSearchURL(leg: first, from: nil, trip: trip) {
+                h += "<div class=\"acts\" style=\"padding:12px 0 0\"><a href=\"\(u.absoluteString)\">Search these flights</a></div>"
+            }
+            h += "<p class=\"foot\" style=\"padding:8px 0 0\">A searched range, not a quote — no live fare feed is "
+            h += "available to an app like this. It is what the route goes for at this time of year.</p></div>"
+        }
+
+        // ---------------------------------------------------------- the verdict
+        //
+        // Score first, then the true cost, then the route. A document
+        // that opens with an itinerary is a brochure; one that opens
+        // with a judgement is advice.
+        h += scoreHTML(trip)
+        h += trueCostHTML(trip)
+        h += qualityHTML(trip)
+
+        // ---------------------------------------------------------- the route in codes
+        h += routingHTML(trip)
+
+        // ---------------------------------------------------------- deal hunt
+        h += "<div class=\"card\"><h2>Deal hunt</h2>"
+        h += dealHuntHTML(trip)
+        h += "</div>"
+
+        // ---------------------------------------------------------- legs
+        for (i, leg) in trip.legs.enumerated() {
+            let prev = i > 0 ? trip.legs[i - 1] : nil
+            let cur = localCurrency(for: leg, in: trip)
+            let hue = Self.legHue(i, of: max(1, trip.legs.count))
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, al: CGFloat = 0
+            hue.getRed(&r, green: &g, blue: &b, alpha: &al)
+            let hex = String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+
+            h += "<div class=\"leg\"><div class=\"lh\"><div class=\"num\" style=\"background:\(hex)\">\(i + 1)</div>"
+            h += "<div><h3>\(E(leg.place))</h3><div class=\"when\">"
+            h += "\(short.string(from: leg.arrive))–\(short.string(from: leg.depart)) · \(leg.nights) nights"
+            if leg.arrival != .none { h += " · \(E(leg.arrival.label))" }
+            h += "</div></div></div>"
+
+            // the leg's map, with the shortlist on it
+            let spots = (extras.bestOf[leg.id] ?? []).flatMap(\.spots)
+            if i < 6, let img = await legMap(leg, spots: Array(spots.prefix(8))),
+               let jpg = img.jpegData(compressionQuality: 0.72) {
+                h += "<div class=\"smap\"><img src=\"data:image/jpeg;base64,\(jpg.base64EncodedString())\" alt=\"\(E(leg.place))\">"
+                if let u = googlePlaceURL(leg) {
+                    h += "<a class=\"hot\" href=\"\(u.absoluteString)\" style=\"left:50%;top:50%;width:12%;padding-bottom:12%\"></a>"
+                }
+                if let zi = await legMap(leg, spots: Array(spots.prefix(8)),
+                                         size: CGSize(width: 1100, height: 700), zoomFactor: 0.45),
+                   let zjpg = zi.jpegData(compressionQuality: 0.72) {
+                    boxes.append(lightbox("z-leg\(i)", "Around \(leg.place)", zjpg))
+                    h += "<a class=\"zb\" href=\"#z-leg\(i)\">⤢ Zoom</a>"
+                }
+                h += "</div>"
+            }
+
+            // why this place
+            if let why = extras.why[leg.id] {
+                h += "<div class=\"why\"><p class=\"hd\">\(E(why.0))</p><ul>"
+                for bullet in why.1 { h += "<li>\(E(bullet))</li>" }
+                h += "</ul>"
+                if !why.2.isEmpty { h += "<p class=\"trade\">\(E(why.2))</p>" }
+                h += "</div>"
+            }
+
+            // the numbers
+            h += "<div class=\"money\">"
+            if leg.arrivalCost > 0 {
+                h += "<div class=\"mrow\"><span class=\"k\">Getting here"
+                if !leg.arrivalNote.isEmpty { h += " — \(E(leg.arrivalNote))" }
+                h += "</span><span class=\"v\">\(ChappyFX.money(leg.arrivalCost, home))"
+                h += gradeSpan(leg.arrivalCost, leg.arrivalBand, home) + "</span></div>"
+            }
+            if leg.nightlyRate > 0 {
+                h += "<div class=\"mrow\"><span class=\"k\">"
+                h += leg.stayName.isEmpty ? "Accommodation" : E(leg.stayName)
+                h += "</span><span class=\"v\">\(E(ChappyFX.pair(leg.nightlyRate, local: cur, home: home)))"
+                h += gradeSpan(leg.nightlyRate, leg.stayBand, cur) + "</span></div>"
+            }
+            if let sc = leg.scooterPerDay, sc > 0 {
+                h += "<div class=\"mrow\"><span class=\"k\">Scooter / day</span><span class=\"v\">"
+                h += "\(E(ChappyFX.pair(sc, local: cur, home: home)))"
+                h += gradeSpan(sc, leg.scooterBand, cur) + "</span></div>"
+            }
+            if leg.foodPerDay > 0 {
+                h += "<div class=\"mrow\"><span class=\"k\">Food, each per day</span><span class=\"v\">"
+                h += "\(E(ChappyFX.pair(leg.foodPerDay, local: cur, home: home)))"
+                h += gradeSpan(leg.foodPerDay, leg.foodBand, cur) + "</span></div>"
+            }
+            h += "</div>"
+
+            // best of
+            if let best = extras.bestOf[leg.id], !best.isEmpty {
+                h += "<details><summary>Best of \(E(leg.place)) "
+                h += "<span class=\"hint2\">Tripadvisor &amp; Apple — Google's licence keeps it out of a saved file</span></summary><div class=\"dc\"><div class=\"bg\">"
+                for group in best {
+                    h += "<div class=\"bl\"><h4>\(E(group.kind.label))</h4>"
+                    for s in group.spots {
+                        let u = googleSearchURL(s.name, near: leg)?.absoluteString ?? "#"
+                        h += "<a class=\"br\" href=\"\(u)\"><span>\(E(s.name))"
+                        if let rl = s.ratingLine { h += "<br><span class=\"rt\">\(E(rl))</span>" }
+                        if let dn = s.divergenceNote { h += "<span class=\"dv\">⚠ \(E(dn))</span>" }
+                        h += "</span></a>"
+                        // BUILD 186: what the reviews actually say, where
+                        // they were read. A star rating with no "why" is
+                        // the least useful number in travel.
+                        if let dig = extras.digests[s.id] {
+                            h += Self.reviewDigestHTML(dig)
+                        }
+                    }
+                    h += "</div>"
+                }
+                h += "</div></div></details>"
+            }
+
+            // book it
+            h += "<details><summary>Book it &amp; get there</summary><div class=\"dc\"><div class=\"acts\" style=\"padding:0\">"
+            h += "<p class=\"t\">Compare the same room</p>"
+            for site in Booking.allCases.sorted(by: { $0.asiaFirst && !$1.asiaFirst }) {
+                if let u = bookingURL(site, leg: leg, trip: trip) {
+                    h += "<a href=\"\(u.absoluteString)\">\(site.label)</a>"
+                }
+            }
+            if leg.nights >= 4, let u = bookingURL(.agoda, leg: leg, trip: trip) {
+                h += "<p class=\"t\">Saving</p><a class=\"hunt\" href=\"\(u.absoluteString)\">"
+                h += "\(leg.nights) nights — ask for the weekly rate, often 30–40% off</a>"
+            }
+            h += "<p class=\"t\">Getting here</p>"
+            if let u = groundURL(.rome2rio, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">Every way there</a>"
+            }
+            if let u = groundURL(.twelvego, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">Bus / boat</a>"
+            }
+            if let u = googleDirectionsURL(to: leg, from: prev) {
+                h += "<a href=\"\(u.absoluteString)\">Directions</a>"
+            }
+            h += "<p class=\"t\">There</p>"
+            if let u = groundURL(.klook, leg: leg, from: prev, trip: trip) {
+                h += "<a href=\"\(u.absoluteString)\">Tours &amp; tickets</a>"
+            }
+            if let u = googlePlaceURL(leg) { h += "<a href=\"\(u.absoluteString)\">Google Maps</a>" }
+            h += "</div></div></details>"
+
+            if !leg.notes.isEmpty { h += "<p class=\"note\" style=\"padding-top:11px\">\(E(leg.notes))</p>" }
+            h += "</div>"
+        }
+
+        // ---------------------------------------------------------- extras
+        if !extras.alternatives.isEmpty {
+            h += "<div class=\"card\"><h2>If you'd rather</h2>"
+            h += "<p class=\"s2\">Swaps I considered and didn't take. Say the word and any of them rebuilds the plan.</p>"
+            for (t, d, delta) in extras.alternatives {
+                let col = delta.hasPrefix("−") || delta.hasPrefix("-") ? "var(--good)" : "var(--warn)"
+                h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(t))</b>"
+                h += "<span class=\"rt\" style=\"color:\(col)\">\(E(delta))</span></div><p>\(E(d))</p></div>"
+            }
+            h += "</div>"
+        }
+        if !extras.events.isEmpty {
+            h += "<div class=\"card\"><h2>What's on while you're there</h2>"
+            for (when, place, what) in extras.events {
+                h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(place))</b><span class=\"rt\">\(E(when))</span></div>"
+                h += "<p>\(E(what))</p></div>"
+            }
+            h += "</div>"
+        }
+        if !extras.onward.isEmpty {
+            h += "<div class=\"card\"><h2>Where this leads</h2>"
+            h += "<p class=\"s2\">Continuations that actually work from where this trip ends — judged on season, "
+            h += "visa runway, flight time and cost.</p>"
+            for (name, meta, why, cost2) in extras.onward {
+                h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(name))</b>"
+                h += "<span class=\"rt\">\(E(meta)) · \(E(cost2))</span></div><p>\(E(why))</p></div>"
+            }
+            h += "</div>"
+        }
+        if !extras.risks.isEmpty {
+            h += "<div class=\"card\"><h2>Stress test</h2>"
+            h += "<p class=\"s2\">Every plan has failure modes. These are yours, ranked, with what to do about each.</p>"
+            for (t, lvl, d, fix) in extras.risks {
+                h += "<div class=\"risk\"><span class=\"rl \(lvl)\">\(lvl)</span><div><b>\(E(t))</b>"
+                h += "<span class=\"d\">\(E(d))</span><div class=\"f\">→ \(E(fix))</div></div></div>"
+            }
+            h += "</div>"
+        }
+
+        h += daysHTML(trip, places: extras.bestOf)
+        h += bookingsHTML(trip)
+        h += timelineHTML(trip)
+        h += watchHTML(trip)
+        h += conversionMeterHTML(trip)
+        h += visaHTML(trip)
+        h += passportHTML(trip)
+        h += disruptionHTML(trip)
+        h += emergencyHTML(trip)
+        h += Self.trustLegendHTML()
+
+        // ---------------------------------------------------------- honesty
+        h += "<div class=\"card\"><h2>How to read it, and what I actually know</h2>"
+        h += "<p class=\"s2\">Local money first, \(home) beside it. The tag says how your price compares with what "
+        h += "that thing goes for there at this time of year:</p><div class=\"legend\">"
+        for gr in [Grade.great, .good, .fair, .high] {
+            h += "<span class=\"g\" style=\"color:\(gr.hex);background:\(gr.hex)22\">\(gr.label)</span>"
+        }
+        h += "</div><p class=\"foot\" style=\"padding:13px 0 0\">"
+        h += "Price ranges are searched typical prices, not a live feed — no live feed is available to an app like "
+        h += "this. Ratings and review counts in this document come from Tripadvisor; Google's terms do not permit "
+        h += "storing its Places content in a saved file, so Google ratings appear live in the app instead. "
+        h += "Seasonal weather is a three-year average until you are inside 14 days, then it becomes a real forecast. "
+        if let at = ChappyFX.shared.fetchedAt {
+            h += "Rates taken \(full.string(from: at)) — daily mid-market, a changer will be a little worse. "
+        }
+        h += "Prepared by Chappy on \(full.string(from: Date())). Maps © Apple.</p></div>"
+
+        h += "</div></div>" + boxes.joined() + "</body></html>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 183 — THE DEAL HUNT, AND THE CONVERSION METER.
+//
+// Two panels the report calls for and the file did not have.
+//
+// The deal hunt is deliberately NOT a coupon list. Coupons are worth a
+// few dollars, expire, and make a document feel like spam. The levers
+// below are worth hundreds and never expire, because each one is a
+// structural fact about how fares and rooms are priced rather than a
+// promotion someone is running this week. Every link is a real search
+// with this trip's dates, places and party already in it — there is not
+// one href="#" in here, which is a rule now.
+//
+// The conversion meter answers the question a raw exchange rate never
+// does. "1 AUD = 10,520 rupiah" is a number nobody can feel. "A coffee
+// is Rp 25,000, which is $2.40" is a number you can shop with, and
+// after three of those you stop converting in your head at all — which
+// is the whole point of putting it in the report instead of a
+// calculator.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// What ordinary things actually cost, in the money you'll be handed
+    /// change in. Mid-range, mid-2026, two people living normally — a
+    /// calibration set, not a price list, and it says so in the report.
+    struct Everyday {
+        var code: String
+        var country: String
+        var rows: [(String, Double)]
+    }
+
+    static let everyday: [Everyday] = [
+        Everyday(code: "IDR", country: "Indonesia", rows: [
+            ("Coffee", 25_000), ("Warung meal", 35_000), ("Large beer", 45_000),
+            ("Scooter, a day", 90_000), ("Massage, an hour", 150_000),
+            ("Guesthouse, a night", 450_000), ("Villa, a night", 1_450_000)]),
+        Everyday(code: "THB", country: "Thailand", rows: [
+            ("Coffee", 60), ("Street meal", 60), ("Large beer", 80),
+            ("Scooter, a day", 250), ("Massage, an hour", 300),
+            ("Guesthouse, a night", 700), ("Good hotel, a night", 2_400)]),
+        Everyday(code: "VND", country: "Vietnam", rows: [
+            ("Coffee", 35_000), ("Banh mi", 30_000), ("Local beer", 25_000),
+            ("Scooter, a day", 150_000), ("Massage, an hour", 300_000),
+            ("Guesthouse, a night", 450_000), ("Good hotel, a night", 1_500_000)]),
+        Everyday(code: "PHP", country: "Philippines", rows: [
+            ("Coffee", 130), ("Local meal", 180), ("Large beer", 90),
+            ("Scooter, a day", 500), ("Massage, an hour", 600),
+            ("Guesthouse, a night", 1_600), ("Good hotel, a night", 5_500)]),
+        Everyday(code: "MYR", country: "Malaysia", rows: [
+            ("Coffee", 12), ("Hawker meal", 12), ("Large beer", 20),
+            ("Scooter, a day", 40), ("Massage, an hour", 90),
+            ("Guesthouse, a night", 120), ("Good hotel, a night", 380)]),
+        Everyday(code: "SGD", country: "Singapore", rows: [
+            ("Coffee", 5), ("Hawker meal", 7), ("Large beer", 14),
+            ("Cross-town ride", 16), ("Massage, an hour", 80),
+            ("Hostel bed, a night", 45), ("Good hotel, a night", 260)]),
+        Everyday(code: "JPY", country: "Japan", rows: [
+            ("Coffee", 450), ("Ramen", 1_000), ("Large beer", 500),
+            ("Day lift pass", 7_500), ("Onsen", 800),
+            ("Guesthouse, a night", 9_000), ("Good hotel, a night", 28_000)]),
+        Everyday(code: "TWD", country: "Taiwan", rows: [
+            ("Coffee", 90), ("Night market meal", 120), ("Large beer", 70),
+            ("Scooter, a day", 500), ("Massage, an hour", 900),
+            ("Guesthouse, a night", 1_400), ("Good hotel, a night", 4_200)]),
+        Everyday(code: "LKR", country: "Sri Lanka", rows: [
+            ("Coffee", 600), ("Rice & curry", 700), ("Large beer", 800),
+            ("Scooter, a day", 2_500), ("Massage, an hour", 4_500),
+            ("Guesthouse, a night", 7_000), ("Good hotel, a night", 26_000)]),
+        Everyday(code: "GEL", country: "Georgia", rows: [
+            ("Coffee", 8), ("Khachapuri", 14), ("Large beer", 7),
+            ("Cross-town taxi", 12), ("Massage, an hour", 70),
+            ("Guesthouse, a night", 90), ("Good hotel, a night", 280)]),
+        Everyday(code: "MXN", country: "Mexico", rows: [
+            ("Coffee", 55), ("Three tacos", 70), ("Large beer", 45),
+            ("Scooter, a day", 500), ("Massage, an hour", 800),
+            ("Guesthouse, a night", 900), ("Good hotel, a night", 3_200)]),
+        Everyday(code: "INR", country: "India", rows: [
+            ("Coffee", 180), ("Thali", 220), ("Large beer", 250),
+            ("Scooter, a day", 700), ("Massage, an hour", 1_500),
+            ("Guesthouse, a night", 2_200), ("Good hotel, a night", 7_500)]),
+        Everyday(code: "KHR", country: "Cambodia", rows: [
+            ("Coffee", 6_500), ("Local meal", 10_000), ("Large beer", 4_000),
+            ("Scooter, a day", 30_000), ("Massage, an hour", 40_000),
+            ("Guesthouse, a night", 60_000), ("Good hotel, a night", 200_000)]),
+        Everyday(code: "NPR", country: "Nepal", rows: [
+            ("Coffee", 250), ("Dal bhat", 400), ("Large beer", 500),
+            ("Day guide", 3_500), ("Massage, an hour", 2_500),
+            ("Guesthouse, a night", 2_000), ("Good hotel, a night", 9_000)]),
+    ]
+
+    static func everydayCosts(_ code: String) -> Everyday? {
+        let c = code.uppercased()
+        return everyday.first { $0.code == c }
+    }
+
+    // -----------------------------------------------------------------
+    // MARK: the deal hunt
+
+    /// Six levers, in order of how much money they actually move, each
+    /// one wired to a live search for THIS trip. The three Australian
+    /// feeds at the bottom are there because error fares and mistake
+    /// pricing are the one thing no algorithm here can find — they are
+    /// found by people, and those three find them first.
+    func dealHuntHTML(_ trip: Trip) -> String {
+        let E = Self.e
+        var rows: [(String, String, String?, String?)] = []   // title, body, link label, url
+
+        let first = trip.legs.first
+        let flightURL = first.flatMap { flightSearchURL(leg: $0, from: nil, trip: trip)?.absoluteString }
+
+        // 1 — the biggest single lever there is.
+        rows.append((
+            "Move the date before you chase the fare",
+            "Open the search and switch it to the date grid rather than a single day. On a long-haul return, "
+            + "shifting departure three or four days is routinely worth 20–30% — more than every promo code, "
+            + "loyalty scheme and comparison site put together. Tuesday and Wednesday departures are cheapest "
+            + "on this kind of route; Friday and Sunday are the two most expensive days to leave.",
+            flightURL == nil ? nil : "Open the date grid", flightURL))
+
+        // 2 — free, and it does the watching for you.
+        if let u = flightURL {
+            rows.append((
+                "Track the route, don't refresh it",
+                "Set a price alert on the same search and it emails you when the fare moves. Fares on this "
+                + "route change several times a week and there is no pattern worth staring at. Let it watch, "
+                + "and book the week it drops.",
+                "Set a price alert", u))
+        }
+
+        // 3 — the one people forget exists.
+        if let f = first, !f.place.isEmpty {
+            let q = "https://www.kayak.com.au/explore"
+            rows.append((
+                "Check the airport next door",
+                "Flying into a secondary airport and taking a bus or a short hop is often several hundred "
+                + "dollars cheaper for two, and on a trip of this length the extra few hours cost you nothing. "
+                + "Compare arriving somewhere other than \(f.place) before you commit.",
+                "Compare nearby arrival points", q))
+        }
+
+        // 4 — the weekly and monthly rate, which only exists if you ask.
+        let longLegs = trip.legs.filter { $0.nights >= 7 }
+        if !longLegs.isEmpty {
+            let names = longLegs.map(\.place).joined(separator: ", ")
+            let u = longLegs.first.flatMap { bookingURL(.airbnb, leg: $0, trip: trip)?.absoluteString }
+            rows.append((
+                "Ask for the weekly rate — \(names)",
+                "Anything from seven nights up is priced differently to a short stay, and most of the discount "
+                + "is not shown on the listing. Airbnb applies a weekly and a monthly rate automatically once "
+                + "the dates are long enough, and a guesthouse messaged directly will usually beat its own "
+                + "online price by 15–25% for a stay this long. Message before you book, not after.",
+                u == nil ? nil : "Open the long-stay search", u))
+        }
+
+        // 5 — the free option nobody takes.
+        if let f = first {
+            let u = bookingURL(.booking, leg: f, trip: trip)?.absoluteString
+            rows.append((
+                "Book refundable, then re-check once",
+                "A free-cancellation room costs a little more on paper and nothing at all in practice: hold the "
+                + "bed now so the trip is real, re-check the same dates four weeks out, and rebook if it has "
+                + "fallen. The only way this loses is if you forget — so it goes in your reminders, not your head.",
+                u == nil ? nil : "Filter to free cancellation", u))
+        }
+
+        // 6 — the structural one for a trip with several stops.
+        if trip.legs.count >= 3 {
+            rows.append((
+                "One fewer move is worth more than any discount",
+                "Every hop on this trip costs a transfer, a check-in, half a day and usually a night's overlap. "
+                + "Merging two short legs into one longer stay saves the fare, unlocks the weekly rate, and "
+                + "gives you the day back. It is the only saving on this page that also improves the trip.",
+                nil, nil))
+        }
+
+        var h = "<p class=\"s2\">Not coupons. These are the six things that actually move the price of a trip "
+        h += "like this one, in order of how much they move it, each already loaded with your dates.</p>"
+
+        for (i, r) in rows.enumerated() {
+            h += "<div class=\"deal\"><span class=\"i\">\(i + 1)</span><div><b>\(E(r.0))</b>"
+            h += "<span>\(E(r.1))</span>"
+            if let label = r.2, let u = r.3 {
+                h += "<span style=\"margin-top:5px;display:block\"><a href=\"\(u)\">\(E(label)) →</a></span>"
+            }
+            h += "</div></div>"
+        }
+
+        // The feeds. Error fares are found by people, not by software.
+        h += "<div class=\"acts\" style=\"padding:14px 0 0\"><p class=\"t\">Where Australian mistake fares surface first</p>"
+        for (name, url) in [("I Know The Pilot", "https://iknowthepilot.com.au/"),
+                            ("Beat That Flight", "https://www.beatthatflight.com.au/"),
+                            ("Secret Flying", "https://www.secretflying.com/")] {
+            h += "<a class=\"hunt\" href=\"\(url)\">\(E(name))</a>"
+        }
+        h += "</div>"
+        h += "<p class=\"foot\" style=\"padding:10px 0 0\">An error fare is gone in hours and cannot be planned "
+        h += "around — but if one lands on this route while your dates are still soft, it is worth more than "
+        h += "everything else on this page combined. Check them the week you book, not before.</p>"
+        return h
+    }
+
+    // -----------------------------------------------------------------
+    // MARK: the conversion meter
+
+    /// The card that stops you converting in your head. Trip currencies
+    /// get the full everyday breakdown; everything else in the table
+    /// gets one rate line, because the question "what would Thailand
+    /// cost instead" is one he asks constantly.
+    func conversionMeterHTML(_ trip: Trip) -> String {
+        let E = Self.e
+        let home = trip.homeCurrency.uppercased()
+
+        // In leg order, deduped. Home currency is not a conversion.
+        var codes: [String] = []
+        for leg in trip.legs {
+            let c = localCurrency(for: leg, in: trip).uppercased()
+            if !c.isEmpty, c != home, !codes.contains(c) { codes.append(c) }
+        }
+        // A leg whose currency was never stamped still has a country.
+        for leg in trip.legs where leg.localCurrency == nil {
+            if let c = suggestedCurrency(for: leg)?.uppercased(),
+               c != home, !codes.contains(c) { codes.append(c) }
+        }
+
+        let cards = codes.compactMap { Self.everydayCosts($0) }
+        let others = Self.everyday.filter { e in
+            e.code != home && !codes.contains(e.code)
+        }
+        guard !cards.isEmpty || !others.isEmpty else { return "" }
+
+        // The RATE is live; the everyday prices next to it are a
+        // calibration set. Two different kinds of number in one card is
+        // exactly where a single honest footnote stops being enough.
+        let rateStamp = ChappyFX.shared.fetchedAt.map {
+            ChappyStamp(.live, at: $0, source: "mid-market rates")
+        } ?? ChappyStamp(.estimated, source: "cached rates")
+        var h = "<div class=\"card\"><h2>\(E(home)) conversion meter"
+        h += Self.stampHTML(rateStamp)
+        h += Self.stampHTML(ChappyStamp(.estimated, source: "everyday prices"))
+        h += "</h2>"
+        h += "<p class=\"s2\">A rate is a number you can't feel. These are things you will actually buy, priced "
+        h += "in the money you'll be handed change in, with \(E(home)) beside them. Read the top three once and "
+        h += "you'll stop doing arithmetic at the counter.</p>"
+
+        if !cards.isEmpty {
+            h += "<div class=\"fxg\">"
+            for e in cards {
+                h += "<div class=\"fxc\"><div class=\"fxh\"><b>\(E(e.country)) · \(E(e.code))</b>"
+                if let r = ChappyFX.shared.convert(1, from: home, to: e.code) {
+                    h += "<span class=\"rate\">1 \(E(home)) = \(ChappyFX.money(r, e.code))</span>"
+                }
+                h += "</div>"
+                for (label, amount) in e.rows {
+                    h += "<div class=\"fxr\"><span>\(E(label))</span>"
+                    h += "<b>\(ChappyFX.pair(amount, local: e.code, home: home))</b></div>"
+                }
+                h += "</div>"
+            }
+            h += "</div>"
+        }
+
+        if !others.isEmpty {
+            var lines: [String] = []
+            for e in others {
+                guard let r = ChappyFX.shared.convert(1, from: home, to: e.code) else { continue }
+                lines.append("<div class=\"cost\"><span>\(E(e.country))</span>"
+                             + "<b>1 \(E(home)) = \(ChappyFX.money(r, e.code))</b></div>")
+            }
+            if !lines.isEmpty {
+                h += "<details><summary>Rates for everywhere else on the shortlist</summary>"
+                h += "<div class=\"dc\" style=\"padding:0\">" + lines.joined() + "</div></details>"
+            }
+        }
+
+        h += "<p class=\"foot\" style=\"padding:11px 0 0\">Everyday prices are typical mid-range figures for two "
+        h += "people living normally — a calibration set, not quotes. Rates are daily mid-market: a money changer "
+        h += "will be 1–3% worse and an airport one considerably worse than that. Cards from an Australian bank "
+        h += "with no international fee beat every changer in the country you are standing in.</p></div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 183 — WHAT THE REPORT KNOWS THAT THE TRIP DOESN'T.
+//
+// A trip is legs, dates and numbers. A report has to argue: why this
+// shape, why this town and not the one next to it, what you're giving
+// up, what's on while you're there, what could go wrong, and where it
+// leads afterwards. None of that is in the data model, and none of it
+// can be hardcoded — it depends on the actual places and the actual
+// month.
+//
+// So it is researched once, at the moment the document is built, and
+// it is researched with web search on, because "what's on in Ubud in
+// September" has an answer that changes every year and a model without
+// search will invent one.
+//
+// Everything degrades. No key, no network, a malformed answer — the
+// report still writes, with the parts that come from the trip itself
+// and a risk list computed locally from the visa engine. A document
+// that fails to generate is worse than a document with one section
+// missing.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// A raw JSON call to the brain. The planner has its own typed
+    /// contract; this one is for the parts that are prose.
+    /// BUILD 189: the watch needs the same plumbing, and it lives in
+    /// another type. Exposed rather than duplicated — one JSON contract,
+    /// one place it can break.
+    func askJSONPublic(_ instruction: String, maxTokens: Int = 5000,
+                       searches: Int = 6) async -> [String: Any]? {
+        await askJSON(instruction, maxTokens: maxTokens, searches: searches)
+    }
+
+    private func askJSON(_ instruction: String, maxTokens: Int = 5000,
+                         searches: Int = 6) async -> [String: Any]? {
+        let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
+        guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.timeoutInterval = 180
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": maxTokens,
+            "system": "You are Chappy's travel agent, writing the reasoning that goes in a client's trip "
+                + "document. Context: \(ContextEngine.shared.contextHeader()) "
+                + "You answer with a single JSON object and nothing else. No code fence, no commentary. "
+                + "Write like a person who has been there: specific, plain, no brochure language, no "
+                + "exclamation marks, and never a sentence that would be true of anywhere.",
+            "messages": [["role": "user", "content": instruction]],
+            "tools": [["type": "web_search_20250305", "name": "web_search", "max_uses": searches]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        CostMeter.shared.addResearch()
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else { return nil }
+        let raw = content.compactMap { ($0["type"] as? String) == "text" ? ($0["text"] as? String) : nil }
+            .joined(separator: "\n")
+        guard let open = raw.firstIndex(of: "{"), let close = raw.lastIndex(of: "}"), open < close
+        else { return nil }
+        let slice = String(raw[open...close])
+        return (try? JSONSerialization.jsonObject(with: Data(slice.utf8))) as? [String: Any]
+    }
+
+    private func str(_ d: [String: Any], _ k: String) -> String {
+        (d[k] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// The risk list the app can work out on its own — visa headroom,
+    /// tight connections, ferry legs. This is what the report falls back
+    /// to when there is no key or no signal, and what gets merged with
+    /// the researched risks when there is.
+    func localRisks(_ trip: Trip) -> [(String, String, String, String)] {
+        var out: [(String, String, String, String)] = []
+
+        // BUILD 184 — THE CHECK-IN DESK, NOT THE BORDER.
+        //
+        // Chappy has been counting visa days to the day while ignoring
+        // the thing that actually stops Australians travelling: a
+        // passport inside six months of expiry. It is enforced by the
+        // AIRLINE, at check-in, because the airline is liable for
+        // carrying you — so a perfect visa position and a five-month
+        // passport is a trip that ends in the departures hall.
+        if let start = trip.start,
+           let v = ChappyProfile.shared.passportCheck(entering: start,
+                                                      country: trip.legs.first?.country ?? ""),
+           v.level != "LOW" {
+            out.append((v.headline, v.level, v.detail,
+                        v.ok ? "Renew before the next trip, not this one."
+                             : "Renew now. Standard is about three weeks, priority is same-week — and do it before you book anything non-refundable."))
+        }
+
+        for p in ChappyVisa.shared.positions(for: trip) {
+            if p.over {
+                out.append(("\(p.country) — over the limit by \(p.days - p.allowance) days", "HIGH",
+                            "\(p.days) days in country against an allowance of \(p.allowance) on \(p.shape.label). "
+                            + "This is not a fine, it is a refused boarding or a deportation stamp.",
+                            "Cut the stay, or apply for the longer visa BEFORE you fly — most cannot be converted "
+                            + "once you have landed on the short one."))
+            } else if p.allowance > 0, p.allowance - p.days <= 5 {
+                out.append(("\(p.country) — only \(p.allowance - p.days) days spare", "MEDIUM",
+                            "Any delay, any extension, any change of mind and you are over. Five days is not a buffer.",
+                            "Know the extension office and what it needs before you go, not on day 28."))
+            }
+        }
+
+        // A ferry or boat with a fixed flight close behind it is the single
+        // most common way a plan of this shape actually fails.
+        if let last = trip.legs.last {
+            let boaty = trip.legs.contains { $0.arrival == .ferry }
+            if boaty, last.nights <= 3 {
+                out.append(("A boat, then a flight, with nothing in between", "MEDIUM",
+                            "Small operators, weather-dependent, and cancellations in strong wind are normal. "
+                            + "There is no bridge, and the flight will not wait.",
+                            "Come back to the mainland a night early and sleep near the airport. It costs one night "
+                            + "and removes the only unrecoverable failure in the plan."))
+            }
+        }
+
+        if trip.legs.contains(where: { ($0.scooterPerDay ?? 0) > 0 }) {
+            out.append(("Scooter without an international permit", "HIGH",
+                        "Checkpoints are routine and the on-the-spot fine is the small part — travel insurance "
+                        + "will not pay a scooter claim without the permit, and scooter claims are the expensive ones.",
+                        "Get an International Driving Permit from your state auto club before you fly. Fifteen "
+                        + "minutes, about $45, valid a year."))
+        }
+
+        if trip.legs.count >= 4 {
+            out.append(("\(trip.legs.count) moves in \(trip.nights) nights", "LOW",
+                        "Every hop costs a transfer, a check-in and most of a day. Four or more starts to feel "
+                        + "like logistics rather than a trip.",
+                        "Merging the two shortest legs gives you a day back and usually unlocks a weekly rate."))
+        }
+
+        return out
+    }
+
+    private func extrasPrompt(_ trip: Trip) -> String {
+        let f = DateFormatter(); f.dateFormat = "d MMM yyyy"
+        let home = trip.homeCurrency
+        let c = cost(trip)
+        var legLines: [String] = []
+        for (i, leg) in trip.legs.enumerated() {
+            var l = "\(i + 1). \(leg.place)"
+            if !leg.country.isEmpty { l += ", \(leg.country)" }
+            l += " — \(leg.nights) nights from \(f.string(from: leg.arrive))"
+            if !leg.stayName.isEmpty { l += ", staying at \(leg.stayName)" }
+            if !leg.notes.isEmpty { l += ". \(leg.notes)" }
+            legLines.append(l)
+        }
+        var rejected = ""
+        if let r = trip.rejected, !r.isEmpty {
+            rejected = "\nHe has already turned these down — never suggest them again: " + r.joined(separator: "; ") + "."
+        }
+
+        return """
+        Write the reasoning for this trip document. Australian passport, \(trip.party) travelling.
+
+        \(trip.name) — \(trip.dateLine), \(trip.nights) nights, about \(ChappyFX.money(c.total, home)) all up.
+        \(legLines.joined(separator: "\n"))
+        \(ChappyIntake.shared.brief)
+        \(personalContext())\(rejected)
+
+        Use web search for anything time-sensitive: what is actually on during these exact dates, what the
+        weather does then, current visa mechanics, and what the onward options cost right now.
+
+        Return ONE JSON object, exactly this shape:
+
+        {
+          "argument": ["three paragraphs, first one is the pitch and gets read as the lede",
+                       "second is the honest trade-offs and what this plan is NOT",
+                       "third is what makes these particular dates the right ones"],
+          "why": [{"place": "must match a leg name above exactly",
+                   "headline": "one line: why this town, in twelve words",
+                   "points": ["three or four specific reasons, each naming something real"],
+                   "tradeoff": "the honest downside of this stop, one sentence"}],
+          "alternatives": [{"title": "a swap you considered and did not take",
+                            "detail": "what it changes and who it suits",
+                            "delta": "the money difference, written with a leading − or + and the currency"}],
+          "events": [{"when": "dates", "place": "where", "what": "what is on, and whether it affects him"}],
+          "onward": [{"place": "country or region", "meta": "best months · flight time from the end of this trip · rough fare",
+                      "why": "why it follows THIS trip specifically — season, visa runway, what it changes",
+                      "cost": "rough monthly cost for the party"}],
+          "risks": [{"title": "what could go wrong", "level": "LOW or MEDIUM or HIGH",
+                     "detail": "why it is a real risk here, not in general",
+                     "fix": "what to actually do about it"}]
+        }
+
+        One "why" per leg. Three to five alternatives, events, onward options and risks. Every number in
+        \(home) unless it is a local price, and then say which currency. No brochure language.
+        """
+    }
+
+    /// Everything the document needs that the trip itself doesn't hold.
+    /// Places and prose are fetched at the same time — the shortlist is a
+    /// lot of small requests and the research is one slow one, so running
+    /// them together roughly halves the wait.
+    func buildExtras(for trip: Trip) async -> ReportExtras {
+        var extras = ReportExtras()
+        buildingReport = true
+        reportStage = "Researching"
+        defer { buildingReport = false; reportStage = "" }
+
+        // DELIBERATELY SEQUENTIAL. The obvious move is to run the research
+        // and the shortlist at the same time, and the obvious move does not
+        // compile cleanly: [String: Any] is not Sendable, so handing the
+        // parsed answer back across a task boundary is exactly the thing
+        // strict concurrency exists to stop. Thirty seconds saved is not
+        // worth a build that fails on a rented Mac at eleven at night.
+        let prose = await askJSON(extrasPrompt(trip))
+
+        // The shortlist, leg by leg. Capped at six legs because a document
+        // with fifty categories in it is not a document anyone reads, and
+        // each leg is eight round trips.
+        var best: [UUID: [ChappyPlaces.BestOf]] = [:]
+        var digests: [String: ChappyReviews.Digest] = [:]
+        for leg in trip.legs.prefix(6) where leg.hasCoord {
+            reportStage = "Best of \(leg.place)"
+            let groups = await ChappyPlaces.shared.reportBestOfEverything(
+                place: leg.place, lat: leg.lat, lon: leg.lon)
+            if !groups.isEmpty { best[leg.id] = groups }
+
+            // BUILD 186: read the reviews for the top two of each
+            // category. Two, not all — the review endpoint is a separate
+            // call per place and a report is not worth four hundred of
+            // them against a five-thousand-a-month allowance.
+            reportStage = "Reading reviews — \(leg.place)"
+            for group in groups {
+                for spot in group.spots.prefix(2) where spot.fromTripAdvisor {
+                    if let d = await ChappyReviews.shared.digest(for: spot, place: leg.place) {
+                        digests[spot.id] = d
+                    }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
+        }
+        extras.bestOf = best
+        extras.digests = digests
+
+        reportStage = "Writing it up"
+        extras.risks = localRisks(trip)
+
+        guard let d = prose else {
+            // No key, no signal, or a mangled answer. The document still
+            // writes — it just argues less.
+            return extras
+        }
+
+        extras.argument = (d["argument"] as? [String] ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        // "why" is matched back to legs by name, because the model cannot
+        // know a UUID and a positional match silently attaches Ubud's
+        // reasoning to Amed the moment it returns them out of order.
+        for row in d["why"] as? [[String: Any]] ?? [] {
+            let place = str(row, "place")
+            guard !place.isEmpty else { continue }
+            let key = place.lowercased()
+            guard let leg = trip.legs.first(where: {
+                let p = $0.place.lowercased()
+                return p == key || p.contains(key) || key.contains(p)
+            }) else { continue }
+            let points = (row["points"] as? [String] ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let head = str(row, "headline")
+            guard !head.isEmpty || !points.isEmpty else { continue }
+            extras.why[leg.id] = (head, points, str(row, "tradeoff"))
+        }
+
+        for row in d["alternatives"] as? [[String: Any]] ?? [] {
+            let t = str(row, "title")
+            guard !t.isEmpty else { continue }
+            extras.alternatives.append((t, str(row, "detail"), str(row, "delta")))
+        }
+
+        for row in d["events"] as? [[String: Any]] ?? [] {
+            let w = str(row, "what")
+            guard !w.isEmpty else { continue }
+            extras.events.append((str(row, "when"), str(row, "place"), w))
+        }
+
+        for row in d["onward"] as? [[String: Any]] ?? [] {
+            let place = str(row, "place")
+            guard !place.isEmpty else { continue }
+            extras.onward.append((place, str(row, "meta"), str(row, "why"), str(row, "cost")))
+        }
+
+        // Researched risks join the computed ones. The level has to be one
+        // of three strings because it is also a CSS class — anything else
+        // renders as an unstyled grey blob, so it is clamped here rather
+        // than hoped for.
+        for row in d["risks"] as? [[String: Any]] ?? [] {
+            let t = str(row, "title")
+            guard !t.isEmpty else { continue }
+            var lvl = str(row, "level").uppercased()
+            if !["LOW", "MEDIUM", "HIGH"].contains(lvl) { lvl = "MEDIUM" }
+            // Don't say the same thing twice — the visa and scooter risks
+            // are computed above and the model will raise them as well.
+            let dupe = extras.risks.contains { existing in
+                let a = Set(existing.0.lowercased().split(separator: " "))
+                let b = Set(t.lowercased().split(separator: " "))
+                return Double(a.intersection(b).count) / Double(max(1, min(a.count, b.count))) > 0.6
+            }
+            guard !dupe else { continue }
+            extras.risks.append((t, lvl, str(row, "detail"), str(row, "fix")))
+        }
+
+        // Worst first. A stress test that opens with "cash in Amed" buries
+        // the one line that could cost him a flight.
+        let order = ["HIGH": 0, "MEDIUM": 1, "LOW": 2]
+        extras.risks.sort { (order[$0.1] ?? 3) < (order[$1.1] ?? 3) }
+
+        return extras
+    }
+}
+
+
+// =====================================================================
+// BUILD 184 — THE AIRPORT ATLAS.
+//
+// Named ChappyPorts, not ChappyAirports, because build 155 already put
+// a ninety-row `enum ChappyAirports` in the view file, still wired to
+// the trip editor's destination field, and `ChappyAtlas` is the map.
+// Two types with one name in one module is a build that does not
+// start — and the second collision in one build is the reason a name
+// sweep runs before packaging, not after.
+//
+// Everything in the flight engine that didn't work, didn't work because
+// Chappy only knew place NAMES. "Ubud" is not somewhere you can fly to,
+// "Denpasar" is not a code, and without codes there is no nearby-airport
+// comparison, no multi-city, no open-jaw, no real duration, no layover
+// judgement and no month-grid link. One missing table was holding six
+// features down.
+//
+// So: a curated table rather than the full OpenFlights dump. Seven
+// thousand rows is mostly airstrips in Alaska, and the cost of carrying
+// them is a slower launch and worse matches — "Perth" resolves to a
+// grass strip in Ontario if you let it. This is roughly three hundred
+// airports covering everywhere an Australian actually flies, ranked, so
+// that when two airports serve the same city the hub wins.
+//
+// Coordinates are to two decimal places, which is about a kilometre.
+// That is the right precision for "is there a closer airport" and the
+// wrong precision for navigation, which is not what this is for.
+// =====================================================================
+
+@MainActor
+final class ChappyPorts {
+
+    struct Airport: Identifiable, Hashable {
+        let iata: String
+        let name: String
+        let city: String
+        let country: String
+        let lat: Double
+        let lon: Double
+        /// 3 = intercontinental hub, 2 = international, 1 = regional.
+        /// Used to break ties, and to refuse to suggest a regional strip
+        /// as an "alternative" to a hub when nothing flies there.
+        let rank: Int
+        /// AUDIT: without these, a leg with no coordinate resolved to
+        /// nothing. "Ubud" is not a city in any airport table on earth,
+        /// and neither is Canggu, Seminyak, Gili or Boracay — which are
+        /// precisely the places he types.
+        var alts: [String] = []
+        var id: String { iata }
+        var label: String { "\(city) (\(iata))" }
+        var full: String { "\(name), \(city)" }
+    }
+
+    private static let table = """
+SYD|Kingsford Smith|Sydney|Australia|-33.95|151.18|3
+MEL|Tullamarine|Melbourne|Australia|-37.67|144.84|3
+BNE|Brisbane|Brisbane|Australia|-27.38|153.12|3
+PER|Perth|Perth|Australia|-31.94|115.97|3
+ADL|Adelaide|Adelaide|Australia|-34.95|138.53|2
+OOL|Gold Coast|Gold Coast|Australia|-28.16|153.51|2|surfers paradise,coolangatta,burleigh,gold coast
+CNS|Cairns|Cairns|Australia|-16.89|145.75|2|port douglas,palm cove,cape tribulation
+DRW|Darwin|Darwin|Australia|-12.41|130.88|2
+HBA|Hobart|Hobart|Australia|-42.84|147.51|2
+CBR|Canberra|Canberra|Australia|-35.31|149.20|2
+AVV|Avalon|Melbourne|Australia|-38.04|144.47|1|geelong,torquay,bells beach
+NTL|Williamtown|Newcastle|Australia|-32.79|151.83|1
+MCY|Sunshine Coast|Maroochydore|Australia|-26.60|153.09|1|noosa,maroochydore,sunshine coast
+TSV|Townsville|Townsville|Australia|-19.25|146.77|1
+MKY|Mackay|Mackay|Australia|-21.17|149.18|1
+PPP|Whitsunday Coast|Proserpine|Australia|-20.50|148.55|1|airlie beach,whitsundays
+HTI|Hamilton Island|Hamilton Island|Australia|-20.36|148.95|1
+ROK|Rockhampton|Rockhampton|Australia|-23.38|150.48|1
+HVB|Hervey Bay|Hervey Bay|Australia|-25.32|152.88|1
+BDB|Bundaberg|Bundaberg|Australia|-24.90|152.32|1
+BNK|Ballina Byron|Byron Bay|Australia|-28.83|153.56|1|byron,byron bay,ballina,lennox head
+CFS|Coffs Harbour|Coffs Harbour|Australia|-30.32|153.12|1
+PQQ|Port Macquarie|Port Macquarie|Australia|-31.44|152.86|1
+LST|Launceston|Launceston|Australia|-41.55|147.21|1
+ASP|Alice Springs|Alice Springs|Australia|-23.81|133.90|1
+AYQ|Ayers Rock|Uluru|Australia|-25.19|130.98|1
+BME|Broome|Broome|Australia|-17.95|122.23|1
+KTA|Karratha|Karratha|Australia|-20.71|116.77|1
+PHE|Port Hedland|Port Hedland|Australia|-20.38|118.63|1
+AKL|Auckland|Auckland|New Zealand|-37.01|174.79|3
+CHC|Christchurch|Christchurch|New Zealand|-43.49|172.53|2
+WLG|Wellington|Wellington|New Zealand|-41.33|174.81|2
+ZQN|Queenstown|Queenstown|New Zealand|-45.02|168.74|2|wanaka,queenstown
+DUD|Dunedin|Dunedin|New Zealand|-45.93|170.20|1
+NAN|Nadi|Nadi|Fiji|-17.75|177.44|2
+SUV|Nausori|Suva|Fiji|-18.04|178.56|1
+VLI|Bauerfield|Port Vila|Vanuatu|-17.70|168.32|1
+NOU|La Tontouta|Noumea|New Caledonia|-22.01|166.21|1
+APW|Faleolo|Apia|Samoa|-13.83|-172.01|1
+TBU|Fua'amotu|Nuku'alofa|Tonga|-21.24|-175.15|1
+RAR|Rarotonga|Rarotonga|Cook Islands|-21.20|-159.80|1
+PPT|Faa'a|Papeete|French Polynesia|-17.55|-149.61|1
+POM|Jacksons|Port Moresby|Papua New Guinea|-9.44|147.22|1
+HNL|Daniel K. Inouye|Honolulu|United States|21.32|-157.92|2
+GUM|Antonio B. Won Pat|Guam|Guam|13.48|144.80|1
+DPS|Ngurah Rai|Denpasar|Indonesia|-8.75|115.17|3|bali,ubud,canggu,seminyak,kuta,uluwatu,sanur,amed,nusa dua,jimbaran,denpasar
+CGK|Soekarno-Hatta|Jakarta|Indonesia|-6.13|106.66|3
+HLP|Halim Perdanakusuma|Jakarta|Indonesia|-6.27|106.89|1
+SUB|Juanda|Surabaya|Indonesia|-7.38|112.79|2
+LOP|Zainuddin Abdul Madjid|Lombok|Indonesia|-8.76|116.28|2|gili,gili trawangan,senggigi,kuta lombok,praya
+YIA|Yogyakarta International|Yogyakarta|Indonesia|-7.90|110.06|2|jogja,borobudur,yogya
+SOC|Adi Soemarmo|Solo|Indonesia|-7.52|110.75|1
+SRG|Achmad Yani|Semarang|Indonesia|-6.97|110.37|1
+BDO|Husein Sastranegara|Bandung|Indonesia|-6.90|107.58|1
+UPG|Sultan Hasanuddin|Makassar|Indonesia|-5.06|119.55|2
+MDC|Sam Ratulangi|Manado|Indonesia|1.55|124.93|1
+BPN|Sultan Aji Muhammad Sulaiman|Balikpapan|Indonesia|-1.27|116.89|1
+LBJ|Komodo|Labuan Bajo|Indonesia|-8.49|119.89|1|komodo,flores
+KOE|El Tari|Kupang|Indonesia|-10.17|123.67|1
+MOF|Frans Seda|Maumere|Indonesia|-8.64|122.24|1
+AMQ|Pattimura|Ambon|Indonesia|-3.71|128.09|1
+BTH|Hang Nadim|Batam|Indonesia|1.12|104.12|1
+KNO|Kualanamu|Medan|Indonesia|3.64|98.89|2
+PDG|Minangkabau|Padang|Indonesia|-0.79|100.28|1
+PKU|Sultan Syarif Kasim II|Pekanbaru|Indonesia|0.46|101.44|1
+PLM|Sultan Mahmud Badaruddin II|Palembang|Indonesia|-2.90|104.70|1
+BTJ|Sultan Iskandar Muda|Banda Aceh|Indonesia|5.52|95.42|1
+SOQ|Domine Eduard Osok|Sorong|Indonesia|-0.89|131.29|1
+DJJ|Sentani|Jayapura|Indonesia|-2.58|140.52|1
+KUL|Kuala Lumpur International|Kuala Lumpur|Malaysia|2.75|101.71|3
+PEN|Penang|Penang|Malaysia|5.30|100.28|2
+LGK|Langkawi|Langkawi|Malaysia|6.33|99.73|1|langkawi island
+BKI|Kota Kinabalu|Kota Kinabalu|Malaysia|5.94|116.05|2|sabah,sepilok,kk
+KCH|Kuching|Kuching|Malaysia|1.49|110.34|2
+JHB|Senai|Johor Bahru|Malaysia|1.64|103.67|1
+MYY|Miri|Miri|Malaysia|4.32|113.99|1
+TWU|Tawau|Tawau|Malaysia|4.32|118.13|1
+KBR|Sultan Ismail Petra|Kota Bharu|Malaysia|6.17|102.29|1
+TGG|Sultan Mahmud|Kuala Terengganu|Malaysia|5.38|103.10|1
+SIN|Changi|Singapore|Singapore|1.36|103.99|3
+BWN|Brunei International|Bandar Seri Begawan|Brunei|4.94|114.93|1
+BKK|Suvarnabhumi|Bangkok|Thailand|13.69|100.75|3
+DMK|Don Mueang|Bangkok|Thailand|13.91|100.61|2
+CNX|Chiang Mai|Chiang Mai|Thailand|18.77|98.96|2|pai,chiang mai old city
+HKT|Phuket|Phuket|Thailand|8.11|98.31|2|patong,kata,karon,koh phi phi,phi phi
+USM|Samui|Koh Samui|Thailand|9.55|100.06|1|koh samui,koh phangan,koh tao
+KBV|Krabi|Krabi|Thailand|8.10|98.99|2|koh lanta,railay,ao nang,krabi town
+CEI|Chiang Rai|Chiang Rai|Thailand|19.95|99.88|1
+UTP|U-Tapao|Pattaya|Thailand|12.68|101.00|1
+HDY|Hat Yai|Hat Yai|Thailand|6.93|100.39|1
+URT|Surat Thani|Surat Thani|Thailand|9.13|99.14|1
+TDX|Trat|Koh Chang|Thailand|12.27|102.32|1
+SGN|Tan Son Nhat|Ho Chi Minh City|Vietnam|10.82|106.66|3
+HAN|Noi Bai|Hanoi|Vietnam|21.22|105.81|3
+DAD|Da Nang|Da Nang|Vietnam|16.04|108.20|2|hoi an,hue coast,my khe
+CXR|Cam Ranh|Nha Trang|Vietnam|12.00|109.22|2|nha trang,cam ranh
+PQC|Phu Quoc|Phu Quoc|Vietnam|10.17|103.99|1
+HUI|Phu Bai|Hue|Vietnam|16.40|107.70|1
+HPH|Cat Bi|Hai Phong|Vietnam|20.82|106.72|1
+VCA|Can Tho|Can Tho|Vietnam|10.09|105.71|1
+DLI|Lien Khuong|Da Lat|Vietnam|11.75|108.37|1
+VDO|Van Don|Ha Long|Vietnam|21.12|107.41|1
+MNL|Ninoy Aquino|Manila|Philippines|14.51|121.02|3
+CEB|Mactan-Cebu|Cebu|Philippines|10.31|123.98|2
+CRK|Clark|Angeles|Philippines|15.19|120.56|2
+DVO|Francisco Bangoy|Davao|Philippines|7.13|125.65|2
+KLO|Kalibo|Boracay|Philippines|11.68|122.38|1
+MPH|Godofredo P. Ramos|Caticlan|Philippines|11.92|121.95|1|boracay,caticlan
+PPS|Puerto Princesa|Puerto Princesa|Philippines|9.74|118.76|1
+USU|Francisco B. Reyes|Coron|Philippines|12.12|120.10|1
+ENI|El Nido|El Nido|Philippines|11.20|119.42|1
+TAG|Bohol-Panglao|Bohol|Philippines|9.60|123.77|1
+IAO|Sayak|Siargao|Philippines|9.86|126.01|1|siargao,general luna
+DGT|Sibulan|Dumaguete|Philippines|9.33|123.30|1
+ILO|Iloilo|Iloilo|Philippines|10.83|122.49|1
+BCD|Bacolod-Silay|Bacolod|Philippines|10.78|123.01|1
+PNH|Phnom Penh|Phnom Penh|Cambodia|11.55|104.84|2
+SAI|Siem Reap-Angkor|Siem Reap|Cambodia|13.36|104.11|2|angkor,angkor wat,siem reap
+KOS|Sihanoukville|Sihanoukville|Cambodia|10.58|103.64|1
+VTE|Wattay|Vientiane|Laos|17.99|102.56|1
+LPQ|Luang Prabang|Luang Prabang|Laos|19.90|102.16|1
+RGN|Yangon|Yangon|Myanmar|16.91|96.13|2
+MDL|Mandalay|Mandalay|Myanmar|21.70|95.98|1
+DIL|Presidente Nicolau Lobato|Dili|Timor-Leste|-8.55|125.53|1
+NRT|Narita|Tokyo|Japan|35.77|140.39|3
+HND|Haneda|Tokyo|Japan|35.55|139.78|3
+KIX|Kansai|Osaka|Japan|34.43|135.24|3|kyoto,nara,osaka
+ITM|Itami|Osaka|Japan|34.79|135.44|1
+CTS|New Chitose|Sapporo|Japan|42.78|141.69|2|niseko,sapporo,furano,hakuba
+FUK|Fukuoka|Fukuoka|Japan|33.58|130.45|2
+NGO|Chubu Centrair|Nagoya|Japan|34.86|136.81|2
+OKA|Naha|Okinawa|Japan|26.20|127.65|2
+SDJ|Sendai|Sendai|Japan|38.14|140.92|1
+HIJ|Hiroshima|Hiroshima|Japan|34.44|132.92|1
+HKD|Hakodate|Hakodate|Japan|41.77|140.82|1
+AKJ|Asahikawa|Asahikawa|Japan|43.67|142.45|1
+KMQ|Komatsu|Kanazawa|Japan|36.39|136.41|1
+ISG|New Ishigaki|Ishigaki|Japan|24.40|124.25|1
+ICN|Incheon|Seoul|South Korea|37.46|126.44|3
+GMP|Gimpo|Seoul|South Korea|37.56|126.80|2
+PUS|Gimhae|Busan|South Korea|35.18|128.94|2
+CJU|Jeju|Jeju|South Korea|33.51|126.49|2
+TPE|Taoyuan|Taipei|Taiwan|25.08|121.23|3
+TSA|Songshan|Taipei|Taiwan|25.07|121.55|1
+KHH|Kaohsiung|Kaohsiung|Taiwan|22.58|120.35|2
+RMQ|Taichung|Taichung|Taiwan|24.26|120.62|1
+HKG|Hong Kong International|Hong Kong|Hong Kong|22.31|113.91|3
+MFM|Macau International|Macau|Macau|22.15|113.59|1
+PVG|Pudong|Shanghai|China|31.14|121.81|3
+SHA|Hongqiao|Shanghai|China|31.20|121.34|2
+PEK|Capital|Beijing|China|40.08|116.58|3
+PKX|Daxing|Beijing|China|39.51|116.41|3
+CAN|Baiyun|Guangzhou|China|23.39|113.31|3
+SZX|Bao'an|Shenzhen|China|22.64|113.81|2
+CTU|Tianfu|Chengdu|China|30.31|104.44|2
+CKG|Jiangbei|Chongqing|China|29.72|106.64|2
+XIY|Xianyang|Xi'an|China|34.44|108.75|2
+KMG|Changshui|Kunming|China|25.10|102.93|2
+HGH|Xiaoshan|Hangzhou|China|30.23|120.43|2
+XMN|Gaoqi|Xiamen|China|24.54|118.13|2
+SYX|Phoenix|Sanya|China|18.30|109.41|1
+HAK|Meilan|Haikou|China|19.94|110.46|1
+UBN|Chinggis Khaan|Ulaanbaatar|Mongolia|47.65|106.82|1
+DEL|Indira Gandhi|Delhi|India|28.57|77.10|3
+BOM|Chhatrapati Shivaji|Mumbai|India|19.09|72.87|3
+BLR|Kempegowda|Bengaluru|India|13.20|77.71|3
+MAA|Chennai|Chennai|India|12.99|80.17|2
+HYD|Rajiv Gandhi|Hyderabad|India|17.24|78.43|2
+CCU|Netaji Subhas Chandra Bose|Kolkata|India|22.65|88.45|2
+COK|Cochin|Kochi|India|10.15|76.40|2
+GOX|Manohar|Goa|India|15.74|73.86|2
+GOI|Dabolim|Goa|India|15.38|73.83|1
+TRV|Trivandrum|Thiruvananthapuram|India|8.48|76.92|1
+AMD|Sardar Vallabhbhai Patel|Ahmedabad|India|23.08|72.63|1
+PNQ|Pune|Pune|India|18.58|73.92|1
+JAI|Jaipur|Jaipur|India|26.82|75.80|1
+IXL|Kushok Bakula Rimpochee|Leh|India|34.14|77.55|1
+CMB|Bandaranaike|Colombo|Sri Lanka|7.18|79.88|2
+KTM|Tribhuvan|Kathmandu|Nepal|27.70|85.36|2
+PKR|Pokhara|Pokhara|Nepal|28.20|83.98|1
+MLE|Velana|Male|Maldives|4.19|73.53|2
+DAC|Hazrat Shahjalal|Dhaka|Bangladesh|23.84|90.40|2
+PBH|Paro|Paro|Bhutan|27.40|89.42|1
+ISB|Islamabad|Islamabad|Pakistan|33.55|72.83|1
+KHI|Jinnah|Karachi|Pakistan|24.91|67.16|1
+DXB|Dubai International|Dubai|United Arab Emirates|25.25|55.36|3
+DWC|Al Maktoum|Dubai|United Arab Emirates|24.90|55.16|1
+AUH|Zayed|Abu Dhabi|United Arab Emirates|24.43|54.65|3
+DOH|Hamad|Doha|Qatar|25.27|51.61|3
+MCT|Muscat|Muscat|Oman|23.59|58.28|2
+BAH|Bahrain|Manama|Bahrain|26.27|50.63|1
+KWI|Kuwait|Kuwait City|Kuwait|29.23|47.97|1
+RUH|King Khalid|Riyadh|Saudi Arabia|24.96|46.70|2
+JED|King Abdulaziz|Jeddah|Saudi Arabia|21.68|39.16|2
+AMM|Queen Alia|Amman|Jordan|31.72|35.99|1
+TLV|Ben Gurion|Tel Aviv|Israel|32.01|34.89|2
+IST|Istanbul|Istanbul|Turkey|41.26|28.74|3
+SAW|Sabiha Gokcen|Istanbul|Turkey|40.90|29.31|2
+AYT|Antalya|Antalya|Turkey|36.90|30.79|2
+ADB|Adnan Menderes|Izmir|Turkey|38.29|27.16|1
+TBS|Shota Rustaveli|Tbilisi|Georgia|41.67|44.95|2|tbilisi
+BUS|Batumi|Batumi|Georgia|41.61|41.60|1|batumi
+KUT|Kutaisi|Kutaisi|Georgia|42.18|42.48|1
+EVN|Zvartnots|Yerevan|Armenia|40.15|44.40|1
+GYD|Heydar Aliyev|Baku|Azerbaijan|40.47|50.05|1
+LHR|Heathrow|London|United Kingdom|51.47|-0.45|3
+LGW|Gatwick|London|United Kingdom|51.15|-0.19|3
+STN|Stansted|London|United Kingdom|51.89|0.24|2
+LTN|Luton|London|United Kingdom|51.87|-0.37|1
+MAN|Manchester|Manchester|United Kingdom|53.36|-2.27|2
+EDI|Edinburgh|Edinburgh|United Kingdom|55.95|-3.37|2
+BHX|Birmingham|Birmingham|United Kingdom|52.45|-1.75|1
+GLA|Glasgow|Glasgow|United Kingdom|55.87|-4.43|1
+DUB|Dublin|Dublin|Ireland|53.43|-6.25|2
+CDG|Charles de Gaulle|Paris|France|49.01|2.55|3
+ORY|Orly|Paris|France|48.73|2.37|2
+NCE|Cote d'Azur|Nice|France|43.66|7.22|2
+LYS|Saint-Exupery|Lyon|France|45.73|5.08|1
+MRS|Provence|Marseille|France|43.44|5.22|1
+TLS|Blagnac|Toulouse|France|43.63|1.37|1
+AMS|Schiphol|Amsterdam|Netherlands|52.31|4.76|3
+BRU|Brussels|Brussels|Belgium|50.90|4.48|2
+FRA|Frankfurt|Frankfurt|Germany|50.03|8.56|3
+MUC|Munich|Munich|Germany|48.35|11.79|3
+BER|Brandenburg|Berlin|Germany|52.36|13.51|2
+DUS|Dusseldorf|Dusseldorf|Germany|51.29|6.77|2
+HAM|Hamburg|Hamburg|Germany|53.63|10.01|1
+ZRH|Zurich|Zurich|Switzerland|47.46|8.55|2
+GVA|Geneva|Geneva|Switzerland|46.24|6.11|2
+VIE|Vienna|Vienna|Austria|48.11|16.57|2
+PRG|Vaclav Havel|Prague|Czechia|50.10|14.26|2
+BUD|Ferenc Liszt|Budapest|Hungary|47.44|19.26|2
+WAW|Chopin|Warsaw|Poland|52.17|20.97|2
+KRK|John Paul II|Krakow|Poland|50.08|19.79|1
+CPH|Kastrup|Copenhagen|Denmark|55.62|12.66|2
+ARN|Arlanda|Stockholm|Sweden|59.65|17.92|2
+OSL|Gardermoen|Oslo|Norway|60.19|11.10|2
+HEL|Vantaa|Helsinki|Finland|60.32|24.96|2
+KEF|Keflavik|Reykjavik|Iceland|63.99|-22.61|2
+RIX|Riga|Riga|Latvia|56.92|23.97|1
+TLL|Lennart Meri|Tallinn|Estonia|59.41|24.83|1
+VNO|Vilnius|Vilnius|Lithuania|54.64|25.29|1
+BCN|El Prat|Barcelona|Spain|41.30|2.08|3
+MAD|Barajas|Madrid|Spain|40.47|-3.56|3
+AGP|Malaga|Malaga|Spain|36.68|-4.50|2
+PMI|Palma de Mallorca|Palma|Spain|39.55|2.74|2
+IBZ|Ibiza|Ibiza|Spain|38.87|1.37|1
+VLC|Valencia|Valencia|Spain|39.49|-0.48|1
+LIS|Humberto Delgado|Lisbon|Portugal|38.77|-9.13|2
+OPO|Francisco Sa Carneiro|Porto|Portugal|41.24|-8.68|1
+FAO|Faro|Faro|Portugal|37.01|-7.97|1
+FCO|Fiumicino|Rome|Italy|41.80|12.25|3
+MXP|Malpensa|Milan|Italy|45.63|8.72|3
+VCE|Marco Polo|Venice|Italy|45.51|12.35|2
+NAP|Capodichino|Naples|Italy|40.89|14.29|1
+CTA|Fontanarossa|Catania|Italy|37.47|15.07|1
+ATH|Eleftherios Venizelos|Athens|Greece|37.94|23.94|2
+JTR|Santorini|Santorini|Greece|36.40|25.48|1
+JMK|Mykonos|Mykonos|Greece|37.44|25.35|1
+HER|Heraklion|Crete|Greece|35.34|25.18|1
+SPU|Split|Split|Croatia|43.54|16.30|1
+DBV|Dubrovnik|Dubrovnik|Croatia|42.56|18.27|1
+ZAG|Franjo Tudman|Zagreb|Croatia|45.74|16.07|1
+LJU|Joze Pucnik|Ljubljana|Slovenia|46.22|14.46|1
+OTP|Henri Coanda|Bucharest|Romania|44.57|26.10|1
+SOF|Sofia|Sofia|Bulgaria|42.70|23.41|1
+BEG|Nikola Tesla|Belgrade|Serbia|44.82|20.29|1
+TIA|Tirana|Tirana|Albania|41.42|19.72|1
+LAX|Los Angeles|Los Angeles|United States|33.94|-118.41|3
+SFO|San Francisco|San Francisco|United States|37.62|-122.38|3
+SEA|Seattle-Tacoma|Seattle|United States|47.45|-122.31|2
+JFK|John F. Kennedy|New York|United States|40.64|-73.78|3
+EWR|Newark|New York|United States|40.69|-74.17|2
+ORD|O'Hare|Chicago|United States|41.98|-87.90|3
+DFW|Dallas Fort Worth|Dallas|United States|32.90|-97.04|3
+IAH|George Bush|Houston|United States|29.99|-95.34|2
+ATL|Hartsfield-Jackson|Atlanta|United States|33.64|-84.43|3
+MIA|Miami|Miami|United States|25.79|-80.29|2
+MCO|Orlando|Orlando|United States|28.43|-81.31|2
+LAS|Harry Reid|Las Vegas|United States|36.08|-115.15|2
+DEN|Denver|Denver|United States|39.86|-104.67|2
+PHX|Sky Harbor|Phoenix|United States|33.43|-112.01|2
+BOS|Logan|Boston|United States|42.36|-71.01|2
+SAN|San Diego|San Diego|United States|32.73|-117.19|1
+IAD|Dulles|Washington|United States|38.95|-77.46|2
+YVR|Vancouver|Vancouver|Canada|49.19|-123.18|2
+YYZ|Pearson|Toronto|Canada|43.68|-79.63|3
+YUL|Trudeau|Montreal|Canada|45.47|-73.74|2
+YYC|Calgary|Calgary|Canada|51.11|-114.02|2
+MEX|Benito Juarez|Mexico City|Mexico|19.44|-99.07|3
+CUN|Cancun|Cancun|Mexico|21.04|-86.87|2
+PVR|Puerto Vallarta|Puerto Vallarta|Mexico|20.68|-105.25|1
+SJD|Los Cabos|Los Cabos|Mexico|23.15|-109.72|1
+GDL|Guadalajara|Guadalajara|Mexico|20.52|-103.31|1
+OAX|Xoxocotlan|Oaxaca|Mexico|16.99|-96.72|1|oaxaca,puerto escondido
+HUX|Bahias de Huatulco|Huatulco|Mexico|15.77|-96.26|1|huatulco,mazunte,zipolite
+SCL|Arturo Merino Benitez|Santiago|Chile|-33.39|-70.79|2
+EZE|Ezeiza|Buenos Aires|Argentina|-34.82|-58.54|2
+GRU|Guarulhos|Sao Paulo|Brazil|-23.43|-46.47|3
+GIG|Galeao|Rio de Janeiro|Brazil|-22.81|-43.25|2
+LIM|Jorge Chavez|Lima|Peru|-12.02|-77.11|2
+CUZ|Alejandro Velasco Astete|Cusco|Peru|-13.54|-71.94|1|machu picchu,sacred valley,cusco
+BOG|El Dorado|Bogota|Colombia|4.70|-74.15|2
+MDE|Jose Maria Cordova|Medellin|Colombia|6.16|-75.42|1
+CTG|Rafael Nunez|Cartagena|Colombia|10.44|-75.51|1
+UIO|Mariscal Sucre|Quito|Ecuador|-0.13|-78.36|1
+MVD|Carrasco|Montevideo|Uruguay|-34.84|-56.03|1
+LPB|El Alto|La Paz|Bolivia|-16.51|-68.19|1
+JNB|O. R. Tambo|Johannesburg|South Africa|-26.13|28.24|3
+CPT|Cape Town|Cape Town|South Africa|-33.97|18.60|2
+DUR|King Shaka|Durban|South Africa|-29.61|31.12|1
+NBO|Jomo Kenyatta|Nairobi|Kenya|-1.32|36.93|2
+MBA|Moi|Mombasa|Kenya|-4.03|39.59|1
+ZNZ|Abeid Amani Karume|Zanzibar|Tanzania|-6.22|39.22|1|nungwi,paje,stone town,zanzibar
+JRO|Kilimanjaro|Kilimanjaro|Tanzania|-3.43|37.07|1|arusha,serengeti,ngorongoro
+DAR|Julius Nyerere|Dar es Salaam|Tanzania|-6.88|39.20|1
+ADD|Bole|Addis Ababa|Ethiopia|8.98|38.80|2
+CAI|Cairo|Cairo|Egypt|30.11|31.41|2
+HRG|Hurghada|Hurghada|Egypt|27.18|33.80|1
+SSH|Sharm el-Sheikh|Sharm el-Sheikh|Egypt|27.98|34.39|1
+RAK|Menara|Marrakech|Morocco|31.61|-8.04|1
+CMN|Mohammed V|Casablanca|Morocco|33.37|-7.59|2
+TUN|Carthage|Tunis|Tunisia|36.85|10.23|1
+MRU|Sir Seewoosagur Ramgoolam|Mauritius|Mauritius|-20.43|57.68|1
+SEZ|Seychelles|Mahe|Seychelles|-4.67|55.52|1
+VFA|Victoria Falls|Victoria Falls|Zimbabwe|-18.10|25.84|1
+WDH|Hosea Kutako|Windhoek|Namibia|-22.48|17.47|1
+"""
+
+    static let all: [Airport] = {
+        table.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard f.count >= 7,
+                  let la = Double(f[4]), let lo = Double(f[5]), let r = Int(f[6])
+            else { return nil }
+            let alts = f.count > 7
+                ? String(f[7]).split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+                : []
+            return Airport(iata: String(f[0]), name: String(f[1]), city: String(f[2]),
+                           country: String(f[3]), lat: la, lon: lo, rank: r, alts: alts)
+        }
+    }()
+
+    private static let byCode: [String: Airport] = {
+        var d: [String: Airport] = [:]
+        for a in all { d[a.iata] = a }
+        return d
+    }()
+
+    // MARK: distance
+
+    /// Great-circle kilometres. Haversine, because the flat-earth
+    /// approximation is out by 300 km on a Sydney–Denpasar leg and this
+    /// number gets shown to a person.
+    static func km(_ aLat: Double, _ aLon: Double, _ bLat: Double, _ bLon: Double) -> Double {
+        let R = 6371.0
+        let p1 = aLat * .pi / 180, p2 = bLat * .pi / 180
+        let dp = (bLat - aLat) * .pi / 180, dl = (bLon - aLon) * .pi / 180
+        let h = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2)
+        return 2 * R * atan2(sqrt(h), sqrt(max(0, 1 - h)))
+    }
+
+    static func km(_ a: Airport, _ b: Airport) -> Double { km(a.lat, a.lon, b.lat, b.lon) }
+
+    /// Gate to gate, roughly. 800 km/h cruise plus 35 minutes of taxi,
+    /// climb and descent — within about fifteen minutes of a real
+    /// schedule on anything over an hour, which is all this is for.
+    static func flightMinutes(_ distanceKm: Double) -> Int {
+        Int((distanceKm / 800.0 * 60.0).rounded()) + 35
+    }
+
+    static func minutesLine(_ m: Int) -> String {
+        if m < 60 { return "\(m)m" }
+        let h = m / 60, r = m % 60
+        return r == 0 ? "\(h)h" : "\(h)h \(r)m"
+    }
+
+    static func durationLine(_ distanceKm: Double) -> String {
+        minutesLine(flightMinutes(distanceKm))
+    }
+
+    // MARK: lookup
+
+    static func byIATA(_ code: String) -> Airport? {
+        byCode[code.uppercased().trimmingCharacters(in: .whitespaces)]
+    }
+
+    /// Every airport within a radius, nearest first.
+    static func near(lat: Double, lon: Double, withinKm: Double = 150,
+                     minRank: Int = 1, limit: Int = 6) -> [(airport: Airport, km: Double)] {
+        guard lat != 0 || lon != 0 else { return [] }
+        return all
+            .filter { $0.rank >= minRank }
+            .map { ($0, km(lat, lon, $0.lat, $0.lon)) }
+            .filter { $0.1 <= withinKm }
+            .sorted { $0.1 < $1.1 }
+            .prefix(limit)
+            .map { (airport: $0.0, km: $0.1) }
+    }
+
+    /// The airport a place actually flies from. Coordinates win when we
+    /// have them — a name match on "Perth" without a coordinate is how
+    /// you end up booking Ontario — and the name is the fallback for a
+    /// leg the geocoder never resolved.
+    static func resolve(place: String, country: String = "",
+                        lat: Double = 0, lon: Double = 0) -> Airport? {
+        let q = place.folding(options: .diacriticInsensitive, locale: .current)
+            .lowercased().trimmingCharacters(in: .whitespaces)
+
+        // A three-letter all-caps word is almost certainly already a code.
+        if q.count == 3, let a = byIATA(q) { return a }
+
+        if lat != 0 || lon != 0 {
+            // Within 130 km, the nearest sizeable airport IS the answer.
+            // Ubud has no airport; Ubud's answer is Denpasar.
+            let hits = near(lat: lat, lon: lon, withinKm: 130, minRank: 1, limit: 8)
+            // AUDIT: this took the highest RANK within 130 km, so rank beat
+            // distance absolutely: Gold Coast resolved to Brisbane 75 km
+            // away, Maroochydore to Brisbane, Newcastle to Sydney, Ballina
+            // to the Gold Coast. Every flight link on a Gold Coast trip was
+            // for the wrong airport.
+            //
+            // Nearest wins. A bigger airport only takes it if it is not
+            // materially further — 40 km is "the same trip to the airport",
+            // and beyond that the small one is genuinely the answer.
+            if let nearest = hits.first {
+                let upgrade = hits.first {
+                    $0.airport.rank > nearest.airport.rank && $0.km <= nearest.km + 40
+                }
+                return (upgrade ?? nearest).airport
+            }
+        }
+
+        // Name match, exact city first, then contained, hub wins ties.
+        let pool = country.isEmpty ? all : all.filter {
+            $0.country.lowercased() == country.lowercased()
+        }
+        let candidates = pool.isEmpty ? all : pool
+        let exact = candidates.filter { $0.city.lowercased() == q }
+        if let a = exact.max(by: { $0.rank < $1.rank }) { return a }
+        // Aliases before fuzzy matching — an exact alias hit ("ubud") is a
+        // stronger signal than a substring of a city name.
+        if let a = candidates.first(where: { $0.alts.contains(q) })
+            ?? all.first(where: { $0.alts.contains(q) }) { return a }
+        let loose = candidates.filter {
+            let c = $0.city.lowercased()
+            return (c.contains(q) || q.contains(c)) && min(c.count, q.count) >= 4
+        }
+        if let a = loose.max(by: { $0.rank < $1.rank }) { return a }
+        return all.first { a in a.alts.contains { $0.contains(q) || q.contains($0) } }
+    }
+
+    /// The question "could I fly into somewhere cheaper". Only offers
+    /// airports that plausibly have flights — a regional strip is not an
+    /// alternative to a hub — and always says how far away it is, because
+    /// a $200 saving three hundred kilometres away is not a saving.
+    static func alternatives(to a: Airport, withinKm: Double = 320,
+                             limit: Int = 4) -> [(airport: Airport, km: Double)] {
+        all
+            .filter { $0.iata != a.iata && $0.rank >= min(2, a.rank) }
+            .map { ($0, km(a, $0)) }
+            .filter { $0.1 <= withinKm }
+            .sorted { $0.1 < $1.1 }
+            .prefix(limit)
+            .map { (airport: $0.0, km: $0.1) }
+    }
+}
+
+
+// =====================================================================
+// BUILD 184 — WHAT THE ATLAS MAKES POSSIBLE.
+//
+// Six things the flight engine could not do yesterday, all of them
+// blocked on the same missing table:
+//
+//   * a real route — SYD → DPS, not "Sydney to Ubud"
+//   * a month grid instead of a single date, which is where the 20–30%
+//     actually lives
+//   * nearby departure and arrival airports, with the distance, so a
+//     saving three hundred kilometres away is visibly not a saving
+//   * flight duration and layover arithmetic
+//   * multi-city and open-jaw links
+//   * a refusal to recommend a connection that cannot be made
+//
+// That last one matters more than it reads. A 55-minute self-transfer
+// on separate tickets in Kuala Lumpur is not a cheap flight, it is a
+// missed flight with no protection and no refund. Software that shows
+// it as the cheapest option is not saving anyone money.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// The airport a leg actually flies into.
+    func airport(for leg: Leg) -> ChappyPorts.Airport? {
+        ChappyPorts.resolve(place: leg.place, country: leg.country,
+                               lat: leg.lat, lon: leg.lon)
+    }
+
+    /// Home, for the outbound. The profile's home city if it is set,
+    /// otherwise the device's region, otherwise Sydney — and it says
+    /// which, rather than pretending to know.
+    func homeAirport() -> ChappyPorts.Airport? {
+        let p = ChappyProfile.shared
+        if !p.homeAirport.isEmpty, let a = ChappyPorts.byIATA(p.homeAirport) { return a }
+        if !p.homeCity.isEmpty, let a = ChappyPorts.resolve(place: p.homeCity) { return a }
+        return ChappyPorts.byIATA("SYD")
+    }
+
+    struct Hop: Identifiable {
+        /// BUILD 190: the flights screen drives a ForEach and a
+        /// .sheet(item:) off these. Derived rather than stored so two
+        /// hops on the same route on the same day stay distinct.
+        var id: String { "\(from.iata)-\(to.iata)-\(when.timeIntervalSince1970)" }
+        var from: ChappyPorts.Airport
+        var to: ChappyPorts.Airport
+        var km: Double
+        var minutes: Int
+        var when: Date
+        var route: String { "\(from.iata) → \(to.iata)" }
+        var line: String {
+            "\(from.city) (\(from.iata)) → \(to.city) (\(to.iata)) · "
+            + "\(Int(km.rounded())) km · \(ChappyPorts.durationLine(km))"
+        }
+    }
+
+    /// Every flown segment of the trip, including the one from home.
+    /// Legs you reach by boat or bus are not hops — they're why the
+    /// route map has dashes and dots.
+    func hops(_ trip: Trip) -> [Hop] {
+        var out: [Hop] = []
+        var previous: ChappyPorts.Airport? = homeAirport()
+        for (i, leg) in trip.legs.enumerated() {
+            guard let to = airport(for: leg) else { continue }
+            // AUDIT: this said `out.isEmpty`, which means "no hop emitted
+            // YET" and not "the first leg". Any leading leg that got
+            // skipped — unresolvable airport, or the same code as home —
+            // left `out` empty, so the next leg was emitted as a FLIGHT
+            // whatever its actual mode. A bus to Canberra came out with a
+            // Google Flights link and an hour of air time.
+            if (leg.arrival == .flight || i == 0), let from = previous, from.iata != to.iata {
+                let d = ChappyPorts.km(from, to)
+                out.append(Hop(from: from, to: to, km: d,
+                               minutes: ChappyPorts.flightMinutes(d), when: leg.arrive))
+            }
+            previous = to
+        }
+        // AUDIT: this claimed "if the trip is a return" and then tested
+        // nothing of the kind — trip.end is non-nil whenever there is a
+        // leg, so a one-way move got an invented flight home, an extra
+        // search link, and inflated air time.
+        if trip.oneWay != true, let last = previous, let home = homeAirport(),
+           last.iata != home.iata, let end = trip.end {
+            let d = ChappyPorts.km(last, home)
+            out.append(Hop(from: last, to: home, km: d,
+                           minutes: ChappyPorts.flightMinutes(d), when: end))
+        }
+        return out
+    }
+
+    private static func ymdShort(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: d)
+    }
+
+    /// A real coded search rather than a sentence. Google Flights parses
+    /// codes far more reliably than place names — "flights to Ubud"
+    /// returns nothing useful, "DPS" returns the route.
+    func codedFlightURL(_ hop: Hop, returning back: Date? = nil, party: Int = 1) -> URL? {
+        var q = "flights from \(hop.from.iata) to \(hop.to.iata) on \(Self.ymdShort(hop.when))"
+        if let b = back { q += " returning \(Self.ymdShort(b))" }
+        if party > 1 { q += " for \(party) adults" }
+        let e = Self.enc(q)
+        return URL(string: "https://www.google.com/travel/flights?q=\(e)")
+    }
+
+    /// THE MONTH GRID. The single highest-value link in the document:
+    /// not "what does the 14th cost" but "which week of September is
+    /// cheapest", which is where the real money is on a soft-dated trip.
+    func monthGridURL(_ hop: Hop, nights: Int) -> URL? {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        // Google gets an English month or it gets nothing useful. A French
+        // phone was sending "septembre 2026".
+        f.locale = Locale(identifier: "en_US_POSIX")
+        let q = "cheapest flights \(hop.from.iata) to \(hop.to.iata) in "
+            + "\(f.string(from: hop.when)) for \(max(1, nights)) nights"
+        return URL(string: "https://www.google.com/travel/flights?q=\(Self.enc(q))")
+    }
+
+    /// Would flying into somewhere else be cheaper? Chappy cannot price
+    /// it — no live fare feed exists for an app like this — but it CAN
+    /// say which alternatives exist, how far away they are, and what
+    /// that distance costs you in ground travel. That is the part
+    /// people get wrong, and it is the part that doesn't need a feed.
+    struct AirportOption: Identifiable {
+        var id: String { airport.iata }
+        var airport: ChappyPorts.Airport
+        var km: Double
+        var groundNote: String
+        var worthIt: Bool
+    }
+
+    func nearbyOptions(for a: ChappyPorts.Airport) -> [AirportOption] {
+        ChappyPorts.alternatives(to: a).map { alt in
+            let hours = alt.km / 65.0     // real road speed, not motorway speed
+            let note: String
+            let worth: Bool
+            switch alt.km {
+            case ..<60:
+                note = "About an hour on the ground — effectively the same city."
+                worth = true
+            case ..<180:
+                note = String(format: "Roughly %.0f hours by road or rail. Worth it for a real saving.", hours.rounded())
+                worth = true
+            default:
+                note = String(format: "About %.0f hours away. Only worth it if the saving is large and you have the day.", hours.rounded())
+                worth = false
+            }
+            return AirportOption(airport: alt.airport, km: alt.km, groundNote: note, worthIt: worth)
+        }
+    }
+
+    /// THE CONNECTION THAT CANNOT BE MADE.
+    ///
+    /// Minimum connection time is 45–60 minutes on one ticket at a
+    /// single terminal, and that assumes the bags are checked through
+    /// and the airline owns the problem if you miss it. On SEPARATE
+    /// tickets none of that is true: you clear immigration, collect
+    /// bags, re-check, clear security again, and if you miss it nobody
+    /// owes you anything. Two hours is the floor and three is honest.
+    static func connectionVerdict(minutes: Int, sameTicket: Bool,
+                                  changeAirports: Bool) -> (level: String, text: String) {
+        if changeAirports {
+            return ("HIGH", "This connection changes airports. Budget four hours minimum, and treat it as two separate journeys — because that is what it is.")
+        }
+        if sameTicket {
+            if minutes < 45 { return ("HIGH", "Under 45 minutes on one ticket is below the published minimum at most airports. Expect to miss it.") }
+            if minutes < 75 { return ("MEDIUM", "Tight, but the airline owns the problem and will rebook you if it goes wrong.") }
+            return ("LOW", "Comfortable, and protected — one ticket means the airline rebooks you if the first leg is late.")
+        }
+        if minutes < 120 {
+            return ("HIGH", "Separate tickets with under two hours. You clear immigration, collect bags, re-check and clear security again — and if you miss it, nobody owes you a seat or a refund. This is not a cheap flight, it is a missed flight.")
+        }
+        if minutes < 180 {
+            return ("MEDIUM", "Separate tickets, so nothing is protected. Doable, but any delay on the first leg is entirely your problem.")
+        }
+        return ("LOW", "Separate tickets, but enough time to absorb a delay and re-check.")
+    }
+
+    /// The routing panel for the report.
+    func routingHTML(_ trip: Trip) -> String {
+        // `let hops = hops(trip)` shadows the method with a variable that is
+        // in scope inside its own initialiser — "variable used within its
+        // own initial value". A one-word name, and it would have failed the
+        // build on a machine he is renting by the hour.
+        let segments = hops(trip)
+        guard !segments.isEmpty else { return "" }
+        let E = Self.e
+        let d = DateFormatter(); d.dateFormat = "d MMM"
+
+        var h = "<div class=\"card\"><h2>The route, in codes"
+        h += Self.stampHTML(ChappyStamp(.official, source: "IATA table", confidence: 92))
+        h += "</h2>"
+        h += "<p class=\"s2\">Place names don't book flights — codes do. These are the actual segments, with "
+        h += "gate-to-gate times, and every one opens a live search with your dates already in it.</p>"
+
+        var total = 0
+        for hop in segments {
+            total += hop.minutes
+            h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(hop.route))</b>"
+            h += "<span class=\"rt\">\(d.string(from: hop.when)) · \(ChappyPorts.durationLine(hop.km))</span></div>"
+            h += "<p>\(E(hop.from.city)) → \(E(hop.to.city)) · \(Int(hop.km.rounded())) km</p>"
+            h += "<div class=\"acts\" style=\"padding:7px 0 0\">"
+            if let u = codedFlightURL(hop, party: trip.party) {
+                h += "<a href=\"\(u.absoluteString)\">Search \(E(hop.route))</a>"
+            }
+            if let u = monthGridURL(hop, nights: trip.nights) {
+                h += "<a class=\"hunt\" href=\"\(u.absoluteString)\">Cheapest week of the month</a>"
+            }
+            h += "</div></div>"
+        }
+
+        h += "<div class=\"cost\" style=\"margin-top:8px\"><span>Time in the air, all segments</span>"
+        // AUDIT: this converted minutes back into kilometres and fed them
+        // to durationLine, which adds the 35-minute taxi block AGAIN. The
+        // total was always exactly 35 minutes long.
+        h += "<b>\(ChappyPorts.minutesLine(max(0, total - 35 * segments.count)))</b></div>"
+
+        // Alternatives into the first destination.
+        if let firstTo = segments.first?.to {
+            let opts = nearbyOptions(for: firstTo)
+            if !opts.isEmpty {
+                h += "<h2 style=\"margin:18px 0 10px\">Could you fly somewhere cheaper</h2>"
+                h += "<p class=\"s2\">Airports within reach of \(E(firstTo.city)). Chappy can't price these — no "
+                h += "live fare feed exists for an app like this — but the distance is the part people get wrong, "
+                h += "and the distance is exactly what decides whether a cheaper fare is actually cheaper.</p>"
+                for o in opts {
+                    let col = o.worthIt ? "var(--good)" : "var(--warn)"
+                    h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(o.airport.label))</b>"
+                    h += "<span class=\"rt\" style=\"color:\(col)\">\(Int(o.km.rounded())) km away</span></div>"
+                    h += "<p>\(E(o.groundNote))</p></div>"
+                }
+            }
+        }
+
+        h += "<p class=\"foot\" style=\"padding:10px 0 0\">Durations are 800 km/h plus 35 minutes of taxi, climb "
+        h += "and descent — within about a quarter hour of a real schedule, and not a substitute for one. "
+        h += "Airport table is curated, not exhaustive: about 330 airports covering where Australians fly.</p>"
+        h += "</div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 184 — THE TRAVELLER.
+//
+// Every engine in here has been planning for a generic Australian.
+// That was fine while the question was "what does Bali cost", and it
+// stops being fine the moment the question is "should I book this".
+// A travel agent who has met you twice knows you fly Qantas because
+// the status is worth more than the fare difference, that you want an
+// aisle, that your passport expires in March — and gives different
+// advice because of it.
+//
+// One of these fields is not a preference at all. PASSPORT EXPIRY is
+// the most common reason an Australian is refused boarding, and it is
+// refused at the CHECK-IN DESK, not at the border: most of Asia
+// requires six months' validity from the date of ENTRY, and the
+// airline is liable for flying you there, so the airline is the one
+// that stops you. Chappy has been counting visa days perfectly while
+// ignoring the thing that actually ends trips at the airport.
+//
+// Persisted to UserDefaults as JSON, and — deliberately — nothing in
+// here is a document number. A passport NUMBER in an app's defaults is
+// a liability with no upside; the expiry date is what the arithmetic
+// needs and all it needs.
+// =====================================================================
+
+@MainActor
+final class ChappyProfile: ObservableObject {
+    static let shared = ChappyProfile()
+
+    struct Profile: Codable, Equatable {
+        var name = ""
+        var homeCity = ""
+        var homeAirport = ""              // IATA, overrides the city
+        var nationality = "Australia"
+        var passportExpiry: Date?
+        var secondPassport = ""           // "Ireland" — changes everything in Europe
+
+        // How he flies.
+        var preferredAirlines: [String] = []
+        var frequentFlyer: [String] = []  // "Qantas Frequent Flyer — Gold"
+        var seatPreference = ""           // "Aisle, forward of the wing"
+        var mealPreference = ""
+        var cabinPreference = "Economy"
+
+        // Where he sleeps.
+        var preferredChains: [String] = []
+        var hotelLoyalty: [String] = []
+        var cardBenefits: [String] = []   // "Amex Platinum — lounge, travel insurance"
+
+        // Who's going.
+        var adults = 2
+        var children = 0
+        var infants = 0
+        var travellingWithPet = false
+        var accessibility = ""
+
+        // What kind of trip.
+        var styleLevel = "Mid-range"      // Budget / Mid-range / Comfortable / Luxury
+        var interests: [String] = []
+        var dietary = ""
+        var needsInternetForWork = false
+
+        // What he's already done.
+        var visited: [String] = []
+
+        /// AUDIT: this sampled five fields, so a profile with the airport,
+        /// party, accessibility, cabin, seat, diet, style, chains and card
+        /// benefits all filled in still read "Not set up yet — worth two
+        /// minutes", inviting him to redo work he had already done.
+        var isEmpty: Bool { self == Profile() }
+    }
+
+    @Published var data = Profile() { didSet { save() } }
+
+    private let key = "chappy_traveller_profile"
+
+    private init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let p = try? JSONDecoder().decode(Profile.self, from: d) { data = p }
+    }
+
+    private var saveWork: DispatchWorkItem?
+
+    /// AUDIT: didSet fires on every keystroke, and this re-encoded the
+    /// whole profile to JSON and wrote UserDefaults each time. Debounced —
+    /// the last edit still lands, it just lands once.
+    private func save() {
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if let d = try? JSONEncoder().encode(self.data) {
+                UserDefaults.standard.set(d, forKey: self.key)
+            }
+        }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    // Convenience the rest of the app reads.
+    var homeCity: String { data.homeCity }
+    var homeAirport: String { data.homeAirport }
+    var party: Int { max(1, data.adults + data.children) }
+
+    // MARK: the passport
+
+    /// Days of validity left on the date you'd be ENTERING. Not today —
+    /// a passport with seven months left today has five months left on
+    /// a trip in sixty days, and five is not six.
+    func passportDaysRemaining(on date: Date) -> Int? {
+        guard let e = data.passportExpiry else { return nil }
+        return Calendar.current.dateComponents([.day], from: date, to: e).day
+    }
+
+    /// The check every airline check-in desk does and Chappy did not.
+    /// Six months is the common rule across South-East Asia; three is
+    /// the Schengen rule; some countries want only validity for the
+    /// stay. Six is the number that keeps you on the plane everywhere.
+    struct PassportVerdict {
+        var ok: Bool
+        var level: String          // LOW / MEDIUM / HIGH
+        var headline: String
+        var detail: String
+    }
+
+    func passportCheck(entering date: Date, country: String = "") -> PassportVerdict? {
+        guard let days = passportDaysRemaining(on: date) else { return nil }
+        let f = DateFormatter(); f.dateFormat = "d MMM yyyy"
+        let expiry = data.passportExpiry.map { f.string(from: $0) } ?? ""
+        let region = country.isEmpty ? "most of Asia" : country
+
+        if days < 0 {
+            return PassportVerdict(
+                ok: false, level: "HIGH",
+                headline: "Your passport expires before this trip",
+                detail: "It runs out on \(expiry), which is before you'd be travelling. Renew before you book anything non-refundable.")
+        }
+        if days < 183 {
+            return PassportVerdict(
+                ok: false, level: "HIGH",
+                headline: "Passport too close to expiry — \(days) days left on arrival",
+                detail: "\(region) requires six months' validity from the date of entry, and it is the AIRLINE that enforces it, at the check-in desk, because they're liable for flying you there. Yours has \(days) days on the day you'd land (expires \(expiry)). Renew now — the standard renewal takes about three weeks and the priority one is same-week.")
+        }
+        if days < 275 {
+            return PassportVerdict(
+                ok: true, level: "MEDIUM",
+                headline: "Passport clears this trip, but only just",
+                detail: "\(days) days of validity on arrival (expires \(expiry)). Fine for this one. If you're planning anything after it — and the onward suggestions in this document assume you might be — renew before that, not after.")
+        }
+        return PassportVerdict(
+            ok: true, level: "LOW",
+            headline: "Passport is fine",
+            detail: "\(days) days of validity when you land, expires \(expiry). Comfortably past the six-month rule.")
+    }
+
+    // MARK: what the planner and the live session get told
+
+    /// Injected into every planning prompt. Written as sentences rather
+    /// than a field dump because the model reads it, not a parser — and
+    /// a model given "seatPreference: aisle" argues about JSON instead
+    /// of booking an aisle.
+    var brief: String {
+        var bits: [String] = []
+        let d = data
+        if !d.name.isEmpty { bits.append("The traveller is \(d.name).") }
+        if !d.homeCity.isEmpty {
+            var h = "Flying from \(d.homeCity)"
+            if !d.homeAirport.isEmpty { h += " (\(d.homeAirport))" }
+            bits.append(h + ".")
+        }
+        var who = "\(d.adults) adult\(d.adults == 1 ? "" : "s")"
+        if d.children > 0 { who += ", \(d.children) child\(d.children == 1 ? "" : "ren")" }
+        if d.infants > 0 { who += ", \(d.infants) infant\(d.infants == 1 ? "" : "s")" }
+        if d.travellingWithPet { who += ", and a pet" }
+        bits.append("Travelling: \(who).")
+        bits.append("\(d.nationality) passport.")
+        if !d.secondPassport.isEmpty {
+            bits.append("ALSO holds a \(d.secondPassport) passport — check whether it gives a better entry or a longer stay, because it often does.")
+        }
+        if let days = passportDaysRemaining(on: Date()), days < 365 {
+            bits.append("Passport has \(days) days left — factor that into anything long or onward.")
+        }
+        if !d.preferredAirlines.isEmpty {
+            bits.append("Prefers \(d.preferredAirlines.joined(separator: ", ")).")
+        }
+        if !d.frequentFlyer.isEmpty {
+            bits.append("Loyalty: \(d.frequentFlyer.joined(separator: "; ")). A fare that earns or retains status can be worth paying more for — say so when it applies.")
+        }
+        if !d.cardBenefits.isEmpty {
+            bits.append("Card benefits: \(d.cardBenefits.joined(separator: "; ")). Check whether these already cover insurance, lounge or rental excess before recommending he buys them.")
+        }
+        if !d.preferredChains.isEmpty || !d.hotelLoyalty.isEmpty {
+            bits.append("Hotels: \((d.preferredChains + d.hotelLoyalty).joined(separator: ", ")).")
+        }
+        if !d.cabinPreference.isEmpty { bits.append("Usually flies \(d.cabinPreference).") }
+        if !d.seatPreference.isEmpty { bits.append("Seat: \(d.seatPreference).") }
+        if !d.mealPreference.isEmpty { bits.append("Meals: \(d.mealPreference).") }
+        if !d.dietary.isEmpty { bits.append("Dietary: \(d.dietary).") }
+        if !d.accessibility.isEmpty {
+            bits.append("ACCESSIBILITY — this is a requirement, not a preference: \(d.accessibility). Check it for every stay, every transfer and every activity you suggest.")
+        }
+        bits.append("Style: \(d.styleLevel).")
+        if !d.interests.isEmpty { bits.append("Into: \(d.interests.joined(separator: ", ")).") }
+        if d.needsInternetForWork {
+            bits.append("WORKS while travelling — internet speed and a place to work are a hard requirement, not a nice-to-have. Say what the connection is actually like, not that it 'has wifi'.")
+        }
+        if !d.visited.isEmpty {
+            bits.append("Has already been to: \(d.visited.joined(separator: ", ")). Don't sell him these as discoveries; either go deeper or go elsewhere.")
+        }
+        return bits.isEmpty ? "" : "TRAVELLER PROFILE — plan for this person specifically.\n" + bits.joined(separator: " ")
+    }
+}
+
+
+// =====================================================================
+// BUILD 184 — SOURCE AND TRUST.
+//
+// The report already looks authoritative. That is exactly the problem:
+// a searched estimate and a live exchange rate look identical on the
+// page, and one of them is worth acting on without checking. Right now
+// the honesty lives in a footnote at the bottom that says "prices are
+// searched, not quoted" — which is true, and which nobody reads, and
+// which does not distinguish between the visa rule (checkable, and it
+// matters enormously) and the price of a massage (an estimate, and it
+// does not).
+//
+// So every number that matters carries a stamp:
+//
+//   LIVE       fetched from a source just now — the rate, the forecast,
+//              the flight status. Trust it, note the timestamp.
+//   OFFICIAL   from a government or the operator itself. The strongest
+//              thing here, and the only thing a visa answer should be.
+//   RESEARCHED found by search on a date, with a source named. Good,
+//              and worth re-checking if the date is old.
+//   ESTIMATED  a model of what things cost. Useful for planning, wrong
+//              to quote to anyone.
+//   RECORD     from his own history — a price he paid, a place he
+//              stayed. The most reliable number in here, and the only
+//              one nobody else's app has.
+//
+// The rule that makes this worth anything: an UNSTAMPED number is an
+// estimate. Never let the absence of a stamp read as confidence.
+// =====================================================================
+
+enum ChappyTrust: String, Codable, CaseIterable {
+    case live, official, researched, estimated, record
+
+    var label: String {
+        switch self {
+        case .live:       return "Live"
+        case .official:   return "Official"
+        case .researched: return "Researched"
+        case .estimated:  return "Estimate"
+        case .record:     return "Your record"
+        }
+    }
+
+    /// One line explaining what the tag is actually claiming — shown on
+    /// tap in the app and in the report's legend, because a coloured
+    /// chip nobody can decode is decoration.
+    var meaning: String {
+        switch self {
+        case .live:       return "Fetched from the source just now."
+        case .official:   return "From the government or the operator itself."
+        case .researched: return "Found by searching on the date shown. Re-check if it's old."
+        case .estimated:  return "A model of typical cost. Fine for planning, don't quote it."
+        case .record:     return "From your own trips — a price you actually paid."
+        }
+    }
+
+    var hex: String {
+        switch self {
+        case .live:       return "#31c47d"
+        case .official:   return "#4cc4ff"
+        case .researched: return "#8fa4bd"
+        case .estimated:  return "#ffb454"
+        case .record:     return "#c48cff"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .live:       return "dot.radiowaves.left.and.right"
+        case .official:   return "checkmark.seal.fill"
+        case .researched: return "magnifyingglass"
+        case .estimated:  return "chart.line.uptrend.xyaxis"
+        case .record:     return "person.crop.circle.badge.checkmark"
+        }
+    }
+
+    /// How far a number of this kind can drift before it's misleading.
+    /// A rate goes stale in a day; a visa rule doesn't go stale, it
+    /// CHANGES, which is a different thing and needs re-checking on a
+    /// schedule rather than an expiry.
+    var staleAfterDays: Int? {
+        switch self {
+        case .live:       return 1
+        case .official:   return 60
+        case .researched: return 30
+        case .estimated:  return nil
+        case .record:     return nil
+        }
+    }
+}
+
+/// A fact, and everything you need to decide whether to act on it.
+struct ChappyStamp: Codable, Hashable {
+    var trust: String                 // ChappyTrust.rawValue — String for Codable safety
+    var at: Date
+    var source: String                // "Open-Meteo", "Smartraveller", "web search"
+    var url: String                   // where to go and check it yourself
+    var note: String                  // "return ticket required", "excludes resort fee"
+    var confidence: Int               // 0–100
+
+    init(_ trust: ChappyTrust, at: Date = Date(), source: String = "",
+         url: String = "", note: String = "", confidence: Int = 0) {
+        self.trust = trust.rawValue
+        self.at = at
+        self.source = source
+        self.url = url
+        self.note = note
+        // An unset confidence takes the tag's own default rather than
+        // reading as zero — "0% confident" is a claim, and not the one
+        // a missing value is making.
+        self.confidence = confidence > 0 ? min(100, confidence) : {
+            switch trust {
+            case .official: return 96
+            case .live: return 94
+            case .record: return 90
+            case .researched: return 72
+            case .estimated: return 55
+            }
+        }()
+    }
+
+    var kind: ChappyTrust { ChappyTrust(rawValue: trust) ?? .estimated }
+
+    var ageDays: Int {
+        Calendar.current.dateComponents([.day], from: at, to: Date()).day ?? 0
+    }
+
+    var isStale: Bool {
+        guard let limit = kind.staleAfterDays else { return false }
+        return ageDays > limit
+    }
+
+    /// "Researched 4 Aug · web search · 72%" — and when it's gone off,
+    /// it says so rather than quietly ageing.
+    var line: String {
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        var bits = [kind.label]
+        bits.append(ageDays == 0 ? "today" : f.string(from: at))
+        if !source.isEmpty { bits.append(source) }
+        if isStale { bits.append("needs re-checking") }
+        return bits.joined(separator: " · ")
+    }
+
+    var spoken: String {
+        switch kind {
+        case .official:   return "that's from \(source.isEmpty ? "the official source" : source), so it's solid"
+        case .live:       return "that one's live, checked just now"
+        case .record:     return "that's from your own trip, so it's a real number"
+        case .researched:
+            return isStale
+                ? "I found that \(ageDays) days ago, so it's worth me re-checking"
+                : "I searched that, so it's good but not a quote"
+        case .estimated:  return "that's my estimate, not a quote"
+        }
+    }
+}
+
+extension ChappyTravel {
+
+    /// The chip that goes next to a number in the report.
+    static func stampHTML(_ s: ChappyStamp) -> String {
+        let k = s.kind
+        var h = "<span class=\"tr\" style=\"color:\(k.hex);background:\(k.hex)1c;border-color:\(k.hex)44\">"
+        h += e(k.label.uppercased())
+        if s.isStale { h += " ·  old" }
+        h += "</span>"
+        return h
+    }
+
+    /// The legend, so the chips mean something. Goes near the bottom
+    /// with the rest of the honesty.
+    static func trustLegendHTML() -> String {
+        var h = "<div class=\"card\"><h2>How much to believe each number</h2>"
+        h += "<p class=\"s2\">Everything in this document carries one of these. It is the difference between "
+        h += "a number you can act on and a number you should check first — and no travel document I've seen "
+        h += "tells you which is which.</p>"
+        for k in ChappyTrust.allCases {
+            h += "<div class=\"row2\"><div class=\"rh\">"
+            h += "<b><span class=\"tr\" style=\"color:\(k.hex);background:\(k.hex)1c;border-color:\(k.hex)44\">"
+            h += "\(e(k.label.uppercased()))</span></b></div><p>\(e(k.meaning))</p></div>"
+        }
+        h += "<p class=\"foot\" style=\"padding:11px 0 0\">An unstamped number is an estimate. Chappy will never "
+        h += "let a missing tag read as confidence — if it doesn't say where something came from, treat it as "
+        h += "the weakest thing on this page.</p></div>"
+        return h
+    }
+}
+
+
+extension ChappyTravel {
+
+    /// The passport, in the document, because the person you forward
+    /// this to is usually the one whose passport is the problem.
+    func passportHTML(_ trip: Trip) -> String {
+        guard let start = trip.start else { return "" }
+        let p = ChappyProfile.shared
+        let E = Self.e
+
+        guard let v = p.passportCheck(entering: start,
+                                      country: trip.legs.first?.country ?? "") else {
+            // No expiry on file. Say so — silence here reads as "checked
+            // and fine", which is the one thing it must never read as.
+            return """
+            <div class="card"><h2>Passport</h2>
+            <p class="s2" style="color:var(--warn)">I don't have your passport expiry, so I could not check the \
+            six-month rule — and that rule refuses more Australians at the check-in desk than visas refuse at the \
+            border. Add it once in Travel Desk settings and every trip from here on gets checked automatically.</p>
+            </div>
+            """
+        }
+
+        let tint = v.level == "HIGH" ? "var(--bad)" : (v.level == "MEDIUM" ? "var(--warn)" : "var(--good)")
+        var h = "<div class=\"card\"><h2>Passport"
+        h += Self.stampHTML(ChappyStamp(.record, source: "your profile"))
+        h += "</h2>"
+        h += "<div class=\"risk\"><span class=\"rl \(v.level)\">\(v.level)</span><div>"
+        h += "<b style=\"color:\(tint)\">\(E(v.headline))</b><span class=\"d\">\(E(v.detail))</span>"
+        h += "</div></div>"
+        if !p.data.secondPassport.isEmpty {
+            h += "<p class=\"s2\" style=\"margin-top:10px\">You also hold a \(E(p.data.secondPassport)) passport — "
+            h += "worth checking which one gives the longer stay here. It is often not the one you'd assume.</p>"
+        }
+        h += "<p class=\"foot\" style=\"padding:9px 0 0\">Six months' validity from the date of entry is the common "
+        h += "requirement across South-East Asia; Schengen asks three months beyond your departure. The airline "
+        h += "enforces it, not the border, because the airline is liable for carrying you.</p></div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 185 — WHAT IT ACTUALLY COSTS.
+//
+// The most common way travel software lies is not by being wrong. It
+// is by being incomplete, and then presenting the incomplete number in
+// a big confident font.
+//
+// A $180 fare with $95 of bags is not cheaper than a $240 fare that
+// includes them, and until this build Chappy would have told him it
+// was — it compared headline prices, like everything else does. A room
+// at $140 a night in Kuala Lumpur is $140 plus RM10 a night of tourism
+// tax charged at check-out and not shown online. A Bali trip has a
+// per-person levy nobody mentions until the arrivals hall. Every one
+// of these is small; together they are consistently 8-15% of a trip,
+// and they land entirely after the decision has been made.
+//
+// So: one function that takes a trip and returns what leaves the bank
+// account. Baked tables where the number is stable (baggage rules and
+// tourism taxes change once a year, not once a day), research where it
+// is not, and a stamp on every line so it is obvious which is which.
+//
+// Two things this deliberately does NOT do:
+//
+//   * Pretend to be a quote. Every figure here is typical, stamped
+//     ESTIMATE or RESEARCHED, and says so.
+//   * Hide the avoidable ones. Half these fees are optional — a
+//     carry-on-only trip pays no baggage fee, a no-FX-fee card pays
+//     no card fee. Telling him what he could avoid is worth more
+//     than telling him what he owes.
+// =====================================================================
+
+@MainActor
+final class ChappyTrueCost {
+
+    enum Kind: String, CaseIterable {
+        case baggage, seat, tourismTax, resortFee, cleaning, cardFX, atm
+        case cancellation, deposit, parking, transfer, other
+
+        var label: String {
+            switch self {
+            case .baggage:      return "Checked bags"
+            case .seat:         return "Seat selection"
+            case .tourismTax:   return "Tourism & city taxes"
+            case .resortFee:    return "Resort fees"
+            case .cleaning:     return "Cleaning & service fees"
+            case .cardFX:       return "Card foreign-transaction fees"
+            case .atm:          return "ATM withdrawal fees"
+            case .cancellation: return "Cancellation & change fees"
+            case .deposit:      return "Deposits held"
+            case .parking:      return "Parking"
+            case .transfer:     return "Airport transfers"
+            case .other:        return "Other"
+            }
+        }
+
+        // AUDIT: a `Kind.avoidable` property lived here, nothing read it,
+        // and it DISAGREED with Result.avoidable — which keys off whether
+        // the fee carries an avoidedBy sentence. Two sources of truth, one
+        // of them dead, is how the next edit introduces a bug. The living
+        // one wins; this is gone.
+    }
+
+    struct Fee: Identifiable {
+        var id: String { "\(kind.rawValue)-\(label)" }
+        var kind: Kind
+        var label: String
+        /// Always in the trip's home currency by the time it lands here.
+        var amount: Double
+        var note: String
+        var stamp: ChappyStamp
+        var avoidedBy: String   // "" when there is nothing he can do about it
+    }
+
+    struct Result {
+        var headline: Double        // what the plan says
+        var fees: [Fee]
+        var trip: String            // the trip's name, for the report
+        var currency: String
+
+        var hidden: Double { fees.reduce(0) { $0 + $1.amount } }
+        var total: Double { headline + hidden }
+        var avoidable: Double { fees.filter { !$0.avoidedBy.isEmpty }.reduce(0) { $0 + $1.amount } }
+        /// The number that matters: how far off the headline was.
+        var uplift: Double { headline > 0 ? hidden / headline : 0 }
+
+        var byKind: [(Kind, Double)] {
+            Kind.allCases.compactMap { k in
+                let t = fees.filter { $0.kind == k }.reduce(0) { $0 + $1.amount }
+                return t > 0 ? (k, t) : nil
+            }
+            .sorted { $0.1 > $1.1 }
+        }
+    }
+
+    // MARK: baked tables
+
+    struct Baggage {
+        var airline: String
+        var carryOnKg: Int
+        var checkedIncludedKg: Int
+        var checkedCostAUD: Double
+        var seatAUD: Double
+        var note: String
+        var isLowCost: Bool { checkedIncludedKg == 0 && checkedCostAUD > 0 }
+    }
+
+    private static let bagTable = """
+Jetstar|7|0|38|8|Bundles are usually cheaper than adding bags later, and much cheaper than at the airport
+Scoot|10|0|42|10|Buy the bag online — the airport price is roughly double
+AirAsia|7|0|30|6|20kg prepaid. The 7kg cabin limit is weighed at the gate on Indonesian routes
+VietJet|7|0|26|5|Weighed strictly. Overweight at the gate is charged per kilo and it is brutal
+Cebu Pacific|7|0|32|6|Prepaid bags only. Airport rate is about triple
+Lion Air|7|0|24|0|Domestic Indonesia. Cash at the counter is common
+Super Air Jet|7|0|24|0|Same group as Lion. No bag included on any fare
+Citilink|7|20|0|0|20kg included on most domestic Indonesian fares
+Batik Air|7|20|0|0|20kg usually included — check the fare class, it varies
+Qantas|7|30|0|0|30kg on international, 23kg domestic, both included
+Jetstar Asia|7|0|38|8|Separate from Jetstar Australia — bags do not carry across
+Virgin Australia|7|23|0|10|Checked included on most fares above the cheapest
+Singapore Airlines|7|30|0|0|30kg economy included. Seat selection free at check-in
+Scoot Plus|15|30|0|0|Included in the fare
+Garuda Indonesia|7|30|0|0|30kg included, and generous about it
+Thai Airways|7|30|0|0|30kg included
+Vietnam Airlines|10|23|0|0|23kg included on international economy
+Malaysia Airlines|7|30|0|0|30kg included
+Philippine Airlines|7|23|0|0|23kg included on international
+Emirates|7|30|0|0|30kg economy included
+Qatar Airways|7|30|0|0|30kg economy included
+Etihad|7|30|0|0|30kg economy included
+ANA|10|46|0|0|Two 23kg bags included
+Japan Airlines|10|46|0|0|Two 23kg bags included
+Korean Air|10|23|0|0|23kg included
+China Airlines|7|30|0|0|30kg included
+EVA Air|7|30|0|0|30kg included
+Cathay Pacific|7|30|0|0|30kg included
+Air New Zealand|7|23|0|12|Seat fee only on the cheapest fare
+Bangkok Airways|7|20|0|0|20kg included, and a lounge even in economy
+"""
+
+    static let baggage: [Baggage] = {
+        bagTable.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard f.count == 6, let c = Int(f[1]), let inc = Int(f[2]),
+                  let cost = Double(f[3]), let seat = Double(f[4]) else { return nil }
+            return Baggage(airline: String(f[0]), carryOnKg: c, checkedIncludedKg: inc,
+                           checkedCostAUD: cost, seatAUD: seat, note: String(f[5]))
+        }
+    }()
+
+    static func baggage(for airline: String) -> Baggage? {
+        let q = airline.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return nil }
+        return baggage.first { $0.airline.lowercased() == q }
+            ?? baggage.first { q.contains($0.airline.lowercased()) }
+            ?? baggage.first { $0.airline.lowercased().contains(q) && q.count >= 4 }
+    }
+
+    struct Tax {
+        var country: String
+        var perNight: Double
+        var perNightCurrency: String
+        var oneOff: Double
+        var oneOffCurrency: String
+        var label: String
+        var note: String
+        /// AUDIT: the per-night branch never multiplied by the party while
+        /// the one-off branch did — and most of these ARE per person per
+        /// night. Two people, ten nights in Kyoto came out at exactly half
+        /// the real tax. Guessing was the bug; the table says it now.
+        var perPerson: Bool = false
+    }
+
+    private static let taxTable = """
+Indonesia|0|IDR|150000|IDR|Bali tourist levy|One-off, per person, paid on arrival in Bali or online beforehand. Pay it online — the airport queue is the airport queue
+Malaysia|10|MYR|0|MYR|Tourism tax|Per room per night, foreign guests only. Charged at check-out, rarely in the online price|0
+Japan|200|JPY|0|JPY|Accommodation tax|Per person per night, varies by city and room rate — Kyoto is the steepest|1
+Philippines|0|PHP|300|PHP|Environmental fee|Boracay and some island municipalities. Cash on arrival
+New Zealand|0|NZD|100|NZD|Visitor levy (IVL)|One-off, paid with the NZeTA before you fly
+Australia|0|AUD|70|AUD|Passenger movement charge|Built into the ticket price on departure
+United Arab Emirates|15|AED|0|AED|Tourism dirham|Per room per night, plus a municipality fee on the room rate|0
+United States|0|USD|0|USD|Occupancy tax|10-17% of the room rate depending on the city, plus resort fees — neither shows in the headline
+Mexico|0|MXN|500|MXN|Visitor tax|Quintana Roo (Cancun, Tulum, Playa) charges a state visitor tax
+Italy|3|EUR|0|EUR|City tax|Per person per night, cash at the property, capped at a few nights|1
+Greece|3|EUR|0|EUR|Climate resilience levy|Per room per night, higher in summer and at better hotels|0
+Spain|2|EUR|0|EUR|Tourist tax|Catalonia and the Balearics. Per person per night|1
+Portugal|2|EUR|0|EUR|Municipal tourist tax|Lisbon and Porto. Per person per night, capped|1
+France|2|EUR|0|EUR|Taxe de sejour|Per person per night, scales with the hotel's star rating|1
+Netherlands|0|EUR|0|EUR|Tourist tax|Amsterdam charges a percentage of the room rate — one of the highest in Europe
+Croatia|2|EUR|0|EUR|Sojourn tax|Per person per night, higher in peak season|1
+Thailand|0|THB|0|THB|Arrival fee|A 300 THB arrival fee has been announced and postponed repeatedly. Check before you fly rather than assuming
+"""
+
+    static let taxes: [Tax] = {
+        taxTable.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard f.count >= 7, let pn = Double(f[1]), let oo = Double(f[3]) else { return nil }
+            return Tax(country: String(f[0]), perNight: pn, perNightCurrency: String(f[2]),
+                       oneOff: oo, oneOffCurrency: String(f[4]),
+                       label: String(f[5]), note: String(f[6]),
+                       perPerson: f.count > 7 && f[7] == "1")
+        }
+    }()
+
+    static func tax(for country: String) -> Tax? {
+        let q = country.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return nil }
+        return taxes.first { $0.country.lowercased() == q }
+    }
+
+    struct Cash {
+        var country: String
+        var atmFee: Double
+        var currency: String
+        var note: String
+    }
+
+    private static let cashTable = """
+Indonesia|50000|IDR|Cash country outside Bali's tourist strip. BCA and Mandiri charge the least; Rp 3.5m is a common per-withdrawal cap
+Thailand|220|THB|Every ATM charges it, no exceptions, and it is per withdrawal — so take out more, less often
+Vietnam|55000|VND|TPBank and Techcombank are usually free. Most others charge, and low caps make it worse
+Philippines|250|PHP|Low withdrawal caps (PHP 10,000 is common) make the flat fee bite twice
+Malaysia|12|MYR|Card acceptance is good in cities. Fee is modest
+Japan|220|JPY|7-Eleven and Japan Post take foreign cards reliably; bank ATMs often will not
+Taiwan|100|TWD|Widely accepted cards, low fees
+Sri Lanka|600|LKR|Cash economy outside Colombo
+India|200|INR|UPI dominates locally, but cards work in hotels and restaurants
+Cambodia|20000|KHR|US dollars are used interchangeably; ATMs dispense both
+Mexico|60|MXN|Use bank-branded ATMs inside branches, not the ones in shops
+Georgia|0|GEL|Bank of Georgia and TBC are usually free to foreign cards
+"""
+
+    static let cash: [Cash] = {
+        cashTable.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard f.count == 4, let fee = Double(f[1]) else { return nil }
+            return Cash(country: String(f[0]), atmFee: fee,
+                        currency: String(f[2]), note: String(f[3]))
+        }
+    }()
+
+    static func cash(for country: String) -> Cash? {
+        let q = country.lowercased().trimmingCharacters(in: .whitespaces)
+        return cash.first { $0.country.lowercased() == q }
+    }
+
+    /// The default Australian card. Three per cent is the standard bank
+    /// fee and there is no reason on earth to pay it — which is exactly
+    /// why it belongs on the list rather than buried in a statement.
+    static let defaultCardFXPercent = 3.0
+
+    static let feeFreeCards = "ING Orange Everyday, Macquarie Transaction, Ubank, Wise, Revolut and most Bankwest travel cards charge no international transaction fee."
+
+    // MARK: the calculation
+
+    static let shared = ChappyTrueCost()
+    private init() {}
+
+    /// Everything the plan doesn't count.
+    func compute(_ trip: ChappyTravel.Trip) -> Result {
+        let desk = ChappyTravel.shared
+        let home = trip.homeCurrency.uppercased()
+        let party = max(1, trip.party)
+        var fees: [Fee] = []
+
+        func toHome(_ amount: Double, _ code: String) -> Double? {
+            let c = code.uppercased()
+            if c == home { return amount }
+            return ChappyFX.shared.convert(amount, from: c, to: home)
+        }
+
+        // ---------------------------------------------------------- bags
+        //
+        // Only the airlines that actually charge. An airline with 30kg
+        // included does not produce a line saying "bags: $0" — a
+        // breakdown full of zeroes is a breakdown nobody reads.
+        // AUDIT: this de-duplicated by AIRLINE, so a four-flight itinerary
+        // on one carrier was charged for a single bag — and the return
+        // sector isn't a Leg at all, so it was never charged either. The
+        // largest avoidable fee on the trip was understated by half or
+        // more, in a panel whose entire job is to find it.
+        //
+        // Count SECTORS. Add the flight home unless the trip is one-way.
+        var sectors: [(String, Int)] = []
+        for leg in trip.legs where leg.arrival == .flight {
+            guard let name = Self.airlineName(from: leg.arrivalNote)
+                ?? Self.airlineName(from: trip.flights?.airlines ?? "") else { continue }
+            if let i = sectors.firstIndex(where: { $0.0 == name }) { sectors[i].1 += 1 }
+            else { sectors.append((name, 1)) }
+        }
+        if trip.oneWay != true, !sectors.isEmpty {
+            // The way home is on whichever carrier flies the most of this
+            // trip — a guess, and a better one than pretending it's free.
+            if let i = sectors.indices.max(by: { sectors[$0].1 < sectors[$1].1 }) {
+                sectors[i].1 += 1
+            }
+        }
+        for (name, count) in sectors {
+            guard let b = Self.baggage(for: name), b.isLowCost else { continue }
+            let bags = b.checkedCostAUD * Double(party) * Double(count)
+            if let converted = toHome(bags, "AUD"), converted > 0 {
+                fees.append(Fee(
+                    kind: .baggage,
+                    label: "\(b.airline) — checked bag, \(count) sector\(count == 1 ? "" : "s")\(party > 1 ? " × \(party)" : "")",
+                    amount: converted,
+                    note: b.note,
+                    stamp: ChappyStamp(.estimated, source: "airline fee table", confidence: 68),
+                    avoidedBy: "Travel carry-on only — \(b.carryOnKg)kg each, and they weigh it at the gate."))
+            }
+            if b.seatAUD > 0,
+               let seat = toHome(b.seatAUD * Double(party) * Double(count), "AUD") {
+                fees.append(Fee(
+                    kind: .seat, label: "\(b.airline) — seat selection, \(count) sector\(count == 1 ? "" : "s")",
+                    amount: seat, note: "Only worth paying on a long sector, or if you must sit together.",
+                    stamp: ChappyStamp(.estimated, source: "airline fee table", confidence: 60),
+                    avoidedBy: "Take the seat you're given. On a two-hour hop it costs you nothing."))
+            }
+        }
+
+        // ---------------------------------------------------------- taxes
+        var seenOneOff = Set<String>()
+        for leg in trip.legs {
+            let country = ChappyVisa.country(from: leg.country)
+                ?? ChappyVisa.country(from: leg.place) ?? leg.country
+            guard let t = Self.tax(for: country) else { continue }
+
+            if t.perNight > 0, leg.nights > 0 {
+                let raw = t.perNight * Double(leg.nights) * (t.perPerson ? Double(party) : 1)
+                if let converted = toHome(raw, t.perNightCurrency), converted > 0 {
+                    fees.append(Fee(
+                        kind: .tourismTax,
+                        label: "\(country) \(t.label.lowercased()) — \(leg.nights) nights in \(leg.place)",
+                        amount: converted, note: t.note,
+                        stamp: ChappyStamp(.researched, source: "national tourism tax", confidence: 74),
+                        avoidedBy: ""))
+                }
+            }
+            if t.oneOff > 0, !seenOneOff.contains(country) {
+                seenOneOff.insert(country)
+                let raw = t.oneOff * Double(party)
+                if let converted = toHome(raw, t.oneOffCurrency), converted > 0 {
+                    fees.append(Fee(
+                        kind: .tourismTax,
+                        label: "\(country) \(t.label.lowercased())\(party > 1 ? " × \(party)" : "")",
+                        amount: converted, note: t.note,
+                        stamp: ChappyStamp(.researched, source: "national tourism tax", confidence: 78),
+                        avoidedBy: ""))
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- the card
+        //
+        // Three per cent of everything spent in country. It is the
+        // single largest avoidable fee on most trips and it is invisible
+        // by design — it arrives as a slightly wrong number on a
+        // statement three weeks later.
+        let c = desk.cost(trip)
+        let onTheGround = c.food + c.ground + c.activities
+        if onTheGround > 0 {
+            let hasFeeFree = ChappyProfile.shared.data.cardBenefits.contains {
+                let l = $0.lowercased()
+                return l.contains("no international") || l.contains("no foreign")
+                    || l.contains("wise") || l.contains("revolut") || l.contains("ing")
+                    || l.contains("macquarie") || l.contains("ubank")
+            }
+            if !hasFeeFree {
+                fees.append(Fee(
+                    kind: .cardFX,
+                    label: "Card foreign-transaction fee, \(Int(Self.defaultCardFXPercent))% of local spending",
+                    amount: onTheGround * Self.defaultCardFXPercent / 100,
+                    note: "Charged on every card transaction abroad, and on the ATM withdrawal itself.",
+                    stamp: ChappyStamp(.estimated, source: "standard Australian bank fee", confidence: 80),
+                    avoidedBy: Self.feeFreeCards))
+            }
+        }
+
+        // ---------------------------------------------------------- cash
+        // AUDIT: this charged the WHOLE TRIP'S nights in EVERY country.
+        // A 28-night trip across four countries produced 32 withdrawals
+        // for 28 nights — roughly four times the real fee, inflating the
+        // total and dragging the hidden-cost score down two bands.
+        //
+        // Also ordered by Set iteration, which is hash-seeded per process,
+        // so the same report put its ATM lines in a different order every
+        // time it was generated.
+        var countryNights: [(String, Int)] = []
+        for leg in trip.legs {
+            guard let c = ChappyVisa.country(from: leg.country)
+                ?? ChappyVisa.country(from: leg.place) else { continue }
+            if let i = countryNights.firstIndex(where: { $0.0 == c }) {
+                countryNights[i].1 += max(0, leg.nights)
+            } else {
+                countryNights.append((c, max(0, leg.nights)))
+            }
+        }
+        for (country, nightsThere) in countryNights {
+            guard let k = Self.cash(for: country), k.atmFee > 0 else { continue }
+            // Roughly one withdrawal a week per person is what people
+            // actually do — more than that and the flat fee is the point.
+            let draws = max(1.0, Double(nightsThere) / 7.0) * Double(party)
+            if let converted = toHome(k.atmFee * draws, k.currency), converted > 0 {
+                fees.append(Fee(
+                    kind: .atm,
+                    label: "\(country) — ATM fees, about \(Int(draws.rounded())) withdrawals",
+                    amount: converted, note: k.note,
+                    stamp: ChappyStamp(.estimated, source: "typical local ATM fee", confidence: 62),
+                    avoidedBy: "Draw larger amounts less often — the fee is per withdrawal, not per dollar."))
+            }
+        }
+
+        // ---------------------------------------------------------- stays
+        //
+        // Airbnb's cleaning and service fees are a percentage of the
+        // stay and they are why a "$90 a night" villa costs $118 a
+        // night. Only applied where the stay looks like a short-term
+        // rental rather than a hotel.
+        for leg in trip.legs where leg.nightlyRate > 0 {
+            let name = leg.stayName.lowercased()
+            // AUDIT: the 14-night cutoff silently charged NOTHING on a
+            // fortnight's villa, when only the flat cleaning fee is
+            // length-sensitive — the service fee applies to any stay.
+            // And the detector missed most real plans, because the
+            // planner writes "Ubud centre", not "Ubud villa".
+            let looksLikeSTR = ["villa", "airbnb", "apartment", "house", "homestay",
+                                "guesthouse", "studio", "bungalow", "cottage"]
+                .contains { name.contains($0) }
+            guard looksLikeSTR, leg.nights >= 1 else { continue }
+            let cur = desk.localCurrency(for: leg, in: trip)
+            let stay = leg.nightlyRate * Double(leg.nights)
+            let pct = 0.14
+            // The cleaning fee is the same for three nights or thirty,
+            // which is why it only distorts the short ones.
+            let cleaning = leg.nights <= 13 ? leg.nightlyRate * 0.8 : 0
+            if let converted = toHome(stay * pct + cleaning, cur), converted > 0 {
+                fees.append(Fee(
+                    kind: .cleaning,
+                    label: "\(leg.place) — service & cleaning fees on \(leg.nights) nights",
+                    amount: converted,
+                    note: "Short-term rental platforms add roughly 14% service plus a flat cleaning fee. The cleaning fee is the same whether you stay three nights or thirty, which is why short stays are disproportionately expensive.",
+                    stamp: ChappyStamp(.estimated, source: "platform fee norms", confidence: 58),
+                    avoidedBy: "Stay longer, or book a guesthouse direct — neither charges a cleaning fee."))
+            }
+        }
+
+        return Result(headline: c.total, fees: fees, trip: trip.name, currency: home)
+    }
+
+    /// Airlines turn up in free text — "QF52", "Jetstar overnight",
+    /// "flight with Scoot". Match the name, never the flight number.
+    /// AUDIT: this was private, so the flights screen fell back to
+    /// baggage(for:) — which is an EXACT string match — against
+    /// FlightBrief.airlines, which is model-written free text like
+    /// "Jetstar, Scoot". It never matched, so the "what's included"
+    /// card silently never rendered. The fuzzy matcher already existed;
+    /// it just wasn't reachable.
+    static func airlineName(from text: String) -> String? {
+        let t = text.lowercased()
+        guard !t.isEmpty else { return nil }
+        // Longest name first: "Scoot" precedes "Scoot Plus" in the table,
+        // so a Scoot Plus fare — which includes 30kg — was matched to
+        // Scoot and charged a phantom bag fee. Same for Jetstar Asia.
+        for b in baggage.sorted(by: { $0.airline.count > $1.airline.count })
+        where t.contains(b.airline.lowercased()) { return b.airline }
+        return nil
+    }
+}
+
+
+// =====================================================================
+// BUILD 185 — THE DEAL SCORE, AND WHY MOST OF THEM ARE WORTHLESS.
+//
+// Every travel site has a score. They are all between 8.1 and 9.4,
+// they never disagree with the price, and nobody has ever changed a
+// decision because of one. Two design faults cause that, and both are
+// avoidable:
+//
+//   1. UNKNOWNS SCORE WELL. When a system can't measure something it
+//      quietly gives it full marks, or a benign 80, and averages it
+//      in. Twelve inputs, eight unknown, and the answer is 88 out of
+//      100 with a straight face.
+//
+//      Here, an unknown is not scored at all. The weights renormalise
+//      over what is actually known and the result CARRIES ITS
+//      COVERAGE — "74, from 7 of 12 inputs". A score built on half
+//      the picture says so, out loud, next to the number.
+//
+//   2. THE FLOOR IS TOO HIGH. A scale that bottoms out at 70 is a
+//      badge, not a judgement. This one is allowed to return 41, and
+//      it is allowed to score the CHEAPEST option lowest — which is
+//      the entire point, and the thing that makes the other 99
+//      numbers worth reading.
+//
+// Every component carries its own sentence. A score without its
+// reasoning is a horoscope.
+// =====================================================================
+
+@MainActor
+final class ChappyScore {
+
+    static let shared = ChappyScore()
+    private init() {}
+
+    struct Component: Identifiable {
+        var id: String { name }
+        var name: String
+        /// 0-100, or nil when it genuinely isn't known. nil is not zero
+        /// and it is not eighty — it is excluded and counted.
+        var score: Int?
+        var weight: Double
+        var why: String
+        var stamp: ChappyStamp
+
+        var hex: String {
+            guard let s = score else { return "#66748a" }
+            if s >= 80 { return "#31c47d" }
+            if s >= 60 { return "#8fd17a" }
+            if s >= 45 { return "#ffb454" }
+            return "#ff6b5e"
+        }
+    }
+
+    struct Verdict {
+        var total: Int
+        var components: [Component]
+        var headline: String
+        var argument: [String]
+        var redFlags: [String]
+
+        var known: [Component] { components.filter { $0.score != nil } }
+        var coverage: String { "from \(known.count) of \(components.count) inputs" }
+        /// How much to trust the score itself, as opposed to what it says.
+        var confident: Bool { Double(known.count) / Double(max(1, components.count)) >= 0.6 }
+
+        var band: String {
+            switch total {
+            case 85...:  return "Exceptional"
+            case 70..<85: return "Strong"
+            case 55..<70: return "Fair"
+            case 40..<55: return "Weak"
+            default:      return "Poor"
+            }
+        }
+
+        var hex: String {
+            switch total {
+            case 80...:   return "#31c47d"
+            case 62..<80: return "#8fd17a"
+            case 45..<62: return "#ffb454"
+            default:      return "#ff6b5e"
+            }
+        }
+    }
+
+    // MARK: the scoring
+
+    func score(_ trip: ChappyTravel.Trip) -> Verdict {
+        let desk = ChappyTravel.shared
+        let c = desk.cost(trip)
+        let truth = ChappyTrueCost.shared.compute(trip)
+        var comps: [Component] = []
+        var flags: [String] = []
+
+        // ---------------------------------------------------------- price
+        //
+        // Not "is it cheap" — is it good FOR WHAT IT IS. The planner
+        // researched a band for each line; how the plan sits inside
+        // those bands is the only price question worth asking.
+        var graded = 0, wins = 0
+        for leg in trip.legs {
+            let cur = desk.localCurrency(for: leg, in: trip)
+            func judge(_ value: Double, _ band: ChappyTravel.Band?) {
+                guard value > 0, let b = band, b.high > b.low else { return }
+                graded += 1
+                if value <= b.low + (b.high - b.low) * 0.35 { wins += 1 }
+            }
+            _ = cur
+            judge(leg.nightlyRate, leg.stayBand)
+            judge(leg.arrivalCost, leg.arrivalBand)
+            judge(leg.foodPerDay, leg.foodBand)
+            judge(leg.groundPerDay, leg.groundBand)
+        }
+        if graded >= 2 {
+            let ratio = Double(wins) / Double(graded)
+            let sc = Int((28 + ratio * 68).rounded())
+            comps.append(Component(
+                name: "Price against what things cost there",
+                score: min(100, sc), weight: 2.2,
+                why: wins == graded
+                    ? "Every priced line sits in the bottom third of what these things go for in these places at this time of year."
+                    : "\(wins) of \(graded) priced lines are in the bottom third of the local range; the rest are mid-band or above.",
+                stamp: ChappyStamp(.researched, source: "price bands", confidence: 70)))
+        } else {
+            comps.append(Component(
+                name: "Price against what things cost there",
+                score: nil, weight: 2.2,
+                why: "No price bands on this plan yet — nothing to compare the numbers against, so this is not scored rather than guessed.",
+                stamp: ChappyStamp(.estimated, source: "not available", confidence: 20)))
+        }
+
+        // ---------------------------------------------------------- hidden fees
+        //
+        // The uplift between headline and reality. Under 5% is a clean
+        // plan; over 20% means the headline was fiction.
+        if c.total > 0 {
+            let up = truth.uplift
+            let sc: Int
+            switch up {
+            case ..<0.03: sc = 96
+            case ..<0.07: sc = 82
+            case ..<0.12: sc = 64
+            case ..<0.20: sc = 44
+            default:      sc = 24
+            }
+            comps.append(Component(
+                name: "Hidden costs",
+                score: sc, weight: 1.8,
+                why: truth.fees.isEmpty
+                    ? "Nothing found beyond the plan — no baggage fees, no tourism taxes, no platform fees on these bookings."
+                    : String(format: "%@ of fees the headline doesn't show — %.0f%% on top. %@",
+                             ChappyFX.money(truth.hidden, trip.homeCurrency), up * 100,
+                             truth.avoidable > 0
+                                ? "\(ChappyFX.money(truth.avoidable, trip.homeCurrency)) of it is avoidable."
+                                : "None of it is avoidable."),
+                stamp: ChappyStamp(.estimated, source: "fee tables", confidence: 70)))
+            if up > 0.18, c.total > 0 {
+                flags.append(String(format: "The real cost is %.0f%% above the headline. Any comparison you've done against another plan is comparing the wrong numbers.", up * 100))
+            }
+        }
+
+        // ---------------------------------------------------------- season
+        // Season is scored from the three-year climate record the weather
+        // module already caches — wet share is the honest single number,
+        // because "28 degrees" means nothing if it rains every afternoon.
+        // AUDIT, found by running ten simulations against this scorer:
+        // averaging the stops instead of the NIGHTS let a plan with 34 of
+        // 84 nights sitting in a monsoon score 82 for season, because four
+        // dry four-night stops outvoted two wet twenty-night ones. The
+        // nights are what you live in. Weight by them.
+        var wetShares: [(String, Double, String, Int)] = []
+        for leg in trip.legs where leg.hasCoord {
+            let month = Calendar.current.component(.month, from: leg.arrive)
+            guard let n = ChappySeason.shared.normals(lat: leg.lat, lon: leg.lon, month: month),
+                  n.totalDays > 0 else { continue }
+            // AUDIT, also from the simulations: a Hokkaido ski trip scored
+            // badly for "season" because Niseko has precipitation on 72%
+            // of January days. That precipitation is the entire reason to
+            // go. Below about three degrees it is snow, and snow is not
+            // weather to be scored against — so the sign flips.
+            let freezing = n.maxC <= 3
+            let effective = freezing ? max(0, 0.30 - n.wetShare * 0.25) : n.wetShare
+            let verdict = freezing
+                ? "snow — \(Int(n.wetShare * 100))% of days see falling snow, which is why you are going"
+                : n.verdict
+            wetShares.append((leg.place, effective, verdict, max(1, leg.nights)))
+        }
+        if wetShares.isEmpty {
+            comps.append(Component(
+                name: "Season",
+                score: nil, weight: 1.6,
+                why: "No climate record loaded for these places yet — open the trip's weather once and this starts scoring.",
+                stamp: ChappyStamp(.estimated, source: "not available", confidence: 20)))
+        } else {
+            let totalNights = wetShares.reduce(0) { $0 + $1.3 }
+            let avg = wetShares.reduce(0.0) { $0 + $1.1 * Double($1.3) } / Double(max(1, totalNights))
+
+            // AUDIT: even night-weighted, an average hides a bad month.
+            // 34 of 84 nights on Thailand's Gulf coast in December — its
+            // monsoon — still averaged out to "fair", because fifty dry
+            // nights elsewhere diluted it. A third of a trip in the rain
+            // is not a fair season, it is a scheduling mistake, and the
+            // score has to be able to say so.
+            let soakedNights = wetShares.filter { $0.1 >= 0.50 }.reduce(0) { $0 + $1.3 }
+            let soakedShare = Double(soakedNights) / Double(max(1, totalNights))
+
+            var sc: Int
+            switch avg {
+            case ..<0.15: sc = 95
+            case ..<0.30: sc = 82
+            case ..<0.45: sc = 62
+            case ..<0.62: sc = 42
+            default:      sc = 22
+            }
+            if soakedShare >= 0.25 { sc = min(sc, 38) }
+            let worst = wetShares.max { $0.1 < $1.1 }
+            comps.append(Component(
+                name: "Season",
+                score: sc, weight: 1.6,
+                why: soakedShare >= 0.25
+                    ? "\(soakedNights) of \(totalNights) nights are somewhere that sees rain every other day or worse in this month. The wettest is \(worst?.0 ?? "") — \(worst?.2 ?? "")."
+                    : (wetShares.count == 1
+                        ? "\(wetShares[0].0) in this month: \(wetShares[0].2)."
+                        : "Across \(totalNights) nights the wettest stop is \(worst?.0 ?? "") — \(worst?.2 ?? "")."),
+                stamp: ChappyStamp(.researched, source: "3-year climate record", confidence: 76)))
+            if sc <= 42, let w = worst, w.1 >= 0.40 {
+                flags.append("\(w.0) is \(w.2) in this month. That is not a detail — it decides what the days look like.")
+            }
+        }
+
+        // ---------------------------------------------------------- visa headroom
+        let positions = ChappyVisa.shared.positions(for: trip)
+        if !positions.isEmpty {
+            let worst = positions.map { p -> Int in
+                guard p.allowance > 0 else { return 60 }
+                if p.over { return 0 }
+                let spare = p.allowance - p.days
+                if spare <= 2 { return 30 }
+                if spare <= 7 { return 55 }
+                if spare <= 21 { return 82 }
+                return 95
+            }.min() ?? 70
+            let over = positions.filter(\.over).map(\.country)
+            comps.append(Component(
+                name: "Visa headroom",
+                score: worst, weight: 1.5,
+                why: over.isEmpty
+                    ? positions.map { "\($0.country): \($0.verdict)" }.joined(separator: " · ")
+                    : "OVER the limit in \(over.joined(separator: ", ")). This is not a fine, it is a refused boarding.",
+                stamp: ChappyStamp(.researched, source: "immigration rules",
+                                   note: "confirm officially", confidence: 72)))
+            if !over.isEmpty { flags.append("Over the visa limit in \(over.joined(separator: ", ")).") }
+        }
+
+        // ---------------------------------------------------------- passport
+        if let start = trip.start,
+           let v = ChappyProfile.shared.passportCheck(entering: start,
+                                                      country: trip.legs.first?.country ?? "") {
+            comps.append(Component(
+                name: "Passport validity",
+                score: v.level == "HIGH" ? 5 : (v.level == "MEDIUM" ? 62 : 98),
+                weight: 1.4, why: v.headline,
+                stamp: ChappyStamp(.record, source: "your profile", confidence: 95)))
+            if !v.ok { flags.append(v.headline + " — this stops you at check-in, not at the border.") }
+        } else {
+            comps.append(Component(
+                name: "Passport validity",
+                score: nil, weight: 1.4,
+                why: "No passport expiry on file, so the six-month rule could not be checked. That rule refuses more Australians than visas do.",
+                stamp: ChappyStamp(.estimated, source: "not set", confidence: 10)))
+        }
+
+        // ---------------------------------------------------------- onward
+        let onward = ChappyOnward.shared.needs(trip)
+        if !onward.isEmpty {
+            let unmet = onward.filter { !$0.satisfied }
+            let lapsing = onward.filter { $0.expiresBefore }
+            let sc: Int = unmet.isEmpty ? 96
+                : (unmet.contains { $0.rule.enforcement == .strict } ? 5 : 55)
+            comps.append(Component(
+                name: "Onward ticket",
+                score: sc, weight: 1.5,
+                why: unmet.isEmpty
+                    ? "Held for \(onward.map(\.country).joined(separator: ", "))."
+                    : (lapsing.isEmpty
+                        ? (ChappyOnward.shared.summary(trip) ?? "Not held.")
+                        : "Held, but it lapses before you fly — a temporary reservation is only proof on the day, and this one has already cancelled itself by the time you reach the desk."),
+                stamp: ChappyStamp(.researched, source: "airline boarding rules", confidence: 82)))
+        }
+
+        // ---------------------------------------------------------- how much moving
+        let moves = trip.legs.count
+        let nights = max(1, trip.nights)
+        if moves > 0 {
+            let perStop = Double(nights) / Double(moves)
+            let sc: Int
+            switch perStop {
+            case ..<2.0:  sc = 30
+            case ..<3.0:  sc = 55
+            case ..<4.5:  sc = 78
+            case ..<10.0: sc = 94
+            default:      sc = 84
+            }
+            comps.append(Component(
+                name: "Pace",
+                score: sc, weight: 1.2,
+                why: String(format: "%d stops over %d nights — %.1f nights a stop. %@",
+                            moves, nights, perStop,
+                            perStop < 3
+                                ? "Every move costs a transfer, a check-in and most of a day."
+                                : (perStop > 10 ? "Long and settled — good for working, thin on variety."
+                                               : "Enough time in each place to stop being a tourist in it.")),
+                stamp: ChappyStamp(.record, source: "your plan", confidence: 92)))
+        }
+
+        // ---------------------------------------------------------- flying
+        let segments = desk.hops(trip)
+        if !segments.isEmpty {
+            let hours = Double(segments.reduce(0) { $0 + $1.minutes }) / 60.0
+            let perNight = hours / Double(nights)
+            let sc: Int
+            switch perNight {
+            case ..<0.25: sc = 94
+            case ..<0.5:  sc = 78
+            case ..<0.9:  sc = 58
+            default:      sc = 34
+            }
+            comps.append(Component(
+                name: "Time in the air",
+                score: sc, weight: 1.0,
+                why: "\(ChappyPorts.minutesLine(segments.reduce(0) { $0 + $1.minutes })) across \(segments.count) segment\(segments.count == 1 ? "" : "s") for \(nights) nights.",
+                stamp: ChappyStamp(.official, source: "IATA distances", confidence: 88)))
+        }
+
+        // ---------------------------------------------------------- what he'd actually want
+        let p = ChappyProfile.shared.data
+        if !p.preferredAirlines.isEmpty, let air = trip.flights?.airlines, !air.isEmpty {
+            let match = p.preferredAirlines.contains { air.lowercased().contains($0.lowercased()) }
+            comps.append(Component(
+                name: "Airlines you'd choose",
+                score: match ? 92 : 48, weight: 0.9,
+                why: match
+                    ? "Flown by \(air) — one of yours, so the points and the status keep working."
+                    : "Flown by \(air). None of your airlines, so nothing earns and nothing is protected by status.",
+                stamp: ChappyStamp(.record, source: "your profile", confidence: 85)))
+        }
+
+        if p.needsInternetForWork {
+            let long = trip.legs.filter { $0.nights >= 5 }.count
+            comps.append(Component(
+                name: "Workable",
+                score: long > 0 ? min(95, 55 + long * 15) : 35, weight: 1.1,
+                why: long > 0
+                    ? "\(long) stop\(long == 1 ? "" : "s") of five nights or more — long enough to find a desk and settle into a connection."
+                    : "No stop longer than four nights. You work while you travel, and this plan gives you nowhere to actually do it.",
+                stamp: ChappyStamp(.record, source: "your profile", confidence: 80)))
+            if long == 0 { flags.append("Nothing here is long enough to work from properly.") }
+        }
+
+        // ---------------------------------------------------------- buffer
+        if c.total > 0 {
+            let pct = trip.bufferPct
+            comps.append(Component(
+                name: "Room to move",
+                score: pct >= 15 ? 92 : (pct >= 8 ? 74 : 42), weight: 0.7,
+                why: String(format: "%.0f%% buffer — %@ set aside for the things that go wrong.",
+                            pct, ChappyFX.money(c.buffer, trip.homeCurrency)),
+                stamp: ChappyStamp(.record, source: "your plan", confidence: 90)))
+        }
+
+        // ---------------------------------------------------------- the total
+        //
+        // Renormalised over what is KNOWN. An input that couldn't be
+        // measured contributes nothing at all — not a benign eighty.
+        let known = comps.filter { $0.score != nil }
+        let weightSum = known.reduce(0.0) { $0 + $1.weight }
+        var total = weightSum > 0
+            ? Int((known.reduce(0.0) { $0 + Double($1.score ?? 0) * $1.weight } / weightSum).rounded())
+            : 0
+
+        // ---------------------------------------------------------- caps
+        //
+        // AUDIT, and the most important change in build 185.
+        //
+        // Running ten simulations through this scorer produced a plan that
+        // was ILLEGAL on its visa and scored 77, and a plan with a third
+        // of its nights inside a monsoon that scored 92. Both were right
+        // by the arithmetic and both were useless as advice.
+        //
+        // The problem is that a weighted average cannot express "you may
+        // not do this". Nine good things genuinely do outvote one fatal
+        // one, mathematically — and a travel agent who did that would be
+        // struck off. Some findings are not inputs to a judgement, they
+        // ARE the judgement.
+        //
+        // So: a small number of conditions put a ceiling on the score, and
+        // the ceiling wins. This is also what makes the number honest at
+        // the other end — a scale that can say 28 is a scale worth
+        // believing when it says 91.
+        var caps: [(Int, String)] = []
+
+        // BUILD 190: a plan you will not be allowed to board is not a
+        // plan. Same class of finding as the passport rule — objective,
+        // checkable, and fatal — so it caps the same way.
+        let onwardGaps = ChappyOnward.shared.needs(trip)
+            .filter { !$0.satisfied && $0.rule.enforcement == .strict }
+        if !onwardGaps.isEmpty {
+            caps.append((32, "No onward ticket for \(onwardGaps.map(\.country).joined(separator: ", ")) — checked at the check-in desk, not the border. Everything else on this page is academic until that exists."))
+        }
+
+        if comps.contains(where: { $0.name == "Visa headroom" && ($0.score ?? 100) == 0 }) {
+            caps.append((30, "You cannot legally do this trip as planned. Nothing else on the page matters until that is fixed."))
+        }
+        if comps.contains(where: { $0.name == "Passport validity" && ($0.score ?? 100) < 20 }) {
+            caps.append((30, "Your passport fails the six-month rule for this trip, and that is enforced at the check-in desk, not at the border."))
+        }
+        if comps.contains(where: { $0.name == "Season" && ($0.score ?? 100) <= 42 }) {
+            caps.append((58, "A significant part of this trip is in the wrong season for where it goes. That is not a detail — it decides what the days look like."))
+        }
+        if truth.uplift > 0.25, c.total > 0 {
+            caps.append((62, "The real cost is more than a quarter above the headline. Any comparison you have made against another plan compared the wrong numbers."))
+        }
+
+        if let worst = caps.min(by: { $0.0 < $1.0 }), total > worst.0 {
+            flags.insert(worst.1, at: 0)
+            total = worst.0
+        }
+
+        var v = Verdict(total: total, components: comps, headline: "",
+                        argument: [], redFlags: flags)
+        v.headline = Self.headline(for: v, trip: trip, truth: truth)
+        v.argument = Self.argument(for: v, trip: trip, truth: truth)
+        return v
+    }
+
+    private static func headline(for v: Verdict, trip: ChappyTravel.Trip,
+                                 truth: ChappyTrueCost.Result) -> String {
+        let money = ChappyFX.money(truth.total, trip.homeCurrency)
+        switch v.total {
+        case 85...:
+            return "\(v.total)/100 — \(v.band). At \(money) all in, this is a plan I'd take myself."
+        case 70..<85:
+            return "\(v.total)/100 — \(v.band). \(money) all in, and the compromises in it are ones worth making."
+        case 55..<70:
+            return "\(v.total)/100 — \(v.band). \(money) all in. It works, but there is a better version of this trip."
+        case 40..<55:
+            return "\(v.total)/100 — \(v.band). \(money) all in, and I would not book this as it stands."
+        default:
+            return "\(v.total)/100 — \(v.band). \(money) all in. Something here needs fixing before this is a trip."
+        }
+    }
+
+    private static func argument(for v: Verdict, trip: ChappyTravel.Trip,
+                                 truth: ChappyTrueCost.Result) -> [String] {
+        var out: [String] = []
+        let strong = v.known.filter { ($0.score ?? 0) >= 78 }.sorted { $0.weight > $1.weight }
+        let weak = v.known.filter { ($0.score ?? 100) < 55 }.sorted { $0.weight > $1.weight }
+
+        if let best = strong.first {
+            out.append("What carries it: \(best.name.lowercased()). \(best.why)")
+        }
+        if let worst = weak.first {
+            out.append("What drags it down: \(worst.name.lowercased()). \(worst.why)")
+        } else if strong.count > 1 {
+            out.append("Nothing scores badly, which is rarer than it sounds — most plans have one line that quietly ruins them.")
+        }
+        if truth.avoidable > 0 {
+            out.append("\(ChappyFX.money(truth.avoidable, trip.homeCurrency)) of the hidden cost is avoidable, and avoiding it is a decision rather than a negotiation.")
+        }
+        if !v.confident {
+            out.append("Read the number with some caution: it is \(v.coverage), and the missing ones are missing because the data isn't there — not because they're fine.")
+        }
+        return out
+    }
+}
+
+
+// =====================================================================
+// BUILD 185 — "I FOUND A CHEAPER OPTION, BUT I DON'T RECOMMEND IT."
+//
+// This is the sentence. Everything else in the Travel Desk — the
+// bands, the true cost, the score, the visa arithmetic, the climate
+// record — exists so that this sentence can be said honestly, with the
+// reasoning attached, and be right.
+//
+// A search engine sorts by price. An agent sorts by price and then
+// tells you when the order is wrong. The difference is not a feature,
+// it is the whole job, and it is why people used to pay one.
+//
+// The rule that keeps it honest: when the cheapest option IS the best
+// one, this says so plainly and does not manufacture a reason to
+// upsell. Software that always recommends the more expensive option
+// has not made a judgement, it has made a policy.
+// =====================================================================
+
+struct ChappyComparison {
+
+    struct Row: Identifiable {
+        var id: UUID { trip.id }
+        var trip: ChappyTravel.Trip
+        var score: ChappyScore.Verdict
+        var truth: ChappyTrueCost.Result
+        var label: String
+
+        var headlineCost: Double { truth.headline }
+        var realCost: Double { truth.total }
+        var isCheapest = false
+        var isRecommended = false
+    }
+
+    var rows: [Row]
+    /// The sentence. Empty only when there is nothing to compare.
+    var recommendation: String
+    /// Set when the recommended option is NOT the cheapest — the reason,
+    /// spelled out, in money and in what it buys.
+    var whyNotCheapest: String?
+    /// Set when the cheapest IS the best. Different sentence, on purpose.
+    var cheapestWins: Bool
+
+    // -----------------------------------------------------------------
+
+    @MainActor
+    static func compare(_ trips: [ChappyTravel.Trip], labels: [String] = []) -> ChappyComparison? {
+        guard trips.count >= 2 else { return nil }
+
+        var rows: [Row] = trips.enumerated().map { i, t in
+            Row(trip: t,
+                score: ChappyScore.shared.score(t),
+                truth: ChappyTrueCost.shared.compute(t),
+                label: i < labels.count ? labels[i]
+                     : (t.shape.flatMap { ChappyTravel.Shape(rawValue: $0)?.label } ?? t.name))
+        }
+
+        // Cheapest on the REAL number, not the headline. Comparing
+        // headlines is the mistake this whole build exists to stop.
+        guard let cheapestIdx = rows.indices.min(by: { rows[$0].realCost < rows[$1].realCost })
+        else { return nil }
+
+        // AUDIT — THE MOST IMPORTANT FOUR LINES IN THIS BUILD.
+        //
+        // max(by:) returns the LAST of equal maxima, and there was no
+        // margin test at all. The three shapes are each graded against
+        // their OWN bands, and visa, passport, pace, season and airline
+        // score identically across them — so ties and one-point gaps are
+        // the NORMAL outcome, not a corner case.
+        //
+        // The old code therefore said "I found a cheaper option, and I
+        // don't recommend it" for three plans all scoring 71, and then
+        // listed no reasons because no component cleared the gap test.
+        // That is precisely the "policy, not a judgement" this build's
+        // own header comment says it exists to avoid.
+        //
+        // So: ties go to the cheaper option, and an upgrade has to be
+        // worth at least four points before it is sold as one.
+        let topScore = rows.map(\.score.total).max() ?? 0
+        let topIdx = rows.indices
+            .filter { rows[$0].score.total == topScore }
+            .min(by: { rows[$0].realCost < rows[$1].realCost }) ?? cheapestIdx
+        let bestIdx = (rows[topIdx].score.total - rows[cheapestIdx].score.total) >= 4
+            ? topIdx : cheapestIdx
+
+        rows[cheapestIdx].isCheapest = true
+        rows[bestIdx].isRecommended = true
+
+        let best = rows[bestIdx], cheap = rows[cheapestIdx]
+        let home = best.trip.homeCurrency
+
+        if bestIdx == cheapestIdx {
+            return ChappyComparison(
+                rows: rows,
+                recommendation: "\(best.label) is both the cheapest and the best of these — "
+                    + "\(ChappyFX.money(best.realCost, home)) all in, scoring \(best.score.total). "
+                    + "That happens less often than you'd hope, and when it does there is nothing to argue about.",
+                whyNotCheapest: nil,
+                cheapestWins: true)
+        }
+
+        // What does the extra money actually buy? Only components where
+        // the recommended option genuinely beats the cheap one by enough
+        // to be worth a sentence.
+        var gains: [String] = []
+        for c in best.score.components {
+            guard let mine = c.score,
+                  let theirs = cheap.score.components.first(where: { $0.name == c.name })?.score,
+                  mine - theirs >= 12 else { continue }
+            gains.append(c.name.lowercased())
+        }
+
+        let delta = best.realCost - cheap.realCost
+        let money = ChappyFX.money(abs(delta), home)
+        let gainText = gains.isEmpty
+            ? "a better plan across the board"
+            : gains.prefix(4).joined(separator: ", ")
+
+        let why = "\(best.label) costs \(money) more than \(cheap.label) and scores "
+            + "\(best.score.total) against \(cheap.score.total). What the \(money) buys: \(gainText). "
+            + (cheap.score.redFlags.isEmpty
+                ? "Neither is a bad plan — this is a judgement, not a rescue."
+                : "And the cheaper one carries something I'd want you to see first: \(cheap.score.redFlags[0])")
+
+        return ChappyComparison(
+            rows: rows,
+            recommendation: "I found a cheaper option, and I don't recommend it. " + why,
+            whyNotCheapest: why,
+            cheapestWins: false)
+    }
+}
+
+// =====================================================================
+// The three panels these produce in the report.
+// =====================================================================
+
+extension ChappyTravel {
+
+    /// What it actually costs, and what he could stop paying.
+    func trueCostHTML(_ trip: Trip) -> String {
+        let t = ChappyTrueCost.shared.compute(trip)
+        guard !t.fees.isEmpty else { return "" }
+        let E = Self.e
+        let home = trip.homeCurrency
+
+        var h = "<div class=\"card\"><h2>What it actually costs"
+        h += Self.stampHTML(ChappyStamp(.estimated, source: "fee tables", confidence: 70))
+        h += "</h2>"
+        h += "<p class=\"s2\">The plan says \(ChappyFX.money(t.headline, home)). These are the things that "
+        h += "arrive afterwards — on a statement, at a check-out desk, at an arrivals hall — and they are "
+        h += "the reason comparing two headline prices tells you nothing.</p>"
+
+        h += "<div class=\"cost\"><span>The plan</span><b>\(ChappyFX.money(t.headline, home))</b></div>"
+        // Sorted is not stable — two equal amounts swapped places between
+        // runs of the same report. Tie-break on the label.
+        for f in t.fees.sorted(by: { ($0.amount, $0.label) > ($1.amount, $1.label) }) {
+            h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(f.label))</b>"
+            h += "<span class=\"rt\">\(ChappyFX.money(f.amount, home))\(Self.stampHTML(f.stamp))</span></div>"
+            h += "<p>\(E(f.note))</p>"
+            if !f.avoidedBy.isEmpty {
+                h += "<p style=\"color:var(--good);font-size:12.5px;margin-top:5px\">Avoidable — \(E(f.avoidedBy))</p>"
+            }
+            h += "</div>"
+        }
+
+        h += "<div class=\"cost\" style=\"border-top:1px solid var(--line2);margin-top:8px;padding-top:11px\">"
+        h += "<span style=\"font-size:15px\">What actually leaves the account</span>"
+        h += "<b style=\"font-size:19px\">\(ChappyFX.money(t.total, home))</b></div>"
+        // AUDIT: the divide-by-zero was guarded and the guard's zero was
+        // then printed as a fact — "$340 of fees. That is 0% above the
+        // headline." A guarded wrong number is still a wrong number.
+        if t.headline > 0 {
+            h += String(format: "<p class=\"s2\" style=\"margin-top:8px\">That is %.0f%% above the headline.</p>", t.uplift * 100)
+        } else {
+            h += "<p class=\"s2\" style=\"margin-top:8px\">The plan has no priced lines yet, so there is "
+            h += "nothing to measure these against.</p>"
+        }
+
+        if t.avoidable > 0 {
+            h += "<p class=\"s2\" style=\"color:var(--good)\">\(ChappyFX.money(t.avoidable, home)) of it is "
+            h += "avoidable, and avoiding it is a decision you make once rather than a negotiation you have "
+            h += "at a counter.</p>"
+        }
+        h += "<p class=\"foot\" style=\"padding:9px 0 0\">Baggage rules and tourism taxes change once a year, "
+        h += "not once a day, so these come from a table rather than a live call. Every figure is typical "
+        h += "and stamped as such — none of it is a quote.</p></div>"
+        return h
+    }
+
+    /// The score, with the reasoning, because a score without it is a
+    /// horoscope.
+    func scoreHTML(_ trip: Trip) -> String {
+        let v = ChappyScore.shared.score(trip)
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>Deal score</h2>"
+        h += "<div class=\"scorehead\"><div class=\"ring\" style=\"--c:\(v.hex)\">"
+        h += "<span class=\"n\">\(v.total)</span><span class=\"o\">/100</span></div>"
+        h += "<div><p class=\"lede\" style=\"margin:0 0 5px\">\(E(v.band))</p>"
+        h += "<p class=\"s2\" style=\"margin:0\">\(E(v.headline))</p>"
+        h += "<p class=\"hint2\">\(E(v.coverage))\(v.confident ? "" : " — read it with some caution")</p>"
+        h += "</div></div>"
+
+        if !v.redFlags.isEmpty {
+            h += "<div class=\"flags\">"
+            for f in v.redFlags { h += "<div class=\"flag\">\(E(f))</div>" }
+            h += "</div>"
+        }
+
+        for c in v.components.sorted(by: { $0.weight > $1.weight }) {
+            let pct = c.score ?? 0
+            h += "<div class=\"comp\"><div class=\"ch\"><b>\(E(c.name))</b>"
+            h += c.score == nil
+                ? "<span class=\"rt\">not scored</span>"
+                : "<span class=\"rt\" style=\"color:\(c.hex)\">\(pct)</span>"
+            h += "</div><div class=\"bar\"><i style=\"width:\(c.score == nil ? 0 : pct)%;background:\(c.hex)\"></i></div>"
+            h += "<p>\(E(c.why))</p></div>"
+        }
+
+        for para in v.argument { h += "<p class=\"s2\" style=\"margin-top:10px\">\(E(para))</p>" }
+
+        h += "<p class=\"foot\" style=\"padding:11px 0 0\">An input that could not be measured is not scored at "
+        h += "all — it is excluded and counted, rather than quietly given full marks. That is why this number "
+        h += "can be low, and why a low one means something.</p></div>"
+        return h
+    }
+
+    /// AUDIT: this shipped with zero call sites — a whole panel and its
+    /// CSS rendering nowhere. Wired below into a shareable document, so
+    /// the three options can be argued about by someone other than him.
+    func writeComparison(_ trips: [Trip]) -> URL? {
+        guard let cmp = ChappyComparison.compare(trips), let first = trips.first else { return nil }
+        var h = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta name="color-scheme" content="dark">
+        <title>Three ways to do it</title><style>\(reportCSS)</style></head><body><div class="wrap">
+        <div class="hero"><p class="kicker">Chappy · The comparison</p>
+        <h1>Three ways to do it</h1>
+        <p class="dates">\(Self.e(first.dateLine)) · \(first.party) travelling</p></div>
+        <div class="body">
+        """
+        h += Self.comparisonHTML(cmp)
+        for r in cmp.rows {
+            h += "<div class=\"card\"><h2>\(Self.e(r.label))</h2>"
+            h += "<p class=\"s2\">\(Self.e(r.trip.legs.map { "\($0.place) \($0.nights)n" }.joined(separator: " · ")))</p>"
+            h += "<p class=\"s2\">\(Self.e(r.score.headline))</p>"
+            for para in r.score.argument { h += "<p class=\"s2\">\(Self.e(para))</p>" }
+            h += "</div>"
+        }
+        h += Self.trustLegendHTML()
+        h += "</div></div></body></html>"
+
+        guard let dir = FileManager.default.urls(for: .documentDirectory,
+                                                 in: .userDomainMask).first else { return nil }
+        let url = dir.appendingPathComponent("Three ways to do it.html")
+        do { try h.data(using: .utf8)?.write(to: url); return url }
+        catch { return nil }
+    }
+
+    /// Side by side, and the sentence.
+    static func comparisonHTML(_ cmp: ChappyComparison) -> String {
+        let E = ChappyTravel.e
+        let home = cmp.rows.first?.trip.homeCurrency ?? "AUD"
+
+        var h = "<div class=\"card\"><h2>Side by side</h2><div class=\"cmp\">"
+        for r in cmp.rows {
+            let border = r.isRecommended ? "var(--good)" : "var(--line)"
+            h += "<div class=\"opt\" style=\"border-color:\(border)\">"
+            h += "<div class=\"oh\"><b>\(E(r.label))</b>"
+            if r.isRecommended { h += "<span class=\"pick\">Pick</span>" }
+            else if r.isCheapest { h += "<span class=\"cheap\">Cheapest</span>" }
+            h += "</div>"
+            h += "<p class=\"big2\" style=\"color:\(r.score.hex)\">\(r.score.total)<span>/100</span></p>"
+            h += "<div class=\"orow\"><span>Headline</span><b>\(ChappyFX.money(r.headlineCost, home))</b></div>"
+            h += "<div class=\"orow\"><span>Really</span><b>\(ChappyFX.money(r.realCost, home))</b></div>"
+            h += "<div class=\"orow\"><span>Nights</span><b>\(r.trip.nights)</b></div>"
+            h += "<div class=\"orow\"><span>Stops</span><b>\(r.trip.legs.count)</b></div>"
+            if !r.score.redFlags.isEmpty {
+                h += "<div class=\"orow\"><span>Warnings</span><b style=\"color:var(--bad)\">\(r.score.redFlags.count)</b></div>"
+            }
+            h += "</div>"
+        }
+        h += "</div>"
+
+        h += "<div class=\"verdict\"><p class=\"vt\">What I'd do</p>"
+        h += "<p class=\"lede\" style=\"margin:0\">\(E(cmp.recommendation))</p></div>"
+
+        if cmp.cheapestWins {
+            h += "<p class=\"foot\" style=\"padding:10px 0 0\">When the cheapest option is also the best one I "
+            h += "say so. Software that always talks you into the dearer choice hasn't made a judgement, it has "
+            h += "made a policy.</p>"
+        }
+        h += "</div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 186 — WHAT THE REVIEWS ACTUALLY SAY.
+//
+// A star rating is a single number standing in for a thousand
+// different opinions, and it hides the only thing that matters: WHY.
+// 4.3 because the rooms are tired but the staff are wonderful is a
+// completely different purchase from 4.3 because it is beautiful and
+// the walls are paper. Both show as 4.3. Both get booked by the same
+// person for the same reason and only one of them ruins the week.
+//
+// So this reads the reviews and answers three questions the number
+// cannot:
+//
+//   1. WHAT DO PEOPLE COMPLAIN ABOUT, repeatedly? One person saying
+//      the wifi was slow is weather. Six people saying it is the
+//      building's wiring is a fact.
+//   2. WHAT IS IT ACTUALLY GOOD AT? Not "is it good" — good at what.
+//   3. IS SOMETHING OFF? Not "are these reviews fake" — nobody can
+//      tell that from five reviews and pretending otherwise is worse
+//      than useless. But a price far below the local band, a rating
+//      that doesn't match the review text, a sudden cluster of
+//      identical five-stars: those are checkable, and they are what
+//      an experienced person notices.
+//
+// HONEST LIMIT, STATED IN THE UI AND NOT BURIED: the Tripadvisor
+// Content API returns up to five reviews per place. Five is enough to
+// find a recurring theme and nowhere near enough to detect review
+// fraud. This module will say "three of five reviews mention noise"
+// and it will refuse to say "these reviews look fake" — because at
+// n=5 that claim is a coin toss dressed as analysis.
+// =====================================================================
+
+@MainActor
+final class ChappyReviews: ObservableObject {
+    static let shared = ChappyReviews()
+    private init() {}
+
+    // MARK: what came back
+
+    struct Review: Identifiable, Hashable {
+        var id: String
+        var rating: Double
+        var title: String
+        var text: String
+        var published: Date?
+        var tripType: String
+
+        var ageDays: Int? {
+            published.map { Calendar.current.dateComponents([.day], from: $0, to: Date()).day ?? 0 }
+        }
+        /// A review from 2019 is describing a different business.
+        var isRecent: Bool { (ageDays ?? 9_999) <= 550 }
+    }
+
+    /// The things people actually complain about and praise, in the
+    /// order they turn up. Each theme is a small vocabulary rather than
+    /// a model, because a bag of words that a person can read and
+    /// correct beats a black box that is right slightly more often.
+    enum Theme: String, CaseIterable, Identifiable {
+        case cleanliness, location, staff, noise, beds, breakfast, wifi
+        case value, safety, water, aircon, pool, food, crowding, maintenance
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .cleanliness: return "Cleanliness"
+            case .location:    return "Location"
+            case .staff:       return "Staff"
+            case .noise:       return "Noise"
+            case .beds:        return "Beds & sleep"
+            case .breakfast:   return "Breakfast"
+            case .wifi:        return "Wi-Fi"
+            case .value:       return "Value"
+            case .safety:      return "Safety"
+            case .water:       return "Hot water & pressure"
+            case .aircon:      return "Air conditioning"
+            case .pool:        return "Pool"
+            case .food:        return "Food"
+            case .crowding:    return "Crowds"
+            case .maintenance: return "Upkeep"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .cleanliness: return "sparkles"
+            case .location:    return "mappin.and.ellipse"
+            case .staff:       return "person.2.fill"
+            case .noise:       return "ear.fill"
+            case .beds:        return "bed.double.fill"
+            case .breakfast:   return "cup.and.saucer.fill"
+            case .wifi:        return "wifi"
+            case .value:       return "dollarsign.circle.fill"
+            case .safety:      return "lock.shield.fill"
+            case .water:       return "drop.fill"
+            case .aircon:      return "snowflake"
+            case .pool:        return "figure.pool.swim"
+            case .food:        return "fork.knife"
+            case .crowding:    return "person.3.fill"
+            case .maintenance: return "wrench.and.screwdriver.fill"
+            }
+        }
+
+        var words: [String] {
+            switch self {
+            case .cleanliness: return ["clean", "dirty", "filthy", "spotless", "hygien", "mould", "mold", "dust", "smell", "stain", "cockroach", "ant", "bug"]
+            case .location:    return ["location", "walk", "close to", "far from", "central", "convenient", "beach", "town", "taxi ride", "middle of nowhere"]
+            case .staff:       return ["staff", "host", "owner", "reception", "manager", "service", "friendly", "helpful", "rude", "welcoming", "attentive"]
+            case .noise:       return ["noise", "noisy", "loud", "quiet", "traffic", "construction", "music", "roosters", "dogs", "barking", "thin wall", "paper wall"]
+            case .beds:        return ["bed", "mattress", "pillow", "sleep", "hard bed", "comfortable bed", "sagging"]
+            case .breakfast:   return ["breakfast", "buffet", "eggs", "coffee in the morning", "included breakfast"]
+            case .wifi:        return ["wifi", "wi-fi", "internet", "connection", "upload", "speed", "zoom call", "work from"]
+            case .value:       return ["value", "worth", "overpriced", "cheap", "expensive", "bargain", "rip off", "ripoff", "for the price"]
+            case .safety:      return ["safe", "unsafe", "security", "theft", "stolen", "scam", "sketchy", "dodgy", "lock"]
+            case .water:       return ["hot water", "cold shower", "water pressure", "shower", "plumbing", "drain"]
+            case .aircon:      return ["air con", "aircon", "a/c", "air-con", "fan", "hot room", "stuffy", "humid"]
+            case .pool:        return ["pool", "swim", "sun lounger", "poolside"]
+            case .food:        return ["food", "restaurant", "menu", "dish", "portion", "delicious", "bland", "tasty"]
+            case .crowding:    return ["crowd", "busy", "packed", "queue", "line up", "tourist trap", "empty", "quiet time"]
+            case .maintenance: return ["broken", "worn", "tired", "dated", "renovat", "repair", "peeling", "leak", "not working"]
+            }
+        }
+
+        /// Words that flip the sentiment of a hit. Kept tiny and obvious
+        /// on purpose — a sentiment model that nobody can inspect is a
+        /// sentiment model nobody can fix.
+        // AUDIT: these were substring-matched, so "no " hit "casino",
+        // "not " hit "nothing", and "lack" hit "black sand beach". And
+        // because isStrength demands negative == 0, ONE false hit
+        // silently deleted a whole theme — the module would print
+        // "nothing stands out either way" about places the reviews were
+        // completely clear on.
+        //
+        // Whole words now, tested against a space-padded sentence.
+        // "however" and "but" moved OUT of here and into the splitter,
+        // where the code's own comment always said they belonged: in a
+        // review they are a full stop wearing a disguise, not a
+        // sentiment.
+        static let negatives = ["not", "no", "never", "cannot", "wasn't", "weren't", "didn't",
+                                "isn't", "wouldn't", "couldn't", "lacking", "lacked", "lacks",
+                                "poor", "bad", "worst", "terrible", "awful", "horrible",
+                                "disappointing", "disappointed", "rude", "dirty", "filthy",
+                                "broken", "slow", "unreliable", "overpriced", "unsafe",
+                                "noisy", "loud", "smelly", "tired", "dated", "worn", "grubby",
+                                "unfortunately", "avoid", "sadly", "shame"]
+
+        /// Two-word phrases, which have to be matched as phrases.
+        static let negativePhrases = ["rip off", "cold shower", "no hot water", "not worth",
+                                      "would not", "did not", "far from", "run down"]
+
+        /// True when THIS sentence reads negative. Whole words only.
+        static func reads(negative sentence: String) -> Bool {
+            let padded = " " + sentence
+                .replacingOccurrences(of: "'", with: "'")
+                .lowercased() + " "
+            if negativePhrases.contains(where: { padded.contains($0) }) { return true }
+            return negatives.contains { padded.contains(" \($0) ") || padded.contains(" \($0),") }
+        }
+    }
+
+    struct Finding: Identifiable {
+        var id: String { theme.rawValue }
+        var theme: Theme
+        var mentions: Int
+        var negative: Int
+        var quote: String
+        var total: Int
+
+        var isComplaint: Bool { negative * 2 >= mentions && mentions >= 2 }
+        var isStrength: Bool { negative == 0 && mentions >= 2 }
+        /// "3 of 5 reviews" — the denominator is the honesty.
+        var weight: String { "\(mentions) of \(total) review\(total == 1 ? "" : "s")" }
+    }
+
+    struct Digest {
+        var place: String
+        var reviews: [Review]
+        var findings: [Finding]
+        var recentShare: Double
+        var averageInText: Double?
+        var stated: Double?
+        var flags: [String]
+        var stamp: ChappyStamp
+
+        var complaints: [Finding] { findings.filter(\.isComplaint).sorted { $0.mentions > $1.mentions } }
+        var strengths: [Finding] { findings.filter(\.isStrength).sorted { $0.mentions > $1.mentions } }
+
+        /// The sentence. What it is good at, what it is bad at, in one
+        /// line, because that is what a person reads.
+        var line: String {
+            let good = strengths.prefix(2).map { $0.theme.label.lowercased() }
+            let bad = complaints.prefix(2).map { $0.theme.label.lowercased() }
+            if good.isEmpty && bad.isEmpty {
+                return reviews.isEmpty
+                    ? "No reviews came back for this one."
+                    : "\(reviews.count) review\(reviews.count == 1 ? "" : "s") and no repeated theme — nothing stands out either way."
+            }
+            if bad.isEmpty { return "Consistently good on \(good.joined(separator: " and "))." }
+            if good.isEmpty { return "The repeated gripe is \(bad.joined(separator: " and "))." }
+            return "Good on \(good.joined(separator: " and ")); the repeated gripe is \(bad.joined(separator: " and "))."
+        }
+
+        var isThin: Bool { reviews.count < 3 }
+    }
+
+    @Published private(set) var cache: [String: Digest] = [:]
+    @Published private(set) var loading: Set<String> = []
+
+    // MARK: the read
+
+    /// Tripadvisor's review endpoint. Google's reviews are deliberately
+    /// NOT read here: their licence forbids storing the content, and a
+    /// digest cached in memory and written into a report is storage.
+    func digest(for spot: ChappyPlaces.Spot, place: String) async -> Digest? {
+        if let d = cache[spot.id] { return d }
+        guard !loading.contains(spot.id) else { return nil }
+        guard spot.fromTripAdvisor else { return nil }
+        let key = UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? ""
+        guard !key.isEmpty else { return nil }
+
+        loading.insert(spot.id)
+        defer { loading.remove(spot.id) }
+
+        let s = "https://api.content.tripadvisor.com/api/v1/location/\(spot.id)/reviews?key=\(key)&language=en"
+        guard let url = URL(string: s) else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "accept")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = json["data"] as? [[String: Any]] else { return nil }
+
+        let iso = DateFormatter()
+        iso.dateFormat = "yyyy-MM-dd"
+        iso.locale = Locale(identifier: "en_US_POSIX")
+
+        let reviews: [Review] = arr.compactMap { row in
+            guard let id = row["id"].map({ "\($0)" }) else { return nil }
+            let r = (row["rating"] as? Double) ?? Double((row["rating"] as? Int) ?? 0)
+            return Review(id: id, rating: r,
+                          title: (row["title"] as? String) ?? "",
+                          text: (row["text"] as? String) ?? "",
+                          published: (row["published_date"] as? String).flatMap {
+                              iso.date(from: String($0.prefix(10)))
+                          },
+                          tripType: (row["trip_type"] as? String) ?? "")
+        }
+        guard !reviews.isEmpty else { return nil }
+
+        let d = Self.analyse(reviews, place: spot.name, stated: spot.rating)
+        cache[spot.id] = d
+        return d
+    }
+
+    // MARK: the analysis
+
+    static func analyse(_ reviews: [Review], place: String, stated: Double?) -> Digest {
+        var findings: [Finding] = []
+
+        for theme in Theme.allCases {
+            var mentions = 0, negative = 0
+            var quote = ""
+            for r in reviews {
+                let body = (r.title + ". " + r.text).lowercased()
+                guard let hit = theme.words.first(where: { body.contains($0) }) else { continue }
+                mentions += 1
+
+                // Sentiment from the SENTENCE the word is in, not the
+                // whole review. "The location is perfect but the wifi is
+                // unusable" is positive about one thing and negative
+                // about another, and scoring the review as a whole gets
+                // both of them wrong.
+                let sentence = Self.sentence(containing: hit, in: body)
+                let bad = Theme.reads(negative: sentence) || r.rating <= 2
+                if bad { negative += 1 }
+                if quote.isEmpty || (bad && negative == 1) {
+                    quote = Self.trim(sentence)
+                }
+            }
+            if mentions > 0 {
+                findings.append(Finding(theme: theme, mentions: mentions, negative: negative,
+                                        quote: quote, total: reviews.count))
+            }
+        }
+
+        let recent = reviews.filter(\.isRecent).count
+        let recentShare = reviews.isEmpty ? 0 : Double(recent) / Double(reviews.count)
+        let avg = reviews.isEmpty ? nil
+            : reviews.reduce(0.0) { $0 + $1.rating } / Double(reviews.count)
+
+        // ---------------------------------------------------------- flags
+        //
+        // Only things that are actually checkable at this sample size.
+        // "These reviews look fake" is NOT on this list and will not be,
+        // because at five reviews that claim is a coin toss.
+        var flags: [String] = []
+
+        if recentShare < 0.34, reviews.count >= 3 {
+            flags.append("Most of these reviews are over eighteen months old. A place can change hands, staff or standards in that time — and often has.")
+        }
+        if let a = avg, let st = stated, abs(a - st) >= 0.8 {
+            flags.append(String(format: "The headline rating is %.1f but the reviews I can read average %.1f. That gap is worth a second look before booking.", st, a))
+        }
+        let fives = reviews.filter { $0.rating >= 5 }
+        if fives.count >= 3, fives.allSatisfy({ $0.text.count < 120 }) {
+            flags.append("Several five-star reviews here are very short and say nothing specific. Not proof of anything — but the useful reviews are usually the long ones.")
+        }
+        if reviews.count < 3 {
+            flags.append("Only \(reviews.count) review\(reviews.count == 1 ? "" : "s") to read. Treat anything below as a hint rather than a finding.")
+        }
+
+        return Digest(place: place, reviews: reviews, findings: findings,
+                      recentShare: recentShare, averageInText: avg, stated: stated,
+                      flags: flags,
+                      stamp: ChappyStamp(.researched, source: "Tripadvisor reviews",
+                                         note: "up to five reviews per place",
+                                         confidence: reviews.count >= 4 ? 66 : 40))
+    }
+
+    /// The sentence a word appears in. Crude on purpose — full stops,
+    /// exclamation marks and the word "but", which in a review is
+    /// almost always a full stop wearing a disguise.
+    /// The clause a word appears in.
+    ///
+    /// "but", "however" and "although" end a clause as firmly as a full
+    /// stop does — "the location is perfect but the wifi is unusable" is
+    /// one positive statement and one negative one, and reading it as a
+    /// single unit gets both of them wrong. So they are rewritten to a
+    /// full stop FIRST, and the word is located in the rewritten string.
+    ///
+    /// Doing the rewrite after finding the range would be a crash: the
+    /// index would belong to a string that no longer exists.
+    private static func sentence(containing word: String, in raw: String) -> String {
+        var body = raw
+        for pivot in [" but ", " however ", " although ", " though ", " except ",
+                      " whereas ", " unfortunately "] {
+            body = body.replacingOccurrences(of: pivot, with: ". ")
+        }
+        guard let r = body.range(of: word) else { return raw }
+
+        let breaks = CharacterSet(charactersIn: ".!?;")
+        var start = body.startIndex, end = body.endIndex
+        if let s = body[body.startIndex..<r.lowerBound].rangeOfCharacter(from: breaks, options: .backwards) {
+            start = body.index(after: s.lowerBound)
+        }
+        if let e = body[r.upperBound...].rangeOfCharacter(from: breaks) {
+            end = e.lowerBound
+        }
+        guard start <= end else { return raw }
+        return String(body[start..<end]).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func trim(_ s: String) -> String {
+        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.count > 190 else { return clean }
+        return String(clean.prefix(187)) + "…"
+    }
+}
+
+// =====================================================================
+// BUILD 186 — THE QUALITY CHECK.
+//
+// Not fraud detection. The things an experienced traveller notices in
+// four seconds and a first-timer does not:
+//
+//   * A price well under the local band is not a bargain, it is a
+//     question. Sometimes the answer is "low season, empty hotel".
+//     Sometimes it is "the photos are of a different building".
+//   * Non-refundable, paid in full, months ahead is a bet on nothing
+//     changing — and something always changes on a three-month trip.
+//   * A booking taken by bank transfer or crypto has no chargeback.
+//     That is not a payment method, it is a decision to have no
+//     recourse.
+//   * A place with a big rating and almost no reviews is not
+//     well-rated. It is un-rated.
+// =====================================================================
+
+@MainActor
+final class ChappyQuality {
+    static let shared = ChappyQuality()
+    private init() {}
+
+    struct Warning: Identifiable {
+        var id: String { title }
+        var title: String
+        var level: String        // LOW / MEDIUM / HIGH — matches the report CSS
+        var detail: String
+        var action: String
+    }
+
+    /// A price against what the planner says things cost there.
+    func check(price: Double, band: ChappyTravel.Band?, label: String,
+               currency: String) -> Warning? {
+        guard let b = band, b.low > 0, price > 0 else { return nil }
+        let ratio = price / b.low
+        if ratio < 0.55 {
+            return Warning(
+                title: "\(label) is far below the local rate",
+                level: "MEDIUM",
+                detail: "At \(ChappyFX.money(price, currency)) this is \(Int((1 - ratio) * 100))% under the bottom of what these go for here. That is sometimes a genuinely empty low season and sometimes a listing that isn't what the photos show.",
+                action: "Check the review dates, look for a street view, and message the host a specific question before you pay. A real host answers in a sentence; a fake listing answers in a paragraph of copy.")
+        }
+        if ratio > 2.2 {
+            return Warning(
+                title: "\(label) is well above the local rate",
+                level: "LOW",
+                detail: "More than double the bottom of the local range. Fine if it's what you want — worth knowing it's a choice rather than the going price.",
+                action: "Compare three others in the same area before committing.")
+        }
+        return nil
+    }
+
+    /// Ratings that aren't ratings.
+    func check(spot: ChappyPlaces.Spot) -> Warning? {
+        let count = (spot.googleCount ?? 0) + (spot.reviews ?? 0)
+        guard let r = spot.rating ?? spot.googleRating else { return nil }
+        if r >= 4.6, count > 0, count < 12 {
+            return Warning(
+                title: "\(spot.name) — a high rating from almost nobody",
+                level: "LOW",
+                detail: "\(String(format: "%.1f", r)) from \(count) review\(count == 1 ? "" : "s"). That isn't a well-rated place, it's an un-rated one — five friends and a good week produce the same number.",
+                action: "Weight it like a tip from a stranger, not like a rating.")
+        }
+        return nil
+    }
+
+    /// The booking itself.
+    func bookingWarnings(_ trip: ChappyTravel.Trip) -> [Warning] {
+        var out: [Warning] = []
+        guard let start = trip.start else { return out }
+        let daysOut = Calendar.current.dateComponents([.day], from: Date(), to: start).day ?? 0
+
+        if daysOut > 60 {
+            out.append(Warning(
+                title: "Anything non-refundable, this far out, is a bet",
+                level: "MEDIUM",
+                detail: "You're \(daysOut) days from the first night. On a trip this length something always moves — a visa, a flight, a plan, a person. Non-refundable saves perhaps 10% and costs 100% when it goes wrong.",
+                action: "Book refundable now to hold the room, set a reminder for four weeks out, and re-check the price then. If it hasn't moved you've lost nothing."))
+        }
+        if trip.nights >= 45 {
+            out.append(Warning(
+                title: "Don't prepay a long stay in full",
+                level: "MEDIUM",
+                detail: "A \(trip.nights)-night booking paid up front is the single biggest sum you'll hand over on this trip, and it is handed to someone you have never met.",
+                action: "Pay a deposit and the rest on arrival, or pay by card so there's a chargeback path. Bank transfer, Western Union and crypto have none — that isn't a payment method, it's a decision to have no recourse."))
+        }
+        return out
+    }
+
+    static let paymentRule = "Pay by card wherever it's accepted, even at a small loss on the fee. A card has a chargeback; a bank transfer, Western Union and crypto do not, and every accommodation scam that has ever worked worked because the money could not come back."
+}
+
+
+extension ChappyTravel {
+
+    /// The quality pass. Everything Chappy noticed that a person with
+    /// twenty years of doing this would have noticed in four seconds.
+    func qualityHTML(_ trip: Trip) -> String {
+        var warnings = ChappyQuality.shared.bookingWarnings(trip)
+        for leg in trip.legs {
+            let cur = localCurrency(for: leg, in: trip)
+            if let w = ChappyQuality.shared.check(price: leg.nightlyRate, band: leg.stayBand,
+                                                  label: "\(leg.place) — \(leg.stayName.isEmpty ? "the stay" : leg.stayName)",
+                                                  currency: cur) {
+                warnings.append(w)
+            }
+        }
+        guard !warnings.isEmpty else { return "" }
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>Before you pay"
+        h += Self.stampHTML(ChappyStamp(.researched, source: "price bands & booking rules", confidence: 72))
+        h += "</h2>"
+        h += "<p class=\"s2\">Not fraud detection — nobody can do that from five reviews and anyone claiming "
+        h += "otherwise is selling something. These are the things an experienced traveller notices in four "
+        h += "seconds and a first-timer finds out afterwards.</p>"
+        for w in warnings {
+            h += "<div class=\"risk\"><span class=\"rl \(w.level)\">\(w.level)</span><div>"
+            h += "<b>\(E(w.title))</b><span class=\"d\">\(E(w.detail))</span>"
+            h += "<div class=\"f\">→ \(E(w.action))</div></div></div>"
+        }
+        h += "<p class=\"foot\" style=\"padding:10px 0 0\">\(E(ChappyQuality.paymentRule))</p></div>"
+        return h
+    }
+
+    /// One place's reviews, digested. Used inside the best-of lists.
+    static func reviewDigestHTML(_ d: ChappyReviews.Digest) -> String {
+        let E = ChappyTravel.e
+        var h = "<div class=\"dig\"><p class=\"digline\">\(E(d.line))</p>"
+
+        if !d.strengths.isEmpty || !d.complaints.isEmpty {
+            h += "<div class=\"themes\">"
+            for f in d.strengths.prefix(3) {
+                h += "<span class=\"th good\">\(E(f.theme.label)) · \(E(f.weight))</span>"
+            }
+            for f in d.complaints.prefix(3) {
+                h += "<span class=\"th bad\">\(E(f.theme.label)) · \(E(f.weight))</span>"
+            }
+            h += "</div>"
+        }
+        if let q = d.complaints.first?.quote, !q.isEmpty {
+            h += "<p class=\"quote\">“\(E(q))”</p>"
+        }
+        for flag in d.flags { h += "<p class=\"digflag\">\(E(flag))</p>" }
+        h += "</div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 187 — THE DAY.
+//
+// Chappy has been planning at the LEG level: Ubud, four nights. That
+// is a plan, and it is not an itinerary. It says nothing about the
+// four days, which is where a trip is actually lived and where all of
+// the annoying failures happen — the temple you drove past twice, the
+// museum that shuts on Mondays, the outdoor thing scheduled for the
+// afternoon it rains every single afternoon, the first morning spent
+// upright and useless because you landed at 6am.
+//
+// Five things this does that a list of places cannot:
+//
+//   1. CLUSTERS BY GEOGRAPHY. Things near each other happen on the
+//      same day. This is the whole game: a day with three stops
+//      within four kilometres is a good day, and the same three stops
+//      spread over thirty is a day spent in a car.
+//
+//   2. REFUSES TO BACKTRACK. Within a day, the stops are ordered as a
+//      route rather than as a wish list. Nearest-neighbour from the
+//      base, which is not the optimal tour and is about 15% off it —
+//      and 15% off optimal, instantly, beats optimal computed never.
+//
+//   3. RESPECTS THE CLOCK. Opening hours where we have them, and the
+//      obvious ones where we don't: markets are mornings, temples
+//      close mid-afternoon, dive shops leave at seven and beach clubs
+//      are a sunset.
+//
+//   4. PROTECTS THE FIRST DAY AND THE LAST. Arrival day is not a
+//      touring day — you have a bag, a check-in time and a body clock
+//      in the wrong timezone. Departure day is not one either. Every
+//      itinerary that ignores this produces the two most miserable
+//      days of the trip.
+//
+//   5. USES THE WEATHER IT ALREADY HAS. If the climate record says
+//      rain lands at three in the afternoon most days, the outdoor
+//      thing goes in the morning. Chappy has had that data since
+//      build 177 and has never once acted on it.
+//
+// A day is not a schedule with times on it. Times are a lie — you
+// will not be at the second temple at 11:40. It is an ORDER, with a
+// shape (morning / middle / evening), and the shape is the useful
+// part.
+// =====================================================================
+
+@MainActor
+final class ChappyDays {
+    static let shared = ChappyDays()
+    private init() {}
+
+    enum Slot: String, CaseIterable, Identifiable {
+        case earlyMorning, morning, midday, afternoon, evening, night
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .earlyMorning: return "Before 9"
+            case .morning:      return "Morning"
+            case .midday:       return "Midday"
+            case .afternoon:    return "Afternoon"
+            case .evening:      return "Evening"
+            case .night:        return "Night"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .earlyMorning: return "sunrise.fill"
+            case .morning:      return "sun.max.fill"
+            case .midday:       return "sun.haze.fill"
+            case .afternoon:    return "cloud.sun.fill"
+            case .evening:      return "sunset.fill"
+            case .night:        return "moon.stars.fill"
+            }
+        }
+        var order: Int { Slot.allCases.firstIndex(of: self) ?? 0 }
+    }
+
+    /// When a kind of place is worth doing. Not opening hours — the
+    /// hour it is actually GOOD at, which is a different and more
+    /// useful thing. A market at 3pm is open and pointless.
+    static func naturalSlot(_ kind: ChappyPlaces.Kind) -> Slot {
+        switch kind {
+        case .attractions: return .morning       // cooler, emptier, better light
+        case .cheapEats:   return .midday
+        case .restaurants: return .evening
+        case .massage:     return .afternoon     // after the doing, before the eating
+        case .recovery:    return .afternoon
+        case .gyms:        return .earlyMorning
+        case .beachClubs:  return .afternoon     // for the sunset
+        case .dive:        return .earlyMorning  // boats leave at seven
+        case .hotels:      return .night
+        }
+    }
+
+    struct Stop: Identifiable {
+        var id: String { spot.id }
+        var spot: ChappyPlaces.Spot
+        var slot: Slot
+        var kmFromPrevious: Double
+        var note: String
+
+        var travelNote: String {
+            guard kmFromPrevious > 0.35 else { return "" }
+            if kmFromPrevious < 1.2 { return "a few minutes' walk" }
+            if kmFromPrevious < 4 { return String(format: "%.0f km — a short ride", kmFromPrevious) }
+            if kmFromPrevious < 15 { return String(format: "%.0f km — 20-30 minutes", kmFromPrevious) }
+            return String(format: "%.0f km — most of an hour, and worth being deliberate about", kmFromPrevious)
+        }
+    }
+
+    enum Shape: String {
+        case arrival, departure, moving, full, rest, work
+
+        var label: String {
+            switch self {
+            case .arrival:   return "Arrive"
+            case .departure: return "Fly out"
+            case .moving:    return "Move on"
+            case .full:      return "Out and about"
+            case .rest:      return "Slow day"
+            case .work:      return "Working day"
+            }
+        }
+        var hex: String {
+            switch self {
+            case .arrival, .departure: return "#4cc4ff"
+            case .moving:              return "#ffb454"
+            case .full:                return "#31c47d"
+            case .rest:                return "#93a2b3"
+            case .work:                return "#c48cff"
+            }
+        }
+    }
+
+    struct Day: Identifiable {
+        var id: String { "\(legID)-\(index)" }
+        var legID: UUID
+        var index: Int          // 0-based within the leg
+        var date: Date
+        var place: String
+        var shape: Shape
+        var headline: String
+        var stops: [Stop]
+        var advice: [String]
+        var totalKm: Double
+
+        var dayName: String {
+            let f = DateFormatter(); f.dateFormat = "EEEE d MMM"
+            return f.string(from: date)
+        }
+        var isLight: Bool { stops.count <= 1 }
+    }
+
+    // MARK: building it
+
+    /// The whole trip, day by day. Pure function of the trip plus
+    /// whatever places and climate are already cached — it never
+    /// fetches, so it can be called from a view body without becoming
+    /// a network request.
+    func plan(_ trip: ChappyTravel.Trip,
+              places: [UUID: [ChappyPlaces.BestOf]]) -> [Day] {
+        var out: [Day] = []
+        let cal = Calendar.current
+
+        for (legIndex, leg) in trip.legs.enumerated() {
+            let nights = max(1, leg.nights)
+            let groups = places[leg.id] ?? []
+
+            // Every spot with a coordinate, best first, deduplicated.
+            var pool: [ChappyPlaces.Spot] = []
+            var seen = Set<String>()
+            for g in groups {
+                for sp in g.spots where sp.lat != 0 || sp.lon != 0 {
+                    let k = ChappyPlaces.matchKey(sp.name)
+                    if seen.contains(k) { continue }
+                    seen.insert(k)
+                    pool.append(sp)
+                }
+            }
+            pool.sort { $0.confidenceScore > $1.confidenceScore }
+
+            // Rain, if the climate record has been loaded.
+            let month = cal.component(.month, from: leg.arrive)
+            let normals = ChappySeason.shared.normals(lat: leg.lat, lon: leg.lon, month: month)
+            let wet = normals?.wetShare ?? 0
+
+            // How many touring days there actually are. The first day of
+            // the first leg is arrival; the last day of the last leg is
+            // departure; a leg you arrive at by flight loses its morning.
+            for d in 0..<nights {
+                let date = cal.date(byAdding: .day, value: d, to: leg.arrive) ?? leg.arrive
+                let isFirstOfLeg = d == 0
+                let isLastOfTrip = legIndex == trip.legs.count - 1 && d == nights - 1
+
+                var shape: Shape = .full
+                var advice: [String] = []
+                var headline = ""
+
+                if isFirstOfLeg && legIndex == 0 {
+                    shape = .arrival
+                    headline = "Land, get to \(leg.place), and do almost nothing"
+                    advice.append("Arrival day is not a touring day. You have a bag, a check-in time and a body clock in the wrong place — and every itinerary that pretends otherwise produces the worst day of the trip.")
+                    advice.append("Get a local SIM or eSIM at the airport before you leave it, draw cash there if the rate is fair, and eat somewhere within walking distance of where you're sleeping.")
+                    if let a = ChappyPorts.resolve(place: leg.place, country: leg.country,
+                                                   lat: leg.lat, lon: leg.lon) {
+                        advice.append("Arriving into \(a.label). Agree the taxi price before you get in, or book the transfer through the accommodation — the airport queue is where every trip loses its first argument.")
+                    }
+                } else if isFirstOfLeg {
+                    shape = .moving
+                    headline = "\(trip.legs[legIndex - 1].place) → \(leg.place)"
+                    advice.append("A moving day eats more than it looks like it will: pack, check out, travel, find the place, check in. Plan one thing for the afternoon, not three.")
+                    if leg.arrival == .ferry {
+                        advice.append("A boat day. Weather-dependent, cancellations in strong wind are normal, and nothing after it should be tight.")
+                    }
+                } else if isLastOfTrip, trip.oneWay == true {
+                    // AUDIT: on a one-way the last day is not a departure
+                    // day, because you are not going home — you are
+                    // moving on, or you have not decided yet. Planning it
+                    // as an airport day wastes it.
+                    shape = .moving
+                    headline = "Last planned day in \(leg.place)"
+                    advice.append("This is where the plan runs out rather than where the trip ends. Decide the next country by now — the onward ticket you'll need at check-in is easier to buy when you know where you're going.")
+                } else if isLastOfTrip {
+                    shape = .departure
+                    headline = "Last day — keep it near the airport"
+                    advice.append("Do not schedule anything you'd be upset to cut. Check out, leave the bags, and stay within reach of the airport.")
+                } else if ChappyProfile.shared.data.needsInternetForWork && d % 3 == 2 {
+                    shape = .work
+                    headline = "A working day in \(leg.place)"
+                    advice.append("You work while you travel, so one day in three is a working day whether you plan it or not. Planning it is how the other two stay whole.")
+                } else if nights >= 5 && d == nights - 2 {
+                    shape = .rest
+                    headline = "A slow day, on purpose"
+                    advice.append("Somewhere around day four of a stay, a scheduled nothing is worth more than another temple. This is that day.")
+                }
+
+                // ------------------------------------------------ the stops
+                var stops: [Stop] = []
+                if shape == .full || shape == .work {
+                    let want = shape == .work ? 2 : 4
+                    let chosen = Self.pick(from: &pool, count: want)
+                    stops = Self.route(chosen, from: (leg.lat, leg.lon), wet: wet)
+                    if headline.isEmpty {
+                        headline = stops.isEmpty
+                            ? "\(leg.place) — nothing pinned yet"
+                            : stops.first.map { "\(leg.place) — \($0.spot.name) and around it" } ?? leg.place
+                    }
+                } else if shape != .departure {
+                    // AUDIT: this took pool.removeFirst() — the leg's
+                    // highest-rated place — and spent it on a day whose
+                    // own advice says "do almost nothing". The first real
+                    // touring day then anchored on the runner-up, and
+                    // because pick() clusters around the anchor, the whole
+                    // leg's geography was built around second best.
+                    //
+                    // A quiet day gets something near where you're
+                    // sleeping, not the best thing in the region.
+                    let handy = Self.nearest(to: (leg.lat, leg.lon), from: &pool, withinKm: 3)
+                    stops = Self.route(handy, from: (leg.lat, leg.lon), wet: wet)
+                }
+
+                // ------------------------------------------------ the weather
+                if wet >= 0.4, shape == .full || shape == .work {
+                    advice.append(String(format: "Rain lands about %.0f%% of days this month, and in this part of the world it lands in the afternoon. Front-load anything outdoors — the order above already does.", wet * 100))
+                }
+
+                // AUDIT: buildExtras only fetches places for the first six
+                // legs, and a category runs dry after about eight days in
+                // one town. So a long trip produced days marked "Out and
+                // about" with nothing in them, which reads as a bug rather
+                // than as an empty diary. An empty day is a slow day.
+                if stops.isEmpty, shape == .full {
+                    shape = .rest
+                    headline = "\(leg.place) — nothing pinned for today"
+                    advice.append("Chappy has run out of shortlisted places for this stop. That is not the same as there being nothing to do — open Eat & see for this leg and it will find more.")
+                }
+
+                let km = stops.reduce(0.0) { $0 + $1.kmFromPrevious }
+                if km > 40 {
+                    advice.append(String(format: "About %.0f km of moving in one day. That is a lot for a day that is meant to be enjoyable — consider dropping the furthest one.", km))
+                }
+
+                out.append(Day(legID: leg.id, index: d, date: date, place: leg.place,
+                               shape: shape,
+                               headline: headline.isEmpty ? leg.place : headline,
+                               stops: stops, advice: advice, totalKm: km))
+            }
+        }
+        return out
+    }
+
+    /// Something within walking distance, for a day that isn't a
+    /// touring day. Returns nothing rather than sending someone across
+    /// town on the afternoon they landed.
+    private static func nearest(to base: (Double, Double),
+                                from pool: inout [ChappyPlaces.Spot],
+                                withinKm: Double) -> [ChappyPlaces.Spot] {
+        guard !pool.isEmpty else { return [] }
+        let ranked = pool.enumerated()
+            .map { ($0.offset, ChappyPorts.km(base.0, base.1, $0.element.lat, $0.element.lon)) }
+            .sorted { $0.1 < $1.1 }
+        guard let (idx, dist) = ranked.first, dist <= withinKm else { return [] }
+        return [pool.remove(at: idx)]
+    }
+
+    /// Take the next few, geographically coherent. Picking the top four
+    /// by rating gives you four things thirty kilometres apart; picking
+    /// the best one and then its neighbours gives you a day.
+    private static func pick(from pool: inout [ChappyPlaces.Spot],
+                             count: Int) -> [ChappyPlaces.Spot] {
+        guard !pool.isEmpty, count > 0 else { return [] }
+        let anchor = pool.removeFirst()
+        var chosen = [anchor]
+
+        while chosen.count < count, !pool.isEmpty {
+            // Nearest to the anchor, but only if it is actually near.
+            // Better a two-stop day than a four-stop day in a car.
+            let ranked = pool.enumerated()
+                .map { ($0.offset, ChappyPorts.km(anchor.lat, anchor.lon, $0.element.lat, $0.element.lon)) }
+                .sorted { $0.1 < $1.1 }
+            guard let (idx, dist) = ranked.first, dist <= 14 else { break }
+            chosen.append(pool.remove(at: idx))
+            _ = dist
+        }
+        return chosen
+    }
+
+    /// Order them as a route, not a list. Nearest-neighbour from the
+    /// base — roughly 15% worse than optimal and computed instantly,
+    /// which is the right trade for four stops.
+    private static func route(_ spots: [ChappyPlaces.Spot],
+                              from base: (Double, Double),
+                              wet: Double) -> [Stop] {
+        guard !spots.isEmpty else { return [] }
+        var remaining = spots
+        var ordered: [ChappyPlaces.Spot] = []
+        var cursorLat = base.0, cursorLon = base.1
+        var legs: [Double] = []
+
+        while !remaining.isEmpty {
+            var bestIdx = 0
+            var bestKm = Double.greatestFiniteMagnitude
+            for (i, sp) in remaining.enumerated() {
+                let d = ChappyPorts.km(cursorLat, cursorLon, sp.lat, sp.lon)
+                if d < bestKm { bestKm = d; bestIdx = i }
+            }
+            let next = remaining.remove(at: bestIdx)
+            ordered.append(next)
+            legs.append(bestKm)
+            cursorLat = next.lat; cursorLon = next.lon
+        }
+
+        // AUDIT: the distances used to be assigned from the nearest-
+        // neighbour tour and THEN the array was sorted by time of day,
+        // which broke the pairing completely. A restaurant 400m from base
+        // sorts to the evening and a viewpoint 9km away sorts to the
+        // morning — so the morning stop printed "a few minutes' walk" for
+        // a nine-kilometre drive and the evening one printed the reverse.
+        // Inverted, on most days, because restaurants and attractions
+        // almost always sort in opposite directions.
+        //
+        // The slot is what the day is ORDERED by. So: decide the slots,
+        // sort, and only then walk the sorted list measuring as you go.
+        _ = legs
+        var slotted: [(ChappyPlaces.Spot, Slot, String)] = []
+        for sp in ordered {
+            var slot = naturalSlot(sp.kind)
+            let outdoors = sp.kind == .attractions || sp.kind == .beachClubs || sp.kind == .dive
+            if wet >= 0.4, outdoors, slot.order >= Slot.afternoon.order {
+                slot = .morning
+            }
+            var note = ""
+            if sp.kind == .dive { note = "Boats leave around seven. This is a whole day, not a stop." }
+            if sp.kind == .beachClubs { note = "Worth timing for sunset — and worth checking the minimum spend before you sit down." }
+            if sp.kind == .attractions, slot == .morning { note = "Early is cooler, emptier and photographs better. By eleven it is neither." }
+            slotted.append((sp, slot, note))
+        }
+
+        // sorted(by:) is not stable, and four restaurants all compare
+        // equal — which would throw away the routing we just computed,
+        // differently on each run. Tie-break on the tour position.
+        let position = Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($0.element.id, $0.offset) })
+        slotted.sort {
+            $0.1.order != $1.1.order
+                ? $0.1.order < $1.1.order
+                : (position[$0.0.id] ?? 0) < (position[$1.0.id] ?? 0)
+        }
+
+        var stops: [Stop] = []
+        var fromLat = base.0, fromLon = base.1
+        for (sp, slot, note) in slotted {
+            let d = ChappyPorts.km(fromLat, fromLon, sp.lat, sp.lon)
+            stops.append(Stop(spot: sp, slot: slot, kmFromPrevious: d, note: note))
+            fromLat = sp.lat; fromLon = sp.lon
+        }
+        return stops
+    }
+}
+
+
+extension ChappyTravel {
+
+    /// The day-by-day, in the document. This is the section people
+    /// actually print out and carry.
+    func daysHTML(_ trip: Trip, places: [UUID: [ChappyPlaces.BestOf]]) -> String {
+        let days = ChappyDays.shared.plan(trip, places: places)
+        guard !days.isEmpty else { return "" }
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>Day by day"
+        h += Self.stampHTML(ChappyStamp(.estimated, source: "clustered from your shortlist", confidence: 64))
+        h += "</h2>"
+        h += "<p class=\"s2\">An order, not a schedule. Times are a lie — you will not be at the second temple "
+        h += "at 11:40. What matters is that things near each other happen on the same day, that the outdoor "
+        h += "ones land before the rain does, and that the day you fly in isn't treated as a touring day.</p>"
+
+        var currentPlace = ""
+        for day in days {
+            if day.place != currentPlace {
+                currentPlace = day.place
+                h += "<p class=\"daysep\">\(E(day.place))</p>"
+            }
+            h += "<div class=\"day\"><div class=\"dh\">"
+            h += "<span class=\"dshape\" style=\"color:\(day.shape.hex);background:\(day.shape.hex)1c\">\(E(day.shape.label))</span>"
+            h += "<div><b>\(E(day.dayName))</b><span class=\"dhl\">\(E(day.headline))</span></div></div>"
+
+            if !day.stops.isEmpty {
+                h += "<div class=\"stops\">"
+                for stop in day.stops {
+                    h += "<div class=\"stop\"><span class=\"slot\">\(E(stop.slot.label))</span><div>"
+                    h += "<b>\(E(stop.spot.name))</b>"
+                    if let rl = stop.spot.ratingLine { h += "<span class=\"srt\">\(E(rl))</span>" }
+                    if !stop.travelNote.isEmpty {
+                        h += "<span class=\"srt\">\(E(stop.travelNote))</span>"
+                    }
+                    if !stop.note.isEmpty { h += "<p class=\"snote\">\(E(stop.note))</p>" }
+                    h += "</div></div>"
+                }
+                h += "</div>"
+            }
+            for a in day.advice { h += "<p class=\"dadvice\">\(E(a))</p>" }
+            h += "</div>"
+        }
+
+        h += "<p class=\"foot\" style=\"padding:11px 0 0\">Stops are clustered so that things near each other "
+        h += "happen together, then ordered nearest-first from where you're sleeping. That is about 15% off the "
+        h += "mathematically optimal route and it is computed instantly — which is the right trade when the "
+        h += "alternative is a perfect route you never get.</p></div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 188 — THE TRIP FILE.
+//
+// Everything up to here has been about DECIDING. This is about the
+// eleven weeks between deciding and going, and the bit at the airport
+// where you need a number.
+//
+// Three things live here:
+//
+//   1. BOOKINGS. What's booked, what it cost, the confirmation
+//      number, and — the one nobody records and everybody needs —
+//      THE CANCELLATION DEADLINE. A refundable booking you forgot to
+//      cancel is a non-refundable booking with extra steps, and it is
+//      the most expensive thing on this list.
+//
+//   2. DOCUMENTS. Passport, visa, insurance, tickets, the
+//      international driving permit. Stored on the phone, available
+//      with no signal, because the moment you need them is the moment
+//      you are standing at a desk in a building with no wifi.
+//
+//   3. THE TIMELINE. 90 / 60 / 30 / 7 / 1 days, generated from the
+//      actual trip rather than from a generic checklist — a visa item
+//      only appears if the visa engine says one is needed, a jab item
+//      only for the countries that want one, and the IDP item only if
+//      there is a scooter in the plan.
+//
+// WHAT THIS DOES NOT DO, and won't pretend to: read his email.
+// Chappy has no mailbox access and asking for it to parse a booking
+// confirmation is a bad trade. The share sheet does the same job —
+// forward a confirmation into Chappy and it lands here — without
+// anyone handing an app their inbox.
+// =====================================================================
+
+@MainActor
+final class ChappyFile: ObservableObject {
+    static let shared = ChappyFile()
+
+    // MARK: bookings
+
+    enum BookingKind: String, Codable, CaseIterable, Identifiable {
+        case flight, stay, transport, tour, insurance, visa, car, onward, other
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .flight:    return "Flight"
+            case .stay:      return "Accommodation"
+            case .transport: return "Bus, train or boat"
+            case .tour:      return "Tour or ticket"
+            case .insurance: return "Insurance"
+            case .visa:      return "Visa"
+            case .car:       return "Car or scooter"
+            case .onward:    return "Onward ticket"
+            case .other:     return "Other"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .flight:    return "airplane"
+            case .stay:      return "bed.double.fill"
+            case .transport: return "tram.fill"
+            case .tour:      return "ticket.fill"
+            case .insurance: return "shield.fill"
+            case .visa:      return "doc.text.fill"
+            case .car:       return "scooter"
+            case .onward:    return "arrow.uturn.right"
+            case .other:     return "tag.fill"
+            }
+        }
+    }
+
+    struct Booking: Codable, Identifiable {
+        var id: UUID = UUID()
+        var tripID: UUID?
+        var kind: BookingKind = .other
+        var title: String = ""
+        var reference: String = ""          // the confirmation number
+        var provider: String = ""
+        var starts: Date?
+        var ends: Date?
+        var amount: Double = 0
+        var currency: String = "AUD"
+        var paid: Bool = false
+        var notes: String = ""
+
+        // Optional, per the persisted-model rule that has bitten this
+        // file three times: never add a non-optional to something that
+        // is already on disk.
+        var refundableUntil: Date?
+        var cancellationNote: String?
+        var url: String?
+
+        /// The thing nobody records and everybody needs.
+        var daysToCancel: Int? {
+            guard let d = refundableUntil else { return nil }
+            return Calendar.current.dateComponents([.day], from: Date(), to: d).day
+        }
+        var cancelUrgent: Bool {
+            guard let d = daysToCancel else { return false }
+            return d >= 0 && d <= 3
+        }
+        var cancelLapsed: Bool { (daysToCancel ?? 1) < 0 }
+    }
+
+    // MARK: documents
+
+    enum DocKind: String, Codable, CaseIterable, Identifiable {
+        case passport, visa, insurance, ticket, booking, licence, idp, vaccination, other
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .passport:    return "Passport"
+            case .visa:        return "Visa"
+            case .insurance:   return "Insurance"
+            case .ticket:      return "Ticket"
+            case .booking:     return "Booking confirmation"
+            case .licence:     return "Driver licence"
+            case .idp:         return "International driving permit"
+            case .vaccination: return "Vaccination record"
+            case .other:       return "Other"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .passport:    return "person.text.rectangle.fill"
+            case .visa:        return "doc.text.fill"
+            case .insurance:   return "shield.fill"
+            case .ticket:      return "ticket.fill"
+            case .booking:     return "checkmark.seal.fill"
+            case .licence:     return "car.fill"
+            case .idp:         return "globe.asia.australia.fill"
+            case .vaccination: return "cross.case.fill"
+            case .other:       return "paperclip"
+            }
+        }
+    }
+
+    struct Document: Codable, Identifiable {
+        var id: UUID = UUID()
+        var kind: DocKind = .other
+        var label: String = ""
+        var filename: String = ""       // inside the app's Documents folder
+        var addedAt: Date = Date()
+        var expires: Date?
+        var note: String = ""
+
+        var daysToExpiry: Int? {
+            guard let e = expires else { return nil }
+            return Calendar.current.dateComponents([.day], from: Date(), to: e).day
+        }
+    }
+
+    @Published private(set) var bookings: [Booking] = []
+    @Published private(set) var documents: [Document] = []
+
+    private let bookingKey = "chappy_bookings"
+    private let docKey = "chappy_documents"
+
+    private init() { load() }
+
+    private func load() {
+        let d = UserDefaults.standard
+        if let raw = d.data(forKey: bookingKey),
+           let v = try? JSONDecoder().decode([Booking].self, from: raw) { bookings = v }
+        if let raw = d.data(forKey: docKey),
+           let v = try? JSONDecoder().decode([Document].self, from: raw) { documents = v }
+    }
+
+    private func save() {
+        let d = UserDefaults.standard
+        if let raw = try? JSONEncoder().encode(bookings) { d.set(raw, forKey: bookingKey) }
+        if let raw = try? JSONEncoder().encode(documents) { d.set(raw, forKey: docKey) }
+    }
+
+    func add(_ b: Booking) { bookings.append(b); sortBookings(); save(); armCancellationReminders() }
+    func update(_ b: Booking) {
+        guard let i = bookings.firstIndex(where: { $0.id == b.id }) else { return }
+        bookings[i] = b; sortBookings(); save(); armCancellationReminders()
+    }
+    func remove(_ b: Booking) { bookings.removeAll { $0.id == b.id }; save() }
+
+    func add(_ d: Document) { documents.append(d); save() }
+    func remove(_ d: Document) {
+        // Take the file with it. An orphaned PDF in Documents is a
+        // passport scan nobody knows is there.
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        if let url = dir?.appendingPathComponent(d.filename), !d.filename.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        }
+        documents.removeAll { $0.id == d.id }
+        save()
+    }
+
+    private func sortBookings() {
+        bookings.sort { ($0.starts ?? .distantFuture) < ($1.starts ?? .distantFuture) }
+    }
+
+    func bookings(for tripID: UUID?) -> [Booking] {
+        guard let id = tripID else { return bookings }
+        return bookings.filter { $0.tripID == id || $0.tripID == nil }
+    }
+
+    /// What's booked, what isn't. The gap is the useful half.
+    func coverage(_ trip: ChappyTravel.Trip) -> (booked: Int, expected: Int, missing: [String]) {
+        let mine = bookings(for: trip.id)
+        var missing: [String] = []
+        let flightLegs = trip.legs.filter { $0.arrival == .flight }.count
+        let haveFlights = mine.filter { $0.kind == .flight }.count
+        if haveFlights < flightLegs { missing.append("\(flightLegs - haveFlights) flight\(flightLegs - haveFlights == 1 ? "" : "s")") }
+        let haveStays = mine.filter { $0.kind == .stay }.count
+        if haveStays < trip.legs.count { missing.append("\(trip.legs.count - haveStays) of \(trip.legs.count) stays") }
+        if !mine.contains(where: { $0.kind == .insurance }) { missing.append("travel insurance") }
+        let expected = flightLegs + trip.legs.count + 1
+        return (mine.count, expected, missing)
+    }
+
+    // MARK: the cancellation clock
+
+    /// The single most valuable reminder in the app. A refundable
+    /// booking you forgot to cancel is a non-refundable booking with
+    /// extra steps, and it costs more than every fee in build 185 put
+    /// together.
+    func armCancellationReminders() {
+        ChappyReminders.shared.drop(source: "cancel-deadline")
+        for b in bookings {
+            guard let deadline = b.refundableUntil, deadline > Date() else { continue }
+            let cal = Calendar.current
+            for daysBefore in [7, 2] {
+                guard let when = cal.date(byAdding: .day, value: -daysBefore, to: deadline),
+                      when > Date() else { continue }
+                let money = b.amount > 0 ? " (\(ChappyFX.money(b.amount, b.currency)))" : ""
+                _ = ChappyReminders.shared.add(
+                    title: "Free cancellation on \(b.title) ends in \(daysBefore) day\(daysBefore == 1 ? "" : "s")\(money)",
+                    at: when, source: "cancel-deadline")
+            }
+        }
+    }
+
+    // MARK: the timeline
+
+    struct TimelineItem: Identifiable {
+        var id: String { "\(bucket)-\(title)" }
+        var bucket: String
+        var daysOut: Int
+        var title: String
+        var detail: String
+        var done: Bool
+        var urgent: Bool
+    }
+
+    /// Built from the ACTUAL trip. A visa line only appears if the visa
+    /// engine says one is needed; the driving-permit line only if there
+    /// is a scooter in the plan. A generic checklist is something you
+    /// stop reading on the second trip.
+    func timeline(_ trip: ChappyTravel.Trip) -> [TimelineItem] {
+        guard let start = trip.start else { return [] }
+        let out = Calendar.current.dateComponents([.day], from: Date(), to: start).day ?? 0
+        let mine = bookings(for: trip.id)
+        var items: [TimelineItem] = []
+
+        func add(_ bucket: String, _ by: Int, _ title: String, _ detail: String, _ done: Bool) {
+            items.append(TimelineItem(bucket: bucket, daysOut: by, title: title,
+                                      detail: detail, done: done,
+                                      urgent: !done && out <= by))
+        }
+
+        // ---------------------------------------------------------- 90
+        let positions = ChappyVisa.shared.positions(for: trip)
+        let needsVisa = positions.contains { $0.shape != .visaFree }
+        if needsVisa {
+            let countries = positions.filter { $0.shape != .visaFree }.map(\.country)
+            add("90 days out", 90, "Visa — \(countries.joined(separator: ", "))",
+                "Applied for BEFORE you fly in most cases. A visa on arrival cannot be converted to a longer one once you have landed, and that is the mistake that ends long stays early.",
+                mine.contains { $0.kind == .visa })
+        }
+        if let v = ChappyProfile.shared.passportCheck(entering: start), !v.ok {
+            add("90 days out", 90, "Renew your passport", v.detail, false)
+        }
+        add("90 days out", 90, "Book the flights",
+            "Fares on this kind of route are usually at their best between two and four months out. Inside six weeks you are paying for indecision.",
+            mine.contains { $0.kind == .flight })
+        add("90 days out", 90, "Book the first stay",
+            "The first few nights only — refundable. The rest can wait, and will be cheaper for waiting.",
+            mine.contains { $0.kind == .stay })
+
+        // ---------------------------------------------------------- 60
+        add("60 days out", 60, "Travel insurance",
+            "Buy it when you book, not before you fly — cancellation cover only works for things that go wrong AFTER you're covered. Check whether your card already includes it before you pay twice.",
+            mine.contains { $0.kind == .insurance })
+        if trip.legs.contains(where: { ($0.scooterPerDay ?? 0) > 0 }) {
+            add("60 days out", 60, "International driving permit",
+                "Fifteen minutes at an auto club, about $45, valid a year. Without it your insurance will not pay a scooter claim, and scooter claims are the expensive ones.",
+                documents.contains { $0.kind == .idp })
+        }
+        add("60 days out", 60, "Anything that sells out",
+            "Tours, a ferry in peak season, a restaurant worth planning around. Not much — but the things that sell out sell out this far ahead.",
+            mine.contains { $0.kind == .tour })
+
+        // ---------------------------------------------------------- 30
+        add("30 days out", 30, "The rest of the accommodation",
+            "By now the prices are real and your plan has stopped moving. Book the remaining legs.",
+            mine.filter { $0.kind == .stay }.count >= trip.legs.count)
+        add("30 days out", 30, "eSIM or local SIM",
+            "An eSIM bought before you fly works the minute you land, which is the minute you need a map and a taxi. Airport SIM counters are the worst price you will pay all trip.",
+            false)
+        add("30 days out", 30, "Money",
+            "Order any cash you want to carry, and check your card's foreign transaction fee — three per cent of everything is the standard Australian bank charge and there is no reason to pay it.",
+            false)
+        add("30 days out", 30, "Re-check the refundable bookings",
+            "You booked refundable so you could do this. Prices move; if one has dropped, rebook and cancel the old one.",
+            false)
+
+        // ---------------------------------------------------------- 7
+        add("7 days out", 7, "Check the forecast, not the climate",
+            "Inside fourteen days it stops being an average and becomes a forecast. Pack for what it actually says.",
+            false)
+        add("7 days out", 7, "Documents on the phone",
+            "Passport, visa, insurance, tickets, the driving permit — in Chappy, offline. The moment you need them is the moment you are in a building with no wifi.",
+            documents.count >= 3)
+        // AUDIT: this ticked itself as DONE whenever any flight was
+        // booked. Having a flight is not having an onward ticket, and
+        // for a one-way traveller it is almost never the same thing —
+        // so the one item that can stop you boarding marked itself
+        // complete the moment you booked the flight you'd be stopped from
+        // boarding.
+        let onwardNeeds = ChappyOnward.shared.needs(trip)
+        if !onwardNeeds.isEmpty {
+            let unmet = onwardNeeds.filter { !$0.satisfied }
+            let strict = unmet.filter { $0.rule.enforcement == .strict }.map(\.country)
+            let detail = strict.isEmpty
+                ? "Asked for inconsistently in \(unmet.map(\.country).joined(separator: ", ")). Cheap insurance either way."
+                : "\(strict.joined(separator: ", ")) checks this AT THE DESK, and the airline is the one that refuses you — they're liable for carrying you somewhere that won't take you. A temporary reservation is a real PNR, cancels itself after about 48 hours, and costs a few dollars."
+            add("7 days out", 7, "Onward ticket — \(onwardNeeds.map(\.country).joined(separator: ", "))",
+                detail, unmet.isEmpty)
+        }
+
+        // ---------------------------------------------------------- 1
+        add("The day before", 1, "Check in",
+            "Online, the moment it opens. Seat selection is free at this point on most airlines that charge for it earlier.",
+            false)
+        add("The day before", 1, "Weigh the bags",
+            "Twenty kilos is twenty kilos. Low-cost carriers weigh at the gate and charge per kilo, and the gate price is roughly triple the online one.",
+            false)
+        add("The day before", 1, "Airport transfer",
+            "Booked or agreed, with a price. The airport taxi rank is where every trip loses its first argument.",
+            false)
+
+        return items
+    }
+}
+
+
+extension ChappyTravel {
+
+    /// The countdown, in the document. This is the section that turns a
+    /// plan into eleven weeks of small correct decisions.
+    func timelineHTML(_ trip: Trip) -> String {
+        let items = ChappyFile.shared.timeline(trip)
+        guard !items.isEmpty else { return "" }
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>What to do, and when"
+        h += Self.stampHTML(ChappyStamp(.record, source: "your plan", confidence: 88))
+        h += "</h2>"
+        h += "<p class=\"s2\">Built from this trip rather than from a generic checklist — the visa line only "
+        h += "appears because this trip needs one, and the driving-permit line only because there's a scooter "
+        h += "in it. Ticked items are things Chappy can already see are done.</p>"
+
+        var bucket = ""
+        for item in items {
+            if item.bucket != bucket {
+                bucket = item.bucket
+                h += "<p class=\"daysep\">\(E(bucket))</p>"
+            }
+            let cls = item.done ? "tl done" : (item.urgent ? "tl urgent" : "tl")
+            h += "<div class=\"\(cls)\"><span class=\"tick\">\(item.done ? "✓" : "○")</span><div>"
+            h += "<b>\(E(item.title))</b><span class=\"d\">\(E(item.detail))</span></div></div>"
+        }
+        h += "</div>"
+        return h
+    }
+
+    /// What's booked, what it cost, and the cancellation deadlines —
+    /// which is the line item nobody records and everybody needs.
+    func bookingsHTML(_ trip: Trip) -> String {
+        let file = ChappyFile.shared
+        let mine = file.bookings(for: trip.id)
+        let cover = file.coverage(trip)
+        guard !mine.isEmpty || !cover.missing.isEmpty else { return "" }
+        let E = Self.e
+        let f = DateFormatter(); f.dateFormat = "d MMM yyyy"
+
+        var h = "<div class=\"card\"><h2>Booked"
+        h += Self.stampHTML(ChappyStamp(.record, source: "your trip file", confidence: 96))
+        h += "</h2>"
+
+        if !mine.isEmpty {
+            for b in mine {
+                h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(b.title.isEmpty ? b.kind.label : b.title))</b>"
+                if b.amount > 0 {
+                    h += "<span class=\"rt\">\(ChappyFX.money(b.amount, b.currency))</span>"
+                }
+                h += "</div><p>"
+                var bits: [String] = [b.kind.label]
+                if !b.provider.isEmpty { bits.append(E(b.provider)) }
+                if !b.reference.isEmpty { bits.append("ref " + E(b.reference)) }
+                if let st = b.starts { bits.append(f.string(from: st)) }
+                h += bits.joined(separator: " · ") + "</p>"
+                if let d = b.refundableUntil {
+                    let days = b.daysToCancel ?? 0
+                    let colour = b.cancelLapsed ? "var(--faint)" : (b.cancelUrgent ? "var(--bad)" : "var(--good)")
+                    h += "<p style=\"color:\(colour);font-size:12.5px;margin-top:4px\">"
+                    h += b.cancelLapsed
+                        ? "Free cancellation ended \(f.string(from: d)) — this is committed money now."
+                        : "Free cancellation until \(f.string(from: d)) — \(days) day\(days == 1 ? "" : "s") left."
+                    h += "</p>"
+                }
+                h += "</div>"
+            }
+        }
+
+        if !cover.missing.isEmpty {
+            h += "<p class=\"s2\" style=\"margin-top:11px;color:var(--warn)\">Still to book: "
+            h += E(cover.missing.joined(separator: ", ")) + ".</p>"
+        }
+        h += "<p class=\"foot\" style=\"padding:9px 0 0\">A refundable booking you forget to cancel is a "
+        h += "non-refundable booking with extra steps, and it costs more than every hidden fee on this page put "
+        h += "together. Chappy reminds you seven days and two days before each deadline.</p></div>"
+        return h
+    }
+
+    /// The emergency page. Printed, screenshotted, carried.
+    func emergencyHTML(_ trip: Trip) -> String {
+        let E = Self.e
+        var countries: [String] = []
+        for leg in trip.legs {
+            guard let c = ChappyVisa.country(from: leg.country) ?? ChappyVisa.country(from: leg.place),
+                  !countries.contains(c) else { continue }
+            countries.append(c)
+        }
+        guard !countries.isEmpty else { return "" }
+
+        var h = "<div class=\"card\"><h2>If something goes wrong</h2>"
+        h += "<table>"
+        for c in countries {
+            let e = ChappyTravel.emergencyNumbers[c] ?? "112 works on most GSM networks"
+            h += "<tr><td><strong>\(E(c))</strong><br><span style=\"color:var(--dim);font-size:12.5px\">\(E(e))</span></td>"
+            h += "<td class=\"r\"><a href=\"https://www.smartraveller.gov.au/destinations\" style=\"color:var(--acc);text-decoration:none\">Smartraveller</a></td></tr>"
+        }
+        h += "</table>"
+        h += "<p class=\"s2\" style=\"margin-top:12px\">The Australian consular emergency centre takes calls "
+        h += "24 hours: <b>+61 2 6261 3305</b> from overseas, 1300 555 135 inside Australia. Register your trip "
+        h += "on Smartraveller before you fly — it takes two minutes and it is how they find you.</p>"
+        h += "<p class=\"foot\" style=\"padding:8px 0 0\">Screenshot this page. The moment you need it is the "
+        h += "moment you have no signal and a flat battery.</p></div>"
+        return h
+    }
+
+    /// Baked, because the one time you need this you have no internet.
+    static let emergencyNumbers: [String: String] = [
+        "Indonesia": "Police 110 · Ambulance 118 · Fire 113 · Tourist police 0361 754 599 (Bali)",
+        "Thailand": "All emergencies 191 · Tourist police 1155 · Ambulance 1669",
+        "Vietnam": "Police 113 · Fire 114 · Ambulance 115",
+        "Philippines": "All emergencies 911 · Tourist assistance 151-TOUR",
+        "Malaysia": "All emergencies 999 · From a mobile 112",
+        "Singapore": "Police 999 · Ambulance and fire 995",
+        "Cambodia": "Police 117 · Ambulance 119 · Fire 118 · Tourist police 012 942 484",
+        "Laos": "Police 191 · Ambulance 195 · Fire 190",
+        "Japan": "Police 110 · Ambulance and fire 119 · Japan Visitor Hotline 050-3816-2787",
+        "South Korea": "Police 112 · Ambulance and fire 119 · Tourist helpline 1330",
+        "Taiwan": "Police 110 · Ambulance and fire 119 · Travel helpline 0800-011-765",
+        "India": "All emergencies 112 · Tourist helpline 1363",
+        "Sri Lanka": "Police 119 · Ambulance 1990 · Tourist police 011 242 1052",
+        "Nepal": "Police 100 · Ambulance 102 · Tourist police 01 424 7041",
+        "New Zealand": "All emergencies 111",
+        "Australia": "All emergencies 000 · From a mobile 112",
+        "Georgia": "All emergencies 112",
+        "Mexico": "All emergencies 911",
+        "United Arab Emirates": "Police 999 · Ambulance 998",
+        "Turkey": "All emergencies 112",
+    ]
+}
+
+
+// =====================================================================
+// BUILD 189 — THE WATCH.
+//
+// Everything before this build answered a question when asked. This
+// one keeps working when nobody is looking, and it is the only module
+// here that gets BETTER the longer it runs.
+//
+// THE PRICE JOURNAL, and why it is the honest answer to a problem
+// that cannot be solved the normal way.
+//
+// Nobody will sell an app like this a live fare feed. Amadeus killed
+// self-service, Kiwi and Skyscanner are partner-only, Duffel needs an
+// airline relationship. So Chappy cannot do what a price-tracking site
+// does — and it can do something a price-tracking site cannot, which
+// is keep a record of what HIS routes cost over time.
+//
+// One researched price a week, written down with a date. After six
+// weeks that is a real series for exactly the routes he cares about,
+// and "book now or wait" stops being a guess about airline behaviour
+// in general and becomes an observation about this route in
+// particular. A generic "fares usually drop six weeks out" is worth
+// nothing. "This route has been between $410 and $470 for five weeks
+// and today it is $389" is worth booking on.
+//
+// It is slower than a live feed and it is more honest than one,
+// because every point in it is stamped with when it was taken.
+//
+// The rest of the module is the same shape: a scheduled check, a
+// recorded answer, and a notification only when something actually
+// changed. Nothing here polls for its own sake — a watch that cries
+// wolf gets turned off in a week, and then it is worth nothing at all.
+// =====================================================================
+
+@MainActor
+final class ChappyWatch: ObservableObject {
+    static let shared = ChappyWatch()
+
+    // MARK: what is being watched
+
+    enum Kind: String, Codable, CaseIterable, Identifiable {
+        case route, stay, advisory, visaRule, flightStatus
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .route:        return "Flight route"
+            case .stay:         return "Accommodation"
+            case .advisory:     return "Safety advisory"
+            case .visaRule:     return "Visa rules"
+            case .flightStatus: return "Booked flight"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .route:        return "airplane.departure"
+            case .stay:         return "bed.double.fill"
+            case .advisory:     return "exclamationmark.shield.fill"
+            case .visaRule:     return "doc.text.magnifyingglass"
+            case .flightStatus: return "dot.radiowaves.left.and.right"
+            }
+        }
+        /// How often it is worth asking. A fare moves several times a
+        /// week; a visa rule moves twice a year. Checking both daily is
+        /// how you burn an API budget and train someone to ignore you.
+        var everyDays: Int {
+            switch self {
+            case .route:        return 7
+            case .stay:         return 10
+            case .advisory:     return 14
+            case .visaRule:     return 30
+            case .flightStatus: return 1
+            }
+        }
+    }
+
+    /// One observation. The date is not decoration — it is the entire
+    /// value of the record.
+    struct Point: Codable, Identifiable, Hashable {
+        var id = UUID()
+        var at: Date
+        var low: Double
+        var high: Double
+        var note: String
+
+        var mid: Double { (low + high) / 2 }
+    }
+
+    /// BUILD 190 — WHAT THE FEED FOUND, AND WHETHER IT'S REAL.
+    ///
+    /// The first version of this posted a reminder saying "a deal feed
+    /// mentioned your route" and left him to go and check. That is half
+    /// the job — it moves the work rather than doing it.
+    ///
+    /// A hit now carries: what the feed said, where to read it, a
+    /// SEARCH LINK STRAIGHT TO THAT ROUTE with his dates and party in
+    /// it, and — the part that matters — whether Chappy went and priced
+    /// the route immediately afterwards to see if the claim held up.
+    ///
+    /// So the notification is not "go and look". It is either "this is
+    /// real, here it is, $389 against a low of $672" or it is nothing
+    /// at all, because an unconfirmed rumour is not worth a buzz.
+    struct Hit: Codable, Identifiable, Hashable {
+        var id = UUID()
+        var foundAt: Date
+        var route: String            // the watch label it matched, or ""
+        var what: String
+        var url: String              // where the feed posted it
+        var searchURL: String        // straight to the route, dates in
+        var expires: String
+
+        /// Chappy priced the route right after reading the claim.
+        var confirmed: Bool = false
+        var confirmedLow: Double?
+        var previousLow: Double?
+        var currency: String = "AUD"
+
+        var ageHours: Int {
+            Calendar.current.dateComponents([.hour], from: foundAt, to: Date()).hour ?? 0
+        }
+        /// Deal posts go stale fast. Two days and it is history.
+        var stale: Bool { ageHours > 48 }
+
+        var verdict: String {
+            guard confirmed, let now = confirmedLow else {
+                return "Posted by a deal feed. I priced the route straight after and couldn't see it — it may be sold out, or a different date, or it may not be real. Worth thirty seconds of your time, not more."
+            }
+            guard let was = previousLow, was > 0 else {
+                return "I priced the route straight after reading it: \(ChappyFX.money(now, currency)). First reading on this route, so nothing to compare it against yet."
+            }
+            let pct = (was - now) / was * 100
+            if now < was {
+                return String(format: "Confirmed. I priced it straight after: %@, against %@ — that's %.0f%% under the cheapest I'd seen. This one is real.",
+                              ChappyFX.money(now, currency), ChappyFX.money(was, currency), pct)
+            }
+            return "I priced the route straight after and it came back \(ChappyFX.money(now, currency)), which is not below what I'd already seen. The post may be for different dates."
+        }
+    }
+
+    struct Watch: Codable, Identifiable {
+        var id = UUID()
+        var kind: Kind = .route
+        var label: String = ""          // "BNE → DPS, September"
+        var query: String = ""          // what to actually ask
+        var currency: String = "AUD"
+        var tripID: UUID?
+        var createdAt: Date = Date()
+        var lastChecked: Date?
+        var points: [Point] = []
+        var active: Bool = true
+        var lastMessage: String?
+        /// BUILD 190: kept on the watch so the Flights screen can show
+        /// them against the route rather than burying them in reminders.
+        var hits: [Hit] = []
+
+        var due: Bool {
+            guard let last = lastChecked else { return true }
+            let days = Calendar.current.dateComponents([.day], from: last, to: Date()).day ?? 0
+            return days >= kind.everyDays
+        }
+
+        var latest: Point? { points.last }
+        var first: Point? { points.first }
+
+        var best: Point? { points.min { $0.mid < $1.mid } }
+        var worst: Point? { points.max { $0.mid < $1.mid } }
+
+        /// Enough of a series to say anything at all. Three points is
+        /// the floor, and even three is thin — the UI says so.
+        var hasSeries: Bool { points.count >= 3 }
+
+        var spreadPct: Double {
+            guard let b = best, let w = worst, b.mid > 0 else { return 0 }
+            return (w.mid - b.mid) / b.mid
+        }
+
+        /// THE ANSWER. Book now or wait, from this route's own history
+        /// rather than from a generalisation about airlines.
+        enum Advice: String {
+            case book, wait, watch, thin
+            var label: String {
+                switch self {
+                case .book:  return "Book it"
+                case .wait:  return "Wait"
+                case .watch: return "Keep watching"
+                case .thin:  return "Not enough history yet"
+                }
+            }
+            var hex: String {
+                switch self {
+                case .book:  return "#31c47d"
+                case .wait:  return "#ffb454"
+                case .watch: return "#93a2b3"
+                case .thin:  return "#66748a"
+                }
+            }
+        }
+
+        var advice: Advice {
+            guard hasSeries, let now = latest, let b = best, let w = worst, b.mid > 0
+            else { return .thin }
+            // Within 4% of the cheapest ever seen on this route.
+            if now.mid <= b.mid * 1.04 { return .book }
+            // Within 8% of the dearest, and the spread is real.
+            if spreadPct > 0.08, now.mid >= w.mid * 0.92 { return .wait }
+            return .watch
+        }
+
+        var adviceLine: String {
+            guard let now = latest else { return "Nothing recorded yet." }
+            let money = { (d: Double) in ChappyFX.money(d, self.currency) }
+            switch advice {
+            case .thin:
+                return "\(points.count) reading\(points.count == 1 ? "" : "s") so far. Three is the minimum before this says anything, and six is when it starts being worth acting on."
+            case .book:
+                return "\(money(now.mid)) today, against a low of \(money(best?.mid ?? 0)) across \(points.count) readings since \(Self.shortDate(first?.at)). This is at or near the bottom of what I've seen — book it."
+            case .wait:
+                return "\(money(now.mid)) today, and I've seen it as low as \(money(best?.mid ?? 0)) since \(Self.shortDate(first?.at)). That's near the top of the range. Nothing is forcing you today."
+            case .watch:
+                return "\(money(now.mid)) today, between \(money(best?.mid ?? 0)) and \(money(worst?.mid ?? 0)) over \(points.count) readings. Middle of its own range — no signal either way yet."
+            }
+        }
+
+        static func shortDate(_ d: Date?) -> String {
+            guard let d else { return "the start" }
+            let f = DateFormatter(); f.dateFormat = "d MMM"
+            return f.string(from: d)
+        }
+    }
+
+    @Published private(set) var watches: [Watch] = []
+    @Published private(set) var running = false
+    @Published var lastRun: Date?
+
+    private let key = "chappy_watches"
+
+    private init() {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let v = try? JSONDecoder().decode([Watch].self, from: d) { watches = v }
+        lastRun = UserDefaults.standard.object(forKey: "chappy_watch_lastrun") as? Date
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(watches) {
+            UserDefaults.standard.set(d, forKey: key)
+        }
+    }
+
+    // MARK: managing them
+
+    func add(_ w: Watch) {
+        guard !watches.contains(where: { $0.label == w.label && $0.kind == w.kind }) else { return }
+        watches.append(w); save()
+    }
+
+    func remove(_ w: Watch) { watches.removeAll { $0.id == w.id }; save() }
+
+    func toggle(_ w: Watch) {
+        guard let i = watches.firstIndex(where: { $0.id == w.id }) else { return }
+        watches[i].active.toggle(); save()
+    }
+
+    /// Watch the routes of a trip automatically. Every flown segment,
+    /// once — this is the whole reason the airport atlas exists.
+    func watchRoutes(of trip: ChappyTravel.Trip) {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        for hop in ChappyTravel.shared.hops(trip) {
+            var w = Watch()
+            w.kind = .route
+            w.tripID = trip.id
+            w.currency = trip.homeCurrency
+            w.label = "\(hop.from.iata) → \(hop.to.iata), \(f.string(from: hop.when))"
+            // AUDIT: hardcoded "return", so the price journal has been
+            // recording the wrong product for someone who books one-way.
+            // And it matters more than a word: one-way is rarely half a
+            // return — roughly half on the Asian low-cost carriers, and
+            // seventy to ninety per cent of a return on full-service.
+            let shape = trip.oneWay == true ? "one-way" : "return"
+            w.query = "\(shape) economy airfare \(hop.from.city) (\(hop.from.iata)) to "
+                + "\(hop.to.city) (\(hop.to.iata)) departing \(f.string(from: hop.when)) "
+                + "for \(trip.party) adult\(trip.party == 1 ? "" : "s"). "
+                + "Give the ONE-WAY price if that is what was asked for — do not halve a return."
+            add(w)
+        }
+    }
+
+    // MARK: the run
+
+    /// One pass over everything due. Deliberately sequential and
+    /// deliberately slow — this is a background job, not a screen, and
+    /// firing twelve research calls at once is how an API key gets rate
+    /// limited into uselessness.
+    func run(force: Bool = false) async {
+        guard !running else { return }
+        running = true
+        await checkFeeds(force: force)
+        defer { running = false; lastRun = Date(); UserDefaults.standard.set(Date(), forKey: "chappy_watch_lastrun") }
+
+        // AUDIT — A LIVE INDEX-OUT-OF-RANGE.
+        //
+        // This iterated `watches.indices` and awaited inside the loop.
+        // Everything here is MainActor, so nothing runs DURING an await —
+        // but the await is a suspension point, and the user can tap "Stop
+        // watching" while it is suspended. `remove` shortens the array,
+        // the loop resumes holding an index into the array that used to
+        // exist, and the app dies. The launch hook makes this reachable
+        // in ordinary use rather than in theory.
+        //
+        // Snapshot the IDs, look each one up again after every await, and
+        // skip the ones that are gone.
+        let due = watches.filter { $0.active && (force || $0.due) }.map(\.id)
+        for id in due {
+            guard let i = watches.firstIndex(where: { $0.id == id }) else { continue }
+            let w = watches[i]
+            switch w.kind {
+            case .route, .stay:
+                if let p = await priceReading(for: w) {
+                    guard let i = watches.firstIndex(where: { $0.id == id }) else { continue }
+                    watches[i].points.append(p)
+                    // Keep two years. Beyond that the route has changed
+                    // airline, aircraft and season pattern anyway.
+                    if watches[i].points.count > 104 { watches[i].points.removeFirst() }
+                    watches[i].lastMessage = watches[i].adviceLine
+                    notifyIfWorthIt(watches[i], newPoint: p)
+                }
+            case .advisory, .visaRule:
+                if let msg = await textReading(for: w) {
+                    guard let i = watches.firstIndex(where: { $0.id == id }) else { continue }
+                    if msg != w.lastMessage {
+                        watches[i].lastMessage = msg
+                        _ = ChappyReminders.shared.add(
+                            title: "\(w.label): \(msg)", at: Date().addingTimeInterval(60),
+                            source: "watch")
+                    }
+                }
+            case .flightStatus:
+                break   // handled by the flight engine's own AviationStack budget
+            }
+            if let i = watches.firstIndex(where: { $0.id == id }) {
+                watches[i].lastChecked = Date()
+            }
+            save()
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+    }
+
+    /// BUILD 190 — THE DEAL FEEDS, DAILY.
+    ///
+    /// A weekly route check will reliably tell you a fare has drifted
+    /// down over six weeks and will reliably MISS a 48-hour flash sale.
+    /// That is arithmetic, not tuning.
+    ///
+    /// The answer isn't checking routes more often — it's checking the
+    /// feeds that find the things no scheduled job can. Australian error
+    /// fares are posted within minutes of being spotted, by people. So
+    /// the feeds are read daily and matched against watched routes, and
+    /// the honest ceiling is stated rather than implied away.
+    func checkFeeds(force: Bool = false) async {
+        let key = "chappy_feeds_lastrun"
+        let last = UserDefaults.standard.object(forKey: key) as? Date
+        if !force, let l = last,
+           Calendar.current.dateComponents([.hour], from: l, to: Date()).hour ?? 99 < 20 { return }
+        UserDefaults.standard.set(Date(), forKey: key)
+
+        let routes = watches.filter { $0.active && $0.kind == .route }.map(\.label)
+        guard !routes.isEmpty else { return }
+
+        let instruction = """
+        Check these Australian flight deal feeds for anything posted in the last 48 hours:
+        \(ChappySaleCalendar.feeds.map { "\($0.name) — \($0.url)" }.joined(separator: "\n"))
+
+        He is watching these routes: \(routes.joined(separator: "; ")).
+        Also relevant: sale windows from Jetstar, Scoot, AirAsia, VietJet, Cebu Pacific.
+
+        Answer with JSON only, no code fence:
+        {"hits": [{"route": "which of his routes it touches, or 'general'",
+                   "what": "one sentence — the fare, the airline, the dates",
+                   "expires": "when it ends, if stated",
+                   "url": "where to read it"}]}
+
+        Return an EMPTY hits array unless something genuinely new and genuinely relevant to HIS routes
+        has appeared. Do not manufacture deals. A quiet week is a quiet week.
+        """
+        guard let d = await ChappyTravel.shared.askJSONPublic(instruction, maxTokens: 1400, searches: 5),
+              let raw = d["hits"] as? [[String: Any]], !raw.isEmpty else { return }
+
+        for row in raw.prefix(3) {
+            guard let what = row["what"] as? String, !what.isEmpty else { continue }
+            let route = (row["route"] as? String) ?? ""
+            let expires = (row["expires"] as? String) ?? ""
+
+            // Which watch does this touch? Match on the route label the
+            // feed named, or on either airport code appearing in the text.
+            let idx = watches.firstIndex { w in
+                guard w.kind == .route else { return false }
+                if !route.isEmpty, route != "general",
+                   w.label.localizedCaseInsensitiveContains(route) { return true }
+                let codes = w.label.split(separator: ",").first.map(String.init) ?? ""
+                return !codes.isEmpty && what.localizedCaseInsensitiveContains(codes)
+            }
+
+            var hit = Hit(foundAt: Date(), route: idx.map { watches[$0].label } ?? route,
+                          what: what, url: (row["url"] as? String) ?? "",
+                          searchURL: "", expires: expires)
+
+            if let i = idx {
+                let w = watches[i]
+                hit.currency = w.currency
+                hit.previousLow = w.best?.mid
+                hit.searchURL = Self.searchLink(for: w)
+
+                // GO AND CHECK IT. This is the difference between an
+                // agent and a notification: read the claim, then price
+                // the route yourself before repeating it to anybody.
+                if let p = await priceReading(for: w) {
+                    guard let i2 = watches.firstIndex(where: { $0.id == w.id }) else { continue }
+                    watches[i2].points.append(p)
+                    if watches[i2].points.count > 104 { watches[i2].points.removeFirst() }
+                    hit.confirmed = true
+                    hit.confirmedLow = p.mid
+                    watches[i2].lastMessage = watches[i2].adviceLine
+                }
+
+                if let i3 = watches.firstIndex(where: { $0.id == w.id }) {
+                    watches[i3].hits.removeAll { $0.stale }
+                    watches[i3].hits.insert(hit, at: 0)
+                    if watches[i3].hits.count > 8 { watches[i3].hits.removeLast() }
+                }
+            }
+
+            // Only interrupt him when it held up. An unconfirmed rumour
+            // is not worth a buzz, and a watch that cries wolf gets
+            // muted inside a fortnight.
+            let worthIt = hit.confirmed
+                && (hit.previousLow == nil || (hit.confirmedLow ?? .infinity) < (hit.previousLow ?? 0))
+            if worthIt, let now = hit.confirmedLow {
+                let ends = expires.isEmpty ? "" : " — ends \(expires)"
+                _ = ChappyReminders.shared.add(
+                    title: "\(hit.route.isEmpty ? "Deal" : hit.route): \(ChappyFX.money(now, hit.currency)) — confirmed, cheapest I've seen\(ends)",
+                    at: Date().addingTimeInterval(60), source: "watch")
+            }
+            save()
+        }
+    }
+
+    /// Straight to the route with his dates and party already in it, so
+    /// the notification is one tap from a bookable page rather than a
+    /// suggestion that he go and search.
+    static func searchLink(for w: Watch) -> String {
+        // Labels are built as "BNE → SGN, February 2027".
+        let codes = w.label.split(separator: ",").first.map(String.init) ?? ""
+        let parts = codes.components(separatedBy: "→").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard parts.count == 2, parts[0].count == 3, parts[1].count == 3 else {
+            return "https://www.skyscanner.com.au/"
+        }
+        let when = w.points.last?.at ?? w.createdAt
+        let f = DateFormatter(); f.dateFormat = "yyMMdd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return "https://www.skyscanner.com.au/transport/flights/"
+            + parts[0].lowercased() + "/" + parts[1].lowercased() + "/"
+            + f.string(from: when) + "/?adults=2&cabinclass=economy&rtn=0"
+    }
+
+    /// Every live hit across every watch, newest first — what the
+    /// Flights screen shows at the top when something's been found.
+    var liveHits: [Hit] {
+        watches.flatMap { $0.hits }.filter { !$0.stale }
+            .sorted { $0.foundAt > $1.foundAt }
+    }
+
+    /// A researched price range, stamped with the day it was taken.
+    /// Never presented as a quote, because it is not one.
+    private func priceReading(for w: Watch) async -> Point? {
+        let instruction = """
+        Find the current typical price for this, right now, using web search:
+
+        \(w.query)
+
+        Answer with JSON only, no code fence, no commentary:
+        {"low": <number>, "high": <number>, "currency": "\(w.currency)",
+         "note": "one short sentence — which airlines, and anything unusual about the price today"}
+
+        Both numbers in \(w.currency). If you genuinely cannot find a price, return {"low": 0, "high": 0, "note": "..."}.
+        """
+        guard let d = await ChappyTravel.shared.askJSONPublic(instruction, maxTokens: 1200, searches: 4),
+              let low = (d["low"] as? Double) ?? (d["low"] as? Int).map(Double.init),
+              let high = (d["high"] as? Double) ?? (d["high"] as? Int).map(Double.init),
+              low > 0, high >= low else { return nil }
+        return Point(at: Date(), low: low, high: high,
+                     note: (d["note"] as? String) ?? "")
+    }
+
+    private func textReading(for w: Watch) async -> String? {
+        let instruction = """
+        \(w.query)
+
+        Answer with JSON only:
+        {"changed": true|false, "summary": "one sentence, plain English, what an Australian traveller needs to know"}
+
+        Set changed to false unless something has genuinely changed recently. Do not manufacture news.
+        """
+        guard let d = await ChappyTravel.shared.askJSONPublic(instruction, maxTokens: 900, searches: 4),
+              (d["changed"] as? Bool) == true,
+              let summary = d["summary"] as? String, !summary.isEmpty else { return nil }
+        return summary
+    }
+
+    /// A notification only when it matters. A watch that pings every
+    /// week gets muted in a fortnight and then it is worth nothing.
+    private func notifyIfWorthIt(_ w: Watch, newPoint p: Point) {
+        guard w.hasSeries, let best = w.best else { return }
+        // Only two things are worth interrupting someone for.
+        if p.mid <= best.mid, w.points.count >= 4 {
+            _ = ChappyReminders.shared.add(
+                title: "\(w.label) is the cheapest I've seen it — \(ChappyFX.money(p.mid, w.currency))",
+                at: Date().addingTimeInterval(60), source: "watch")
+            return
+        }
+        if let previous = w.points.dropLast().last, previous.mid > 0 {
+            let drop = (previous.mid - p.mid) / previous.mid
+            if drop >= 0.12 {
+                _ = ChappyReminders.shared.add(
+                    title: String(format: "%@ dropped %.0f%% this week — now %@", w.label, drop * 100,
+                                  ChappyFX.money(p.mid, w.currency)),
+                    at: Date().addingTimeInterval(60), source: "watch")
+            }
+        }
+    }
+}
+
+// =====================================================================
+// BUILD 189 — WHEN IT GOES WRONG.
+//
+// Ten steps, in the order a person actually needs them, and the one
+// step nobody thinks of: WHAT YOU ARE OWED. Most travellers find out
+// what they were entitled to about four months later, from someone
+// else, in a pub.
+// =====================================================================
+
+@MainActor
+final class ChappyDisruption {
+    static let shared = ChappyDisruption()
+    private init() {}
+
+    struct Step: Identifiable {
+        var id: Int
+        var title: String
+        var detail: String
+        var url: String?
+    }
+
+    /// The playbook. Deliberately not an AI answer — when a flight is
+    /// cancelled you are standing in a queue with 4% battery and you
+    /// need the list, not a conversation.
+    func playbook(cancelledAt airport: String, to destination: String,
+                  trip: ChappyTravel.Trip?) -> [Step] {
+        var steps: [Step] = []
+        var n = 1
+        func add(_ title: String, _ detail: String, _ url: String? = nil) {
+            steps.append(Step(id: n, title: title, detail: detail, url: url)); n += 1
+        }
+
+        add("Get in the queue AND on the phone",
+            "Do both at once. The desk queue is an hour; the airline's phone line is often ten minutes, and whoever answers first rebooks you. If the airline has a chat in its app, that is a third queue and it counts.")
+
+        add("Ask for a specific flight, not for help",
+            "\"Can you put us on the 18:40 to \(destination)\" gets a different answer from \"what are our options\". Look up the alternatives before you reach the desk — you will know them better than the person you are speaking to.")
+
+        add("Check the other airlines yourself",
+            "Airlines rebook onto their own metal first and a partner second, and will rarely volunteer a competitor. If a competitor has a seat and you are entitled to rerouting, ask for it by flight number.",
+            "https://www.google.com/travel/flights")
+
+        if let t = trip, let leg = t.legs.first(where: { $0.place.lowercased().contains(destination.lowercased()) }),
+           let a = ChappyPorts.resolve(place: leg.place, country: leg.country, lat: leg.lat, lon: leg.lon) {
+            let alts = ChappyPorts.alternatives(to: a, withinKm: 320, limit: 3)
+            if !alts.isEmpty {
+                add("Consider a different airport",
+                    "You do not have to land where you planned. " + alts.map {
+                        "\($0.airport.label) is \(Int($0.km.rounded())) km away"
+                    }.joined(separator: "; ") + ". A seat tonight into a nearby airport beats a seat tomorrow into the right one.")
+            }
+        }
+
+        add("Check the ground alternatives",
+            "On anything under about 700 km, a train or a night bus is often faster than the next available seat — and always more certain.",
+            "https://www.rome2rio.com")
+
+        add("Sort tonight before you sort tomorrow",
+            "If you are stranded, book somewhere to sleep NOW, refundable, while there are still rooms. You can cancel it in twenty minutes if the airline puts you up. You cannot un-sell out a city.")
+
+        add("Photograph everything",
+            "The departure board showing the cancellation, the boarding pass, any text from the airline, and the receipt for anything you spend. Claims are won on evidence and lost on memory.")
+
+        add("Know what you are owed",
+            "This is the step everyone skips. In the EU and UK, EU261/UK261 gives cash compensation on top of a refund for cancellations inside 14 days — often €250-600 per person, and it is per PERSON, not per booking. Australia has no equivalent statutory scheme, but the Australian Consumer Law guarantees still apply to flights sold here, and every airline has published conditions of carriage that bind it. Travel insurance sits on top of all of it.",
+            "https://www.smartraveller.gov.au")
+
+        add("Claim the same day",
+            "Airline first, in writing, with the photographs. Insurance second, once the airline has answered — most policies require you to have tried the airline first, and a claim filed in the wrong order gets declined for the wrong reason.")
+
+        add("Tell Chappy what happened",
+            "The trip, the costs and the reminders all move with it — and the next plan learns that this route, this airline or this connection is not as reliable as the schedule says.")
+
+        return steps
+    }
+
+    /// The one thing worth checking BEFORE it goes wrong.
+    static func connectionAdvice(_ trip: ChappyTravel.Trip) -> [String] {
+        var out: [String] = []
+        let hops = ChappyTravel.shared.hops(trip)
+        guard hops.count >= 2 else { return out }
+        for i in 1..<hops.count {
+            let gap = hops[i].when.timeIntervalSince(hops[i - 1].when) / 60
+            guard gap > 0, gap < 24 * 60 else { continue }
+            let v = ChappyTravel.connectionVerdict(minutes: Int(gap), sameTicket: false,
+                                                   changeAirports: hops[i - 1].to.iata != hops[i].from.iata)
+            if v.level != "LOW" {
+                out.append("\(hops[i - 1].to.iata) → \(hops[i].from.iata): \(v.text)")
+            }
+        }
+        return out
+    }
+}
+
+
+extension ChappyTravel {
+
+    /// The price journal, in the document. Only renders once there is
+    /// something to show — a chart of one point is a dot.
+    func watchHTML(_ trip: Trip) -> String {
+        let mine = ChappyWatch.shared.watches.filter { $0.tripID == trip.id && !$0.points.isEmpty }
+        guard !mine.isEmpty else { return "" }
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>Price journal"
+        h += Self.stampHTML(ChappyStamp(.record, source: "your own readings", confidence: 88))
+        h += "</h2>"
+        h += "<p class=\"s2\">One researched price a week, written down with the date. Nobody will sell an app "
+        h += "like this a live fare feed — so instead of guessing at airline behaviour in general, this is a "
+        h += "record of what <em>your</em> routes have actually cost. It gets better every week it runs.</p>"
+
+        for w in mine {
+            h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(w.label))</b>"
+            h += "<span class=\"rt\" style=\"color:\(w.advice.hex)\">\(E(w.advice.label))</span></div>"
+            h += "<p>\(E(w.adviceLine))</p>"
+
+            // A sparkline, drawn in HTML because a chart library in an
+            // emailed file is a chart library that doesn't load.
+            if w.points.count >= 2 {
+                let mids = w.points.map(\.mid)
+                let lo = mids.min() ?? 0, hi = mids.max() ?? 1
+                let span = max(0.0001, hi - lo)
+                h += "<div class=\"spark\">"
+                for p in w.points {
+                    let pct = Int(((p.mid - lo) / span) * 74) + 13
+                    let isLow = abs(p.mid - lo) < 0.001
+                    h += "<i style=\"height:\(pct)%;background:\(isLow ? "var(--good)" : "var(--line2)")\" "
+                    h += "title=\"\(E(ChappyWatch.Watch.shortDate(p.at))) — \(ChappyFX.money(p.mid, w.currency))\"></i>"
+                }
+                h += "</div>"
+                h += "<p class=\"sparkl\"><span>\(E(ChappyWatch.Watch.shortDate(w.first?.at)))</span>"
+                h += "<span>\(ChappyFX.money(lo, w.currency)) – \(ChappyFX.money(hi, w.currency))</span>"
+                h += "<span>now</span></p>"
+            }
+            if let n = w.latest?.note, !n.isEmpty {
+                h += "<p style=\"font-size:12px;color:var(--faint);margin-top:5px\">\(E(n))</p>"
+            }
+            h += "</div>"
+        }
+        h += "<p class=\"foot\" style=\"padding:10px 0 0\">Every reading is a searched typical price on the day "
+        h += "shown, not a quote and not a live feed. The value is the series, not any single point in it.</p></div>"
+        return h
+    }
+
+    /// What to do when it goes wrong, printed before it does.
+    func disruptionHTML(_ trip: Trip) -> String {
+        let warnings = ChappyDisruption.connectionAdvice(trip)
+        let steps = ChappyDisruption.shared.playbook(
+            cancelledAt: "your departure airport",
+            to: trip.legs.first?.place ?? "your destination", trip: trip)
+        guard !steps.isEmpty else { return "" }
+        let E = Self.e
+
+        var h = "<div class=\"card\"><h2>If a flight is cancelled</h2>"
+        if !warnings.isEmpty {
+            for wn in warnings {
+                h += "<div class=\"flag\">\(E(wn))</div>"
+            }
+        }
+        h += "<p class=\"s2\">Ten steps, in the order you actually need them — because when this happens you are "
+        h += "in a queue with four per cent battery and you need a list, not a conversation.</p>"
+        h += "<ol class=\"play\">"
+        for st in steps {
+            h += "<li><b>\(E(st.title))</b><span>\(E(st.detail))</span>"
+            if let u = st.url { h += "<a href=\"\(u)\">Open</a>" }
+            h += "</li>"
+        }
+        h += "</ol>"
+        h += "<p class=\"foot\" style=\"padding:9px 0 0\">Step eight is the one everyone skips. In the EU and UK, "
+        h += "EU261 and UK261 pay cash compensation on top of a refund for cancellations inside fourteen days — "
+        h += "per person, not per booking. Australia has no equivalent statutory scheme, but the Australian "
+        h += "Consumer Law guarantees still apply to flights sold here.</p></div>"
+        return h
+    }
+}
+
+
+// =====================================================================
+// BUILD 190 — ONE-WAY IS THE DEFAULT, NOT THE EXCEPTION.
+//
+// Every engine in here has assumed a return trip: hops() invented a
+// flight home, the true cost added a return baggage sector, the price
+// journal watched "return economy airfare", the last day of the trip
+// was labelled "keep it near the airport", and the report said
+// "return, per person" in fixed text.
+//
+// None of that describes how he actually travels. He books one-way,
+// leg by leg, and has done for years — which was written down and
+// which I built five builds on top of anyway.
+//
+// One-way changes more than a fare. It changes:
+//
+//   * WHAT YOU'RE ALLOWED TO BOARD. Indonesia, Thailand and the
+//     Philippines require proof of onward travel, and it is the
+//     AIRLINE that enforces it at check-in, because the airline is
+//     liable for flying you somewhere that won't take you. Island
+//     nations reject bus and train tickets outright. A one-way
+//     traveller with no onward proof is not risking a fine, they are
+//     risking not boarding.
+//
+//   * WHAT A FARE MEANS. One-way is rarely half a return. On the
+//     Asian low-cost carriers it roughly is; on full-service it can
+//     be seventy to ninety per cent of a return fare, which
+//     occasionally makes the return the cheaper way to buy a one-way.
+//
+//   * WHAT THE LAST DAY IS. On a return it is a departure day. On a
+//     one-way it is a moving day, and it should be planned like one.
+// =====================================================================
+
+@MainActor
+final class ChappyOnward {
+    static let shared = ChappyOnward()
+    private init() {}
+
+    /// How strictly a country actually enforces proof of onward travel.
+    /// This is about the CHECK-IN DESK, not the border — the desk is
+    /// where it happens, and the desk is where people are surprised.
+    enum Enforcement: String {
+        case strict, common, rare, none
+
+        var label: String {
+            switch self {
+            case .strict: return "Enforced at the desk"
+            case .common: return "Often checked"
+            case .rare:   return "Rarely checked"
+            case .none:   return "Not required"
+            }
+        }
+        var hex: String {
+            switch self {
+            case .strict: return "#ff6b5e"
+            case .common: return "#ffb454"
+            case .rare:   return "#8fa4bd"
+            case .none:   return "#31c47d"
+            }
+        }
+        /// Only the top two are worth blocking a plan over.
+        var blocking: Bool { self == .strict || self == .common }
+    }
+
+    struct Rule {
+        var country: String
+        var enforcement: Enforcement
+        var landAccepted: Bool      // will a bus or train ticket do?
+        var note: String
+    }
+
+    /// Baked, because you need this before you have signal and long
+    /// before you reach an immigration hall.
+    static let rules: [Rule] = [
+        Rule(country: "Indonesia", enforcement: .strict, landAccepted: false,
+             note: "Checked at Australian departure gates more reliably than at Denpasar. An island — ferry and bus tickets are not accepted."),
+        Rule(country: "Philippines", enforcement: .strict, landAccepted: false,
+             note: "The most consistently enforced in the region. Airlines are fined for carrying passengers without it, so they check every time."),
+        Rule(country: "Thailand", enforcement: .strict, landAccepted: false,
+             note: "Air departure proof specifically — bus and train tickets to Malaysia are routinely rejected at check-in."),
+        Rule(country: "Singapore", enforcement: .strict, landAccepted: true,
+             note: "Checked on arrival as well as at the desk. A bus to Johor is accepted."),
+        Rule(country: "Vietnam", enforcement: .rare, landAccepted: true,
+             note: "The e-visa is the document that matters here; onward proof is seldom asked for on top of it."),
+        Rule(country: "Malaysia", enforcement: .common, landAccepted: true,
+             note: "Asked for inconsistently. Land borders to Thailand and Singapore are accepted."),
+        Rule(country: "Cambodia", enforcement: .rare, landAccepted: true,
+             note: "The visa on arrival largely settles it. Land crossings are normal here."),
+        Rule(country: "Laos", enforcement: .rare, landAccepted: true,
+             note: "Overland is the usual way in and out. Rarely an issue."),
+        Rule(country: "Japan", enforcement: .common, landAccepted: false,
+             note: "Asked for on one-way arrivals, and 90 days is a hard ceiling with no extension — so they do look."),
+        Rule(country: "Taiwan", enforcement: .common, landAccepted: false, note: "Commonly checked on a one-way."),
+        Rule(country: "South Korea", enforcement: .common, landAccepted: false, note: "Commonly checked on a one-way."),
+        Rule(country: "Sri Lanka", enforcement: .rare, landAccepted: false, note: "The ETA carries most of the weight."),
+        Rule(country: "India", enforcement: .rare, landAccepted: true, note: "The visa carries it."),
+        Rule(country: "New Zealand", enforcement: .strict, landAccepted: false,
+             note: "Enforced, and they are not casual about it."),
+        Rule(country: "Australia", enforcement: .none, landAccepted: true, note: "You live there."),
+    ]
+
+    static func rule(for country: String) -> Rule? {
+        let q = country.lowercased().trimmingCharacters(in: .whitespaces)
+        return rules.first { $0.country.lowercased() == q }
+    }
+
+    // MARK: how he actually solves it
+
+    /// HIS METHOD, as the default rather than as a lecture.
+    ///
+    /// He buys a temporary reservation that auto-cancels — a real PNR,
+    /// verifiable on the airline's site, valid about 48 hours, a few
+    /// dollars. It is the cheapest legal answer and it is what he
+    /// already does, so Chappy's job is to time it and remember it
+    /// rather than to explain it every trip.
+    enum Method: String, Codable, CaseIterable, Identifiable {
+        case temporary, refundable, realOnward, land
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .temporary:  return "Temporary reservation"
+            case .refundable: return "Refundable real flight"
+            case .realOnward: return "The next flight, actually booked"
+            case .land:       return "Bus or train ticket"
+            }
+        }
+        var cost: String {
+            switch self {
+            case .temporary:  return "a few dollars"
+            case .refundable: return "$200–1,200 locked up for weeks"
+            case .realOnward: return "full fare"
+            case .land:       return "$15–50"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .temporary:
+                return "A real PNR, verifiable on the airline's site, that cancels itself after about 48 hours. Cheapest legal answer, and the one you already use."
+            case .refundable:
+                return "Works, and it ties up real money for three weeks or more while the refund clears."
+            case .realOnward:
+                return "The cleanest of all, when you already know where you're going next."
+            case .land:
+                return "Only for land borders. Island arrivals reject it, which is most of where you go."
+            }
+        }
+    }
+
+    /// NEVER offered, and worth saying why once rather than never.
+    static let neverGenerate = "A generated PDF that isn't a real booking is document fraud — it risks refusal, deportation and an entry ban, and it costs the same as the legal option. Chappy will not produce one and will not link to one."
+
+    /// The window. Buy it too early and it expires before check-in;
+    /// too late and you're doing it at the airport on hotel wifi.
+    static func buyWindow(for departure: Date) -> (open: Date, close: Date) {
+        let cal = Calendar.current
+        let close = cal.date(byAdding: .hour, value: -4, to: departure) ?? departure
+        let open = cal.date(byAdding: .hour, value: -30, to: departure) ?? departure
+        return (open, close)
+    }
+
+    // MARK: what a trip needs
+
+    struct Need: Identifiable {
+        var id: String { country }
+        var country: String
+        var arriveOn: Date
+        var rule: Rule
+        var satisfied: Bool
+        var expiresBefore: Bool     // held, but it lapses before you fly
+
+        var level: String {
+            if satisfied { return "LOW" }
+            return rule.enforcement == .strict ? "HIGH" : "MEDIUM"
+        }
+    }
+
+    /// Every country on this trip that will ask, and whether the trip
+    /// file already answers it.
+    func needs(_ trip: ChappyTravel.Trip) -> [Need] {
+        guard trip.oneWay == true else { return [] }
+        var out: [Need] = []
+        var seen = Set<String>()
+        let held = ChappyFile.shared.bookings(for: trip.id)
+            .filter { $0.kind == .onward }
+
+        for leg in trip.legs {
+            guard let country = ChappyVisa.country(from: leg.country)
+                ?? ChappyVisa.country(from: leg.place),
+                  !seen.contains(country) else { continue }
+            seen.insert(country)
+            guard let r = Self.rule(for: country), r.enforcement.blocking else { continue }
+
+            let match = held.first { b in
+                b.notes.localizedCaseInsensitiveContains(country)
+                    || b.title.localizedCaseInsensitiveContains(country)
+            }
+            // A temporary reservation is only proof on the day. One held
+            // for a flight three weeks from now has already cancelled
+            // itself, and that is the specific way this goes wrong.
+            let lapses: Bool = {
+                guard let m = match, let ends = m.ends ?? m.refundableUntil else { return false }
+                return ends < leg.arrive
+            }()
+            out.append(Need(country: country, arriveOn: leg.arrive, rule: r,
+                            satisfied: match != nil && !lapses, expiresBefore: lapses))
+        }
+        return out
+    }
+
+    /// The one line the report and the score both use.
+    func summary(_ trip: ChappyTravel.Trip) -> String? {
+        let n = needs(trip)
+        guard !n.isEmpty else { return nil }
+        let open = n.filter { !$0.satisfied }
+        if open.isEmpty {
+            return "Onward proof is held for \(n.map(\.country).joined(separator: ", "))."
+        }
+        let strict = open.filter { $0.rule.enforcement == .strict }.map(\.country)
+        if !strict.isEmpty {
+            return "No onward ticket for \(strict.joined(separator: ", ")) — and that is checked at the desk, not the border. You will not be boarded without it."
+        }
+        return "No onward ticket for \(open.map(\.country).joined(separator: ", ")), which is asked for inconsistently."
+    }
+}
+
+// =====================================================================
+// BUILD 190 — WHAT THE NUMBER ACTUALLY BUYS.
+//
+// "Five thousand dollars, two months, Bali" is a sentence Chappy could
+// already act on — the planner takes a hard ceiling and hits it. The
+// problem is HOW it hits it: a model told to reach a number reaches it
+// by thinning the trip until it fits. Twenty-two dollar rooms, twelve
+// dollar days, and a plan that is technically real and practically
+// miserable.
+//
+// And the deal score does not catch it, because every line sits at the
+// bottom of its band — which the scorer reads as good value.
+//
+// A travel agent does not do that. They tell you what the number buys
+// BEFORE you pick the country. That is all this is: budget, minus
+// flights, divided by nights and party, against what each place
+// actually costs — and then the honest sentence.
+// =====================================================================
+
+@MainActor
+final class ChappyAfford {
+    static let shared = ChappyAfford()
+    private init() {}
+
+    /// Real cost per night for two, on the ground, flights excluded.
+    /// Taken from the ten long-stay simulations rather than invented —
+    /// these are what the plans actually came out at.
+    struct Place {
+        var country: String
+        var region: String
+        var perNightTwo: Double      // AUD
+        var note: String
+    }
+
+    static let costs: [Place] = [
+        Place(country: "Cambodia", region: "Kampot, Siem Reap", perNightTwo: 38,
+              note: "Riverside guesthouses at twenty dollars that are genuinely nice."),
+        Place(country: "Laos", region: "Luang Prabang, Vientiane", perNightTwo: 44,
+              note: "Cheap if you stay put. Two bases, not six."),
+        Place(country: "Vietnam", region: "Da Nang, Hoi An", perNightTwo: 52,
+              note: "Works on a monthly apartment rate rather than a nightly one."),
+        Place(country: "Philippines", region: "the Visayas", perNightTwo: 68,
+              note: "Ferries and island hops add up faster than the beds do."),
+        Place(country: "Thailand", region: "Chiang Mai", perNightTwo: 62,
+              note: "The north is affordable. The islands are not."),
+        Place(country: "Thailand", region: "the islands", perNightTwo: 88,
+              note: "Lanta and Samui are twice the north."),
+        Place(country: "Malaysia", region: "Penang, KL", perNightTwo: 58,
+              note: "The cheapest place on this list to be genuinely comfortable."),
+        Place(country: "Indonesia", region: "Bali, lean", perNightTwo: 96,
+              note: "Canggu and Ubud have priced themselves well above the rest of Indonesia."),
+        Place(country: "Indonesia", region: "Java and the east", perNightTwo: 54,
+              note: "Yogyakarta and Flores are a different country to Bali, on price."),
+        Place(country: "Sri Lanka", region: "south and hills", perNightTwo: 56, note: "Cheap outside Colombo."),
+        Place(country: "Japan", region: "anywhere", perNightTwo: 210,
+              note: "Roughly four times South-East Asia. Not a two-month budget destination."),
+        Place(country: "Taiwan", region: "Taipei", perNightTwo: 104, note: "Excellent, and not cheap."),
+        Place(country: "Georgia", region: "Tbilisi, Batumi", perNightTwo: 62, note: "Very cheap, very far away."),
+    ]
+
+    struct Verdict {
+        var budget: Double
+        var nights: Int
+        var party: Int
+        var currency: String
+        var flightAllowance: Double
+        var perNight: Double
+        var perPersonDay: Double
+        var works: [Place]
+        var doesnt: [Place]
+        var named: Place?           // the destination he actually asked about
+        var headline: String
+        var advice: String
+    }
+
+    /// Return fares are not the question for him — he flies one-way, so
+    /// the allowance is the way IN plus a modest onward hop, not a
+    /// return pair.
+    /// AUDIT, found by simulation: `base` was 620, which is a RETURN-ish
+    /// fare being used as a one-way base — so a $5,000 budget came back
+    /// $6 a night meaner than it should have, and the difference landed
+    /// exactly on the line between Chiang Mai fitting and not fitting.
+    ///
+    /// Brisbane to Denpasar one-way is $250–400; to Ho Chi Minh it's
+    /// $400–600. 380 is the honest middle for a one-way long-haul out of
+    /// Australia, and the 1.35 covers the hop onward at the end.
+    static func flightAllowance(party: Int, oneWay: Bool, longHaul: Bool) -> Double {
+        let base = longHaul ? 380.0 : 170.0
+        return oneWay ? base * Double(party) * 1.35   // in, plus one hop out
+                      : base * 2.0 * Double(party) * 1.15   // returns price above 2x a one-way
+    }
+
+    func check(budget: Double, nights: Int, party: Int, currency: String = "AUD",
+               destination: String? = nil, oneWay: Bool = true) -> Verdict {
+        let n = max(1, nights), p = max(1, party)
+        let allow = Self.flightAllowance(party: p, oneWay: oneWay, longHaul: true)
+        let onGround = max(0, budget - allow)
+        let perNight = onGround / Double(n)
+        let perPersonDay = perNight / Double(p)
+
+        // Scaled to the party — the table is priced for two.
+        let scale = Double(p) / 2.0
+        let works = Self.costs.filter { $0.perNightTwo * scale <= perNight }
+            .sorted { $0.perNightTwo < $1.perNightTwo }
+        let doesnt = Self.costs.filter { $0.perNightTwo * scale > perNight }
+            .sorted { $0.perNightTwo < $1.perNightTwo }
+
+        // AUDIT: matched on COUNTRY only, so "Bali" — the literal example
+        // in this file's own header comment — matched nothing and fell
+        // through to the generic answer. And when a country did match,
+        // .first returned the most expensive row for it (Bali at $96
+        // rather than Java at $54), which is the wrong way to be wrong.
+        let named: Place? = destination.flatMap { d in
+            let q = d.lowercased().trimmingCharacters(in: .whitespaces)
+            guard !q.isEmpty else { return nil }
+            let hits = Self.costs.filter {
+                let c = $0.country.lowercased(), r = $0.region.lowercased()
+                return c == q || q.contains(c) || r.contains(q) || q.contains(r)
+            }
+            // A region hit is more specific than a country hit, so it wins.
+            return hits.first { $0.region.lowercased().contains(q) } ?? hits.first
+        }
+
+        let money = { (v: Double) in ChappyFX.money(v, currency) }
+        var headline = "\(money(budget)) for \(p == 1 ? "you" : "\(p) of you"), \(n) nights. "
+        headline += "Flights take about \(money(allow)) of it, which leaves \(money(perNight)) a night for "
+        headline += "\(p == 1 ? "you" : "the \(p) of you") — \(money(perPersonDay)) each per day covering the bed, "
+        headline += "the food and everything else."
+
+        var advice: String
+        if let place = named {
+            let need = place.perNightTwo * scale
+            if need <= perNight {
+                advice = "\(place.country) — \(place.region) runs about \(money(need)) a night for "
+                advice += "\(p == 1 ? "one" : "\(p)"). That fits, with \(money(perNight - need)) a night spare."
+            } else if need <= perNight * 1.15 {
+                // AUDIT: the simulation had this calling Chiang Mai and
+                // Penang "SHORT" on a six per cent gap — technically true
+                // and useless as advice. Six per cent is a monthly rate
+                // and one fewer move, not a different country.
+                advice = "\(place.country) — \(place.region) runs about \(money(need)) a night, which is "
+                advice += "\(money(need - perNight)) over. That's close enough to work on monthly rates rather "
+                advice += "than nightly ones, with one fewer move than you'd otherwise make. Tight, not wrong."
+            } else {
+                let short = (need - perNight) * Double(n)
+                advice = "\(place.country) — \(place.region) runs about \(money(need)) a night. "
+                advice += "You are \(money(need - perNight)) a night short, which is \(money(short)) across the trip. "
+                if let best = works.first {
+                    advice += "I can still plan it, and you'd be living thinner than you'd enjoy by week three. "
+                    advice += "\(best.country) at \(money(best.perNightTwo * scale)) a night is comfortable on the same money."
+                } else {
+                    advice += "Nothing on my list fits this number — the budget, not the destination, is the thing to change."
+                }
+            }
+        } else if let best = works.first, let worst = works.last {
+            advice = "That works comfortably in \(best.country) and stretches as far as \(worst.country). "
+            advice += "It does not reach \(doesnt.first?.country ?? "the expensive end")."
+        } else {
+            advice = "That is below the cheapest plan I have on file. It is not impossible — it is a different "
+            advice += "kind of trip, staying in one place and cooking."
+        }
+
+        return Verdict(budget: budget, nights: n, party: p, currency: currency,
+                       flightAllowance: allow, perNight: perNight, perPersonDay: perPersonDay,
+                       works: works, doesnt: doesnt, named: named,
+                       headline: headline, advice: advice)
+    }
+}
+
+// =====================================================================
+// BUILD 190 — SEARCHING WHERE THE AIRLINE ACTUALLY IS.
+//
+// Every flight link in this app pointed at Google Flights, and on the
+// routes he actually flies that is the worst available choice.
+//
+// VietJet Air and AirAsia X do not publish fares to Google at all —
+// they withhold them deliberately to push you to their own sites. So
+// on a Ho Chi Minh hop or a Kuala Lumpur one, Chappy has been sending
+// him to the one search engine that cannot see the cheapest carrier on
+// the route.
+//
+// Three links, in the order they are useful:
+//
+//   1. SKYSCANNER for the search. Deepest low-cost coverage, and it
+//      lists the carriers Google omits.
+//   2. THE AIRLINE ITSELF, when we know who flies it. Asian low-cost
+//      carriers are frequently cheapest direct, and their member fares
+//      and flash sales exist nowhere else.
+//   3. GOOGLE FLIGHTS for the month grid, which is still the best
+//      version of that one thing and is worth keeping for it alone.
+// =====================================================================
+
+@MainActor
+enum ChappyFareShop {
+
+    /// Booking sites for the carriers in the baggage table. Deliberately
+    /// the home page rather than a deep link — these sites change their
+    /// search URLs constantly and a broken deep link is worse than a
+    /// working home page.
+    static let airlineSites: [String: String] = [
+        "Jetstar": "https://www.jetstar.com",
+        "Jetstar Asia": "https://www.jetstar.com",
+        "Scoot": "https://www.flyscoot.com",
+        "Scoot Plus": "https://www.flyscoot.com",
+        "AirAsia": "https://www.airasia.com",
+        "VietJet": "https://www.vietjetair.com",
+        "Cebu Pacific": "https://www.cebupacificair.com",
+        "Lion Air": "https://www.lionair.co.id",
+        "Super Air Jet": "https://www.superairjet.com",
+        "Citilink": "https://www.citilink.co.id",
+        "Batik Air": "https://www.batikair.com",
+        "Qantas": "https://www.qantas.com",
+        "Virgin Australia": "https://www.virginaustralia.com",
+        "Singapore Airlines": "https://www.singaporeair.com",
+        "Garuda Indonesia": "https://www.garuda-indonesia.com",
+        "Thai Airways": "https://www.thaiairways.com",
+        "Vietnam Airlines": "https://www.vietnamairlines.com",
+        "Malaysia Airlines": "https://www.malaysiaairlines.com",
+        "Philippine Airlines": "https://www.philippineairlines.com",
+        "Bangkok Airways": "https://www.bangkokair.com",
+        "Emirates": "https://www.emirates.com",
+        "Qatar Airways": "https://www.qatarairways.com",
+        "ANA": "https://www.ana.co.jp",
+        "Japan Airlines": "https://www.jal.co.jp",
+        "Korean Air": "https://www.koreanair.com",
+        "China Airlines": "https://www.china-airlines.com",
+        "EVA Air": "https://www.evaair.com",
+        "Cathay Pacific": "https://www.cathaypacific.com",
+        "Air New Zealand": "https://www.airnewzealand.com.au",
+    ]
+
+    /// Carriers that Google genuinely cannot see. Worth naming in the
+    /// UI, because "search somewhere else" without a reason is noise.
+    static let hiddenFromGoogle: Set<String> = [
+        "VietJet", "AirAsia", "AirAsia X", "Lion Air", "Super Air Jet", "Citilink",
+    ]
+
+    /// The one that should be tapped first.
+    static func skyscanner(from: String, to: String, on date: Date,
+                           party: Int, oneWay: Bool) -> URL? {
+        let f = DateFormatter(); f.dateFormat = "yyMMdd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        // Skyscanner's path form is stable and has been for years:
+        // /transport/flights/<from>/<to>/<yymmdd>/?adults=N
+        var s = "https://www.skyscanner.com.au/transport/flights/"
+        s += from.lowercased() + "/" + to.lowercased() + "/" + f.string(from: date) + "/"
+        s += "?adults=\(max(1, party))&cabinclass=economy"
+        if oneWay { s += "&rtn=0" }
+        return URL(string: s)
+    }
+
+    static func airline(_ name: String) -> URL? {
+        airlineSites[name].flatMap(URL.init(string:))
+    }
+
+    /// Whether it's worth telling him Google can't see this route well.
+    static func googleBlindSpot(_ airlines: String) -> String? {
+        var hits = hiddenFromGoogle.filter { airlines.localizedCaseInsensitiveContains($0) }
+        // "AirAsia X" also matches "AirAsia", which produced
+        // "AirAsia and AirAsia X doesn't publish fares" — a duplicated
+        // carrier and a singular verb on a plural list.
+        hits = hits.filter { h in !hits.contains { $0 != h && $0.contains(h) } }
+        guard !hits.isEmpty else { return nil }
+        let list = hits.sorted().joined(separator: " and ")
+        let verb = hits.count == 1 ? "doesn't" : "don't"
+        return "\(list) \(verb) publish fares to Google — search Skyscanner or the airline directly, or you'll never see the cheapest option on this route."
+    }
+}
+
+// =====================================================================
+// BUILD 190 — WHEN THE SALES ACTUALLY HAPPEN.
+//
+// A watch that checks a route once a week will reliably tell you it
+// has drifted down over six weeks, and will reliably MISS a 48-hour
+// flash sale. That is not a tuning problem, it is an arithmetic one.
+//
+// The fix isn't checking more often — it's checking at the right time.
+// Most low-cost carrier sales are not random: they recur, and several
+// are on a published weekly cycle. Knowing WHEN to look costs nothing
+// and beats looking constantly.
+//
+// The honest ceiling, stated in the UI rather than implied away: a
+// six-hour error fare will not be caught by any scheduled job. Those
+// are found by people and published within minutes, which is why the
+// deal feeds are checked daily and the routes weekly.
+// =====================================================================
+
+@MainActor
+enum ChappySaleCalendar {
+
+    struct Window {
+        var name: String
+        var who: String
+        var when: String
+        var weekday: Int?        // 1 = Sunday, per Calendar
+        var note: String
+    }
+
+    static let windows: [Window] = [
+        Window(name: "Friday Frenzy", who: "Jetstar", when: "Every Friday, from about 4pm AEST",
+               weekday: 6,
+               note: "Weekly, time-boxed, and gone by Saturday. The most predictable sale an Australian can plan around."),
+        Window(name: "Happy Friday", who: "Virgin Australia", when: "Most Fridays",
+               weekday: 6, note: "Domestic-weighted, but the short-haul international appears too."),
+        Window(name: "Big Sale / Free Seats", who: "AirAsia", when: "Several times a year, announced ahead",
+               weekday: nil,
+               note: "Booking windows for travel six to twelve months out. Base fare is free; you still pay taxes and bags."),
+        Window(name: "Flash promos", who: "VietJet", when: "Irregular, often midweek",
+               weekday: nil, note: "Announced on their own channels and almost nowhere else. Google cannot see these at all."),
+        Window(name: "Seat sales", who: "Cebu Pacific", when: "Monthly, often around payday",
+               weekday: nil, note: "Piso fares sell out in hours and are domestic-heavy."),
+        Window(name: "Escape sales", who: "Scoot", when: "Roughly monthly",
+               weekday: nil, note: "Usually a Tuesday or Wednesday launch."),
+    ]
+
+    /// Feeds that find the things no scheduled job will. Checked daily
+    /// because that is cheap; matched against his watched routes.
+    static let feeds: [(name: String, url: String, what: String)] = [
+        ("I Know The Pilot", "https://iknowthepilot.com.au/",
+         "The best Australian error-fare feed. Posts within minutes."),
+        ("Beat That Flight", "https://www.beatthatflight.com.au/",
+         "Australian sale aggregation, strong on Asia."),
+        ("Secret Flying", "https://www.secretflying.com/",
+         "Global mistake fares. Less Australia-specific, occasionally spectacular."),
+    ]
+
+    /// Is a known sale window open, or about to be?
+    static func imminent(on date: Date = Date()) -> [Window] {
+        let wd = Calendar.current.component(.weekday, from: date)
+        return windows.filter { $0.weekday == wd || $0.weekday == (wd % 7) + 1 }
+    }
+
+    static let honestCeiling = "A six-hour error fare will not be caught by any scheduled check — those are found by people and gone before a weekly job runs. Chappy watches the feeds that find them daily and tells you when one lands on a route you're watching. That is a real thing and it is not the same as catching one live."
+}
+
+
+// =====================================================================
+// BUILD 190 — THE FLIGHTS DOCUMENT.
+//
+// The trip report has flights inside it. This is the one you forward
+// to someone, or open at a check-in desk on a phone with no signal:
+// the segments as codes, what each actually costs once the bags are
+// in, what the journal has seen, what's included, the onward-ticket
+// position, and where to search for a carrier Google cannot see.
+//
+// Same writer as the trip report, so it emails and saves to iCloud
+// through the same share sheet.
+// =====================================================================
+
+extension ChappyTravel {
+
+    func flightsHTML(_ trip: Trip) -> String {
+        let segments = hops(trip)
+        let E = Self.e
+        let home = trip.homeCurrency
+        let d = DateFormatter(); d.dateFormat = "EEE d MMM yyyy"
+        let oneWay = trip.oneWay == true
+
+        var h = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta name="color-scheme" content="dark">
+        <title>Flights — \(E(trip.name))</title><style>\(reportCSS)</style></head><body><div class="wrap">
+        <div class="hero"><p class="kicker">Chappy · Flights\(oneWay ? " · one-way" : "")</p>
+        <h1>\(E(trip.name))</h1>
+        <p class="dates">\(E(trip.dateLine)) · \(trip.party) travelling · Australian passport\(trip.party > 1 ? "s" : "")</p>
+        </div><div class="body">
+        """
+
+        // AUDIT: this guard used to sit ABOVE the onward block and return
+        // early — so a one-way trip whose legs hadn't geocoded yet got a
+        // flights document with no onward-ticket section at all. The one
+        // thing that stops you boarding was omitted precisely in the
+        // incomplete-data case. The onward block only reads trip.legs and
+        // needs no airports, so it goes first.
+        let noSegments = segments.isEmpty
+
+        // ---------------------------------------------------------- onward
+        let needs = ChappyOnward.shared.needs(trip)
+        if !needs.isEmpty {
+            let unmet = needs.filter { !$0.satisfied }
+            h += "<div class=\"card\"><h2>Onward ticket"
+            h += Self.stampHTML(ChappyStamp(.researched, source: "airline boarding rules", confidence: 82))
+            h += "</h2>"
+            if unmet.isEmpty {
+                h += "<p class=\"s2\" style=\"color:var(--good)\">Held for every country on this trip that asks.</p>"
+            } else {
+                h += "<p class=\"s2\">You're flying one-way. These countries want proof you're leaving, and it is "
+                h += "the <b>airline</b> that enforces it at the check-in desk — they're liable for carrying "
+                h += "someone a country won't admit, so they check every time.</p>"
+            }
+            for n in needs {
+                let lvl = n.level
+                h += "<div class=\"risk\"><span class=\"rl \(lvl)\">\(lvl)</span><div>"
+                h += "<b>\(E(n.country)) — \(E(n.rule.enforcement.label))</b>"
+                h += "<span class=\"d\">\(E(n.rule.note))"
+                if !n.rule.landAccepted { h += " Bus and train tickets are not accepted here." }
+                h += "</span>"
+                if n.expiresBefore {
+                    h += "<div class=\"f\">→ You've recorded one, but it lapses before you fly. A temporary "
+                    h += "reservation is only proof on the day.</div>"
+                } else if !n.satisfied {
+                    h += "<div class=\"f\">→ A temporary reservation is a real PNR, verifiable on the airline's "
+                    h += "site, cancels itself after about 48 hours, and costs a few dollars. Buy it the day "
+                    h += "before, not the week before.</div>"
+                }
+                h += "</div></div>"
+            }
+            h += "<p class=\"foot\" style=\"padding:10px 0 0\">\(E(ChappyOnward.neverGenerate))</p></div>"
+        }
+
+        guard !noSegments else {
+            h += "<div class=\"card\"><h2>No flights yet</h2><p class=\"s2\">Nothing in this trip is reached by "
+            h += "air yet, or the places haven't been geocoded. The onward-ticket position above still applies "
+            h += "— it depends on where you're going, not on how you get there.</p></div>"
+            h += "</div></div></body></html>"
+            return h
+        }
+
+        // ---------------------------------------------------------- segments
+        let truth = ChappyTrueCost.shared.compute(trip)
+        let bagLines = truth.fees.filter { $0.kind == .baggage || $0.kind == .seat }
+
+        h += "<div class=\"card\"><h2>The segments"
+        h += Self.stampHTML(ChappyStamp(.official, source: "IATA table", confidence: 92))
+        h += "</h2>"
+        for hop in segments {
+            h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(hop.route))</b>"
+            h += "<span class=\"rt\">\(d.string(from: hop.when)) · \(ChappyPorts.durationLine(hop.km))</span></div>"
+            h += "<p>\(E(hop.from.full)) → \(E(hop.to.full)) · \(Int(hop.km.rounded())) km</p>"
+            h += "<div class=\"acts\" style=\"padding:7px 0 0\">"
+            if let u = ChappyFareShop.skyscanner(from: hop.from.iata, to: hop.to.iata,
+                                                 on: hop.when, party: trip.party, oneWay: oneWay) {
+                h += "<a href=\"\(u.absoluteString)\">Skyscanner</a>"
+            }
+            if let u = monthGridURL(hop, nights: trip.nights) {
+                h += "<a class=\"hunt\" href=\"\(u.absoluteString)\">Cheapest week</a>"
+            }
+            if let u = codedFlightURL(hop, party: trip.party) {
+                h += "<a href=\"\(u.absoluteString)\">Google Flights</a>"
+            }
+            h += "</div></div>"
+        }
+        h += "</div>"
+
+        // ---------------------------------------------------------- the blind spot
+        if let airlines = trip.flights?.airlines,
+           let warn = ChappyFareShop.googleBlindSpot(airlines) {
+            h += "<div class=\"card\"><h2>Search somewhere other than Google</h2>"
+            h += "<div class=\"flag\">\(E(warn))</div>"
+            h += "<div class=\"acts\" style=\"padding:9px 0 0\">"
+            for (name, url) in ChappyFareShop.airlineSites.sorted(by: { $0.key < $1.key })
+                where airlines.localizedCaseInsensitiveContains(name) {
+                h += "<a class=\"hunt\" href=\"\(url)\">\(E(name)) direct</a>"
+            }
+            h += "</div></div>"
+        }
+
+        // ---------------------------------------------------------- what it costs
+        if !bagLines.isEmpty {
+            h += "<div class=\"card\"><h2>What the fare doesn't include</h2>"
+            for f in bagLines {
+                h += "<div class=\"cost\"><span>\(E(f.label))</span><b>\(ChappyFX.money(f.amount, home))</b></div>"
+            }
+            h += "<p class=\"s2\" style=\"margin-top:9px\">\(trip.party) traveller\(trip.party == 1 ? "" : "s") "
+            h += "at 20kg each. Buy the bags with the fare "
+            h += "— at the airport it is roughly triple, and low-cost carriers weigh at the gate.</p></div>"
+        }
+
+        // ---------------------------------------------------------- the journal
+        h += watchHTML(trip)
+
+        // ---------------------------------------------------------- when the sales are
+        h += "<div class=\"card\"><h2>When the sales actually happen</h2>"
+        h += "<p class=\"s2\">Most low-cost sales are not random — several run on a published weekly cycle. "
+        h += "Knowing when to look costs nothing and beats looking constantly.</p>"
+        let soon = ChappySaleCalendar.imminent()
+        if !soon.isEmpty {
+            h += "<div class=\"flag\">Today or tomorrow: "
+            h += E(soon.map { "\($0.who) \($0.name)" }.joined(separator: ", ")) + ".</div>"
+        }
+        for wdw in ChappySaleCalendar.windows {
+            h += "<div class=\"row2\"><div class=\"rh\"><b>\(E(wdw.who)) — \(E(wdw.name))</b>"
+            h += "<span class=\"rt\">\(E(wdw.when))</span></div><p>\(E(wdw.note))</p></div>"
+        }
+        h += "<div class=\"acts\" style=\"padding:11px 0 0\"><p class=\"t\">Checked daily</p>"
+        for (name, url, _) in ChappySaleCalendar.feeds {
+            h += "<a class=\"hunt\" href=\"\(url)\">\(E(name))</a>"
+        }
+        h += "</div><p class=\"foot\" style=\"padding:10px 0 0\">\(E(ChappySaleCalendar.honestCeiling))</p></div>"
+
+        h += disruptionHTML(trip)
+        h += Self.trustLegendHTML()
+        h += "</div></div></body></html>"
+        return h
+    }
+
+    /// Written to Documents, then handed to the share sheet — which is
+    /// how it reaches Mail, and how it reaches iCloud Drive via Files.
+    func writeFlights(_ trip: Trip) -> URL? {
+        let safe = trip.name.replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = "Flights — " + (safe.isEmpty ? "Trip" : safe) + ".html"
+        guard let dir = FileManager.default.urls(for: .documentDirectory,
+                                                 in: .userDomainMask).first else { return nil }
+        let url = dir.appendingPathComponent(name)
+        do { try flightsHTML(trip).data(using: .utf8)?.write(to: url); return url }
+        catch { return nil }
     }
 }

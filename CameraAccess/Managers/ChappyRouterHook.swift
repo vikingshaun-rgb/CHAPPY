@@ -52,9 +52,17 @@ enum ChappyRouterHook {
         }
 
         // ── 2. A live session owns the wearer's speech ──────────────────
+        //
+        // BUILD 182: it used to own it ABSOLUTELY, so while a conversation
+        // was open there was no way to ask the weather, the trip cost, a
+        // visa, a conversion or a web look-up — every one of those went to
+        // a brain that cannot answer them, and the wearer had no idea why.
+        // A sentence that names a real module now escapes the session and
+        // the session stays open behind it.
         if ChappyConversation.shared.isActive {
-            if isSignOff(c) { ChappyConversation.shared.close(sayBye: true) }
-            else            { ChappyConversation.shared.send(c) }
+            if isSignOff(c) { ChappyConversation.shared.close(sayBye: true); return true }
+            if hasAModule(c) { return false }
+            ChappyConversation.shared.send(c)
             return true
         }
 
@@ -250,9 +258,57 @@ enum ChappyRouterHook {
             "any ideas", "what have i got on", "let's talk", "lets talk",
             "talk to me about", "i need to sort", "sort out", "recommend"
         ]
+        // BUILD 182 — DON'T SWALLOW A COMMAND A MODULE CAN ACTUALLY DO.
+        //
+        // This hook runs BEFORE the whole keyword router, and it opened a
+        // conversation for anything that looked like planning or advice.
+        // But the conversation brain's tools are photo, navigate,
+        // translate, reminders, lists, timers and recall — it has no
+        // travel, visa, weather, currency, flight or web-search hands at
+        // all. So "plan my trip to Vietnam", a shipped command, was dead
+        // code: intercepted here and answered by a brain that cannot
+        // build a trip.
+        //
+        // A sentence that names a thing Chappy has a real module for goes
+        // to that module. Only genuinely open-ended judgement reaches the
+        // conversation.
+        if hasAModule(c) { return false }
         if openers.contains(where: { c.contains($0) }) { return true }
-        // Long multi-clause sentences are conversations wearing a command's hat.
+        // Long multi-clause sentences are conversations wearing a command's
+        // hat — unless they name a module, which the check above caught.
         return c.split(separator: " ").count > 22
+    }
+
+    /// Does a real engine own this? Kept deliberately concrete: these are
+    /// the words the keyword router matches on, so anything here has a
+    /// better home than a chat session.
+    private static func hasAModule(_ c: String) -> Bool {
+        let owned = [
+            // travel desk
+            "trip", "itinerary", "travel desk", "plan me", "plan a trip",
+            "plan my trip", "flight", "flights", "hotel", "airbnb",
+            // visa
+            "visa", "passport", "immigration", "how long can i stay",
+            // weather
+            "weather", "forecast", "windy", "humid", "sunset", "sunrise",
+            "sunscreen",
+            // money
+            "how much is", "convert", "exchange rate", "rupiah", "baht",
+            "ringgit", "currency",
+            // search + the rest
+            "look up", "search the web", "translate", "remember this",
+            "take a photo", "navigate to", "take me to",
+        ]
+        // AUDIT: this matched SUBSTRINGS, which is a trap with short words.
+        // "leg" fired on legal, college and delegate; "rain" on training and
+        // brain; "uv" on louvre. That both blocked real conversations ("help
+        // me sort out the legal stuff") and ejected people mid-session ("my
+        // legs are sore"). Whole words only, and the two-and-three letter
+        // entries are gone.
+        let padded = " " + c.replacingOccurrences(of: ",", with: " ")
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "?", with: " ") + " "
+        return owned.contains { padded.contains(" " + $0 + " ") || padded.contains(" " + $0 + "s ") }
     }
 
     // MARK: - Ambient memory commands (PHASE 5 STEP 2)
