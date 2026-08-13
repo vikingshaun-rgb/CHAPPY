@@ -27,6 +27,8 @@ class APIKeyManager {
         migrateLegacyKey()
         // Seed built-in default keys if none saved yet
         seedDefaultKeys()
+        // BUILD 175: rewrite every stored key to AfterFirstUnlock, once.
+        upgradeKeychainAccessibility()
     }
     // MARK: - Built-in Default Keys (auto-seeded into Keychain)
     //
@@ -72,7 +74,12 @@ class APIKeyManager {
             _ = saveKey(defaultGoogleKey, for: googleAccount)
             print("✅ Seeded built-in Gemini API key (force=\(force))")
         }
-        if (force || getKey(for: googleMapsAccount) == nil),
+        // BUILD 183: if he has explicitly CLEARED the Maps key, leave it
+        // cleared. This used to put the built-in key back on the next cold
+        // launch, so "Cleared" lasted until you closed the app and Google
+        // lookups quietly resumed on somebody else's billing account.
+        let mapsClearedByUser = defaults.bool(forKey: "chappy_maps_key_cleared")
+        if (force || getKey(for: googleMapsAccount) == nil), !mapsClearedByUser,
            defaultGoogleMapsKey.hasPrefix("AIza") {
             _ = saveKey(defaultGoogleMapsKey, for: googleMapsAccount)
             print("✅ Seeded built-in Maps API key (force=\(force))")
@@ -228,16 +235,56 @@ class APIKeyManager {
         _ = deleteKey(for: account)
 
         // Add new key
+        //
+        // BUILD 175 — THE ROBOT VOICE AT STARTUP. THIS LINE IS THE CAUSE.
+        //
+        // There was no kSecAttrAccessible here, so every key in this app was
+        // stored with the Keychain's DEFAULT: kSecAttrAccessibleWhenUnlocked.
+        // That means the key is literally unreadable whenever the phone is
+        // locked — SecItemCopyMatching returns errSecInteractionNotAllowed and
+        // getGoogleAPIKey() hands back nil.
+        //
+        // Chappy reads that as "no Gemini key" and speaks in Apple's voice,
+        // silently, with nothing on screen to say why. And the moments that
+        // hit it are EXACTLY the ones that matter: the morning brief firing on
+        // a locked phone, the proactive background task, a notification tap
+        // before the phone has finished unlocking, and launch itself.
+        //
+        // AfterFirstUnlock means: unreadable after a reboot until the wearer
+        // unlocks once, then readable for the rest of the phone's life whether
+        // it is locked or not. That is the correct class for a background
+        // service key, and it is what Apple recommends for exactly this.
+        // ThisDeviceOnly keeps it off iCloud Keychain backups.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecValueData as String: data
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
         let status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecSuccess {
+            Self.memo[account] = key      // BUILD 175: see getKey
+        }
         return status == errSecSuccess
     }
+
+    // BUILD 175 — REMEMBER THE KEY.
+    //
+    // Every single spoken line called into the Keychain. The Keychain is not
+    // guaranteed to answer — it refuses while the device is locked, and it can
+    // return errSecInteractionNotAllowed for a moment during unlock. One
+    // refused read cost the wearer the real voice for that line, with no way
+    // to tell that from "there is genuinely no key".
+    //
+    // So: once a key has been read successfully, it is held in memory for the
+    // life of the process. A later refusal falls back to what we already know
+    // rather than to silence. Cleared on delete, refreshed on save.
+    private static var memo: [String: String] = [:]
+
+    /// BUILD 175: why the last Keychain read failed, for the voice status line.
+    private(set) static var lastKeychainStatus: OSStatus = errSecSuccess
 
     private func getKey(for account: String) -> String? {
         let query: [String: Any] = [
@@ -250,14 +297,54 @@ class APIKeyManager {
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        Self.lastKeychainStatus = status
 
         guard status == errSecSuccess,
               let data = result as? Data,
               let key = String(data: data, encoding: .utf8) else {
-            return nil
+            if status == errSecInteractionNotAllowed {
+                print("\u{26A0}\u{FE0F} [Keys] Keychain locked (errSecInteractionNotAllowed) for \(account) - using the remembered copy")
+            }
+            return Self.memo[account]
         }
 
+        Self.memo[account] = key
         return key
+    }
+
+    // BUILD 175 — REWRITE THE OLD ITEMS.
+    //
+    // Fixing saveKey only helps keys saved from now on. Everything already in
+    // the Keychain — including the baked Gemini key seeded on first launch —
+    // still carries WhenUnlocked and would stay unreadable on a locked phone
+    // forever. This reads each one while the app is in the foreground (so the
+    // device is definitionally unlocked and the read WILL succeed) and writes
+    // the accessibility attribute onto it in place. Runs once, then never again.
+    func upgradeKeychainAccessibility() {
+        let done = "chappy_keychain_afu_v1"
+        guard !UserDefaults.standard.bool(forKey: done) else { return }
+        let accounts = [alibabaBeijingAccount, alibabaSingaporeAccount,
+                        anthropicAccount, openrouterAccount, googleAccount,
+                        googleMapsAccount, legacyAccount, legacyAlibabaAccount]
+        var moved = 0
+        for account in accounts {
+            let find: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account
+            ]
+            let update: [String: Any] = [
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            ]
+            if SecItemUpdate(find as CFDictionary, update as CFDictionary) == errSecSuccess {
+                moved += 1
+            }
+        }
+        // Only mark it done if the device was actually unlocked enough to read.
+        if getKey(for: googleAccount) != nil {
+            UserDefaults.standard.set(true, forKey: done)
+            print("\u{1F511} [Keys] Keychain upgraded to AfterFirstUnlock (\(moved) items) - the voice now survives a locked phone")
+        }
     }
 
     private func deleteKey(for account: String) -> Bool {
@@ -268,6 +355,7 @@ class APIKeyManager {
         ]
 
         let status = SecItemDelete(query as CFDictionary)
+        Self.memo[account] = nil      // BUILD 175
         return status == errSecSuccess || status == errSecItemNotFound
     }
 }
