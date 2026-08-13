@@ -1558,7 +1558,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// Turn the ear back on in Settings, or say nothing and it stays
     /// off — this build is for finding out, not for using.
     static var earArmsItself: Bool {
-        get { UserDefaults.standard.object(forKey: "chappy_auto_arm") as? Bool ?? false }
+        // BUILD 214: back ON by default. 213 proved the ear was never the
+        // problem — the crash report names a stack overflow in SwiftUI's
+        // type machinery, on the main thread, before any audio runs.
+        get { UserDefaults.standard.object(forKey: "chappy_auto_arm") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "chappy_auto_arm") }
     }
 
