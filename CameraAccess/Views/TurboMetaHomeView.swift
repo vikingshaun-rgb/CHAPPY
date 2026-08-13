@@ -306,6 +306,13 @@ struct TurboMetaHomeView: View {
     @State private var notifsOff = false        // BUILD 163: permission truth
     @State private var showNotifDoctor = false  // BUILD 172
     @State private var showWeather = false      // BUILD 173
+    @State private var showTravel = false       // BUILD 177
+    @State private var showVisas = false        // BUILD 178
+    @State private var showOptions = false      // BUILD 181
+    @State private var showIntake = false       // BUILD 181
+    @State private var showAtlasMap = false     // BUILD 178
+    @State private var showCurrency = false     // BUILD 177
+    @State private var showSearch = false       // BUILD 177
     @State private var showBriefs = false       // BUILD 173
     @State private var dictateAutoStart = false
     @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
@@ -504,6 +511,37 @@ struct TurboMetaHomeView: View {
 
     /// BUILD 173 — live conditions on the tile face, so the common question
     /// is answered without opening anything.
+    /// BUILD 177: the tile says what the trip IS, not what the screen is
+    /// called — a tile reading "Travel Desk / plan trips" is a label, and a
+    /// tile reading "Bali - 14 nights, $4,180" is information.
+    /// BUILD 178: the tile leads with the PROBLEM when there is one. A
+    /// visa overrun found on a home screen three months out is a fixable
+    /// annoyance; found at a check-in desk it is a cancelled trip.
+    private var visaDetailLine: String {
+        guard let t = ChappyTravel.shared.active, !t.legs.isEmpty else {
+            return "What an Australian passport gets, anywhere"
+        }
+        let pos = ChappyVisa.shared.positions(for: t)
+        if let bad = pos.first(where: { $0.over }) {
+            return "\(bad.country): \(bad.days) days but you get \(bad.allowance)"
+        }
+        if let act = pos.first(where: { $0.shape.needsActionBeforeFlying }) {
+            return "\(act.country) needs sorting before you fly"
+        }
+        if pos.isEmpty { return "What an Australian passport gets, anywhere" }
+        return "\(pos.count) \(pos.count == 1 ? "country" : "countries") — all inside the limit"
+    }
+
+    private var travelDetailLine: String {
+        guard let t = ChappyTravel.shared.active, !t.legs.isEmpty else {
+            return "Plan, cost and map a whole trip"
+        }
+        let c = ChappyTravel.shared.cost(t)
+        var s = "\(t.name) \u{2014} \(t.nights) \(t.nights == 1 ? "night" : "nights")"
+        if c.total > 0 { s += ", \(ChappyFX.money(c.total, t.homeCurrency))" }
+        return s
+    }
+
     private var weatherDetailLine: String {
         guard let n = ChappyWeather.shared.now else {
             return "Wind, rain, UV, pressure — 7 days ahead"
@@ -977,10 +1015,17 @@ struct TurboMetaHomeView: View {
                                        tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
                                 showPlaces = true
                             }
+                            // AUDIT: the subtitle counted ChappyFlights.watches
+                            // (the 176 status store) while the tile now opens a
+                            // screen backed by ChappyWatch.watches. Two separate
+                            // stores — so it could read "3 routes watched" and
+                            // then show you nothing.
                             ChappyTile(icon: "airplane", title: "Flights",
-                                       detail: ChappyFlights.shared.watches.isEmpty
-                                            ? "Watch routes, track your flight"
-                                            : "\(ChappyFlights.shared.watches.count) route\(ChappyFlights.shared.watches.count == 1 ? "" : "s") watched",
+                                       detail: {
+                                            let n = ChappyWatch.shared.watches.filter { $0.kind == .route }.count
+                                            return n == 0 ? "Segments, bags, price journal"
+                                                          : "\(n) route\(n == 1 ? "" : "s") watched"
+                                       }(),
                                        tint: Color(red: 0.30, green: 0.75, blue: 1.0)) {
                                 showFlights = true
                             }
@@ -999,6 +1044,28 @@ struct TurboMetaHomeView: View {
                                        detail: weatherDetailLine,
                                        tint: Color(red: 0.35, green: 0.78, blue: 1.0)) {
                                 showWeather = true
+                            }
+                            // BUILD 177 — the Travel Desk, the converter
+                            // and the web look-up.
+                            ChappyTile(icon: "map.fill", title: "Travel Desk",
+                                       detail: travelDetailLine,
+                                       tint: Color(red: 0.42, green: 0.86, blue: 0.62)) {
+                                showTravel = true
+                            }
+                            ChappyTile(icon: "globe.asia.australia.fill", title: "Visas",
+                                       detail: visaDetailLine,
+                                       tint: Color(red: 0.98, green: 0.55, blue: 0.42)) {
+                                showVisas = true
+                            }
+                            ChappyTile(icon: "dollarsign.arrow.circlepath", title: "Currency",
+                                       detail: "Convert anything, works offline",
+                                       tint: Color(red: 0.96, green: 0.80, blue: 0.35)) {
+                                showCurrency = true
+                            }
+                            ChappyTile(icon: "magnifyingglass.circle.fill", title: "Look it up",
+                                       detail: "Search the web \u{2014} spoken, with sources",
+                                       tint: Color(red: 0.68, green: 0.60, blue: 0.98)) {
+                                showSearch = true
                             }
                             ChappyTile(icon: "sun.horizon.fill", title: "Briefs",
                                        detail: "How your daily brief is built — and when",
@@ -1081,6 +1148,34 @@ struct TurboMetaHomeView: View {
             }
             .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
             .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
+            .fullScreenCover(isPresented: $showTravel) { TravelDeskView() }
+            .fullScreenCover(isPresented: $showAtlasMap) { TripAtlasView() }
+            .sheet(isPresented: $showVisas) { VisaDeskView() }
+            .sheet(isPresented: $showOptions) { TripOptionsSheet() }
+            .sheet(isPresented: $showIntake) { IntakeSheet() }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenOptions)) { _ in
+                showOptions = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenIntake)) { _ in
+                showIntake = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenVisa)) { _ in
+                showVisas = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlasMap)) { _ in
+                showAtlasMap = true
+            }
+            .sheet(isPresented: $showCurrency) { CurrencyView() }
+            .sheet(isPresented: $showSearch) { WebSearchView() }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenTravel)) { _ in
+                showTravel = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFX)) { _ in
+                showCurrency = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenSearch)) { _ in
+                showSearch = true
+            }
             .sheet(isPresented: $showBriefs) { BriefStudio() }
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenWeather)) { _ in
                 showWeather = true
@@ -1154,6 +1249,10 @@ struct TurboMetaHomeView: View {
                     showAtlas = false;       showPlaces = false
                     showUpcoming = false;    showDictate = false
                     showWeather = false;     showBriefs = false
+                    showTravel = false;      showCurrency = false
+                    showSearch = false;      showVisas = false
+                    showAtlasMap = false
+                    showOptions = false;     showIntake = false
                     showNotifDoctor = false
                     showFlights = false;     showCommands = false
                     showReminders = false;   showMapSheet = false
@@ -1164,8 +1263,12 @@ struct TurboMetaHomeView: View {
                     armStandbyIfClear(reason: "reset")
                 }
             }
+            // BUILD 190: the tile now opens the route screen — segments,
+            // true cost, the price journal, nearby airports, connection
+            // verdicts. The 176 status view is still there and is still
+            // the right thing on the day you fly; it's one tap inside.
             .sheet(isPresented: $showFlights) {
-                FlightsView(theme: theme)
+                ChappyFlightsView()
             }
             .fullScreenCover(isPresented: $showReminders) {
                 RemindersView()
@@ -3835,6 +3938,87 @@ struct OriginalMediaView: View {
 // BUILD 150 — THE FLIGHT DECK. Watched routes with price history drawn as
 // sparklines, the tracked flight's travel-day card, and a search box that
 // speaks Amadeus. Booking hands off to the big sites with the route ready.
+// BUILD 176 — WHAT'S LEFT IN THE TANK.
+//
+// The flight lookups run on AviationStack's free 100-a-month, and that
+// plan has NO overage: at the limit the calls don't get billed, they
+// start failing. So the way this breaks is Chappy going quiet on gate
+// and delay information in an airport, with nothing on screen to explain
+// it. Nothing in the app counted, so there was never a warning.
+//
+// Shown in FLIGHT DAYS, not raw calls. "Sixty-one left" is a number;
+// "about seven more flight days" is something you can plan around.
+struct FlightBudgetBar: View {
+    let theme: ChappyTheme
+    @ObservedObject private var budget = ChappyFlightBudget.shared
+    @State private var editing = false
+    @State private var limitField = ""
+
+    private var tint: Color {
+        let f = budget.fraction
+        if f >= 0.9 { return .red }
+        if f >= 0.7 { return .orange }
+        return theme.accent
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("FLIGHT CHECKS", systemImage: "gauge.with.needle")
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(.cyan)
+                Spacer()
+                Button {
+                    limitField = String(budget.limit)
+                    editing = true
+                } label: {
+                    Text("\(budget.used) / \(budget.limit)")
+                        .font(.caption).fontWeight(.semibold)
+                        .foregroundColor(tint)
+                }
+                .buttonStyle(.plain)
+            }
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.10))
+                    Capsule().fill(tint.opacity(0.85))
+                        .frame(width: max(3, geo.size.width * budget.fraction))
+                }
+            }
+            .frame(height: 7)
+
+            Text(summary)
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+        .alert("Monthly flight checks", isPresented: $editing) {
+            TextField("100", text: $limitField).keyboardType(.numberPad)
+            Button("Save") {
+                if let n = Int(limitField), n > 0 { budget.limit = n }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("AviationStack's free plan is 100 a month. If you upgrade, put the new number here - nothing else has to change.")
+        }
+    }
+
+    private var summary: String {
+        if budget.remaining == 0 {
+            return "All used for this month. Flight status goes to the screen instead of being read out. Resets in \(budget.daysUntilReset) days."
+        }
+        let d = budget.flightDaysLeft
+        let days = d >= 1
+            ? "About \(d) more flight \(d == 1 ? "day" : "days")."
+            : "Not quite a full flight day left."
+        return "\(days) A tracked flight day costs at most \(ChappyFlightBudget.costOfAFlightDay). Resets in \(budget.daysUntilReset) days."
+    }
+}
+
 struct FlightsView: View {
     @Environment(\.dismiss) private var dismiss
     let theme: ChappyTheme
@@ -3850,6 +4034,8 @@ struct FlightsView: View {
                 AuroraBackdrop(theme: theme)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
+                        // BUILD 176 — THE FLIGHT BUDGET METER.
+                        FlightBudgetBar(theme: theme)
                         // SEARCH / WATCH BOX
                         VStack(alignment: .leading, spacing: 8) {
                             Text("WATCH A ROUTE")
@@ -8592,6 +8778,8 @@ struct WeatherStation: View {
                             if !wx.hours.isEmpty { hourStrip }
                             if !wx.days.isEmpty { weekPanel }
                             sunPanel(n)
+                        todayPanel()
+                        freshness
                             speakRow
                             satelliteRow
                         }
@@ -8799,6 +8987,88 @@ struct WeatherStation: View {
         }
         .padding(13)
         .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+    }
+
+    // BUILD 182 — THE THREE THAT WERE FETCHED AND NEVER SHOWN.
+    //
+    // ChappyWeather has always pulled the day's total rainfall, the day's
+    // PEAK UV and the day's maximum wind. All three went straight into the
+    // morning brief and were invisible on the screen built to show every
+    // instrument — so the UV gauge showed the reading for right now, which
+    // at 7am is zero, while the day was going to hit eleven.
+    private func todayPanel() -> some View {
+        Group {
+            if let d = wx.days.first {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("TODAY'S PEAKS")
+                        .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                        .foregroundColor(.cyan)
+                    HStack(spacing: 0) {
+                        peakCell("Rain today", d.rainMm >= 0.1
+                                    ? String(format: "%.1f mm", d.rainMm) : "None",
+                                 "drop.fill", .blue,
+                                 d.rainChance > 0 ? "\(d.rainChance)% chance" : "")
+                        peakCell("Peak UV", "\(Int(d.uvMax.rounded()))",
+                                 "sun.max.trianglebadge.exclamationmark.fill",
+                                 d.uvMax >= 8 ? .red : (d.uvMax >= 6 ? .orange : .yellow),
+                                 ChappyWeather.uvWord(d.uvMax))
+                        peakCell("Top wind", "\(Int(d.windMaxKmh.rounded()))",
+                                 "wind", .teal, "km/h")
+                    }
+                }
+                .padding(13)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 15).fill(.ultraThinMaterial))
+            }
+        }
+    }
+
+    private func peakCell(_ title: String, _ value: String, _ icon: String,
+                          _ tint: Color, _ sub: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 17)).foregroundStyle(tint)
+            Text(title).font(.caption2).foregroundColor(theme.textSecondary)
+            Text(value)
+                .font(.subheadline).fontWeight(.semibold)
+                .foregroundColor(theme.textPrimary)
+            if !sub.isEmpty {
+                Text(sub).font(.system(size: 10)).foregroundColor(theme.textSecondary.opacity(0.8))
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// BUILD 182: how old the reading is. Every other data screen in the
+    /// app says this — the currency screen has said it since 177 — and the
+    /// one built around live instruments did not, so a twenty-minute-old
+    /// wind speed looked exactly like a live one.
+    private var freshness: some View {
+        Group {
+            if let at = wx.fetchedAt {
+                let mins = Int(Date().timeIntervalSince(at) / 60)
+                HStack(spacing: 5) {
+                    Image(systemName: "clock").font(.system(size: 10))
+                    Text(mins < 1 ? "Just now"
+                         : (mins < 60 ? "As at \(Self.timeLabel(at)) · \(mins) min ago"
+                                      : "As at \(Self.timeLabel(at))"))
+                    Spacer()
+                    if mins >= 30 {
+                        Button {
+                            Task { await wx.loadHere() }
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(theme.accent)
+                    }
+                }
+                .font(.system(size: 10))
+                .foregroundColor(mins >= 60 ? .orange : theme.textSecondary.opacity(0.85))
+                .padding(.horizontal, 4)
+            }
+        }
     }
 
     private func sunCell(_ title: String, _ d: Date?, _ icon: String, _ tint: Color) -> some View {
@@ -9066,5 +9336,4247 @@ struct BriefStudio: View {
         let ampm = h < 12 ? "am" : "pm"
         let display = h == 0 ? 12 : (h > 12 ? h - 12 : h)
         return "\(display):00 \(ampm)"
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE TRAVEL DESK.
+//
+// One screen that holds a whole trip: the map, the money, the legs, the
+// places to eat and see, the weather for the month you're actually
+// going, and a booking link per leg with your dates already in it.
+//
+// What it deliberately does NOT do is pretend to book. Airbnb has had no
+// public API since 2019; Booking, Agoda, Trip.com, Klook and Traveloka
+// all gate theirs behind an approved commercial agreement; Facebook
+// Marketplace has never had one at all. So the honest design — and the
+// one TripIt, Wanderlog and Kayak's planner all use — is: do the
+// thinking here, hand off with everything pre-filled. Every link below
+// is a plain universal link, so it opens the app if you have it and the
+// site if you don't.
+// =====================================================================
+
+struct TravelDeskView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var fx = ChappyFX.shared
+    /// AUDIT: the per-leg climate line read ChappySeason but never observed
+    /// it, so the normals landed after the last redraw and the row stayed
+    /// invisible until something unrelated forced a refresh.
+    @ObservedObject private var season = ChappySeason.shared
+
+    @State private var showNewTrip = false
+    @State private var showTripFile = false
+    @State private var showFlights = false
+    @State private var showBudget = false
+    @State private var newName = ""
+    @State private var newPlace = ""
+    @State private var editingLeg: ChappyTravel.Leg?
+    @State private var placesLeg: ChappyTravel.Leg?
+    @State private var showTripPicker = false
+    @State private var shareURL: URL?
+    @State private var showShare = false
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: -8.5, longitude: 115.2),
+        span: MKCoordinateSpan(latitudeDelta: 6, longitudeDelta: 6))
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                if let t = trip {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 14) {
+                            headerCard(t)
+                            // BUILD 190: high in the stack on purpose. It
+                            // decides the fare, the bags, the last day and
+                            // whether you can be boarded — that belongs
+                            // above the money, not buried under it.
+                            ChappyOneWayCard(trip: t, theme: theme)
+                            mapCard(t)
+                            moneyCard(t)
+                            legsCard(t)
+                            extrasCard(t)
+                                            actionsCard(t)
+                            gripeCard(t)
+                            honestyNote
+                        }
+                        .padding(14)
+                        .padding(.bottom, 40)
+                    }
+                } else {
+                    emptyState
+                }
+            }
+            .sheet(isPresented: $showTripFile) { ChappyTripFileView(theme: theme) }
+            .sheet(isPresented: $showFlights) { ChappyFlightsView() }
+            .sheet(isPresented: $showBudget) { ChappyBudgetView(theme: theme) }
+            .navigationTitle("Travel Desk")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            showTripFile = true
+                        } label: { Label("Trip file", systemImage: "folder.fill") }
+                        Button {
+                            showFlights = true
+                        } label: { Label("Flights", systemImage: "airplane") }
+                        Button {
+                            showBudget = true
+                        } label: { Label("What will it buy", systemImage: "dollarsign.circle") }
+                        Button {
+                            newName = ""; showNewTrip = true
+                        } label: { Label("New trip", systemImage: "plus") }
+                        if desk.trips.count > 1 {
+                            Button {
+                                showTripPicker = true
+                            } label: { Label("Switch trip", systemImage: "arrow.left.arrow.right") }
+                        }
+                        if let t = trip {
+                            Button(role: .destructive) {
+                                desk.deleteTrip(t.id)
+                            } label: { Label("Delete this trip", systemImage: "trash") }
+                        }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                }
+            }
+            .task {
+                await fx.refresh()
+                await loadSeasons()
+                frameMap()
+            }
+            .onChange(of: desk.activeID) { _ in frameMap(); Task { await loadSeasons() } }
+            .alert("New trip", isPresented: $showNewTrip) {
+                TextField("Bali, September", text: $newName)
+                Button("Create") {
+                    let t = desk.newTrip(named: newName)
+                    _ = t
+                }
+                Button("Cancel", role: .cancel) { }
+            }
+            .confirmationDialog("Switch trip", isPresented: $showTripPicker, titleVisibility: .visible) {
+                ForEach(desk.trips) { t in
+                    // AUDIT: activeID is only written to disk inside the
+                    // private save(), so switching trips didn't survive a
+                    // relaunch unless some other edit happened to save.
+                    Button(t.name) { desk.activeID = t.id; desk.savePublic() }
+                }
+            }
+            .sheet(item: $editingLeg) { leg in
+                LegEditorSheet(legID: leg.id, theme: theme)
+            }
+            .sheet(item: $placesLeg) { leg in
+                LegPlacesSheet(legID: leg.id, theme: theme)
+            }
+            .sheet(isPresented: $showShare) {
+                if let u = shareURL { ChappyShareSheet(items: [u]) }
+            }
+            .sheet(isPresented: $showPlanner) { TripPlannerSheet(theme: theme) }
+            .sheet(isPresented: $showOptionsSheet) { TripOptionsSheet() }
+            .sheet(isPresented: $showIntakeSheet) { IntakeSheet() }
+            .fullScreenCover(isPresented: $showBigMap) { TripAtlasView() }
+            .sheet(isPresented: $showVisaDesk) { VisaDeskView() }
+            .overlay {
+                if desk.planning {
+                    ZStack {
+                        Color.black.opacity(0.55).ignoresSafeArea()
+                        VStack(spacing: 14) {
+                            ProgressView().tint(theme.accent).scaleEffect(1.3)
+                            Text("Pricing your trip…")
+                                .font(.headline).foregroundColor(.white)
+                            Text("Checking real prices and how to get between places. Up to a minute.")
+                                .font(.caption).foregroundColor(.white.opacity(0.75))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 40)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: header
+
+    private func headerCard(_ t: ChappyTravel.Trip) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(t.name)
+                .font(.title2).fontWeight(.bold)
+                .foregroundColor(theme.textPrimary)
+            Text(t.dateLine)
+                .font(.subheadline)
+                .foregroundColor(theme.textSecondary)
+            HStack(spacing: 14) {
+                stat("\(t.nights)", t.nights == 1 ? "night" : "nights")
+                stat("\(t.legs.count)", t.legs.count == 1 ? "place" : "places")
+                stat("\(t.party)", t.party == 1 ? "traveller" : "travelling")
+                Spacer()
+                Stepper("", value: Binding(
+                    get: { t.party },
+                    set: { var c = t; c.party = max(1, $0); desk.update(c) }
+                ), in: 1...12)
+                .labelsHidden()
+            }
+            .padding(.top, 2)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    private func stat(_ big: String, _ small: String) -> some View {
+        HStack(spacing: 4) {
+            Text(big).font(.headline).foregroundColor(theme.accent)
+            Text(small).font(.caption).foregroundColor(theme.textSecondary)
+        }
+    }
+
+    // MARK: map
+
+    private struct LegPin: Identifiable {
+        let id: UUID
+        let coord: CLLocationCoordinate2D
+        let n: Int
+    }
+
+    private func pins(_ t: ChappyTravel.Trip) -> [LegPin] {
+        t.legs.enumerated().compactMap { i, leg in
+            guard leg.hasCoord else { return nil }
+            return LegPin(id: leg.id,
+                          coord: CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon),
+                          n: i + 1)
+        }
+    }
+
+    private func mapCard(_ t: ChappyTravel.Trip) -> some View {
+        Group {
+            if pins(t).isEmpty {
+                EmptyView()
+            } else {
+                Map(coordinateRegion: $region, annotationItems: pins(t)) { pin in
+                    MapAnnotation(coordinate: pin.coord) {
+                        ZStack {
+                            Circle().fill(theme.accent).frame(width: 26, height: 26)
+                            Circle().stroke(.white.opacity(0.9), lineWidth: 2).frame(width: 26, height: 26)
+                            Text("\(pin.n)")
+                                .font(.caption2).fontWeight(.heavy)
+                                .foregroundColor(.black)
+                        }
+                        .shadow(radius: 3)
+                    }
+                }
+                .frame(height: 200)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(alignment: .bottomTrailing) {
+                    // BUILD 178: the strip is a preview now — the real atlas
+                    // is a screen of its own.
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        showBigMap = true
+                    } label: {
+                        Label("Open atlas", systemImage: "arrow.up.left.and.arrow.down.right")
+                            .font(.caption2).fontWeight(.semibold)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Capsule().fill(.black.opacity(0.6)))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(10)
+                }
+            }
+        }
+    }
+
+    /// Frame every leg at once. A map showing one pin when the trip has
+    /// six is a map that has quietly lied about the shape of the trip.
+    private func frameMap() {
+        guard let t = trip else { return }
+        let coords = t.legs.filter(\.hasCoord).map { ($0.lat, $0.lon) }
+        guard !coords.isEmpty else { return }
+        let lats = coords.map(\.0), lons = coords.map(\.1)
+        let minLa = lats.min()!, maxLa = lats.max()!
+        let minLo = lons.min()!, maxLo = lons.max()!
+        region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLa + maxLa) / 2,
+                                           longitude: (minLo + maxLo) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max(0.6, (maxLa - minLa) * 1.6),
+                                   longitudeDelta: max(0.6, (maxLo - minLo) * 1.6)))
+    }
+
+    private func loadSeasons() async {
+        guard let t = trip else { return }
+        for leg in t.legs where leg.hasCoord {
+            let m = Calendar.current.component(.month, from: leg.arrive)
+            await ChappySeason.shared.load(lat: leg.lat, lon: leg.lon, month: m)
+        }
+    }
+
+    // MARK: money
+
+    private func moneyCard(_ t: ChappyTravel.Trip) -> some View {
+        let c = desk.cost(t)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("WHAT IT COSTS")
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(.cyan)
+                Spacer()
+                Text(t.homeCurrency)
+                    .font(.caption2).fontWeight(.semibold)
+                    .foregroundColor(theme.textSecondary)
+            }
+            Text(ChappyFX.money(c.total, t.homeCurrency))
+                .font(.system(size: 36, weight: .bold, design: .rounded))
+                .foregroundColor(theme.textPrimary)
+            // BUILD 182: a total built from a missing exchange rate is WRONG,
+            // and it used to be shown and spoken with nothing to say so.
+            if c.hasUnconverted {
+                Label("Some prices couldn't be converted — this total is off until rates load",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // BUILD 181: the total inverts the price rule on purpose —
+            // "Rp 65,300,000" tells you nothing about whether you can
+            // afford to go, and "$6,240" tells you immediately.
+            if let first = t.legs.first {
+                let local = desk.localCurrency(for: first, in: t)
+                if local != t.homeCurrency,
+                   let inLocal = ChappyFX.shared.convert(c.total, from: t.homeCurrency, to: local) {
+                    Text(ChappyFX.money(inLocal, local))
+                        .font(.subheadline)
+                        .foregroundColor(theme.textSecondary.opacity(0.9))
+                }
+            }
+            HStack(spacing: 10) {
+                if t.party > 1 {
+                    Text("\(ChappyFX.money(c.perPerson, t.homeCurrency)) each")
+                }
+                Text("\(ChappyFX.money(c.perDay, t.homeCurrency)) a day")
+            }
+            .font(.subheadline)
+            .foregroundColor(theme.textSecondary)
+
+            if c.total > 0 {
+                VStack(spacing: 7) {
+                    ForEach(c.lines) { line in
+                        HStack(spacing: 10) {
+                            Image(systemName: line.icon)
+                                .font(.caption)
+                                .foregroundColor(theme.accent)
+                                .frame(width: 18)
+                            Text(line.label)
+                                .font(.subheadline)
+                                .foregroundColor(theme.textPrimary)
+                            Spacer()
+                            Text(ChappyFX.money(line.amount, t.homeCurrency))
+                                .font(.subheadline).fontWeight(.semibold)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.white.opacity(0.07))
+                                Capsule().fill(theme.accent.opacity(0.75))
+                                    .frame(width: max(2, geo.size.width
+                                        * (c.total > 0 ? line.amount / c.total : 0)))
+                            }
+                        }
+                        .frame(height: 4)
+                    }
+                }
+                .padding(.top, 4)
+            }
+
+            HStack {
+                Text("Buffer")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { Int(t.bufferPct) },
+                    set: { var c2 = t; c2.bufferPct = Double($0); desk.update(c2) }
+                )) {
+                    ForEach([0, 5, 10, 15, 20, 25], id: \.self) { Text("\($0)%").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 240)
+            }
+            .padding(.top, 6)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    // MARK: legs
+
+    private func legsCard(_ t: ChappyTravel.Trip) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("THE PLAN")
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(.cyan)
+                Spacer()
+                Button {
+                    newPlace = ""
+                    addLegPrompt = true
+                } label: {
+                    Label("Add", systemImage: "plus.circle.fill")
+                        .font(.caption).fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+
+            if t.legs.isEmpty {
+                Text("No legs yet. Add a place, or just say \u{201C}add five nights in Ubud\u{201D}.")
+                    .font(.subheadline)
+                    .foregroundColor(theme.textSecondary)
+            }
+
+            ForEach(Array(t.legs.enumerated()), id: \.element.id) { i, leg in
+                legRow(leg, index: i, prev: i > 0 ? t.legs[i - 1] : nil, trip: t)
+                if i < t.legs.count - 1 {
+                    Rectangle().fill(Color.white.opacity(0.07))
+                        .frame(height: 1).padding(.leading, 34)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+        .alert("Add a place", isPresented: $addLegPrompt) {
+            TextField("Ubud", text: $newPlace)
+            Button("Add") {
+                guard let t = trip, !newPlace.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                desk.addLeg(to: t.id, place: newPlace.trimmingCharacters(in: .whitespaces))
+                Task { await loadSeasons(); frameMap() }
+            }
+            Button("Cancel", role: .cancel) { }
+        }
+    }
+
+    private func legRow(_ leg: ChappyTravel.Leg, index: Int,
+                        prev: ChappyTravel.Leg?, trip t: ChappyTravel.Trip) -> some View {
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        let month = Calendar.current.component(.month, from: leg.arrive)
+        let normals = leg.hasCoord
+            ? ChappySeason.shared.normals(lat: leg.lat, lon: leg.lon, month: month) : nil
+        let legCur = ChappyTravel.shared.localCurrency(for: leg, in: t)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                ZStack {
+                    Circle().fill(theme.accent.opacity(0.22)).frame(width: 26, height: 26)
+                    Text("\(index + 1)")
+                        .font(.caption2).fontWeight(.heavy)
+                        .foregroundColor(theme.accent)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(leg.place)
+                        .font(.headline)
+                        .foregroundColor(theme.textPrimary)
+                    Text("\(f.string(from: leg.arrive)) – \(f.string(from: leg.depart)) · \(leg.nights) \(leg.nights == 1 ? "night" : "nights")")
+                        .font(.caption)
+                        .foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                Button {
+                    editingLeg = leg
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.footnote)
+                        .foregroundColor(theme.accent)
+                        .padding(7)
+                        .background(Circle().fill(Color.white.opacity(0.07)))
+                }
+                .buttonStyle(.plain)
+            }
+
+            // BUILD 181 — LOCAL FIRST, DOLLARS BESIDE IT, AND A GRADE.
+            //
+            // "Rp 1,450,000 a night" means nothing on its own unless you
+            // already know what villas in Canggu go for in September — and
+            // if you knew that you wouldn't need the app. The band is what
+            // turns the number into information.
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Label(leg.arrival.label, systemImage: leg.arrival.icon)
+                    if leg.arrivalCost > 0 {
+                        Text(ChappyFX.money(leg.arrivalCost, t.homeCurrency))
+                        DealChip(grade: ChappyTravel.grade(leg.arrivalCost, leg.arrivalBand),
+                                 band: leg.arrivalBand, currency: t.homeCurrency, compact: true)
+                    }
+                }
+                if leg.nightlyRate > 0 {
+                    HStack(spacing: 8) {
+                        Image(systemName: "bed.double.fill")
+                        Text(ChappyFX.pair(leg.nightlyRate, local: legCur, home: t.homeCurrency) + " / night")
+                        DealChip(grade: ChappyTravel.grade(leg.nightlyRate, leg.stayBand),
+                                 band: leg.stayBand, currency: legCur, compact: true)
+                    }
+                }
+                if let scoot = leg.scooterPerDay, scoot > 0 {
+                    HStack(spacing: 8) {
+                        Image(systemName: "scooter")
+                        Text(ChappyFX.pair(scoot, local: legCur, home: t.homeCurrency) + " / day")
+                        DealChip(grade: ChappyTravel.grade(scoot, leg.scooterBand),
+                                 band: leg.scooterBand, currency: legCur, compact: true)
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundColor(theme.textSecondary)
+            .padding(.leading, 36)
+
+            // the weather you'll actually get, for the month you're going
+            if let n = normals {
+                Label("\(Int(n.maxC.rounded()))° / \(Int(n.minC.rounded()))° · \(n.verdict)",
+                      systemImage: "cloud.sun.fill")
+                    .font(.caption)
+                    .foregroundColor(theme.textSecondary)
+                    .padding(.leading, 36)
+            }
+
+            if !leg.shortlist.isEmpty {
+                Text(leg.shortlist.prefix(4).joined(separator: " · "))
+                    .font(.caption2)
+                    .foregroundColor(theme.textSecondary.opacity(0.85))
+                    .lineLimit(2)
+                    .padding(.leading, 36)
+            }
+
+            // the handoff row
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    chip("Eat & see", "fork.knife") { placesLeg = leg }
+                    // BUILD 179: the map you actually navigate with.
+                    if let g = desk.googlePlaceURL(leg) {
+                        chip("Google Maps", "map.fill") { desk.open(g) }
+                    }
+                    if let gd = desk.googleDirectionsURL(to: leg, from: prev) {
+                        chip("Directions", "arrow.triangle.turn.up.right.circle.fill") { desk.open(gd) }
+                    }
+                    if leg.arrival == .flight,
+                       let u = desk.flightSearchURL(leg: leg, from: prev, trip: t) {
+                        chip("Flights", "airplane") { desk.open(u) }
+                    }
+                    if let u = desk.groundURL(.rome2rio, leg: leg, from: prev, trip: t) {
+                        chip("How to get there", "arrow.triangle.swap") { desk.open(u) }
+                    }
+                    if let u = desk.groundURL(.twelvego, leg: leg, from: prev, trip: t) {
+                        chip("Bus / train / ferry", "tram.fill") { desk.open(u) }
+                    }
+                    ForEach(ChappyTravel.Booking.allCases) { site in
+                        if let u = desk.bookingURL(site, leg: leg, trip: t) {
+                            chip(site.label, "bed.double.fill") { desk.open(u) }
+                        }
+                    }
+                    if let u = desk.groundURL(.klook, leg: leg, from: prev, trip: t) {
+                        chip("Tours & tickets", "ticket.fill") { desk.open(u) }
+                    }
+                }
+                .padding(.leading, 36)
+                .padding(.trailing, 4)
+            }
+        }
+    }
+
+    private func chip(_ label: String, _ icon: String, action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
+            Label(label, systemImage: icon)
+                .font(.caption2).fontWeight(.semibold)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Capsule().fill(theme.accent.opacity(0.16)))
+                .foregroundColor(theme.accent)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: extras
+
+    private func extrasCard(_ t: ChappyTravel.Trip) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("VISAS, INSURANCE, EXTRAS")
+                    .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                    .foregroundColor(.cyan)
+                Spacer()
+                Button {
+                    extraLabel = ""; extraAmount = ""; addExtraPrompt = true
+                } label: {
+                    Image(systemName: "plus.circle.fill").font(.footnote)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+            if t.extras.isEmpty {
+                Text("The lines people forget: visa on arrival, travel insurance, a local SIM, vaccinations, airport parking.")
+                    .font(.caption)
+                    .foregroundColor(theme.textSecondary)
+            }
+            ForEach(t.extras) { e in
+                HStack {
+                    Text(e.label)
+                        .font(.subheadline)
+                        .foregroundColor(theme.textPrimary)
+                    if e.perPerson {
+                        Text("each").font(.caption2)
+                            .foregroundColor(theme.textSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.white.opacity(0.08)))
+                    }
+                    Spacer()
+                    Text(ChappyFX.money(e.perPerson ? e.amount * Double(t.party) : e.amount,
+                                        t.homeCurrency))
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textSecondary)
+                    Button {
+                        var c = t; c.extras.removeAll { $0.id == e.id }; desk.update(c)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                            .font(.footnote).foregroundColor(.red.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+        .alert("Add an extra", isPresented: $addExtraPrompt) {
+            TextField("Travel insurance", text: $extraLabel)
+            TextField("Amount", text: $extraAmount).keyboardType(.decimalPad)
+            Button("Add") {
+                guard var c = trip, let amt = Double(extraAmount), !extraLabel.isEmpty else { return }
+                c.extras.append(ChappyTravel.Extra(label: extraLabel, amount: amt, perPerson: true))
+                desk.update(c)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Counted per person. Tap it off later if it's a one-off for the whole party.")
+        }
+    }
+
+    // MARK: actions
+
+    private func actionsCard(_ t: ChappyTravel.Trip) -> some View {
+        VStack(spacing: 10) {
+            Button {
+                ChappyEarcon.shared.tap()
+                showPlanner = true
+            } label: {
+                actionRow("Plan another one with AI", "sparkles")
+            }
+            if !desk.pendingOptions.isEmpty {
+                Button {
+                    ChappyEarcon.shared.tap()
+                    showOptionsSheet = true
+                } label: {
+                    actionRow("Compare the three options", "square.stack.3d.up.fill")
+                }
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                showIntakeSheet = true
+            } label: {
+                actionRow(ChappyIntake.shared.isComplete
+                          ? "How you travel \u{2014} answered"
+                          : "Tell me how you travel (\(ChappyIntake.shared.unanswered.count) questions)",
+                          "person.text.rectangle.fill")
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                TTSService.shared.speak(desk.spokenCost(t))
+            } label: {
+                actionRow("Read me the numbers", "speaker.wave.2.fill")
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                _ = desk.emailReport(t)
+            } label: {
+                actionRow("Email the plan", "envelope.fill")
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                showVisaDesk = true
+            } label: {
+                actionRow("Check the visas", "globe.asia.australia.fill")
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                // BUILD 178: the shared report now carries a rendered map.
+                Task {
+                    if let u = await desk.writeReportWithMap(t) { shareURL = u; showShare = true }
+                }
+            } label: {
+                actionRow("Share the full report", "square.and.arrow.up")
+            }
+        }
+        .padding(14)
+        .background(card)
+    }
+
+    private func actionRow(_ label: String, _ icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.subheadline)
+                .foregroundColor(theme.accent)
+                .frame(width: 22)
+            Text(label)
+                .font(.subheadline).fontWeight(.medium)
+                .foregroundColor(theme.textPrimary)
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption2).foregroundColor(theme.textSecondary)
+        }
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    /// BUILD 181 — ARGUE WITH IT, FROM THE TRIP ITSELF.
+    ///
+    /// The options screen has the same box, but most push-back happens
+    /// later — you look at the plan again three days on and know exactly
+    /// what's wrong with it. Making him reopen the options screen to say
+    /// so would mean he simply wouldn't.
+    private func gripeCard(_ t: ChappyTravel.Trip) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("TELL ME WHAT'S WRONG WITH IT")
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(.cyan)
+            HStack(spacing: 8) {
+                TextField("Too expensive. Keep it under six grand.", text: $gripeField)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.send)
+                    .onSubmit { pushBack(t) }
+                Button { pushBack(t) } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2).foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+                .disabled(gripeField.trimmingCharacters(in: .whitespaces).isEmpty || desk.planning)
+            }
+            Text("Or just say it out loud. It keeps everything you didn't complain about, and it remembers what you turned down.")
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary.opacity(0.8))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    private func pushBack(_ t: ChappyTravel.Trip) {
+        let said = gripeField.trimmingCharacters(in: .whitespaces)
+        guard !said.isEmpty else { return }
+        gripeField = ""
+        ChappyEarcon.shared.tap()
+        Task { await desk.revise(t, saying: said) }
+    }
+
+    private var honestyNote: some View {
+        Text("Chappy plans and prices — it can't book. Airbnb has had no public API since 2019, and Booking, Agoda, Trip.com, Klook and Traveloka all need an approved commercial agreement. The links above carry your dates and party size through to each site, where the real prices are.")
+            .font(.caption2)
+            .foregroundColor(theme.textSecondary.opacity(0.8))
+            .padding(.horizontal, 4)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "map.fill")
+                .font(.system(size: 52))
+                .foregroundColor(theme.textSecondary.opacity(0.6))
+            Text("No trips yet")
+                .font(.title3).fontWeight(.semibold)
+                .foregroundColor(theme.textPrimary)
+            Text("Start one here, or just say \u{201C}plan a trip\u{201D} and then \u{201C}add five nights in Ubud\u{201D}.")
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+                .foregroundColor(theme.textSecondary)
+                .padding(.horizontal, 40)
+            Button {
+                showPlanner = true
+            } label: {
+                Label("Plan one with AI", systemImage: "sparkles")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .padding(.horizontal, 20).padding(.vertical, 11)
+                    .background(Capsule().fill(theme.accent.opacity(0.28)))
+                    .foregroundColor(theme.accent)
+            }
+            .buttonStyle(.plain)
+            Button {
+                newName = ""; showNewTrip = true
+            } label: {
+                Text("Or build one by hand")
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(theme.textSecondary)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var card: some View {
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05))
+    }
+
+    @State private var showPlanner = false
+    @State private var showOptionsSheet = false
+    @State private var showIntakeSheet = false
+    @State private var gripeField = ""
+    @State private var showBigMap = false
+    @State private var showVisaDesk = false
+    @State private var addLegPrompt = false
+    @State private var addExtraPrompt = false
+    @State private var extraLabel = ""
+    @State private var extraAmount = ""
+}
+
+// MARK: - Leg editor
+
+/// Edits by ID rather than by value, because a sheet holding a COPY of a
+/// leg is a sheet that silently throws away anything changed underneath
+/// it — and dates rechain themselves the moment nights change.
+struct LegEditorSheet: View {
+    let legID: UUID
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var desk = ChappyTravel.shared
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var leg: ChappyTravel.Leg? { trip?.legs.first { $0.id == legID } }
+
+    /// AUDIT: this called rechain() on EVERY edit, and rechain rewrites
+    /// each leg's arrival from the one before it. So changing the date on
+    /// leg two or later was reverted inside the same setter — the picker
+    /// looked broken because it was. Nights still chain (that's the point);
+    /// the date itself does not, unless it's the first leg, which is the
+    /// only date the chain is actually anchored to.
+    private func bind<T>(_ path: WritableKeyPath<ChappyTravel.Leg, T>,
+                         _ fallback: T, chain: Bool = true) -> Binding<T> {
+        Binding(
+            get: { leg?[keyPath: path] ?? fallback },
+            set: { v in
+                guard var t = trip, let i = t.legs.firstIndex(where: { $0.id == legID }) else { return }
+                t.legs[i][keyPath: path] = v
+                desk.update(t)
+                if chain { desk.rechain(t.id) }
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Where") {
+                    TextField("Place", text: bind(\.place, ""))
+                    DatePicker("Arrive", selection: bind(\.arrive, Date(), chain: false),
+                               displayedComponents: .date)
+                    Stepper("Nights: \(leg?.nights ?? 0)", value: bind(\.nights, 1), in: 1...90)
+                }
+
+                Section("Getting here") {
+                    Picker("How", selection: bind(\.arrival, ChappyTravel.Arrival.flight)) {
+                        ForEach(ChappyTravel.Arrival.allCases) { a in
+                            Label(a.label, systemImage: a.icon).tag(a)
+                        }
+                    }
+                    HStack {
+                        Text("Cost")
+                        Spacer()
+                        TextField("0", value: bind(\.arrivalCost, 0.0), format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    TextField("Flight number, bus company…", text: bind(\.arrivalNote, ""))
+                } footer: {
+                    Text("Total for the whole party.")
+                }
+
+                Section("Where you sleep") {
+                    TextField("Place name (optional)", text: bind(\.stayName, ""))
+                    HStack {
+                        Text("Per night")
+                        Spacer()
+                        TextField("0", value: bind(\.nightlyRate, 0.0), format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Picker("Priced in", selection: bind(\.stayCurrency, "")) {
+                        Text(trip?.homeCurrency ?? "AUD").tag("")
+                        // The blank tag ALREADY means the home currency, so
+                        // listing it again gave two identical-looking rows
+                        // with different meanings.
+                        ForEach(ChappyFX.common.filter { $0 != (trip?.homeCurrency ?? "") },
+                                id: \.self) { Text($0).tag($0) }
+                    }
+                } footer: {
+                    Text("Quote it in whatever the listing says — rupiah, baht, dollars. Chappy converts it into the trip's currency for the total.")
+                }
+
+                Section("Day to day") {
+                    HStack {
+                        Text("Food, per person per day")
+                        Spacer()
+                        TextField("0", value: bind(\.foodPerDay, 0.0), format: .number)
+                            .keyboardType(.decimalPad).multilineTextAlignment(.trailing)
+                    }
+                    HStack {
+                        Text("Getting around, per person per day")
+                        Spacer()
+                        TextField("0", value: bind(\.groundPerDay, 0.0), format: .number)
+                            .keyboardType(.decimalPad).multilineTextAlignment(.trailing)
+                    }
+                    HStack {
+                        Text("Things to do, whole leg")
+                        Spacer()
+                        TextField("0", value: bind(\.activitiesTotal, 0.0), format: .number)
+                            .keyboardType(.decimalPad).multilineTextAlignment(.trailing)
+                    }
+                }
+
+                Section("Notes") {
+                    TextField("Anything worth remembering", text: bind(\.notes, ""), axis: .vertical)
+                        .lineLimit(2...6)
+                }
+
+                if let l = leg, !l.shortlist.isEmpty {
+                    Section("Shortlist") {
+                        ForEach(l.shortlist, id: \.self) { s in Text(s) }
+                            .onDelete { idx in
+                                guard var t = trip,
+                                      let i = t.legs.firstIndex(where: { $0.id == legID }) else { return }
+                                t.legs[i].shortlist.remove(atOffsets: idx)
+                                desk.update(t)
+                            }
+                    }
+                }
+
+                Section {
+                    Button(role: .destructive) {
+                        if let t = trip { desk.removeLeg(legID, from: t.id) }
+                        dismiss()
+                    } label: { Text("Remove this leg") }
+                }
+            }
+            .navigationTitle(leg?.place ?? "Leg")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Eat & see
+
+struct LegPlacesSheet: View {
+    let legID: UUID
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var places = ChappyPlaces.shared
+    @ObservedObject private var reviews = ChappyReviews.shared
+    @ObservedObject private var desk = ChappyTravel.shared
+    @State private var kind: ChappyPlaces.Kind = .restaurants
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var leg: ChappyTravel.Leg? { trip?.legs.first { $0.id == legID } }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                VStack(spacing: 0) {
+                    // BUILD 183: nine categories will not fit in a segmented
+                    // control, and cramming them in produces nine unreadable
+                    // two-letter labels. A scrolling chip row holds as many
+                    // as we like and reads at a glance.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(ChappyPlaces.Kind.allCases) { k in
+                                Button {
+                                    guard k != kind else { return }
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    kind = k
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: k.icon2).font(.caption2)
+                                        Text(k.label).font(.caption).fontWeight(.semibold)
+                                    }
+                                    .padding(.horizontal, 11).padding(.vertical, 7)
+                                    .background(
+                                        Capsule().fill(k == kind
+                                            ? theme.accent.opacity(0.22)
+                                            : Color.white.opacity(0.06)))
+                                    .overlay(Capsule().stroke(
+                                        k == kind ? theme.accent.opacity(0.55) : .clear, lineWidth: 1))
+                                    .foregroundColor(k == kind ? theme.accent : theme.textSecondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                    }
+                    .padding(.vertical, 12)
+
+                    if places.loading {
+                        Spacer()
+                        ProgressView().tint(theme.accent)
+                        Spacer()
+                    } else if places.results.isEmpty {
+                        Spacer()
+                        Text(places.error ?? "Nothing yet.")
+                            .font(.subheadline)
+                            .foregroundColor(theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 40)
+                        Spacer()
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 8) {
+                                ForEach(places.results) { spot in
+                                    row(spot)
+                                }
+                            }
+                            .padding(12)
+                        }
+                    }
+
+                    Text(places.sourceNote)
+                        .font(.caption2)
+                        .foregroundColor(theme.textSecondary.opacity(0.8))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 20).padding(.bottom, 12)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .navigationTitle(leg?.place ?? "Places")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .task(id: kind) { await reload() }
+        }
+    }
+
+    private func reload() async {
+        guard let l = leg else { return }
+        await places.search(near: l.lat, lon: l.lon, place: l.place, kind: kind)
+        // BUILD 186: digest the top few in the background. Only the ones
+        // Tripadvisor supplied — Google's licence does not permit us to
+        // hold its review text, even in memory for a screen.
+        for spot in places.results.prefix(4) where spot.fromTripAdvisor {
+            _ = await reviews.digest(for: spot, place: l.place)
+        }
+    }
+
+    private func row(_ spot: ChappyPlaces.Spot) -> some View {
+        let saved = leg?.shortlist.contains(spot.name) ?? false
+        return HStack(spacing: 12) {
+            Image(systemName: spot.kind.icon)
+                .font(.subheadline)
+                .foregroundColor(theme.accent)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(spot.name)
+                    .font(.subheadline).fontWeight(.medium)
+                    .foregroundColor(theme.textPrimary)
+
+                // BUILD 183: two numbers, labelled, so it is obvious which
+                // is which — and an unlabelled 4.6 next to a 4.2 is just
+                // confusing.
+                if spot.googleRating != nil || spot.rating != nil {
+                    HStack(spacing: 8) {
+                        if let g = spot.googleRating {
+                            ratingChip("G", g, spot.googleCount, .orange)
+                        }
+                        if let t = spot.rating {
+                            ratingChip("TA", t, spot.reviews, Color(red: 0.20, green: 0.68, blue: 0.42))
+                        }
+                        if !spot.priceLevel.isEmpty {
+                            Text(spot.priceLevel).font(.caption2)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        if spot.openNow == true {
+                            Text("Open").font(.caption2).fontWeight(.semibold)
+                                .foregroundColor(.green)
+                        } else if spot.openNow == false {
+                            Text("Closed").font(.caption2)
+                                .foregroundColor(theme.textSecondary.opacity(0.8))
+                        }
+                    }
+                }
+
+                // BUILD 186: what the reviews say, under the stars.
+                if let d = reviews.cache[spot.id] {
+                    Text(d.line)
+                        .font(.caption2)
+                        .foregroundColor(theme.textSecondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !d.complaints.isEmpty || !d.strengths.isEmpty {
+                        HStack(spacing: 4) {
+                            ForEach(d.strengths.prefix(2)) { f in
+                                themeChip(f.theme.label, .green)
+                            }
+                            ForEach(d.complaints.prefix(2)) { f in
+                                themeChip(f.theme.label, .orange)
+                            }
+                        }
+                    }
+                } else if spot.fromTripAdvisor, reviews.loading.contains(spot.id) {
+                    Text("Reading the reviews…")
+                        .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+
+                // The whole reason for having two sources.
+                if let note = spot.divergenceNote {
+                    Text(note).font(.caption2)
+                        .foregroundColor(.orange.opacity(0.9))
+                        .lineLimit(2)
+                } else if !spot.address.isEmpty {
+                    Text(spot.address).font(.caption)
+                        .foregroundColor(theme.textSecondary).lineLimit(1)
+                }
+            }
+            Spacer()
+            // BUILD 179: a name in a list is not much use. This opens the
+            // actual place on Google — hours, photos, whether it's still
+            // there — searched near this leg so it finds the right one.
+            Button {
+                guard let l = leg,
+                      let u = ChappyTravel.shared.googleSearchURL(spot.name, near: l) else { return }
+                UIApplication.shared.open(u, options: [:], completionHandler: nil)
+            } label: {
+                Image(systemName: "map")
+                    .font(.footnote)
+                    .foregroundColor(theme.textSecondary)
+                    .padding(7)
+            }
+            .buttonStyle(.plain)
+            Button {
+                toggle(spot)
+            } label: {
+                Image(systemName: saved ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.title3)
+                    .foregroundColor(saved ? .green : theme.accent)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    private func themeChip(_ text: String, _ tint: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(tint.opacity(0.16)))
+            .foregroundColor(tint)
+    }
+
+    /// One source's verdict, with its review count, because a 5.0 from
+    /// eleven people and a 4.6 from six thousand are not the same claim.
+    private func ratingChip(_ tag: String, _ value: Double, _ count: Int?, _ tint: Color) -> some View {
+        HStack(spacing: 3) {
+            Text(tag).font(.system(size: 9, weight: .heavy))
+                .foregroundColor(tint.opacity(0.9))
+            Text(String(format: "%.1f", value))
+                .font(.caption).fontWeight(.semibold)
+                .foregroundColor(tint)
+            if let n = count, n > 0 {
+                Text("(\(n.formatted()))").font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary.opacity(0.85))
+            }
+        }
+    }
+
+    private func toggle(_ spot: ChappyPlaces.Spot) {
+        guard var t = trip, let i = t.legs.firstIndex(where: { $0.id == legID }) else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if let at = t.legs[i].shortlist.firstIndex(of: spot.name) {
+            t.legs[i].shortlist.remove(at: at)
+        } else {
+            t.legs[i].shortlist.append(spot.name)
+        }
+        desk.update(t)
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE CONVERTER.
+//
+// "How much is that in real money" is the most asked question of any
+// trip and Chappy had no answer to it anywhere. Rates come from a free
+// keyless service, cached to disk, so this works on a plane and in a
+// market with one bar — which is precisely where you need it.
+// =====================================================================
+
+struct CurrencyView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    @ObservedObject private var fx = ChappyFX.shared
+
+    @State private var amount = "100"
+    @State private var from = "IDR"
+    @State private var to = "AUD"
+
+    private var value: Double { Double(amount.replacingOccurrences(of: ",", with: "")) ?? 0 }
+    private var converted: Double? { fx.convert(value, from: from, to: to) }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(spacing: 14) {
+                        VStack(spacing: 12) {
+                            TextField("0", text: $amount)
+                                .keyboardType(.decimalPad)
+                                .font(.system(size: 40, weight: .bold, design: .rounded))
+                                .multilineTextAlignment(.center)
+                                .foregroundColor(theme.textPrimary)
+
+                            HStack(spacing: 10) {
+                                picker($from)
+                                Button {
+                                    let t = from; from = to; to = t
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    Image(systemName: "arrow.left.arrow.right")
+                                        .font(.subheadline)
+                                        .foregroundColor(theme.accent)
+                                        .padding(9)
+                                        .background(Circle().fill(Color.white.opacity(0.08)))
+                                }
+                                .buttonStyle(.plain)
+                                picker($to)
+                            }
+
+                            Text(converted.map { ChappyFX.money($0, to) } ?? "No rate for that pair yet")
+                                .font(.system(size: 34, weight: .bold, design: .rounded))
+                                .foregroundColor(converted == nil ? theme.textSecondary : theme.accent)
+                                .padding(.top, 4)
+
+                            if let c = converted, value > 0 {
+                                Text("1 \(from) = \(String(format: "%.4f", c / value)) \(to)")
+                                    .font(.caption)
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                        }
+                        .padding(18)
+                        .frame(maxWidth: .infinity)
+                        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.white.opacity(0.05)))
+
+                        // the quick answers — round numbers you actually meet
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("AT A GLANCE")
+                                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                                .foregroundColor(.cyan)
+                            ForEach(glanceRows) { row in
+                                HStack {
+                                    Text(row.from).font(.subheadline)
+                                        .foregroundColor(theme.textPrimary)
+                                    Spacer()
+                                    Text(row.to).font(.subheadline).fontWeight(.semibold)
+                                        .foregroundColor(theme.textSecondary)
+                                }
+                            }
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(Color.white.opacity(0.05)))
+
+                        HStack {
+                            Text(fx.fetchedAt.map { d -> String in
+                                let f = DateFormatter(); f.dateStyle = .medium
+                                return "Rates from \(f.string(from: d))"
+                            } ?? "No rates yet")
+                                .font(.caption2)
+                                .foregroundColor(fx.isStale ? .orange : theme.textSecondary)
+                            Spacer()
+                            Button {
+                                Task { await fx.refresh(force: true) }
+                            } label: {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                                    .font(.caption2).fontWeight(.semibold)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(theme.accent)
+                        }
+                        .padding(.horizontal, 4)
+
+                        Text("Rates are daily mid-market — a bank or a money changer will be a little worse. Cached on the phone, so this keeps working with no signal.")
+                            .font(.caption2)
+                            .foregroundColor(theme.textSecondary.opacity(0.8))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 4)
+                    }
+                    .padding(14)
+                }
+            }
+            .navigationTitle("Currency")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .task {
+                to = fx.home
+                await fx.refresh()
+            }
+        }
+    }
+
+    private func picker(_ sel: Binding<String>) -> some View {
+        Picker("", selection: sel) {
+            ForEach(ChappyFX.common, id: \.self) { c in Text(c).tag(c) }
+        }
+        .pickerStyle(.menu)
+        .tint(theme.accent)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+    }
+
+    /// The amounts you actually hand over: a coffee, a meal, a night,
+    /// a taxi. Far more useful than a rate to four decimal places.
+    struct Glance: Identifiable {
+        var id: String { from }
+        var from: String
+        var to: String
+    }
+
+    private var glanceRows: [Glance] {
+        [10.0, 50, 100, 500, 1000, 10000, 100_000, 1_000_000]
+            .filter { amt in
+                // Only show magnitudes that make sense for the currency —
+                // nobody needs "1,000,000 AUD" or "10 IDR".
+                ChappyFX.zeroDecimal.contains(from) ? amt >= 1000 : amt <= 1000
+            }
+            .prefix(5)
+            .compactMap { amt in
+                guard let out = fx.convert(amt, from: from, to: to) else { return nil }
+                return Glance(from: ChappyFX.money(amt, from), to: ChappyFX.money(out, to))
+            }
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE WEB LOOK-UP.
+//
+// Chappy could already search three separate ways — Google grounding in
+// Live AI, Anthropic search in Quick Vision, deep_research from the live
+// model — and not one was reachable from standby with the phone in a
+// pocket. The answer is spoken; the SOURCES land here, because a travel
+// answer you can't check is one you shouldn't act on.
+// =====================================================================
+
+struct WebSearchView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    @ObservedObject private var search = ChappySearch.shared
+    @State private var field = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                VStack(spacing: 0) {
+                    HStack(spacing: 8) {
+                        TextField("Does the Gilimanuk ferry run at night?", text: $field)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focused)
+                            .submitLabel(.search)
+                            .onSubmit { go() }
+                        Button {
+                            go()
+                        } label: {
+                            Image(systemName: "magnifyingglass.circle.fill")
+                                .font(.title2).foregroundColor(theme.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(search.busy || field.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    .padding(12)
+
+                    if search.busy {
+                        HStack(spacing: 8) {
+                            ProgressView().tint(theme.accent)
+                            Text("Looking it up…")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                        }
+                        .padding(.bottom, 8)
+                    }
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(search.history) { a in
+                                answerCard(a)
+                            }
+                            if search.history.isEmpty && !search.busy {
+                                Text("Ask anything current — opening hours, ferry times, visa rules, whether a place is still open. Works by voice too: \u{201C}Chappy, look up whether the Ubud market opens on Sundays\u{201D}.")
+                                    .font(.subheadline)
+                                    .foregroundColor(theme.textSecondary)
+                                    .padding(.top, 30)
+                                    .padding(.horizontal, 20)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                        .padding(12)
+                    }
+
+                    Text("\(search.remainingToday) look-ups left today")
+                        .font(.caption2)
+                        .foregroundColor(search.remainingToday <= 2 ? .orange : theme.textSecondary)
+                        .padding(.bottom, 10)
+                }
+            }
+            .navigationTitle("Look it up")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .onAppear { focused = search.history.isEmpty }
+        }
+    }
+
+    private func go() {
+        let q = field.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        focused = false
+        Task { await search.ask(q) }
+        field = ""
+    }
+
+    private func answerCard(_ a: ChappySearch.Answer) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(a.question)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundColor(theme.accent)
+            Text(a.text)
+                .font(.subheadline)
+                .foregroundColor(theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !a.sources.isEmpty {
+                Divider().background(Color.white.opacity(0.1))
+                ForEach(a.sources.prefix(6)) { s in
+                    Button {
+                        if let u = URL(string: s.url) {
+                            UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "link").font(.caption2)
+                            Text(s.host).font(.caption2).lineLimit(1)
+                            Spacer()
+                            Image(systemName: "arrow.up.right").font(.caption2)
+                        }
+                        .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            HStack {
+                Spacer()
+                Button {
+                    TTSService.shared.speakLong(a.text)
+                } label: {
+                    Label("Read it", systemImage: "speaker.wave.2.fill")
+                        .font(.caption2).fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+}
+
+// =====================================================================
+// BUILD 177 — THE PLANNER SHEET.
+//
+// Everything else in the Travel Desk is a form. This is the agent: say
+// where and how long, and a whole costed itinerary comes back with the
+// legs, the nightly rates, the food, the transport between them and the
+// extras people forget. Then you edit it — because a plan you can't
+// argue with is a plan you don't trust.
+//
+// Every field except the destination has a default, so the fastest path
+// through this screen is: type "Vietnam", tap Plan.
+// =====================================================================
+
+struct TripPlannerSheet: View {
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var desk = ChappyTravel.shared
+
+    @State private var destination = ""
+    @State private var nights = 10
+    @State private var party = 2
+    @State private var useBudget = false
+    @State private var budget = "4000"
+    @State private var month = 0          // 0 = whenever
+    @State private var style = ""
+
+    private let styles = ["relaxed", "food", "beaches", "diving", "surfing", "hiking",
+                          "temples", "nightlife", "photography", "island hopping",
+                          "budget", "luxury", "family", "motorbike"]
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Where and how long") {
+                    TextField("Vietnam, Bali, northern Thailand…", text: $destination)
+                        .autocorrectionDisabled()
+                    Stepper("\(nights) nights", value: $nights, in: 2...60)
+                    Stepper("\(party) \(party == 1 ? "traveller" : "travelling")", value: $party, in: 1...12)
+                    Picker("When", selection: $month) {
+                        Text("Whenever").tag(0)
+                        ForEach(1...12, id: \.self) { m in
+                            Text(DateFormatter().monthSymbols[m - 1]).tag(m)
+                        }
+                    }
+                }
+
+                Section("Budget") {
+                    Toggle("Work to a ceiling", isOn: $useBudget)
+                    if useBudget {
+                        HStack {
+                            Text(ChappyFX.shared.home)
+                            Spacer()
+                            TextField("4000", text: $budget)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                } footer: {
+                    Text(useBudget
+                         ? "The whole trip for everyone, not each. It builds the plan to fit, and tells you if it can't."
+                         : "Without a ceiling it aims at good value rather than cheapest.")
+                }
+
+                Section("What kind of trip") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 7) {
+                            ForEach(styles, id: \.self) { s in
+                                let on = style.contains(s)
+                                Button {
+                                    // Rebuild the list rather than patching the
+                                    // string — string surgery left ", ," in the
+                                    // middle when a chip was deselected, and
+                                    // that went straight into the AI prompt.
+                                    var parts = style.split(separator: ",")
+                                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                                        .filter { !$0.isEmpty }
+                                    if on { parts.removeAll { $0 == s } }
+                                    else if !parts.contains(s) { parts.append(s) }
+                                    style = parts.joined(separator: ", ")
+                                } label: {
+                                    Text(s)
+                                        .font(.caption).fontWeight(.semibold)
+                                        .padding(.horizontal, 11).padding(.vertical, 6)
+                                        .background(Capsule().fill(on ? theme.accent.opacity(0.25)
+                                                                      : Color.gray.opacity(0.16)))
+                                        .foregroundColor(on ? theme.accent : .secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+
+                if let e = desk.planError {
+                    Section { Text(e).font(.caption).foregroundColor(.red) }
+                }
+
+                Section {
+                    Button {
+                        go()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label(desk.planning ? "Working…" : "Plan it", systemImage: "sparkles")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .disabled(desk.planning || destination.trimmingCharacters(in: .whitespaces).isEmpty)
+                } footer: {
+                    Text("Chappy checks current prices and how people actually travel between these places, then builds it into legs you can edit. It plans and prices — booking still happens on the sites, through the links on each leg.")
+                }
+            }
+            .navigationTitle("Plan a trip")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() } }
+            }
+        }
+    }
+
+    private func go() {
+        let d = destination.trimmingCharacters(in: .whitespaces)
+        guard !d.isEmpty else { return }
+        let req = ChappyTravel.PlanRequest(
+            destination: d,
+            nights: nights,
+            party: party,
+            budget: useBudget ? Double(budget) : nil,
+            month: month == 0 ? nil : month,
+            style: style.trimmingCharacters(in: CharacterSet(charactersIn: " ,")))
+        dismiss()
+        Task { await desk.aiPlan(req) }
+    }
+}
+
+// =====================================================================
+// BUILD 178 — THE TRIP ATLAS.
+//
+// 177 had a two-hundred-point strip with numbered pins on it. That is a
+// locator, not an atlas, and it was the weakest thing in the module.
+//
+// This is the real one, and it is built on iOS 17's MapKit rather than a
+// Google Maps package, deliberately: no new dependency, no second API
+// key to enable, nothing that can break the build — and it does
+// everything the job actually needs.
+//
+//   * A HUE RAMP along the journey. Leg one is cool, the last leg is
+//     warm, and you can read the DIRECTION of a trip at a glance without
+//     reading a single number. That is the thing a row of identical red
+//     pins can never tell you.
+//   * THE ROUTE DRAWN, styled by how you travel it — dashed for flights,
+//     solid for road and rail, dotted for ferries. The shape of the trip
+//     becomes obvious: three short hops and one long haul looks different
+//     from four even legs, and it should.
+//   * TAP A PIN and you get that leg — nights, cost, the weather you'll
+//     actually get, the visa position, and every booking link.
+//   * LAYERS. Standard, hybrid or satellite, and your shortlisted
+//     restaurants and attractions as a second set of pins you can switch
+//     on when you want them and off when they're clutter.
+// =====================================================================
+
+struct TripAtlasView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var season = ChappySeason.shared
+    @ObservedObject private var visa = ChappyVisa.shared
+
+    @State private var camera: MapCameraPosition = .automatic
+    @State private var style: Style = .standard
+    @State private var showShortlist = false
+    @State private var selected: ChappyTravel.Leg?
+    @State private var placePins: [PlacePin] = []
+
+    enum Style: String, CaseIterable, Identifiable {
+        case standard = "Map", hybrid = "Hybrid", imagery = "Satellite"
+        var id: String { rawValue }
+        var mapStyle: MapStyle {
+            switch self {
+            case .standard: return .standard(elevation: .realistic)
+            case .hybrid:   return .hybrid(elevation: .realistic)
+            case .imagery:  return .imagery(elevation: .realistic)
+            }
+        }
+    }
+
+    struct PlacePin: Identifiable {
+        let id = UUID()
+        let name: String
+        let coord: CLLocationCoordinate2D
+        let legIndex: Int
+    }
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var legs: [ChappyTravel.Leg] { (trip?.legs ?? []).filter(\.hasCoord) }
+
+    /// THE HUE RAMP. Cool to warm along the journey — 200° through to
+    /// about 20°, which reads as blue → teal → gold → orange. Chosen
+    /// because it stays legible on satellite imagery AND on the standard
+    /// map, which a red-to-green ramp does not.
+    private func hue(_ i: Int) -> Color {
+        let n = max(1, legs.count - 1)
+        let t = Double(min(i, n)) / Double(n)
+        return Color(hue: (200.0 - 180.0 * t) / 360.0, saturation: 0.85, brightness: 0.95)
+    }
+
+    private func coord(_ leg: ChappyTravel.Leg) -> CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: leg.lat, longitude: leg.lon)
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack(alignment: .bottom) {
+                map
+                controls
+            }
+            .navigationTitle(trip?.name ?? "Atlas")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                        HStack(spacing: 14) {
+                        // BUILD 179: hand the entire route to Google in one
+                        // tap — every stop, in order, in the right mode.
+                        if let t = trip, let g = desk.googleTripURL(t) {
+                            Button { desk.open(g) } label: { Image(systemName: "map.fill") }
+                        }
+                        Button { frameTrip() } label: { Image(systemName: "scope") }
+                    }
+                }
+            }
+            .sheet(item: $selected) { leg in
+                AtlasLegCard(legID: leg.id, theme: theme)
+                    .presentationDetents([.medium, .large])
+            }
+            .task {
+                frameTrip()
+                await loadSeasons()
+                buildPlacePins()
+            }
+            .onChange(of: showShortlist) { _, on in if on { buildPlacePins() } }
+        }
+    }
+
+    // MARK: the map itself
+
+    private var map: some View {
+        Map(position: $camera) {
+            // THE ROUTE. Drawn per hop so each one can carry the style of
+            // the way you actually travel it.
+            ForEach(Array(legs.enumerated()), id: \.element.id) { i, leg in
+                if i > 0 {
+                    let from = coord(legs[i - 1])
+                    let to = coord(leg)
+                    MapPolyline(coordinates: [from, to])
+                        .stroke(hue(i).opacity(0.9),
+                                style: strokeStyle(for: leg.arrival))
+                }
+            }
+
+            // The shortlist, underneath the legs so it never covers one.
+            if showShortlist {
+                ForEach(placePins) { pin in
+                    Annotation(pin.name, coordinate: pin.coord) {
+                        Image(systemName: "star.circle.fill")
+                            .font(.system(size: 17))
+                            .foregroundStyle(.white, hue(pin.legIndex))
+                            .shadow(radius: 2)
+                    }
+                    .annotationTitles(.hidden)
+                }
+            }
+
+            ForEach(Array(legs.enumerated()), id: \.element.id) { i, leg in
+                Annotation(leg.place, coordinate: coord(leg)) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        selected = leg
+                    } label: {
+                        legPin(leg, index: i)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .mapStyle(style.mapStyle)
+        .mapControls {
+            MapCompass()
+            MapScaleView()
+        }
+        .ignoresSafeArea(edges: .bottom)
+    }
+
+    private func strokeStyle(for a: ChappyTravel.Arrival) -> StrokeStyle {
+        switch a {
+        case .flight:
+            return StrokeStyle(lineWidth: 3.5, lineCap: .round, dash: [11, 7])
+        case .ferry:
+            return StrokeStyle(lineWidth: 3.5, lineCap: .round, dash: [2, 7])
+        case .walk:
+            return StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: [1, 5])
+        default:
+            return StrokeStyle(lineWidth: 4, lineCap: .round)
+        }
+    }
+
+    private func legPin(_ leg: ChappyTravel.Leg, index i: Int) -> some View {
+        VStack(spacing: 2) {
+            ZStack {
+                Circle().fill(hue(i)).frame(width: 34, height: 34)
+                Circle().stroke(.white, lineWidth: 2.5).frame(width: 34, height: 34)
+                VStack(spacing: -1) {
+                    Text("\(i + 1)")
+                        .font(.system(size: 13, weight: .heavy))
+                        .foregroundStyle(.black.opacity(0.8))
+                    Text("\(leg.nights)n")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.black.opacity(0.55))
+                }
+            }
+            .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            Text(leg.place)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(.black.opacity(0.55)))
+        }
+    }
+
+    // MARK: controls
+
+    private var controls: some View {
+        VStack(spacing: 10) {
+            if let t = trip {
+                let c = desk.cost(t)
+                HStack(spacing: 12) {
+                    Label("\(t.nights) nights", systemImage: "moon.stars.fill")
+                    Label("\(legs.count) stops", systemImage: "mappin.and.ellipse")
+                    if c.total > 0 {
+                        Label(ChappyFX.money(c.total, t.homeCurrency), systemImage: "creditcard.fill")
+                    }
+                }
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(Capsule().fill(.black.opacity(0.55)))
+            }
+
+            HStack(spacing: 8) {
+                Picker("", selection: $style) {
+                    ForEach(Style.allCases) { s in Text(s.rawValue).tag(s) }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 230)
+
+                Button {
+                    showShortlist.toggle()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    Image(systemName: showShortlist ? "star.circle.fill" : "star.circle")
+                        .font(.title3)
+                        .foregroundStyle(showShortlist ? theme.accent : .white)
+                        .padding(8)
+                        .background(Circle().fill(.black.opacity(0.5)))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.bottom, 6)
+        }
+        .padding(.bottom, 14)
+    }
+
+    // MARK: framing and data
+
+    /// Fit the WHOLE trip. A map showing one pin when the trip has six has
+    /// quietly lied about the shape of it.
+    /// AUDIT: named frame(), which collides with SwiftUI's deprecated
+    /// zero-argument View.frame() modifier. If overload resolution ever
+    /// picked the modifier, this would silently become a no-op and the
+    /// "fit the whole trip" button would do nothing, with no error.
+    private func frameTrip() {
+        guard !legs.isEmpty else { return }
+        let lats = legs.map(\.lat), lons = legs.map(\.lon)
+        guard let minLa = lats.min(), let maxLa = lats.max(),
+              let minLo = lons.min(), let maxLo = lons.max() else { return }
+        let region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLa + maxLa) / 2,
+                                           longitude: (minLo + maxLo) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max(0.5, (maxLa - minLa) * 1.7),
+                                   longitudeDelta: max(0.5, (maxLo - minLo) * 1.7)))
+        withAnimation(.easeInOut(duration: 0.6)) {
+            camera = .region(region)
+        }
+    }
+
+    private func loadSeasons() async {
+        for leg in legs {
+            let m = Calendar.current.component(.month, from: leg.arrive)
+            await ChappySeason.shared.load(lat: leg.lat, lon: leg.lon, month: m)
+        }
+    }
+
+    /// Shortlisted places have names but no coordinates — they were saved
+    /// from a list, not a map. Geocode them once, near their own leg, so
+    /// the pin lands in the right town rather than on a same-named street
+    /// on the other side of the world.
+    private func buildPlacePins() {
+        guard showShortlist else { placePins = []; return }
+        Task { @MainActor in
+            var out: [PlacePin] = []
+            for (i, leg) in legs.enumerated() {
+                for name in leg.shortlist.prefix(8) {
+                    let req = MKLocalSearch.Request()
+                    req.naturalLanguageQuery = "\(name) \(leg.place)"
+                    req.region = MKCoordinateRegion(center: coord(leg),
+                                                    latitudinalMeters: 30000,
+                                                    longitudinalMeters: 30000)
+                    guard let resp = try? await MKLocalSearch(request: req).start(),
+                          let item = resp.mapItems.first else { continue }
+                    out.append(PlacePin(name: name,
+                                        coord: item.placemark.coordinate,
+                                        legIndex: i))
+                }
+            }
+            placePins = out
+        }
+    }
+}
+
+// MARK: - The card behind a pin
+
+struct AtlasLegCard: View {
+    let legID: UUID
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var visa = ChappyVisa.shared
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var leg: ChappyTravel.Leg? { trip?.legs.first { $0.id == legID } }
+    private var index: Int? { trip?.legs.firstIndex { $0.id == legID } }
+
+    var body: some View {
+        ZStack {
+            AuroraBackdrop(theme: theme)
+            ScrollView {
+                if let l = leg, let t = trip {
+                    VStack(alignment: .leading, spacing: 14) {
+                        header(l, t)
+                        facts(l, t)
+                        links(l, t)
+                    }
+                    .padding(16)
+                } else {
+                    Text("That leg is gone.")
+                        .foregroundColor(theme.textSecondary)
+                        .padding(40)
+                }
+            }
+        }
+    }
+
+    private func header(_ l: ChappyTravel.Leg, _ t: ChappyTravel.Trip) -> some View {
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM"
+        return VStack(alignment: .leading, spacing: 4) {
+            Text(l.place)
+                .font(.title2).fontWeight(.bold)
+                .foregroundColor(theme.textPrimary)
+            Text("\(f.string(from: l.arrive)) – \(f.string(from: l.depart)) · \(l.nights) \(l.nights == 1 ? "night" : "nights")")
+                .font(.subheadline)
+                .foregroundColor(theme.textSecondary)
+        }
+    }
+
+    private func facts(_ l: ChappyTravel.Leg, _ t: ChappyTravel.Trip) -> some View {
+        let month = Calendar.current.component(.month, from: l.arrive)
+        let normals = ChappySeason.shared.normals(lat: l.lat, lon: l.lon, month: month)
+        let legCur = l.stayCurrency.isEmpty ? t.homeCurrency : l.stayCurrency
+        let country = ChappyVisa.country(from: l.country.isEmpty ? l.place : l.country)
+        let rule = country.flatMap { ChappyVisa.auPassport[$0] }
+
+        return VStack(alignment: .leading, spacing: 9) {
+            if let n = normals {
+                fact("cloud.sun.fill",
+                     "\(Int(n.maxC.rounded()))° / \(Int(n.minC.rounded()))° · \(n.verdict)",
+                     "Average of the last three \(DateFormatter().monthSymbols[month - 1])s, not a forecast")
+            }
+            if let r = rule, let c = country {
+                fact(r.shape.icon,
+                     "\(c): \(r.shape.label)\(r.days > 0 ? " · \(r.days) days" : "")",
+                     ChappyVisa.shared.live[c]?.ageLine ?? "Indicative — tap Visas for the live rules")
+            }
+            if l.arrival != .none {
+                fact(l.arrival.icon,
+                     l.arrivalNote.isEmpty ? l.arrival.label : "\(l.arrival.label) — \(l.arrivalNote)",
+                     l.arrivalCost > 0 ? ChappyFX.money(l.arrivalCost, t.homeCurrency) : "")
+            }
+            if l.nightlyRate > 0 {
+                fact("bed.double.fill",
+                     "\(ChappyFX.money(l.nightlyRate, legCur)) a night",
+                     l.stayName.isEmpty ? "" : l.stayName)
+            }
+            if !l.shortlist.isEmpty {
+                fact("star.fill", l.shortlist.prefix(4).joined(separator: " · "),
+                     l.shortlist.count > 4 ? "and \(l.shortlist.count - 4) more" : "")
+            }
+            if !l.notes.isEmpty { fact("note.text", l.notes, "") }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    private func fact(_ icon: String, _ line: String, _ sub: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.footnote)
+                .foregroundColor(theme.accent)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(line)
+                    .font(.subheadline)
+                    .foregroundColor(theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !sub.isEmpty {
+                    Text(sub).font(.caption2).foregroundColor(theme.textSecondary)
+                }
+            }
+            Spacer()
+        }
+    }
+
+    private func links(_ l: ChappyTravel.Leg, _ t: ChappyTravel.Trip) -> some View {
+        let prev = (index ?? 0) > 0 ? t.legs[(index ?? 1) - 1] : nil
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                // BUILD 179 — GOOGLE FIRST.
+                //
+                // MapKit draws the atlas because that was the right call for
+                // the build: no package, no second key, nothing that can
+                // break an archive. But where you LAND when you tap a place
+                // is a different question, and in Asia the businesses, the
+                // opening hours and the transit legs are all on Google.
+                // Universal links, so the app opens if it's installed.
+                if let g = desk.googlePlaceURL(l) {
+                    linkChip("Google Maps", "map.fill") { desk.open(g) }
+                }
+                if let gd = desk.googleDirectionsURL(to: l, from: prev) {
+                    linkChip("Directions", "arrow.triangle.turn.up.right.circle.fill") { desk.open(gd) }
+                }
+                if let u = desk.groundURL(.rome2rio, leg: l, from: prev, trip: t) {
+                    linkChip("How to get there", "arrow.triangle.swap") { desk.open(u) }
+                }
+                if let u = desk.groundURL(.twelvego, leg: l, from: prev, trip: t) {
+                    linkChip("Bus / train / ferry", "tram.fill") { desk.open(u) }
+                }
+                ForEach(ChappyTravel.Booking.allCases) { site in
+                    if let u = desk.bookingURL(site, leg: l, trip: t) {
+                        linkChip(site.label, "bed.double.fill") { desk.open(u) }
+                    }
+                }
+                if let u = desk.groundURL(.klook, leg: l, from: prev, trip: t) {
+                    linkChip("Tours & tickets", "ticket.fill") { desk.open(u) }
+                }
+            }
+        }
+    }
+
+    private func linkChip(_ label: String, _ icon: String, action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
+            Label(label, systemImage: icon)
+                .font(.caption2).fontWeight(.semibold)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Capsule().fill(theme.accent.opacity(0.16)))
+                .foregroundColor(theme.accent)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// =====================================================================
+// BUILD 178 — THE VISA DESK, ON SCREEN.
+//
+// The screen's whole job is to keep the three layers visibly apart:
+// what the baked table says (instant, indicative), what the live check
+// found (dated, sourced), and where the official word is (always one
+// tap away). A screen that blurred those would be worse than no screen.
+// =====================================================================
+
+struct VisaDeskView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @ObservedObject private var visa = ChappyVisa.shared
+    @ObservedObject private var desk = ChappyTravel.shared
+    @State private var lookup = ""
+    @State private var manual: String?
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var positions: [ChappyVisa.Position] { trip.map { visa.positions(for: $0) } ?? [] }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let t = trip, !positions.isEmpty {
+                            verdictCard(t)
+                            ForEach(positions) { p in countryCard(p) }
+                        } else {
+                            Text("No trip planned, so there's nothing to check against. Look a country up below, or plan a trip first.")
+                                .font(.subheadline)
+                                .foregroundColor(theme.textSecondary)
+                                .padding(.top, 8)
+                        }
+                        lookupCard
+                        if let m = manual, let r = ChappyVisa.auPassport[m] {
+                            manualCard(m, r)
+                        }
+                        disclaimer
+                    }
+                    .padding(14)
+                    .padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("Visas")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        guard let t = trip else { return }
+                        Task { await visa.checkWholeTrip(t) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(trip == nil || !visa.checking.isEmpty)
+                }
+            }
+            .onAppear { visa.pruneStale() }
+        }
+    }
+
+    // MARK: the verdict
+
+    private func verdictCard(_ t: ChappyTravel.Trip) -> some View {
+        let over = positions.filter(\.over)
+        let action = positions.filter { $0.shape.needsActionBeforeFlying }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: over.isEmpty ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .foregroundColor(over.isEmpty ? .green : .orange)
+                Text(over.isEmpty ? "Nothing over the limit" : "\(over.count) problem\(over.count == 1 ? "" : "s")")
+                    .font(.headline)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+            }
+            if !over.isEmpty {
+                ForEach(over) { p in
+                    Text("\(p.days) days in \(p.country) — counting arrival days — and an Australian passport gets \(p.allowance). Extend in country, do a border run, or apply for a longer visa before you fly.")
+                        .font(.subheadline)
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if !action.isEmpty {
+                Text("Sort before you board: " + action.map { "\($0.country) (\($0.shape.label.lowercased()))" }
+                    .joined(separator: ", ") + ".")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button {
+                ChappyEarcon.shared.tap()
+                TTSService.shared.speakLong(visa.spokenTripCheck(t))
+            } label: {
+                Label("Read it to me", systemImage: "speaker.wave.2.fill")
+                    .font(.caption).fontWeight(.semibold)
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(theme.accent)
+            .padding(.top, 2)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    // MARK: one country
+
+    private func countryCard(_ p: ChappyVisa.Position) -> some View {
+        let l = visa.live[p.country]
+        let busy = visa.checking.contains(p.country)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: p.shape.icon)
+                    .font(.title3)
+                    .foregroundColor(p.over ? .orange : theme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(p.country)
+                        .font(.headline).foregroundColor(theme.textPrimary)
+                    Text("\(p.shape.label)\(p.allowance > 0 ? " · \(p.allowance) days" : "")")
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    // Days of presence, not nights — that is what a visa
+                    // allowance counts, and the difference is an overstay.
+                    Text("\(p.days) days")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                    Text(p.verdict)
+                        .font(.caption2)
+                        .foregroundColor(p.over ? .orange : (p.tight ? .yellow : .green))
+                }
+            }
+
+            if !p.legs.isEmpty {
+                Text(p.legs.joined(separator: " · "))
+                    .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.8))
+            }
+
+            // THE LIVE LAYER, clearly separated from the table above it.
+            if busy {
+                HStack(spacing: 7) {
+                    ProgressView().tint(theme.accent).scaleEffect(0.7)
+                    Text("Checking the current rules…")
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                }
+            } else if let l {
+                Divider().background(Color.white.opacity(0.1))
+                Text(l.summary)
+                    .font(.subheadline)
+                    .foregroundColor(theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                detail("Costs", l.cost)
+                detail("How", l.howTo)
+                detail("Extending", l.extendable)
+                detail("Onward ticket", l.onwardTicket)
+                detail("Passport", l.passportValidity)
+                detail("Working remotely", l.remoteWork)
+                HStack {
+                    Text(l.ageLine)
+                        .font(.caption2)
+                        .foregroundColor(l.isStale ? .orange : theme.textSecondary)
+                    Spacer()
+                    if !p.schengenGroup {
+                        Button {
+                            Task { await visa.deepCheck(country: p.country, nights: p.nights, force: true) }
+                        } label: {
+                            Text("Re-check").font(.caption2).fontWeight(.semibold)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(theme.accent)
+                    }
+                }
+                if !l.sources.isEmpty {
+                    ForEach(l.sources.prefix(4), id: \.self) { u in
+                        Button {
+                            if let url = URL(string: u) {
+                                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "link").font(.caption2)
+                                Text(URL(string: u)?.host?.replacingOccurrences(of: "www.", with: "") ?? u)
+                                    .font(.caption2).lineLimit(1)
+                                Spacer()
+                            }
+                            .foregroundColor(theme.textSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } else if !p.schengenGroup {
+                Button {
+                    Task { await visa.deepCheck(country: p.country, nights: p.nights) }
+                } label: {
+                    Label("Check the current rules", systemImage: "magnifyingglass")
+                        .font(.caption).fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+
+            // "Schengen area" is a bucket, not a country. Asking the visa
+            // desk about it produces nonsense, and building a Smartraveller
+            // URL from it produces a 404. Show the countries instead.
+            if p.schengenGroup {
+                Text("Schengen counts as ONE allowance: 90 days in any rolling 180 across the whole zone, not per country. Check each country you're entering below.")
+                    .font(.caption)
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(p.legs.prefix(6), id: \.self) { place in
+                    if let c = ChappyVisa.country(from: place) {
+                        official(c)
+                    }
+                }
+            } else {
+                official(p.country)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    private func detail(_ label: String, _ value: String) -> some View {
+        Group {
+            if !value.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Text(label + ":")
+                        .font(.caption).fontWeight(.semibold)
+                        .foregroundColor(theme.accent)
+                    Text(value)
+                        .font(.caption)
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    /// The official word is one tap away on EVERY card. Chappy is a
+    /// briefing, not an authority, and the design has to keep saying so.
+    private func official(_ country: String) -> some View {
+        HStack(spacing: 8) {
+            if let u = ChappyVisa.smartravellerURL(country) {
+                Button {
+                    UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                } label: {
+                    Label("Smartraveller", systemImage: "shield.lefthalf.filled")
+                        .font(.caption2).fontWeight(.semibold)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.textSecondary)
+            }
+            if let u = ChappyVisa.officialSearchURL(country) {
+                Button {
+                    UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                } label: {
+                    Label("Official source", systemImage: "building.columns")
+                        .font(.caption2).fontWeight(.semibold)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.textSecondary)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: look one up
+
+    private var lookupCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("LOOK A COUNTRY UP")
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(.cyan)
+            HStack(spacing: 8) {
+                TextField("Philippines, Japan, Vietnam…", text: $lookup)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                    .onSubmit { look() }
+                Button { look() } label: {
+                    Image(systemName: "magnifyingglass.circle.fill")
+                        .font(.title2).foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+            Text("Thinking about somewhere after this trip? Check it here before you build a plan around it.")
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary.opacity(0.85))
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    private func look() {
+        let q = lookup.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        guard let c = ChappyVisa.country(from: q) else {
+            manual = nil
+            Task { await visa.deepCheck(country: q, force: true) }
+            return
+        }
+        manual = c
+        Task { await visa.deepCheck(country: c) }
+    }
+
+    private func manualCard(_ country: String, _ r: ChappyVisa.Rule) -> some View {
+        let l = visa.live[country]
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 10) {
+                Image(systemName: r.shape.icon).font(.title3).foregroundColor(theme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(country).font(.headline).foregroundColor(theme.textPrimary)
+                    Text("\(r.shape.label)\(r.days > 0 ? " · \(r.days) days" : "")")
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+            }
+            if !r.note.isEmpty {
+                Text(r.note).font(.caption).foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if visa.checking.contains(country) {
+                HStack(spacing: 7) {
+                    ProgressView().tint(theme.accent).scaleEffect(0.7)
+                    Text("Checking the current rules…").font(.caption)
+                        .foregroundColor(theme.textSecondary)
+                }
+            } else if let l {
+                Divider().background(Color.white.opacity(0.1))
+                Text(l.summary).font(.subheadline).foregroundColor(theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                detail("Costs", l.cost)
+                detail("How", l.howTo)
+                detail("Working remotely", l.remoteWork)
+                Text(l.ageLine).font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            official(country)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(card)
+    }
+
+    private var disclaimer: some View {
+        Text("The shapes above are an indicative table for an AUSTRALIAN passport, reviewed August 2026. The checked answers come from a live search and carry their sources and a date. Neither is an authority — visa rules change without notice and only the country's own immigration service and Smartraveller can tell you what is true at the border today. Check both before you fly.")
+            .font(.caption2)
+            .foregroundColor(theme.textSecondary.opacity(0.8))
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 4)
+    }
+
+    private var card: some View {
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05))
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THE DEAL CHIP.
+//
+// A price on its own is not information. "Rp 1,450,000 a night" tells
+// you nothing unless you already know what villas in Canggu go for in
+// September — and if you knew that, you wouldn't need the app.
+//
+// So every price that has a searched band behind it carries a grade:
+// green at or under the low end, amber around what everyone pays, red
+// above the tourist line, with the range spelled out so it can be
+// argued with. The colours are chosen to survive both themes and to
+// still read on a printed page, because this goes in the report too.
+// =====================================================================
+
+struct DealChip: View {
+    let grade: ChappyTravel.Grade
+    let band: ChappyTravel.Band?
+    let currency: String
+    var compact = false
+
+    private var colour: Color {
+        switch grade {
+        case .great:   return Color(red: 0.11, green: 0.61, blue: 0.35)
+        case .good:    return Color(red: 0.29, green: 0.63, blue: 0.24)
+        case .fair:    return Color(red: 0.79, green: 0.54, blue: 0.07)
+        case .high:    return Color(red: 0.75, green: 0.23, blue: 0.17)
+        case .unknown: return .gray
+        }
+    }
+
+    var body: some View {
+        if grade == .unknown {
+            EmptyView()
+        } else {
+            HStack(spacing: 5) {
+                Circle().fill(colour).frame(width: 7, height: 7)
+                Text(grade.label)
+                    .font(.system(size: 9, weight: .heavy))
+                    .foregroundColor(colour)
+                if !compact, let b = band, b.isUsable {
+                    Text("typical \(ChappyFX.money(b.low, currency))–\(ChappyFX.money(b.high, currency))")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(colour.opacity(0.13)))
+        }
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THE THREE OPTIONS.
+//
+// One plan is a quote. Three is a conversation. Same region, same
+// length, same reasons for going — the only thing that changes is what
+// you're spending and what it buys, which is the only comparison worth
+// putting on a screen.
+//
+// And underneath: a box to argue with it in plain words, because the
+// moment after you compare three prices is exactly the moment you know
+// what's wrong with all of them.
+// =====================================================================
+
+struct TripOptionsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    @ObservedObject private var desk = ChappyTravel.shared
+    @State private var gripe = ""
+    @State private var comparison: ChappyComparison?
+    @State private var share: URL?
+    @State private var verdicts: [UUID: (ChappyScore.Verdict, ChappyTrueCost.Result)] = [:]
+
+    /// Scored once per option set. Everything downstream reads the cache.
+    private func rebuildVerdicts() {
+        comparison = ChappyComparison.compare(desk.pendingOptions)
+        var out: [UUID: (ChappyScore.Verdict, ChappyTrueCost.Result)] = [:]
+        for t in desk.pendingOptions {
+            out[t.id] = (ChappyScore.shared.score(t), ChappyTrueCost.shared.compute(t))
+        }
+        verdicts = out
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if desk.pendingOptions.isEmpty {
+                            Text("No options built yet. Say \u{201C}plan me two weeks in Bali\u{201D}, or use the planner.")
+                                .font(.subheadline)
+                                .foregroundColor(theme.textSecondary)
+                                .padding(.top, 30)
+                        }
+                        // BUILD 185: the sentence goes ABOVE the options, not
+                        // below them. By the time you have scrolled past three
+                        // prices you have already decided, and the whole point
+                        // of the verdict is to reach you before that.
+                        // AUDIT: computing this in the body ran six full
+                        // scorings, twelve true-cost passes and about
+                        // twenty-one cost() calls on EVERY render — and
+                        // cost() spawns an FX refresh Task when a rate is
+                        // missing, so an offline session fired twenty-one
+                        // of those per frame. Computed once, when the
+                        // options change.
+                        if let cmp = comparison {
+                            ChappyVerdictBanner(cmp: cmp, theme: theme)
+                        }
+                        ForEach(desk.pendingOptions) { t in
+                            optionCard(t)
+                        }
+                        if !desk.pendingOptions.isEmpty { gripeBox }
+                    }
+                    .padding(14)
+                    .padding(.bottom, 40)
+                }
+                if desk.planning { busy }
+            }
+            .task(id: desk.pendingOptions.map(\.id)) { rebuildVerdicts() }
+            .sheet(item: $share) { u in ChappyShareSheet(items: [u]) }
+            .navigationTitle("Three ways to do it")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if !desk.pendingOptions.isEmpty {
+                        Button {
+                            if let u = desk.writeComparison(desk.pendingOptions) { share = u }
+                        } label: { Image(systemName: "square.and.arrow.up") }
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+
+    /// The score plus the true-cost uplift. Two numbers, and the second
+    /// one is the one that changes minds: "$4,180 — really $4,690".
+    @ViewBuilder
+    private func scoreRow(_ t: ChappyTravel.Trip) -> some View {
+        if let cached = verdicts[t.id] {
+            scoreRowBody(t, cached.0, cached.1)
+        }
+    }
+
+    @ViewBuilder
+    private func scoreRowBody(_ t: ChappyTravel.Trip,
+                              _ v: ChappyScore.Verdict,
+                              _ truth: ChappyTrueCost.Result) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("\(v.total)")
+                    .font(.system(size: 17, weight: .heavy, design: .rounded))
+                    .foregroundColor(ChappyVerdictBanner.colour(v.total))
+                Text(v.band)
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(ChappyVerdictBanner.colour(v.total))
+                Text(v.coverage)
+                    .font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary.opacity(0.8))
+                Spacer()
+                if truth.hidden > 0 {
+                    Text("really \(ChappyFX.money(truth.total, t.homeCurrency))")
+                        .font(.caption).fontWeight(.semibold)
+                        .foregroundColor(.orange)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule()
+                        .fill(ChappyVerdictBanner.colour(v.total))
+                        .frame(width: geo.size.width * CGFloat(max(0, min(100, v.total))) / 100)
+                }
+            }
+            .frame(height: 4)
+            if let flag = v.redFlags.first {
+                Text(flag)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func optionCard(_ t: ChappyTravel.Trip) -> some View {
+        let shape = ChappyTravel.Shape(rawValue: t.shape ?? "") ?? .balanced
+        let c = desk.cost(t)
+        let isLive = desk.activeID == t.id
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(shape.label)
+                        .font(.headline).foregroundColor(theme.textPrimary)
+                    Text(shape.blurb)
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(ChappyFX.money(c.total, t.homeCurrency))
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .foregroundColor(isLive ? theme.accent : theme.textPrimary)
+                    if t.party > 1 {
+                        Text("\(ChappyFX.money(c.perPerson, t.homeCurrency)) each")
+                            .font(.caption2).foregroundColor(theme.textSecondary)
+                    }
+                }
+            }
+
+            Text(t.legs.map { "\($0.place) \($0.nights)n" }.joined(separator: " · "))
+                .font(.caption)
+                .foregroundColor(theme.textSecondary)
+                .lineLimit(2)
+
+            // BUILD 185: the score, and — more useful than the score —
+            // what the headline price is actually missing.
+            scoreRow(t)
+
+            // How much of this plan is actually well priced — the single
+            // most useful thing about having bands at all.
+            let grades = gradeSpread(t)
+            if grades.total > 0 {
+                HStack(spacing: 10) {
+                    if grades.great > 0 { tally("\(grades.great) great", .green) }
+                    if grades.fair > 0 { tally("\(grades.fair) about right", .orange) }
+                    if grades.high > 0 { tally("\(grades.high) over the odds", .red) }
+                }
+            }
+
+            if let s = t.summary, !s.isEmpty {
+                Text(s)
+                    .font(.caption)
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button {
+                ChappyEarcon.shared.tap()
+                desk.adopt(t)
+                dismiss()
+            } label: {
+                Text(isLive ? "This is the one you're on" : "Use this one")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(Capsule().fill(isLive ? Color.white.opacity(0.08)
+                                                      : theme.accent.opacity(0.22)))
+                    .foregroundColor(isLive ? theme.textSecondary : theme.accent)
+            }
+            .buttonStyle(.plain)
+            .disabled(isLive)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(isLive ? 0.09 : 0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .stroke(isLive ? theme.accent.opacity(0.5) : .clear, lineWidth: 1.5))
+    }
+
+    private func tally(_ text: String, _ colour: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(colour).frame(width: 6, height: 6)
+            Text(text).font(.system(size: 10, weight: .semibold))
+                .foregroundColor(theme.textSecondary)
+        }
+    }
+
+    private func gradeSpread(_ t: ChappyTravel.Trip) -> (great: Int, fair: Int, high: Int, total: Int) {
+        var g = 0, f = 0, h = 0
+        for leg in t.legs {
+            for (value, band) in [(leg.nightlyRate, leg.stayBand),
+                                  (leg.arrivalCost, leg.arrivalBand),
+                                  (leg.foodPerDay, leg.foodBand),
+                                  (leg.groundPerDay, leg.groundBand)] {
+                switch ChappyTravel.grade(value, band) {
+                case .great, .good: g += 1
+                case .fair:         f += 1
+                case .high:         h += 1
+                case .unknown:      continue
+                }
+            }
+        }
+        return (g, f, h, g + f + h)
+    }
+
+    private var gripeBox: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("TELL ME WHAT'S WRONG WITH IT")
+                .font(.caption2).fontWeight(.heavy).tracking(0.6)
+                .foregroundColor(.cyan)
+            HStack(spacing: 8) {
+                TextField("Too expensive. Keep it under six grand.", text: $gripe)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.send)
+                    .onSubmit { send() }
+                Button { send() } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2).foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+                .disabled(gripe.trimmingCharacters(in: .whitespaces).isEmpty || desk.planning)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(["Too expensive", "Cut a leg", "Fewer places",
+                             "Nicer rooms", "Less flying", "No hostels"], id: \.self) { q in
+                        Button {
+                            gripe = q; send()
+                        } label: {
+                            Text(q)
+                                .font(.caption2).fontWeight(.semibold)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Capsule().fill(theme.accent.opacity(0.14)))
+                                .foregroundColor(theme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            Text("It keeps everything you didn't complain about, and it remembers what you turned down.")
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary.opacity(0.8))
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    private func send() {
+        let said = gripe.trimmingCharacters(in: .whitespaces)
+        guard !said.isEmpty else { return }
+        gripe = ""
+        ChappyEarcon.shared.tap()
+        Task {
+            guard let t = desk.active ?? desk.pendingOptions.first else { return }
+            await desk.revise(t, saying: said)
+        }
+    }
+
+    private var busy: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 12) {
+                ProgressView().tint(theme.accent).scaleEffect(1.3)
+                Text("Reworking it…").font(.headline).foregroundColor(.white)
+                Text("Checking real prices again. Up to a minute.")
+                    .font(.caption).foregroundColor(.white.opacity(0.75))
+            }
+        }
+    }
+}
+
+// =====================================================================
+// BUILD 181 — THE INTAKE, ON SCREEN.
+//
+// The same questions the voice version asks, in the same order, sharing
+// the same answers — so you can start it out loud on a walk and finish
+// it on the couch, or the other way round.
+//
+// Every question carries WHY it changes the plan. A questionnaire that
+// won't tell you why it's asking is one people abandon halfway, and
+// half an intake is worse than none because the plan then quietly
+// assumes things you never said.
+// =====================================================================
+
+struct IntakeSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+    @ObservedObject private var intake = ChappyIntake.shared
+    @State private var text: [String: String] = [:]
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header
+                        ForEach(intake.live) { q in
+                            question(q)
+                        }
+                        Text("Answered once, remembered for good. Every plan from here on reads these, which is why the second trip you plan comes out better than the first.")
+                            .font(.caption2)
+                            .foregroundColor(theme.textSecondary.opacity(0.8))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(role: .destructive) {
+                            intake.reset(); text = [:]
+                        } label: {
+                            Text("Start over").font(.caption).fontWeight(.semibold)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.red.opacity(0.8))
+                    }
+                    .padding(14)
+                    .padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("How you travel")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { intake.showing = false; dismiss() }
+                }
+            }
+            .onAppear {
+                for q in ChappyIntake.questions where q.kind == .text || q.kind == .number {
+                    text[q.id] = intake.answers[q.id] ?? ""
+                }
+            }
+            // AUDIT: showing was only cleared by the Done button, so a swipe
+            // dismiss left it true and every later utterance was read as an
+            // interview answer until the questionnaire finished.
+            .onDisappear { intake.showing = false }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(intake.isComplete ? "All set" : "\(intake.unanswered.count) to go")
+                    .font(.headline).foregroundColor(theme.textPrimary)
+                Spacer()
+                Text("\(Int(intake.progress * 100))%")
+                    .font(.caption).foregroundColor(theme.accent)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.09))
+                    Capsule().fill(theme.accent)
+                        .frame(width: max(3, geo.size.width * intake.progress))
+                }
+            }
+            .frame(height: 6)
+            Text("These are about how YOU travel, not about one trip. You can also just say \u{201C}Chappy, ask me about how I travel\u{201D} and do it out loud.")
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    @ViewBuilder
+    private func question(_ q: ChappyIntake.Question) -> some View {
+        let answered = !(intake.answers[q.id] ?? "").isEmpty
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: answered ? "checkmark.circle.fill" : "circle")
+                    .font(.footnote)
+                    .foregroundColor(answered ? .green : theme.textSecondary.opacity(0.5))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(q.prompt)
+                        .font(.subheadline).fontWeight(.medium)
+                        .foregroundColor(theme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !q.why.isEmpty {
+                        Text(q.why)
+                            .font(.caption2)
+                            .foregroundColor(theme.textSecondary.opacity(0.85))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            switch q.kind {
+            case .yesno:
+                HStack(spacing: 8) {
+                    ForEach(["Yes", "No"], id: \.self) { v in
+                        pill(v, on: intake.answers[q.id] == v) { intake.set(q.id, v) }
+                    }
+                }
+            case .choice:
+                FlowChips(options: q.options,
+                          isOn: { intake.answers[q.id] == $0 },
+                          tap: { intake.set(q.id, $0) },
+                          theme: theme)
+            case .multi:
+                FlowChips(options: q.options,
+                          isOn: { intake.has(q.id, $0) },
+                          tap: { intake.toggleMulti(q.id, $0) },
+                          theme: theme)
+            case .text, .number:
+                TextField("Your answer", text: Binding(
+                    get: { text[q.id] ?? "" },
+                    set: { text[q.id] = $0; intake.set(q.id, $0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(q.kind == .number ? .numberPad : .default)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    private func pill(_ label: String, on: Bool, tap: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            tap()
+        } label: {
+            Text(label)
+                .font(.caption).fontWeight(.semibold)
+                .padding(.horizontal, 14).padding(.vertical, 7)
+                .background(Capsule().fill(on ? theme.accent.opacity(0.25) : Color.white.opacity(0.07)))
+                .foregroundColor(on ? theme.accent : theme.textSecondary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Chips that wrap instead of scrolling sideways — an option you have to
+/// swipe to discover is an option most people never see.
+struct FlowChips: View {
+    let options: [String]
+    let isOn: (String) -> Bool
+    let tap: (String) -> Void
+    let theme: ChappyTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(rows(), id: \.self) { row in
+                HStack(spacing: 7) {
+                    ForEach(row, id: \.self) { o in
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            tap(o)
+                        } label: {
+                            Text(o)
+                                .font(.caption).fontWeight(.semibold)
+                                .padding(.horizontal, 11).padding(.vertical, 7)
+                                .background(Capsule().fill(isOn(o) ? theme.accent.opacity(0.25)
+                                                                   : Color.white.opacity(0.07)))
+                                .foregroundColor(isOn(o) ? theme.accent : theme.textSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    /// Rough packing by character count — good enough for chips this size
+    /// and far cheaper than a real flow layout.
+    private func rows() -> [[String]] {
+        var out: [[String]] = []
+        var row: [String] = []
+        var width = 0
+        for o in options {
+            let w = o.count + 4
+            if width + w > 34, !row.isEmpty { out.append(row); row = []; width = 0 }
+            row.append(o); width += w
+        }
+        if !row.isEmpty { out.append(row) }
+        return out
+    }
+}
+
+
+// =====================================================================
+// BUILD 185 — THE SENTENCE, ON SCREEN.
+//
+// The report can afford a page. This has one paragraph and it has to
+// land before he has scrolled past three prices — because once he has
+// seen three prices he has already decided, and the verdict arrives
+// as an argument rather than as advice.
+//
+// So: what I'd do, why, and when the cheapest is genuinely the best
+// one, that sentence instead. The second case matters more than it
+// looks. A recommender that always points at the dearer option has
+// not made a judgement, and people work that out fast.
+// =====================================================================
+
+struct ChappyVerdictBanner: View {
+    let cmp: ChappyComparison
+    let theme: ChappyTheme
+    @State private var expanded = false
+
+    static func colour(_ score: Int) -> Color {
+        switch score {
+        case 80...:   return Color(red: 0.19, green: 0.77, blue: 0.49)
+        case 62..<80: return Color(red: 0.56, green: 0.82, blue: 0.48)
+        case 45..<62: return .orange
+        default:      return Color(red: 1.0, green: 0.42, blue: 0.37)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: cmp.cheapestWins ? "checkmark.seal.fill" : "hand.raised.fill")
+                    .font(.caption)
+                Text(cmp.cheapestWins ? "The cheapest is the best one" : "What I'd do")
+                    .font(.caption).fontWeight(.heavy)
+                    .textCase(.uppercase)
+                    .kerning(1.2)
+                Spacer()
+            }
+            .foregroundColor(theme.accent)
+
+            Text(cmp.recommendation)
+                .font(.subheadline)
+                .foregroundColor(theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if expanded {
+                Divider().background(Color.white.opacity(0.10))
+                ForEach(cmp.rows) { r in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(r.score.total)")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
+                            .foregroundColor(Self.colour(r.score.total))
+                            .frame(width: 30, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(r.label).font(.caption).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                            Text(ChappyFX.money(r.realCost, r.trip.homeCurrency)
+                                 + (r.truth.hidden > 0
+                                    ? " all in · headline \(ChappyFX.money(r.headlineCost, r.trip.homeCurrency))"
+                                    : " all in"))
+                                .font(.caption2).foregroundColor(theme.textSecondary)
+                        }
+                        Spacer()
+                        if r.isRecommended {
+                            Text("PICK").font(.system(size: 9, weight: .heavy))
+                                .foregroundColor(Self.colour(90))
+                        } else if r.isCheapest {
+                            Text("CHEAPEST").font(.system(size: 9, weight: .heavy))
+                                .foregroundColor(theme.textSecondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                Text(expanded ? "Less" : "Show the numbers")
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(theme.accent)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(theme.accent.opacity(0.08))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(theme.accent.opacity(0.22), lineWidth: 1)))
+    }
+}
+
+
+// =====================================================================
+// BUILD 188 — THE TRIP FILE SCREEN.
+//
+// Three tabs, because these are three different moods. "What do I
+// still have to do" is a Sunday-afternoon question. "What's the
+// confirmation number" is a standing-at-a-desk question. "Where's my
+// passport scan" is a panicking question, and it has to work with no
+// signal.
+//
+// The timeline is first on purpose: it is the only one of the three
+// that tells you something you did not already know.
+// =====================================================================
+
+struct ChappyTripFileView: View {
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var file = ChappyFile.shared
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var watch = ChappyWatch.shared
+    @State private var tab = 0
+    @State private var editing: ChappyFile.Booking?
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                VStack(spacing: 0) {
+                    Picker("", selection: $tab) {
+                        Text("To do").tag(0)
+                        Text("Booked").tag(1)
+                        Text("Watching").tag(2)
+                        Text("Docs").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(12)
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            if tab == 0 { timelineTab }
+                            else if tab == 1 { bookingsTab }
+                            else if tab == 2 { watchTab }
+                            else { documentsTab }
+                        }
+                        .padding(14)
+                        .padding(.bottom, 40)
+                    }
+                }
+            }
+            .navigationTitle("Trip file")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if tab == 1 {
+                        Button {
+                            var b = ChappyFile.Booking()
+                            b.tripID = trip?.id
+                            b.currency = trip?.homeCurrency ?? "AUD"
+                            editing = b
+                        } label: { Image(systemName: "plus") }
+                    }
+                }
+            }
+            .sheet(item: $editing) { b in
+                ChappyBookingEditor(booking: b, theme: theme)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- to do
+
+    @ViewBuilder private var timelineTab: some View {
+        if let t = trip {
+            let items = file.timeline(t)
+            if items.isEmpty {
+                empty("No dates on the trip yet, so there's nothing to count down to.")
+            } else {
+                let done = items.filter(\.done).count
+                Text("\(done) of \(items.count) done")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                // timeline() already returns these in bucket order, so the
+                // list just follows it. An extra sort here was a leftover
+                // that compared a value with itself and did nothing.
+                ForEach(items) { item in
+                    timelineRow(item)
+                }
+            }
+        } else {
+            empty("No active trip.")
+        }
+    }
+
+    private func timelineRow(_ item: ChappyFile.TimelineItem) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: item.done ? "checkmark.circle.fill" : "circle")
+                .foregroundColor(item.done ? .green : (item.urgent ? .orange : theme.textSecondary))
+                .font(.subheadline)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(item.title)
+                        .font(.subheadline).fontWeight(.medium)
+                        .foregroundColor(item.done ? theme.textSecondary : theme.textPrimary)
+                        .strikethrough(item.done, color: theme.textSecondary)
+                    Spacer()
+                    Text(item.bucket)
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(item.urgent ? .orange : theme.textSecondary.opacity(0.7))
+                }
+                Text(item.detail)
+                    .font(.caption)
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Color.white.opacity(item.urgent ? 0.08 : 0.04)))
+    }
+
+    // ---------------------------------------------------------- booked
+
+    @ViewBuilder private var bookingsTab: some View {
+        let mine = file.bookings(for: trip?.id)
+        if mine.isEmpty {
+            empty("Nothing recorded yet. Add a booking as you make it — the confirmation number is the bit you'll want at a desk with no signal.")
+        } else {
+            ForEach(mine) { b in
+                Button { editing = b } label: { bookingRow(b) }
+                    .buttonStyle(.plain)
+            }
+        }
+        if let t = trip {
+            let cover = file.coverage(t)
+            if !cover.missing.isEmpty {
+                Text("Still to book: " + cover.missing.joined(separator: ", "))
+                    .font(.caption).foregroundColor(.orange)
+                    .padding(.top, 4)
+            }
+        }
+    }
+
+    private func bookingRow(_ b: ChappyFile.Booking) -> some View {
+        HStack(spacing: 11) {
+            Image(systemName: b.kind.icon)
+                .foregroundColor(theme.accent).frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(b.title.isEmpty ? b.kind.label : b.title)
+                    .font(.subheadline).fontWeight(.medium)
+                    .foregroundColor(theme.textPrimary)
+                if !b.reference.isEmpty {
+                    Text("Ref \(b.reference)")
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                }
+                if let d = b.daysToCancel {
+                    Text(d < 0
+                         ? "Free cancellation has passed"
+                         : "Free cancellation for \(d) more day\(d == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundColor(d < 0 ? theme.textSecondary : (d <= 3 ? .red : .green))
+                }
+            }
+            Spacer()
+            if b.amount > 0 {
+                Text(ChappyFX.money(b.amount, b.currency))
+                    .font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    // ---------------------------------------------------------- watching
+
+    @ViewBuilder private var watchTab: some View {
+        let mine = watch.watches.filter { $0.tripID == trip?.id || $0.tripID == nil }
+        HStack {
+            if let t = trip {
+                Button {
+                    watch.watchRoutes(of: t)
+                } label: {
+                    Label("Watch this trip's routes", systemImage: "plus.circle")
+                        .font(.caption).fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+            Spacer()
+            if watch.running {
+                ProgressView().scaleEffect(0.7)
+            } else {
+                Button { Task { await watch.run(force: true) } } label: {
+                    Label("Check now", systemImage: "arrow.clockwise")
+                        .font(.caption).fontWeight(.semibold)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.accent)
+            }
+        }
+
+        if mine.isEmpty {
+            empty("Nothing being watched yet. Add this trip's routes and Chappy takes one researched price a week and writes it down. After six weeks, \"book now or wait\" stops being a guess about airlines in general and becomes an observation about your route.")
+        } else {
+            ForEach(mine) { w in
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Image(systemName: w.kind.icon)
+                            .font(.caption).foregroundColor(theme.accent)
+                        Text(w.label)
+                            .font(.subheadline).fontWeight(.medium)
+                            .foregroundColor(theme.textPrimary)
+                        Spacer()
+                        Text(w.advice.label)
+                            .font(.caption).fontWeight(.heavy)
+                            .foregroundColor(ChappyVerdictBanner.colour(
+                                w.advice == .book ? 90 : (w.advice == .wait ? 50 : 65)))
+                    }
+                    Text(w.adviceLine)
+                        .font(.caption).foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if w.points.count >= 2 {
+                        sparkline(w)
+                    }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.05)))
+                .contextMenu {
+                    Button(role: .destructive) { watch.remove(w) } label: {
+                        Label("Stop watching", systemImage: "trash")
+                    }
+                }
+            }
+        }
+        if let last = watch.lastRun {
+            Text("Last checked \(last.formatted(date: .abbreviated, time: .shortened))")
+                .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.7))
+        }
+    }
+
+    private func sparkline(_ w: ChappyWatch.Watch) -> some View {
+        let mids = w.points.map(\.mid)
+        let lo = mids.min() ?? 0
+        let hi = mids.max() ?? 1
+        let span = max(0.0001, hi - lo)
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(w.points) { p in
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(abs(p.mid - lo) < 0.001 ? Color.green : Color.white.opacity(0.22))
+                    .frame(height: 6 + CGFloat((p.mid - lo) / span) * 24)
+            }
+        }
+        .frame(height: 30)
+    }
+
+    // ---------------------------------------------------------- documents
+
+    @ViewBuilder private var documentsTab: some View {
+        if file.documents.isEmpty {
+            empty("Nothing stored. Share a PDF or a photo into Chappy — passport, visa, insurance, tickets — and it lives here, offline, for the moment you're at a desk with no wifi.")
+        } else {
+            ForEach(file.documents) { d in
+                HStack(spacing: 11) {
+                    Image(systemName: d.kind.icon)
+                        .foregroundColor(theme.accent).frame(width: 24)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(d.label.isEmpty ? d.kind.label : d.label)
+                            .font(.subheadline).fontWeight(.medium)
+                            .foregroundColor(theme.textPrimary)
+                        if let days = d.daysToExpiry {
+                            Text(days < 0 ? "Expired" : "Expires in \(days) days")
+                                .font(.caption2)
+                                .foregroundColor(days < 0 ? .red : (days < 183 ? .orange : theme.textSecondary))
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.05)))
+            }
+        }
+    }
+
+    private func empty(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline)
+            .foregroundColor(theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 24)
+    }
+}
+
+// =====================================================================
+
+struct ChappyBookingEditor: View {
+    @State var booking: ChappyFile.Booking
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var file = ChappyFile.shared
+    @State private var hasStart = false
+    @State private var hasCancel = false
+    @State private var start = Date()
+    @State private var cancel = Date()
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    Picker("Kind", selection: $booking.kind) {
+                        ForEach(ChappyFile.BookingKind.allCases) { k in
+                            Label(k.label, systemImage: k.icon).tag(k)
+                        }
+                    }
+                    TextField("What is it", text: $booking.title)
+                    TextField("Provider", text: $booking.provider)
+                    TextField("Confirmation number", text: $booking.reference)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.characters)
+                }
+                Section("Money") {
+                    HStack {
+                        Text("Amount")
+                        Spacer()
+                        TextField("0", value: $booking.amount, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Picker("Currency", selection: $booking.currency) {
+                        ForEach(ChappyFX.common, id: \.self) { Text($0).tag($0) }
+                    }
+                    Toggle("Already paid", isOn: $booking.paid)
+                }
+                Section("Dates") {
+                    Toggle("Has a start date", isOn: $hasStart)
+                    if hasStart {
+                        DatePicker("Starts", selection: $start, displayedComponents: .date)
+                    }
+                } footer: {
+                    Text("Used to sort the file and to put the booking on the right day of the itinerary.")
+                }
+                Section("Free cancellation") {
+                    Toggle("Refundable until a date", isOn: $hasCancel)
+                    if hasCancel {
+                        DatePicker("Until", selection: $cancel, displayedComponents: .date)
+                    }
+                } footer: {
+                    Text("The most valuable field on this screen. Chappy reminds you seven days and two days before the deadline — a refundable booking you forgot to cancel is a non-refundable booking with extra steps, and it costs more than every hidden fee in the report put together.")
+                }
+                Section {
+                    TextField("Notes", text: $booking.notes, axis: .vertical)
+                        .lineLimit(2...5)
+                }
+                if file.bookings.contains(where: { $0.id == booking.id }) {
+                    Section {
+                        Button(role: .destructive) {
+                            file.remove(booking); dismiss()
+                        } label: { Text("Delete this booking") }
+                    }
+                }
+            }
+            .navigationTitle(booking.title.isEmpty ? "Booking" : booking.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") { commit() }.fontWeight(.semibold)
+                }
+            }
+            .onAppear {
+                if let s = booking.starts { start = s; hasStart = true }
+                if let c = booking.refundableUntil { cancel = c; hasCancel = true }
+            }
+        }
+    }
+
+    private func commit() {
+        booking.starts = hasStart ? start : nil
+        booking.refundableUntil = hasCancel ? cancel : nil
+        if file.bookings.contains(where: { $0.id == booking.id }) { file.update(booking) }
+        else { file.add(booking) }
+        dismiss()
+    }
+}
+
+
+// =====================================================================
+// BUILD 190 — THE ONE-WAY CARD.
+//
+// Small, and it drives eight things: whether hops() invents a flight
+// home, whether the true cost adds a return baggage sector, what the
+// price journal is pricing, what the last day of the trip is, and —
+// the one that actually stops people at an airport — whether an onward
+// ticket is needed to board.
+//
+// The onward line is not a checklist item. In Indonesia, Thailand and
+// the Philippines it is the airline that refuses you, at the desk,
+// because the airline is liable for carrying someone a country won't
+// admit. So it gets a red card and a countdown, not a tick box.
+// =====================================================================
+
+struct ChappyOneWayCard: View {
+    let trip: ChappyTravel.Trip
+    let theme: ChappyTheme
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var file = ChappyFile.shared
+    @State private var showOnward = false
+
+    private var isOneWay: Bool { trip.oneWay == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: isOneWay ? "arrow.right" : "arrow.left.arrow.right")
+                    .foregroundColor(theme.accent).font(.subheadline)
+                Text(isOneWay ? "One-way" : "Return")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { isOneWay },
+                    set: { on in
+                        var t = trip
+                        t.oneWay = on
+                        desk.update(t)
+                    }))
+                    .labelsHidden()
+            }
+
+            Text(isOneWay
+                 ? "No flight home in the plan, bags counted one way, and the price journal prices one-ways rather than halving a return."
+                 : "A return is assumed — there's a flight home in the route and the bags are counted both ways.")
+                .font(.caption)
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if isOneWay {
+                let needs = ChappyOnward.shared.needs(trip)
+                if !needs.isEmpty {
+                    Divider().background(Color.white.opacity(0.10))
+                    ForEach(needs) { need in
+                        onwardRow(need)
+                    }
+                    Button { showOnward = true } label: {
+                        Label("Record an onward ticket", systemImage: "plus.circle")
+                            .font(.caption).fontWeight(.semibold)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accent)
+                }
+            }
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+        .sheet(isPresented: $showOnward) {
+            ChappyOnwardSheet(trip: trip, theme: theme)
+        }
+    }
+
+    @ViewBuilder
+    private func onwardRow(_ need: ChappyOnward.Need) -> some View {
+        let bad = !need.satisfied && need.rule.enforcement == .strict
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: need.satisfied ? "checkmark.seal.fill"
+                  : (bad ? "exclamationmark.triangle.fill" : "questionmark.circle"))
+                .foregroundColor(need.satisfied ? .green : (bad ? .red : .orange))
+                .font(.caption)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(need.country) — \(need.rule.enforcement.label)")
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Text(need.expiresBefore
+                     ? "You've recorded one, but it lapses before you fly. A temporary reservation is only proof on the day."
+                     : (need.satisfied ? "Held." : need.rule.note))
+                    .font(.caption2)
+                    .foregroundColor(need.expiresBefore ? .orange : theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+// =====================================================================
+
+struct ChappyOnwardSheet: View {
+    let trip: ChappyTravel.Trip
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var file = ChappyFile.shared
+    @State private var country = ""
+    @State private var reference = ""
+    @State private var method: ChappyOnward.Method = .temporary
+    @State private var validUntil = Date().addingTimeInterval(48 * 3600)
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Which country") {
+                    Picker("Country", selection: $country) {
+                        ForEach(ChappyOnward.shared.needs(trip)) { n in
+                            Text(n.country).tag(n.country)
+                        }
+                    }
+                }
+                Section("How") {
+                    Picker("Method", selection: $method) {
+                        ForEach(ChappyOnward.Method.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
+                    }
+                    Text(method.detail)
+                        .font(.caption).foregroundColor(.secondary)
+                    Text("Cost: \(method.cost)")
+                        .font(.caption).foregroundColor(.secondary)
+                } footer: {
+                    Text(ChappyOnward.neverGenerate)
+                }
+                Section("The booking") {
+                    TextField("PNR / confirmation", text: $reference)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.characters)
+                    DatePicker("Valid until", selection: $validUntil)
+                } footer: {
+                    Text("A temporary reservation cancels itself after about 48 hours, so it's only proof on the day you fly. Chappy checks the date against your arrival and warns you if it lapses first — which is the specific way this goes wrong.")
+                }
+            }
+            .navigationTitle("Onward ticket")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") { save() }.fontWeight(.semibold)
+                }
+            }
+            .onAppear {
+                if country.isEmpty { country = ChappyOnward.shared.needs(trip).first?.country ?? "" }
+            }
+        }
+    }
+
+    private func save() {
+        var b = ChappyFile.Booking()
+        b.tripID = trip.id
+        b.kind = .onward
+        b.title = "Onward from \(country)"
+        b.reference = reference
+        b.notes = "\(country) · \(method.label)"
+        b.ends = validUntil
+        b.currency = trip.homeCurrency
+        file.add(b)
+        dismiss()
+    }
+}
+
+
+// =====================================================================
+// BUILD 190 — THE FLIGHTS SCREEN.
+//
+// Everything below already existed as engine and had no way in: the
+// airport atlas, the connection verdicts, the nearby-airport
+// alternatives, the baggage table, the price journal. It lived in the
+// emailed report, which meant it only reached him if he thought to
+// generate one.
+//
+// The screen is deliberately not a flight search. Chappy has no live
+// fares and never will, so imitating Google Flights would produce a
+// worse Google Flights with no prices in it. What it does instead is
+// tell him what a search RESULT means — whether $180 plus $95 of bags
+// beats $240, whether the connection can be made, whether a cheaper
+// airport is actually cheaper once the road is counted, and whether
+// this week's number is good measured against his own record.
+// =====================================================================
+
+struct ChappyFlightsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var watch = ChappyWatch.shared
+    @State private var picked: ChappyTravel.Hop?
+    @State private var share: URL?
+    @State private var showStatus = false
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var segments: [ChappyTravel.Hop] { trip.map { desk.hops($0) } ?? [] }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if let t = trip {
+                            hitsSection
+                            routeSection(t)
+                            watchSection(t)
+                            meterSection
+                        } else {
+                            Text("No active trip. Plan one in the Travel Desk and the segments show up here.")
+                                .font(.subheadline).foregroundColor(theme.textSecondary)
+                                .padding(.top, 30)
+                        }
+                        Button { showStatus = true } label: {
+                            Label("Flight status & tracking", systemImage: "dot.radiowaves.left.and.right")
+                                .font(.subheadline).fontWeight(.semibold)
+                        }
+                        .buttonStyle(.plain).foregroundColor(theme.accent).padding(.top, 8)
+                    }
+                    .padding(14).padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("Flights")
+            .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showStatus) { FlightsView(theme: theme) }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if let t = trip {
+                        Button {
+                            share = desk.writeFlights(t)
+                        } label: { Image(systemName: "square.and.arrow.up") }
+                    }
+                }
+            }
+            .sheet(item: $picked) { hop in
+                ChappySegmentView(hop: hop, theme: theme)
+            }
+            .sheet(item: $share) { u in ChappyShareSheet(items: [u]) }
+        }
+    }
+
+    // ---------------------------------------------------------- route
+
+    @ViewBuilder private func routeSection(_ t: ChappyTravel.Trip) -> some View {
+        HStack {
+            Text(t.name).font(.headline).foregroundColor(theme.textPrimary)
+            Spacer()
+            if t.oneWay == true {
+                Text("ONE-WAY").font(.system(size: 9, weight: .heavy))
+                    .foregroundColor(theme.accent)
+            }
+        }
+        if segments.isEmpty {
+            Text("Nothing in this trip is reached by air yet.")
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+        } else {
+            ForEach(segments) { hop in
+                Button { picked = hop } label: { segmentRow(hop, t) }
+                    .buttonStyle(.plain)
+            }
+            let mins = segments.reduce(0) { $0 + $1.minutes }
+            HStack {
+                Text("Time in the air, all \(segments.count)")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                Spacer()
+                Text(ChappyPorts.minutesLine(max(0, mins - 35 * segments.count)))
+                    .font(.caption).fontWeight(.semibold).foregroundColor(theme.textPrimary)
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    private func segmentRow(_ hop: ChappyTravel.Hop, _ t: ChappyTravel.Trip) -> some View {
+        let w = watch.watches.first {
+            $0.tripID == t.id && $0.label.hasPrefix("\(hop.from.iata) → \(hop.to.iata)")
+        }
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM"
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(hop.route)
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundColor(theme.textPrimary)
+                Text("\(f.string(from: hop.when)) · \(ChappyPorts.durationLine(hop.km)) · \(Int(hop.km.rounded())) km")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+            }
+            Spacer()
+            if let adv = w?.advice, adv != .thin {
+                Text(adv.label.uppercased())
+                    .font(.system(size: 9, weight: .heavy))
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill(ChappyVerdictBanner.colour(adv == .book ? 90 : (adv == .wait ? 50 : 65)).opacity(0.18)))
+                    .foregroundColor(ChappyVerdictBanner.colour(adv == .book ? 90 : (adv == .wait ? 50 : 65)))
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.6))
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    // ---------------------------------------------------------- what it found
+
+    /// The top of the screen when something has actually turned up.
+    /// Every one of these has already been priced by Chappy — the feed
+    /// made a claim and Chappy went and checked it before showing him.
+    @ViewBuilder private var hitsSection: some View {
+        let hits = watch.liveHits
+        if !hits.isEmpty {
+            ForEach(hits.prefix(3)) { hit in
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 6) {
+                        Image(systemName: hit.confirmed ? "checkmark.seal.fill" : "questionmark.circle")
+                            .font(.caption)
+                        Text(hit.confirmed ? "CONFIRMED" : "UNCONFIRMED")
+                            .font(.system(size: 9, weight: .heavy)).kerning(1)
+                        Spacer()
+                        Text("\(hit.ageHours)h ago")
+                            .font(.caption2).foregroundColor(theme.textSecondary)
+                    }
+                    .foregroundColor(hit.confirmed ? .green : .orange)
+
+                    if !hit.route.isEmpty {
+                        Text(hit.route).font(.subheadline).fontWeight(.semibold)
+                            .foregroundColor(theme.textPrimary)
+                    }
+                    Text(hit.what).font(.caption).foregroundColor(theme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(hit.verdict).font(.caption2).foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 10) {
+                        if let u = URL(string: hit.searchURL), !hit.searchURL.isEmpty {
+                            Button { UIApplication.shared.open(u) } label: {
+                                Label("Book it", systemImage: "airplane.departure")
+                                    .font(.caption).fontWeight(.semibold)
+                            }
+                            .buttonStyle(.plain).foregroundColor(theme.accent)
+                        }
+                        if let u = URL(string: hit.url), !hit.url.isEmpty {
+                            Button { UIApplication.shared.open(u) } label: {
+                                Label("Read the post", systemImage: "safari")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.plain).foregroundColor(theme.textSecondary)
+                        }
+                    }
+                }
+                .padding(13)
+                .background(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill((hit.confirmed ? Color.green : Color.orange).opacity(0.09)))
+                .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .stroke((hit.confirmed ? Color.green : Color.orange).opacity(0.26), lineWidth: 1))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- watching
+
+    @ViewBuilder private func watchSection(_ t: ChappyTravel.Trip) -> some View {
+        // AUDIT: filtering on !points.isEmpty meant that after tapping
+        // "Watch these routes" — which creates them with no points yet —
+        // the list was still empty and the button was still there. It
+        // read as a broken button. The .thin copy already says "one
+        // reading so far, three is the minimum"; let it say it.
+        let mine = watch.watches.filter { $0.tripID == t.id && $0.kind == .route }
+        if !mine.isEmpty {
+            Text("Watching").font(.caption).fontWeight(.semibold)
+                .foregroundColor(theme.textSecondary).padding(.top, 6)
+            ForEach(mine) { w in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(w.label).font(.caption).fontWeight(.semibold)
+                            .foregroundColor(theme.textPrimary)
+                        Spacer()
+                        Text(w.advice.label).font(.caption).fontWeight(.heavy)
+                            .foregroundColor(ChappyVerdictBanner.colour(w.advice == .book ? 90 : (w.advice == .wait ? 50 : 65)))
+                    }
+                    Text(w.adviceLine).font(.caption2).foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.05)))
+            }
+        } else if let t2 = trip {
+            Button { watch.watchRoutes(of: t2) } label: {
+                Label("Watch these routes", systemImage: "plus.circle")
+                    .font(.caption).fontWeight(.semibold)
+            }
+            .buttonStyle(.plain).foregroundColor(theme.accent).padding(.top, 4)
+        }
+    }
+
+    @ViewBuilder private var meterSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // The bar already exists and already knows the rules — no
+            // reason to invent a second way of saying the same thing.
+            FlightBudgetBar(theme: theme)
+            Text("Spent on the flights you've booked, not on searching. Searching is free; status isn't.")
+                .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.75))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 8)
+    }
+}
+
+// =====================================================================
+
+struct ChappySegmentView: View {
+    let hop: ChappyTravel.Hop
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var desk = ChappyTravel.shared
+    @ObservedObject private var watch = ChappyWatch.shared
+
+    private var trip: ChappyTravel.Trip? { desk.active }
+    private var oneWay: Bool { trip?.oneWay == true }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        header
+                        if let w = mine { journal(w) }
+                        included
+                        alternatives
+                        actions
+                    }
+                    .padding(14).padding(.bottom, 40)
+                }
+            }
+            .navigationTitle(hop.route)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+
+    /// AUDIT: no trip filter, and watches persist across trips in one
+    /// array — so last year's SYD → DPS watch was shown against a trip
+    /// six months from now, with a stale verdict.
+    private var mine: ChappyWatch.Watch? {
+        watch.watches.first {
+            $0.tripID == trip?.id
+                && $0.label.hasPrefix("\(hop.from.iata) → \(hop.to.iata)")
+        }
+    }
+
+    /// AUDIT — THE ONE THAT WOULD NOT HAVE BUILT.
+    ///
+    /// `let f = DateFormatter()` is a declaration and the result builder
+    /// leaves it alone. `f.dateFormat = "..."` is an expression statement
+    /// of type (), and ViewBuilder has no Void overload — "type '()'
+    /// cannot conform to 'View'". It is the only bare assignment at the
+    /// top of a builder body anywhere in this file; every other formatter
+    /// in here is set up inside a plain func with an explicit return.
+    private var header: some View {
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM yyyy"
+        return VStack(alignment: .leading, spacing: 4) {
+            Text(hop.route)
+                .font(.system(size: 30, weight: .heavy, design: .rounded))
+                .foregroundColor(theme.textPrimary)
+            Text("\(hop.from.city) → \(hop.to.city) · \(f.string(from: hop.when))")
+                .font(.caption).foregroundColor(theme.textSecondary)
+            Text("\(ChappyPorts.durationLine(hop.km)) gate to gate · \(Int(hop.km.rounded())) km · \(trip?.party ?? 1) travelling\(oneWay ? " · one-way" : "")")
+                .font(.caption).foregroundColor(theme.textSecondary)
+        }
+    }
+
+    @ViewBuilder private func journal(_ w: ChappyWatch.Watch) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(w.advice.label).font(.subheadline).fontWeight(.heavy)
+                    .foregroundColor(ChappyVerdictBanner.colour(w.advice == .book ? 90 : (w.advice == .wait ? 50 : 65)))
+                Spacer()
+                Text("\(w.points.count) readings").font(.caption2)
+                    .foregroundColor(theme.textSecondary)
+            }
+            Text(w.adviceLine).font(.caption).foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous)
+            .fill(ChappyVerdictBanner.colour(w.advice == .book ? 90 : (w.advice == .wait ? 50 : 65)).opacity(0.09)))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
+            .stroke(ChappyVerdictBanner.colour(w.advice == .book ? 90 : (w.advice == .wait ? 50 : 65)).opacity(0.24), lineWidth: 1))
+    }
+
+    @ViewBuilder private var included: some View {
+        // AUDIT: baggage(for:) is an EXACT match and FlightBrief.airlines
+        // is free text ("Jetstar, Scoot"), so this never fired at all.
+        // Routed through the fuzzy matcher now — and labelled honestly,
+        // because FlightBrief holds ONE airline string for the whole
+        // trip, so it may not be the carrier on this particular segment.
+        if let raw = trip?.flights?.airlines,
+           let name = ChappyTrueCost.airlineName(from: raw),
+           let bag = ChappyTrueCost.baggage(for: name) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(bag.isLowCost ? "\(bag.airline) carries no bag" : "\(bag.airline) — \(bag.checkedIncludedKg)kg included")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Text(bag.isLowCost
+                     ? "\(bag.carryOnKg)kg cabin, nothing checked on any fare. You carry 20kg each, so that isn't optional — buy it with the fare, because at the airport it's roughly triple."
+                     : bag.note)
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if raw.contains(",") || raw.localizedCaseInsensitiveContains(" or ") {
+                    Text("This trip lists \(raw) — Chappy holds one carrier for the whole plan, so check who actually flies this segment before trusting the bag rules.")
+                        .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(13)
+            .background(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.orange.opacity(bag.isLowCost ? 0.10 : 0.05)))
+        }
+    }
+
+    @ViewBuilder private var alternatives: some View {
+        let opts = desk.nearbyOptions(for: hop.to)
+        if !opts.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Fly into somewhere else")
+                    .font(.caption).fontWeight(.semibold).foregroundColor(theme.textSecondary)
+                ForEach(opts) { o in
+                    HStack(alignment: .top, spacing: 10) {
+                        Text("\(Int(o.km.rounded())) km")
+                            .font(.caption).fontWeight(.bold)
+                            .foregroundColor(o.worthIt ? .green : .orange)
+                            .frame(width: 58, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(o.airport.label).font(.caption).fontWeight(.semibold)
+                                .foregroundColor(theme.textPrimary)
+                            Text(o.groundNote).font(.caption2).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                Text("I can't price these — no live fare feed exists for an app like this. The distance is the part people get wrong, and the distance is what decides whether a cheaper fare is actually cheaper.")
+                    .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.8))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(13)
+            .background(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.white.opacity(0.05)))
+        }
+    }
+
+    @ViewBuilder private var actions: some View {
+        VStack(spacing: 8) {
+            if let u = ChappyFareShop.skyscanner(from: hop.from.iata, to: hop.to.iata,
+                                                 on: hop.when, party: trip?.party ?? 1, oneWay: oneWay) {
+                linkButton("Search on Skyscanner", "magnifyingglass", u, theme.accent)
+            }
+            if let u = desk.monthGridURL(hop, nights: trip?.nights ?? 1) {
+                linkButton("Cheapest week of the month", "calendar", u, .orange)
+            }
+            if let name = trip?.flights?.airlines,
+               let site = ChappyFareShop.airlineSites
+               .sorted(by: { $0.key.count > $1.key.count })
+               .first(where: { name.localizedCaseInsensitiveContains($0.key) }),
+               let u = URL(string: site.value) {
+                linkButton("\(site.key) direct", "airplane", u, theme.accent)
+            }
+            if let u = desk.codedFlightURL(hop, party: trip?.party ?? 1) {
+                linkButton("Google Flights", "globe", u, theme.textSecondary)
+            }
+        }
+        if let name = trip?.flights?.airlines,
+           let warn = ChappyFareShop.googleBlindSpot(name) {
+            Text(warn).font(.caption2).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 4)
+        }
+    }
+
+    private func linkButton(_ title: String, _ icon: String, _ url: URL, _ tint: Color) -> some View {
+        Button { UIApplication.shared.open(url) } label: {
+            HStack {
+                Image(systemName: icon).font(.caption)
+                Text(title).font(.subheadline).fontWeight(.semibold)
+                Spacer()
+                Image(systemName: "arrow.up.right").font(.caption2)
+            }
+            .foregroundColor(tint)
+            .padding(13)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(tint.opacity(0.10)))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(tint.opacity(0.24), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+
+// =====================================================================
+// BUILD 190 — WHAT THE NUMBER ACTUALLY BUYS.
+//
+// Ask for a trip on a budget and the planner will hit the budget —
+// by thinning the trip until it fits. Twenty-two dollar rooms, twelve
+// dollar days, and a plan that is technically real and practically
+// miserable. The deal score doesn't catch it either, because every
+// line sits at the bottom of its band, which reads as good value.
+//
+// This runs BEFORE the planner. Budget, minus flights, divided by
+// nights and party, against what each country actually costs — and
+// then the sentence a travel agent would say out loud before you
+// picked the country rather than after.
+//
+// It advises rather than blocks. It's his money and his call; being
+// told the trade-off beats being refused.
+// =====================================================================
+
+struct ChappyBudgetView: View {
+    let theme: ChappyTheme
+    @Environment(\.dismiss) private var dismiss
+    @State private var budget: Double = 5000
+    @State private var nights: Double = 60
+    @State private var party = 2
+    @State private var destination = ""
+    @State private var oneWay = true
+
+    private var verdict: ChappyAfford.Verdict {
+        ChappyAfford.shared.check(budget: budget, nights: Int(nights), party: party,
+                                  destination: destination.isEmpty ? nil : destination,
+                                  oneWay: oneWay)
+    }
+
+    var body: some View {
+        // AUDIT: `verdict` is computed, and body referenced it six times
+        // — two filters, two sorts and eight ChappyFX.money calls each,
+        // and money() allocates a fresh NumberFormatter every time. On a
+        // slider drag that is a few thousand formatter allocations a
+        // second, which is a visible stutter rather than a theoretical
+        // one. Computed once per pass.
+        let v = verdict
+        return NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 13) {
+                        inputs
+                        headlineCard(v)
+                        if !v.works.isEmpty { list("Where that works", v.works, true) }
+                        if !v.doesnt.isEmpty { list("Where it doesn't", v.doesnt, false) }
+                        note
+                    }
+                    .padding(14).padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("What will it buy")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } }
+            }
+        }
+    }
+
+    @ViewBuilder private var inputs: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Budget").font(.subheadline).foregroundColor(theme.textSecondary)
+                Spacer()
+                Text(ChappyFX.money(budget, "AUD"))
+                    .font(.system(size: 19, weight: .bold, design: .rounded))
+                    .foregroundColor(theme.textPrimary)
+            }
+            Slider(value: $budget, in: 1500...30000, step: 250).tint(theme.accent)
+            HStack {
+                Text("Nights").font(.subheadline).foregroundColor(theme.textSecondary)
+                Spacer()
+                Text("\(Int(nights))").font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+            }
+            Slider(value: $nights, in: 7...180, step: 1).tint(theme.accent)
+            HStack {
+                Stepper("Travelling: \(party)", value: $party, in: 1...6)
+                    .font(.subheadline).foregroundColor(theme.textSecondary)
+            }
+            Toggle("One-way", isOn: $oneWay)
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+            TextField("Somewhere in mind? (optional)", text: $destination)
+                .font(.subheadline)
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 9).fill(Color.white.opacity(0.06)))
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    private func headlineCard(_ v: ChappyAfford.Verdict) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(v.headline)
+                .font(.subheadline).foregroundColor(theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider().background(Color.white.opacity(0.10))
+            Text(v.advice)
+                .font(.subheadline).foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(theme.accent.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(theme.accent.opacity(0.22), lineWidth: 1))
+    }
+
+    private func list(_ title: String, _ places: [ChappyAfford.Place], _ good: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.caption).fontWeight(.semibold)
+                .foregroundColor(theme.textSecondary)
+            ForEach(places.prefix(good ? 6 : 4), id: \.region) { p in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(ChappyFX.money(p.perNightTwo * Double(party) / 2, "AUD"))
+                        .font(.caption).fontWeight(.bold)
+                        .foregroundColor(good ? .green : .red)
+                        .frame(width: 52, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(p.country) — \(p.region)")
+                            .font(.caption).fontWeight(.semibold)
+                            .foregroundColor(theme.textPrimary)
+                        Text(p.note).font(.caption2).foregroundColor(theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .padding(13)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    @ViewBuilder private var note: some View {
+        Text("Per night for the whole party, on the ground, flights excluded. These come from real plans rather than a guess — they're what the long-stay simulations actually came out at. A number that fits here is a number you'd still enjoy in week eight.")
+            .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.8))
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 4)
     }
 }

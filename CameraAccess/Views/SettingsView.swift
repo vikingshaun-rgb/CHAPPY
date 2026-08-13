@@ -650,6 +650,46 @@ struct SettingsView: View {
                         .font(AppTypography.caption)
                 }
 
+                // BUILD 180 — YOUR MUSIC.
+                Section {
+                    NavigationLink {
+                        AudioPolicyView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "speaker.wave.2.circle.fill")
+                                .foregroundColor(.pink)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Music & other audio")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyAudio.policyLine)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                }
+
+                // BUILD 177 — TRAVEL DESK: the one open door in travel data.
+                Section {
+                    NavigationLink {
+                        TravelKeysView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "map.circle.fill")
+                                .foregroundColor(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Travel Desk")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyPlaces.shared.hasTripAdvisorKey
+                                     ? "Tripadvisor connected \u{2014} ratings and reviews on every leg"
+                                     : "Add a free Tripadvisor key for ratings and reviews")
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                }
+
                 // BUILD 150 — FLIGHTS (Amadeus keys, addable any time).
                 Section {
                     NavigationLink {
@@ -2344,7 +2384,7 @@ struct FlightKeysView: View {
                 }
                 if !status.isEmpty { Text(status).font(.footnote).foregroundColor(.secondary) }
             } footer: {
-                Text("Make them free at developers.amadeus.com: sign up, My Self-Service Workspace, Create New App, copy both values. Chappy uses the test environment - 2,000 calls a month, plenty for a personal deal watcher.")
+                Text("AMADEUS IS GONE. Amadeus paused self-service registrations in March 2026 and decommissioned the developer portal entirely on 17 July 2026 - keys disabled, no signup form left. This is not an accreditation problem; there is nothing to sign up for. Your flight day runs on AviationStack instead and always did, so these fields do nothing unless you happen to hold old enterprise keys. Leave them empty.")
             }
         }
         .navigationTitle("Flights")
@@ -2407,5 +2447,425 @@ struct RideSetupView: View {
         }
         .navigationTitle("Rides & Food")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// =====================================================================
+// BUILD 177 — TRAVEL DESK KEYS.
+//
+// Worth being straight about why there is only ONE field here.
+//
+// Airbnb closed its public API in 2019 — partner only. Booking.com,
+// Agoda, Trip.com, Klook and Traveloka all gate theirs behind an
+// approved commercial agreement with traffic requirements. Facebook
+// Marketplace has never had an API at all. Kiwi moved Tequila to partner
+// approval. Amadeus decommissioned self-service outright in July 2026.
+//
+// Tripadvisor's Content API is the single open door: 5,000 calls a month
+// free, self-signup in about five minutes, no company and no partnership.
+// It gives real places with real ratings and review counts.
+//
+// And the Travel Desk works fully WITHOUT it — Apple Maps supplies the
+// places, you just don't get the ratings. This is an upgrade, not a
+// requirement.
+// =====================================================================
+
+struct TravelKeysView: View {
+    @State private var key = UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? ""
+    @State private var status = ""
+    @State private var gkey = APIKeyManager.shared.getMapsAPIKey() ?? ""
+    @State private var gstatus = ""
+    @ObservedObject private var fx = ChappyFX.shared
+    @ObservedObject private var gplaces = ChappyGooglePlaces.shared
+    @ObservedObject private var profile = ChappyProfile.shared
+
+    private var profileSummary: String {
+        let d = profile.data
+        if d.isEmpty { return "Not set up yet — worth two minutes" }
+        var bits: [String] = []
+        if !d.name.isEmpty { bits.append(d.name) }
+        if !d.homeCity.isEmpty { bits.append("from \(d.homeCity)") }
+        if let days = profile.passportDaysRemaining(on: Date()) {
+            // AUDIT: a lapsed passport returns a NEGATIVE number, which
+            // fell into "expiring soon". It has expired. Say that.
+            if days < 0 { bits.append("PASSPORT EXPIRED") }
+            else if days < 183 { bits.append("passport expiring soon") }
+            else { bits.append("passport on file") }
+        } else {
+            bits.append("no passport expiry")
+        }
+        return bits.joined(separator: " · ")
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                NavigationLink {
+                    TravellerProfileView()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "person.text.rectangle.fill")
+                            .foregroundColor(.accentColor)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Who's travelling").fontWeight(.medium)
+                            Text(profileSummary).font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+            } footer: {
+                Text("Passport expiry, who you fly with, who's coming. Chappy plans for this person rather than a generic Australian — and it checks the six-month passport rule on every trip, which is what actually stops people at the check-in desk.")
+            }
+
+            Section("Home currency") {
+                Picker("Everything is priced in", selection: Binding(
+                    get: { fx.home },
+                    set: { fx.home = $0 }
+                )) {
+                    ForEach(ChappyFX.common, id: \.self) { c in
+                        Text("\(c) — \(ChappyFX.names[c] ?? c)").tag(c)
+                    }
+                }
+            } footer: {
+                Text("Trip totals, the converter and every report land in this currency. You can still price an individual hotel in rupiah or baht — Chappy converts it.")
+            }
+
+            Section("Tripadvisor content key") {
+                SecureField("Paste the key", text: $key)
+                Button("Save") {
+                    let k = key.trimmingCharacters(in: .whitespaces)
+                    UserDefaults.standard.set(k, forKey: "chappy_tripadvisor_key")
+                    status = k.isEmpty
+                        ? "Cleared. Places now come from Apple Maps."
+                        : "Saved. Open a leg and tap Eat & see."
+                }
+                if !status.isEmpty {
+                    Text(status).font(.footnote).foregroundColor(.secondary)
+                }
+            } footer: {
+                Text("Free at tripadvisor.com/developers — sign up, create a key, paste it here. 5,000 calls a month, which is far more than a person can use. A card is required for overage but you will not reach it. WITHOUT this the Travel Desk still works: places come from Apple Maps, you just don't get star ratings and review counts.")
+            }
+
+            // BUILD 183 — THE SECOND OPINION.
+            Section("Google ratings") {
+                SecureField("Google Maps API key", text: $gkey)
+                Button("Save") {
+                    let k = gkey.trimmingCharacters(in: .whitespaces)
+                    if k.isEmpty {
+                        _ = APIKeyManager.shared.deleteMapsAPIKey()
+                        // AUDIT: seedDefaultKeys() puts the built-in key back
+                        // on the next cold launch whenever the slot is empty,
+                        // so "Cleared" lasted until you closed the app and
+                        // the lookups quietly resumed on someone else's bill.
+                        UserDefaults.standard.set(true, forKey: "chappy_maps_key_cleared")
+                        gstatus = "Cleared. Places show Tripadvisor ratings only."
+                    } else {
+                        UserDefaults.standard.set(false, forKey: "chappy_maps_key_cleared")
+                        gstatus = APIKeyManager.shared.saveMapsAPIKey(k)
+                            ? "Saved. Open a leg and tap Eat & see — you'll get both numbers."
+                            : "Couldn't save that to the keychain."
+                    }
+                    ChappyGooglePlaces.shared.refreshConfigured()
+                }
+                if !gstatus.isEmpty {
+                    Text(gstatus).font(.footnote).foregroundColor(.secondary)
+                }
+                if let ge = gplaces.error, !ge.isEmpty {
+                    Text(ge).font(.footnote).foregroundColor(.orange)
+                }
+                if gplaces.isConfigured {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView(value: gplaces.fraction)
+                            .tint(gplaces.fraction > 0.85 ? .orange : .accentColor)
+                        Text(gplaces.meterLine)
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            } footer: {
+                Text("Optional, and it changes what the places list is worth. Google covers the gym, the ice bath, the dive shop and the warung down the lane — none of which Tripadvisor has heard of — and rates them by who actually goes. Where the two disagree by more than half a star, Chappy says so: higher on Google means locals love it and travellers don't, and the reverse is a tourist trap. Console.cloud.google.com, enable Places API (New), 5,000 free lookups a month.\n\nGoogle ratings appear in the APP only, never in the emailed report. Their licence permits storing exactly one thing — the place ID — and a saved document is storage. The report carries Tripadvisor, which does permit it. That split is deliberate.")
+            }
+
+            Section("What Chappy can and can't do") {
+                Text("Chappy plans, prices, maps and hands off. It cannot book, and neither can any solo developer: Airbnb has had no public API since 2019, and Booking, Agoda, Trip.com, Klook and Traveloka all require an approved commercial agreement. Every booking link in the app carries your dates and party size through to the site, where the real prices are.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("Travel Desk")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+
+// =====================================================================
+// BUILD 180 — MUSIC & OTHER AUDIO.
+//
+// The wake word runs on the PHONE, with a live microphone, so that it
+// works with the phone in your pocket and no glasses on. That is the
+// feature — and it is also why Chappy has an active audio session while
+// it is open, which is something "Hey Meta" does not, because that one
+// runs on the glasses' own chip.
+//
+// An active session is not the problem. Asking iOS to hold every other
+// app down for the whole time it is active was. This screen is where
+// that choice lives.
+// =====================================================================
+
+struct AudioPolicyView: View {
+    @State private var policy = ChappyAudio.policy
+
+    var body: some View {
+        Form {
+            Section("While Chappy is open") {
+                Picker("Your music", selection: $policy) {
+                    Text("Dips only while Chappy talks").tag("speaking")
+                    Text("Never touch it").tag("never")
+                    Text("Stays down the whole time").tag("always")
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+                .onChange(of: policy) { _, new in
+                    ChappyAudio.policy = new
+                    // Take effect now, not at the next spoken line.
+                    ChappyAudio.apply(.listening)
+                }
+            } footer: {
+                Text(footerText)
+            }
+
+            Section("Why this exists") {
+                Text("Chappy's wake word listens on the phone, so it has a live audio session open the whole time the app is running. Until build 180 that session asked iOS to hold every other app's audio down for its entire life, which is why Apple Music went quiet the moment you opened Chappy and came back the moment you closed it.\n\n\u{201C}Hey Meta\u{201D} does not do this because it is not listening on your phone at all \u{2014} it runs on the glasses\u{2019} own always-on chip, and the Meta app only opens a session when you actually invoke it. The trade is that its wake word needs the glasses on your face; Chappy\u{2019}s works from your pocket.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("Music & audio")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var footerText: String {
+        switch policy {
+        case "never":
+            return "Chappy talks over the top of your music at full volume. Worth knowing: with music coming out of the phone\u{2019}s own speaker, the microphone can hear it, and now and then a lyric sounds enough like the name to wake him. On headphones or through the glasses that can\u{2019}t happen."
+        case "always":
+            return "The old behaviour. Everything else stays quiet for as long as Chappy is open."
+        default:
+            return "Recommended. Your music plays at full volume while Chappy listens, dips for the second or two he is speaking, and comes straight back. Live AI and Translate still take the audio properly while a conversation is running \u{2014} that is deliberate."
+        }
+    }
+}
+
+
+// =====================================================================
+// BUILD 184 — THE TRAVELLER SCREEN.
+//
+// One screen, filled in once, that changes every answer Chappy gives
+// afterwards. The passport expiry field at the top is not a preference
+// and is not optional in spirit: it is the single most common reason
+// an Australian is turned away, and it is turned away at check-in by
+// the airline rather than at the border by an official, which is why
+// nobody sees it coming.
+//
+// Deliberately absent: passport NUMBER. Storing one in an app's
+// defaults is a liability with no upside — the expiry date is what the
+// arithmetic needs and all of what it needs.
+// =====================================================================
+
+struct TravellerProfileView: View {
+    @ObservedObject private var store = ChappyProfile.shared
+    @State private var hasExpiry = false
+    /// AUDIT: without this, tapping "I know my expiry date" wrote TODAY
+    /// as the expiry before the date picker had even drawn — and today
+    /// is inside six months of today, so every trip from then on carried
+    /// a red "passport expires in 0 days". Persisted, too.
+    @State private var expiryTouched = false
+    @State private var expiry = Date()
+    @State private var airlineText = ""
+    @State private var loyaltyText = ""
+    @State private var cardText = ""
+    @State private var chainText = ""
+    @State private var hotelText = ""
+    @State private var interestText = ""
+    @State private var visitedText = ""
+
+    private let styles = ["Budget", "Mid-range", "Comfortable", "Luxury"]
+    private let cabins = ["Economy", "Premium economy", "Business", "First"]
+
+    /// Split into computed sections deliberately. As one expression this
+    /// was a Form with six sections, twenty-two rows and fifteen generic
+    /// key-path calls solved as a single constraint system — the exact
+    /// shape that produces "unable to type-check in reasonable time" with
+    /// no useful diagnostic, on a machine he is renting by the hour.
+    var body: some View {
+        Form {
+            youSection
+            passportSection
+            partySection
+            flyingSection
+            stayingSection
+            tripSection
+        }
+        .navigationTitle("Who's travelling")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: load)
+        .onChange(of: hasExpiry) { _ in commitExpiry() }
+        .onChange(of: expiry) { _ in expiryTouched = true; commitExpiry() }
+    }
+
+    @ViewBuilder private var youSection: some View {
+        Group {
+            Section("You") {
+                TextField("Name", text: binding(\.name))
+                TextField("Home city", text: binding(\.homeCity))
+                TextField("Home airport code (optional, e.g. BNE)", text: binding(\.homeAirport))
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                TextField("Passport nationality", text: binding(\.nationality))
+                TextField("Second passport, if you have one", text: binding(\.secondPassport))
+            } footer: {
+                Text("A second passport is worth entering even if you never use it — it often gives a longer stay or a cheaper visa than the one you'd reach for.")
+            }
+
+        }
+    }
+
+    @ViewBuilder private var passportSection: some View {
+        Group {
+            Section("Passport expiry") {
+                Toggle("I know my expiry date", isOn: $hasExpiry)
+                if hasExpiry {
+                    DatePicker("Expires", selection: $expiry, displayedComponents: .date)
+                    if !expiryTouched {
+                        Text("Set the date above — nothing is saved until you do.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                if let v = verdict {
+                    Label(v.headline, systemImage: v.level == "LOW" ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundColor(v.level == "HIGH" ? .red : (v.level == "MEDIUM" ? .orange : .green))
+                }
+            } footer: {
+                Text("Most of Asia wants six months' validity from the day you ARRIVE, and the airline enforces it at check-in because they're liable for carrying you. Chappy checks every trip against the date you'd land, not today.")
+            }
+
+        }
+    }
+
+    @ViewBuilder private var partySection: some View {
+        Group {
+            Section("Who's coming") {
+                Stepper("Adults: \(store.data.adults)", value: binding(\.adults), in: 1...9)
+                Stepper("Children: \(store.data.children)", value: binding(\.children), in: 0...9)
+                Stepper("Infants: \(store.data.infants)", value: binding(\.infants), in: 0...4)
+                Toggle("Travelling with a pet", isOn: binding(\.travellingWithPet))
+                TextField("Accessibility requirements", text: binding(\.accessibility), axis: .vertical)
+                    .lineLimit(1...3)
+            } footer: {
+                Text("Accessibility is treated as a requirement, not a preference — it's checked against every stay, transfer and activity Chappy suggests.")
+            }
+
+        }
+    }
+
+    @ViewBuilder private var flyingSection: some View {
+        Group {
+            Section("How you fly") {
+                Picker("Usual cabin", selection: binding(\.cabinPreference)) {
+                    ForEach(cabins, id: \.self) { Text($0).tag($0) }
+                }
+                TextField("Seat preference", text: binding(\.seatPreference))
+                TextField("Meal preference", text: binding(\.mealPreference))
+                listField("Preferred airlines", $airlineText, \.preferredAirlines,
+                          "Qantas, Singapore Airlines")
+                listField("Frequent flyer & status", $loyaltyText, \.frequentFlyer,
+                          "Qantas Frequent Flyer — Gold")
+            } footer: {
+                Text("Status changes the maths. A fare that keeps you Gold can be worth paying more for, and Chappy will say so rather than just showing you the cheapest number.")
+            }
+
+        }
+    }
+
+    @ViewBuilder private var stayingSection: some View {
+        Group {
+            Section("Where you stay, what you carry") {
+                listField("Preferred hotel chains", $chainText, \.preferredChains, "Accor, Marriott")
+                listField("Hotel loyalty & status", $hotelText, \.hotelLoyalty,
+                          "Accor Plus, Marriott Titanium")
+                listField("Card travel benefits", $cardText, \.cardBenefits,
+                          "Amex Platinum — lounge, travel insurance, rental excess")
+            } footer: {
+                Text("Card benefits matter because they stop you buying things twice. If your card already covers travel insurance and rental excess, Chappy shouldn't be recommending you buy them.")
+            }
+
+        }
+    }
+
+    @ViewBuilder private var tripSection: some View {
+        Group {
+            Section("What kind of trip") {
+                Picker("Style", selection: binding(\.styleLevel)) {
+                    ForEach(styles, id: \.self) { Text($0).tag($0) }
+                }
+                Toggle("I work while travelling", isOn: binding(\.needsInternetForWork))
+                TextField("Dietary", text: binding(\.dietary))
+                listField("Interests", $interestText, \.interests,
+                          "diving, food, hiking, recovery")
+                listField("Already been to", $visitedText, \.visited, "Bali, Thailand, Japan")
+            } footer: {
+                Text("\"Already been to\" stops Chappy selling you places you know as if they were discoveries — it goes deeper or goes elsewhere instead.")
+            }
+        }
+    }
+
+    private var verdict: ChappyProfile.PassportVerdict? {
+        store.passportCheck(entering: Date())
+    }
+
+    private func load() {
+        if let e = store.data.passportExpiry {
+            expiry = e
+            hasExpiry = true
+            expiryTouched = true
+        }
+        airlineText = store.data.preferredAirlines.joined(separator: ", ")
+        loyaltyText = store.data.frequentFlyer.joined(separator: ", ")
+        cardText = store.data.cardBenefits.joined(separator: ", ")
+        chainText = store.data.preferredChains.joined(separator: ", ")
+        hotelText = store.data.hotelLoyalty.joined(separator: ", ")
+        interestText = store.data.interests.joined(separator: ", ")
+        visitedText = store.data.visited.joined(separator: ", ")
+    }
+
+    private func commitExpiry() {
+        store.data.passportExpiry = (hasExpiry && expiryTouched) ? expiry : nil
+    }
+
+    /// A plain binding into the store, so every edit persists the moment
+    /// it happens. No Save button — a settings screen with a Save button
+    /// is a settings screen people leave half-filled.
+    private func binding<T>(_ path: WritableKeyPath<ChappyProfile.Profile, T>) -> Binding<T> {
+        Binding(get: { store.data[keyPath: path] },
+                set: { store.data[keyPath: path] = $0 })
+    }
+
+    /// Comma-separated text in, array out. Kept as loose text while
+    /// you're typing, because splitting on every keystroke eats the
+    /// comma you just pressed.
+    private func listField(_ title: String, _ text: Binding<String>,
+                           _ path: WritableKeyPath<ChappyProfile.Profile, [String]>,
+                           _ hint: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption).foregroundColor(.secondary)
+            TextField(hint, text: text, axis: .vertical)
+                .lineLimit(1...3)
+                .onChange(of: text.wrappedValue) { new in
+                    store.data[keyPath: path] = new
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                }
+        }
     }
 }
