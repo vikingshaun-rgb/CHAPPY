@@ -1296,7 +1296,150 @@ struct TurboMetaHomeView: View {
     /// BUILD 193: The two-column colour-coded tile grid — the largest single
     /// expression on the screen, and the main reason the type
     /// checker was timing out.
-    private var tileGrid: some View {
+    // ================================================================
+    // BUILD 199 — THE WALL COMES DOWN.
+    //
+    // Twenty tiles in one grid, under four mode buttons, seven quick
+    // actions, a journal row and two cards. Everything equally loud,
+    // nothing aware of the time or the place.
+    //
+    // The fix the good ones use is not fewer tiles. It is one live
+    // thing at the top and everything else demoted — Google leads
+    // with a field, Apple with a couple of cards that change, Samsung
+    // sections everything so your thumb finds a group rather than an
+    // icon. First screenful goes from twenty-plus targets to about
+    // eight, and the ones that survive are the ones that change.
+    //
+    // Every tile body below is the one that was already there, moved
+    // and not rewritten. This file has defeated the type checker
+    // twice; a redesign is not the moment to also retype it.
+    // ================================================================
+
+    /// The one card that earns the top of the screen: what the
+    /// weather is doing, what is next, and what trip is open. All
+    /// three lines already existed as tile subtitles — they were just
+    /// buried among nineteen others.
+    private var nowCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("Now")
+                    .font(.system(size: 12, weight: .heavy, design: .rounded))
+                    .foregroundColor(theme.textSecondary)
+                    .tracking(1.1)
+                Spacer()
+            }
+            nowLine("cloud.sun.fill", weatherDetailLine)
+            nowLine("calendar", upcomingDetailLine)
+            nowLine("map.fill", travelDetailLine)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(theme.accent.opacity(0.22), lineWidth: 1)
+        )
+    }
+
+    private func nowLine(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundColor(theme.accent)
+                .frame(width: 18)
+            Text(text)
+                .font(.footnote)
+                .foregroundColor(theme.textPrimary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// A group header. Tapping one closes whatever else was open —
+    /// one section at a time is the whole point; two open sections is
+    /// just the wall again with lines drawn on it.
+    private func groupHeader(_ id: String, _ title: String,
+                             _ icon: String, _ count: Int) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                openGroup = (openGroup == id) ? "" : id
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(theme.accent)
+                    .frame(width: 20)
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(theme.textPrimary)
+                Text("\(count)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(theme.textSecondary)
+                Spacer()
+                Image(systemName: openGroup == id ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(theme.textSecondary)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var group_travel: some View {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
+                                            GridItem(.flexible(), spacing: 11)],
+                                  spacing: 11) {
+                            ChappyTile(icon: "map.fill", title: "Travel Desk",
+                                       detail: travelDetailLine,
+                                       tint: Color(red: 0.42, green: 0.86, blue: 0.62)) {
+                                showTravel = true
+                            }
+                            ChappyTile(icon: "airplane", title: "Flights",
+                                       detail: flightsDetailLine,
+                                       tint: Color(red: 0.30, green: 0.75, blue: 1.0)) {
+                                showFlights = true
+                            }
+                            ChappyTile(icon: "globe.asia.australia.fill", title: "Visas",
+                                       detail: visaDetailLine,
+                                       tint: Color(red: 0.98, green: 0.55, blue: 0.42)) {
+                                showVisas = true
+                            }
+                            ChappyTile(icon: "dollarsign.arrow.circlepath", title: "Currency",
+                                       detail: "Convert anything, works offline",
+                                       tint: Color(red: 0.96, green: 0.80, blue: 0.35)) {
+                                showCurrency = true
+                            }
+                            ChappyTile(icon: "globe.asia.australia.fill", title: "Atlas",
+                                       detail: ChappyAtlas.shared.summary.isEmpty
+                                            ? "Everywhere you've been, mapped"
+                                            : ChappyAtlas.shared.summary,
+                                       tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
+                                atlasTarget = nil; atlasLayer = nil
+                                showAtlas = true
+                            }
+                            ChappyTile(icon: "mappin.and.ellipse", title: "Places",
+                                       detail: placesDetailLine,
+                                       tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
+                                showPlaces = true
+                            }
+                            // AUDIT: the subtitle counted ChappyFlights.watches
+                            // (the 176 status store) while the tile now opens a
+                            // screen backed by ChappyWatch.watches. Two separate
+                            // stores — so it could read "3 routes watched" and
+                            // then show you nothing.
+                        }
+    }
+
+    private var group_day: some View {
                         LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
                                             GridItem(.flexible(), spacing: 11)],
                                   spacing: 11) {
@@ -1310,50 +1453,28 @@ struct TurboMetaHomeView: View {
                                        tint: Color(red: 0.72, green: 0.55, blue: 1.0)) {
                                 showUpcoming = true
                             }
+                            ChappyTile(icon: "brain", title: "Memory",
+                                       detail: memoryDetailLine,
+                                       tint: Color(red: 0.55, green: 0.45, blue: 1.0)) {
+                                showMemory = true
+                            }
                             ChappyTile(icon: "mic.fill", title: "Dictate",
                                        detail: "Talk it out — get clean, professional text",
                                        tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
                                 dictateAutoStart = false
                                 showDictate = true
                             }
-                            ChappyTile(icon: "globe.asia.australia.fill", title: "Atlas",
-                                       detail: ChappyAtlas.shared.summary.isEmpty
-                                            ? "Everywhere you've been, mapped"
-                                            : ChappyAtlas.shared.summary,
-                                       tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
-                                atlasTarget = nil; atlasLayer = nil
-                                showAtlas = true
-                            }
-                            ChappyTile(icon: "brain", title: "Memory",
-                                       detail: memoryDetailLine,
-                                       tint: Color(red: 0.55, green: 0.45, blue: 1.0)) {
-                                showMemory = true
-                            }
-                            ChappyTile(icon: "mappin.and.ellipse", title: "Places",
-                                       detail: placesDetailLine,
-                                       tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
-                                showPlaces = true
-                            }
-                            // AUDIT: the subtitle counted ChappyFlights.watches
-                            // (the 176 status store) while the tile now opens a
-                            // screen backed by ChappyWatch.watches. Two separate
-                            // stores — so it could read "3 routes watched" and
-                            // then show you nothing.
-                            ChappyTile(icon: "airplane", title: "Flights",
-                                       detail: flightsDetailLine,
-                                       tint: Color(red: 0.30, green: 0.75, blue: 1.0)) {
-                                showFlights = true
-                            }
-                            ChappyTile(icon: "questionmark.bubble.fill", title: "What can I say?",
-                                       detail: "Every voice command, searchable",
-                                       tint: Color(red: 0.25, green: 0.85, blue: 0.72)) {
-                                showCommands = true
-                            }
-                            ChappyTile(icon: "link.circle.fill", title: "OpenClaw",
-                                       detail: openClawService.connectionState == .connected
-                                            ? "Connected" : "Home computer bridge",
-                                       tint: Color(red: 0.55, green: 0.62, blue: 0.72)) {
-                                showOpenClaw = true
+                        }
+    }
+
+    private var group_ask: some View {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
+                                            GridItem(.flexible(), spacing: 11)],
+                                  spacing: 11) {
+                            ChappyTile(icon: "magnifyingglass.circle.fill", title: "Look it up",
+                                       detail: "Search the web \u{2014} spoken, with sources",
+                                       tint: Color(red: 0.68, green: 0.60, blue: 0.98)) {
+                                showSearch = true
                             }
                             ChappyTile(icon: "cloud.sun.fill", title: "Weather",
                                        detail: weatherDetailLine,
@@ -1362,31 +1483,23 @@ struct TurboMetaHomeView: View {
                             }
                             // BUILD 177 — the Travel Desk, the converter
                             // and the web look-up.
-                            ChappyTile(icon: "map.fill", title: "Travel Desk",
-                                       detail: travelDetailLine,
-                                       tint: Color(red: 0.42, green: 0.86, blue: 0.62)) {
-                                showTravel = true
-                            }
-                            ChappyTile(icon: "globe.asia.australia.fill", title: "Visas",
-                                       detail: visaDetailLine,
-                                       tint: Color(red: 0.98, green: 0.55, blue: 0.42)) {
-                                showVisas = true
-                            }
-                            ChappyTile(icon: "dollarsign.arrow.circlepath", title: "Currency",
-                                       detail: "Convert anything, works offline",
-                                       tint: Color(red: 0.96, green: 0.80, blue: 0.35)) {
-                                showCurrency = true
-                            }
-                            ChappyTile(icon: "magnifyingglass.circle.fill", title: "Look it up",
-                                       detail: "Search the web \u{2014} spoken, with sources",
-                                       tint: Color(red: 0.68, green: 0.60, blue: 0.98)) {
-                                showSearch = true
+                            ChappyTile(icon: "questionmark.bubble.fill", title: "What can I say?",
+                                       detail: "Every voice command, searchable",
+                                       tint: Color(red: 0.25, green: 0.85, blue: 0.72)) {
+                                showCommands = true
                             }
                             ChappyTile(icon: "sun.horizon.fill", title: "Briefs",
                                        detail: "How your daily brief is built — and when",
                                        tint: Color(red: 1.0, green: 0.72, blue: 0.35)) {
                                 showBriefs = true
                             }
+                        }
+    }
+
+    private var group_setup: some View {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 11),
+                                            GridItem(.flexible(), spacing: 11)],
+                                  spacing: 11) {
                             ChappyTile(icon: "bell.badge.fill", title: "Notifications",
                                        detail: notifsOff ? "OFF — tap to see why"
                                                          : "Check what iOS is holding or hiding",
@@ -1399,6 +1512,12 @@ struct TurboMetaHomeView: View {
                                             ? "Set the WhatsApp number" : "Saved — tap to change",
                                        tint: Color(red: 1.0, green: 0.35, blue: 0.38)) {
                                 showEmergencyContact = true
+                            }
+                            ChappyTile(icon: "link.circle.fill", title: "OpenClaw",
+                                       detail: openClawService.connectionState == .connected
+                                            ? "Connected" : "Home computer bridge",
+                                       tint: Color(red: 0.55, green: 0.62, blue: 0.72)) {
+                                showOpenClaw = true
                             }
                             // The old experimental tools, only when asked for.
                             if showAdvancedTools {
@@ -1413,7 +1532,23 @@ struct TurboMetaHomeView: View {
                                            tint: .gray) { showLeanEat = true }
                             }
                         }
-                        .padding(.bottom, 30)
+    }
+
+    /// What used to be the wall. Same tiles, same actions, same
+    /// colours — sorted, and mostly folded away.
+    private var tileGrid: some View {
+        VStack(spacing: 10) {
+            nowCard
+            groupHeader("travel", "Travel", "airplane", 6)
+            if openGroup == "travel" { group_travel }
+            groupHeader("day", "Your day", "sun.max.fill", 4)
+            if openGroup == "day" { group_day }
+            groupHeader("ask", "Ask", "questionmark.circle.fill", 4)
+            if openGroup == "ask" { group_ask }
+            groupHeader("setup", "Set up", "gearshape.fill", 3 + (showAdvancedTools ? 3 : 0))
+            if openGroup == "setup" { group_setup }
+        }
+        .padding(.bottom, 30)
     }
 
     private var homeStack: some View {
@@ -1580,6 +1715,23 @@ struct TurboMetaHomeView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
                 showUpcoming = true
+            }
+            // BUILD 196: Flights could only ever be opened by tapping the
+            // tile — no voice route existed, which is no use at all with
+            // the phone pocketed and the glasses on.
+            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFlights)) { _ in
+                showFlights = true
+            }
+            // BUILD 202 — SIRI'S WAY IN.
+            //
+            // An App Intent posts this from outside the app entirely:
+            // "Hey Siri, Chappy flights", the Action button, a Shortcut,
+            // Spotlight. It carries the tool and whatever detail the
+            // shortcut supplied, and the interview asks for the rest.
+            .onReceive(NotificationCenter.default.publisher(for: .chappyStartTool)) { note in
+                guard let id = note.userInfo?["tool"] as? String else { return }
+                let values = (note.userInfo?["values"] as? [String: String]) ?? [:]
+                ChappyStandby.shared.startTool(id: id, values: values)
             }
     }
 
@@ -9775,6 +9927,9 @@ struct TravelDeskView: View {
     @State private var showNewTrip = false
     @State private var showTripFile = false
     @State private var showFlights = false
+    /// BUILD 199: which section is open. Travel by default — it is
+    /// September, and everything else can wait behind one tap.
+    @State private var openGroup = "travel"
     @State private var showBudget = false
     @State private var newName = ""
     @State private var newPlace = ""
