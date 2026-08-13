@@ -1718,6 +1718,34 @@ final class ChappyStandby: NSObject, ObservableObject {
             return
         }
 
+        // BUILD 211 — SAFE MODE. THE APP MUST ALWAYS OPEN.
+        //
+        // He reported Chappy not opening, WITHOUT the glasses connected,
+        // which rules out the Bluetooth race 210 closed. I do not know
+        // what the cause is yet and I am not going to guess at it in the
+        // code.
+        //
+        // What I can do is make the failure survivable. Everything the ear
+        // touches — the audio session, the recogniser, installTap — is
+        // exactly the machinery that can take a process down uncatchably.
+        // So: a flag is set the moment arming begins and cleared once the
+        // ear is actually up. If it is still set at the NEXT launch, the
+        // last attempt did not survive, and this one does not try.
+        //
+        // A crash loop you cannot get into the app to fix is the worst
+        // failure this app has. This makes the second launch always work,
+        // with the ear off and something said about it.
+        let d = UserDefaults.standard
+        if d.bool(forKey: "chappy_arm_incomplete") {
+            d.set(false, forKey: "chappy_arm_incomplete")
+            d.set(true, forKey: "chappy_safe_mode")
+            starting = false
+            print("🛟 [Standby] Last arm did not survive — SAFE MODE, ear stays off")
+            announceArmFailure("Chappy started without the ear, because the last try didn't survive. Turn Daily listening back on in Settings when you're ready.")
+            return
+        }
+        d.set(true, forKey: "chappy_arm_incomplete")
+
         let session = AVAudioSession.sharedInstance()
         // ============ LEAVING "HEY META" ALONE ============
         // Bluetooth HFP is an EXCLUSIVE link: whoever claims the glasses'
@@ -1747,6 +1775,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         let earOrder: [AVAudioSession.Port] = [.bluetoothHFP, .headsetMic, .bluetoothLE, .builtInMic]
         let inputs = session.availableInputs ?? []
         if let chosen = earOrder.compactMap({ p in inputs.first { $0.portType == p } }).first {
+            // BUILD 210: choosing an input IS an upheaval, and the biggest
+            // one there is when it means bringing up a Bluetooth SCO link.
+            // Stamp it before asking, so the tap that follows waits.
+            if session.preferredInput?.portType != chosen.portType {
+                Self.lastAudioUpheavalAt = Date()
+            }
             try? session.setPreferredInput(chosen)
             print("👂 [Standby] Listening on \(chosen.portName) [\(chosen.portType.rawValue)]")
         }
@@ -3099,6 +3133,40 @@ final class ChappyStandby: NSObject, ObservableObject {
             return false
         }
         let format = input.outputFormat(forBus: 0)
+
+        // BUILD 210 — THE LAUNCH CRASH, AND IT IS THE SAME ONE.
+        //
+        // 208 closed this hole in Live AI. It is here too, and here it is
+        // worse, because this tap goes in about a second after the app
+        // appears — so the crash is not "Live AI dies", it is "Chappy will
+        // not open".
+        //
+        // The sequence, when the glasses are connected:
+        //   arm() applies the listening profile with .allowBluetooth
+        //   setPreferredInput picks the Ray-Ban HFP port
+        //   startRecognition() runs IMMEDIATELY
+        //   the node still reports 48 kHz; the session is already 16
+        //   installTap's precondition fails — uncatchably — and the
+        //   process dies before the first screen is drawn.
+        //
+        // The settling window above cannot help: it is stamped by the
+        // route-change NOTIFICATION, which is asynchronous and had not
+        // arrived yet. 208 fixed that stamp; this closes the race itself.
+        //
+        // Build 196 moved the ear onto the glasses and this is the bill
+        // for it. The trade is still right — the ear has to be where the
+        // mouth is — but it needed this guard on the same day.
+        let session = AVAudioSession.sharedInstance()
+        let hwRate = session.sampleRate
+        if hwRate > 0, abs(hwRate - format.sampleRate) > 1 {
+            print("👂 [Standby] Node says \(format.sampleRate) Hz, session says \(hwRate) Hz — deferring rather than crashing")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, self.isListening else { return }
+                _ = self.startRecognition()
+            }
+            return false
+        }
+
         guard format.sampleRate > 0, format.channelCount > 0 else {
             print("⚠️ [Standby] Mic format not ready")
             return false
@@ -3112,6 +3180,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             self?.lastBufferAt = Date()
         }
         lastBufferAt = Date()
+        // BUILD 211: the tap is in and nothing exploded. Whatever the next
+        // launch finds, it will not be a half-finished arm.
+        UserDefaults.standard.set(false, forKey: "chappy_arm_incomplete")
         if !engine.isRunning {
             engine.prepare()
             do { try engine.start() } catch {
@@ -3886,7 +3957,14 @@ final class ChappyStandby: NSObject, ObservableObject {
                 }
             }
             if let yn = ChappySlots.parse(c, as: .yesNo) {
-                if yn == "no" { speak("Fair enough."); return }
+                if yn == "no" {
+                    // BUILD 206: a no is data. Two of them in a day and
+                    // the suggestions stop until tomorrow.
+                    ChappyNext.declined()
+                    speak("Fair enough.")
+                    return
+                }
+                ChappyNext.accepted()
                 if let t = ChappyRegistry.tool(id: pending) {
                     // AUDIT (200): this path serves two callers — a medium
                     // confidence "did you mean X?" and a permission gate
@@ -3933,6 +4011,35 @@ final class ChappyStandby: NSObject, ObservableObject {
             let reply = await NavEngine.shared.navigate(to: picked.title, driving: driving)
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
             if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+            return
+        }
+
+        // BUILD 212 — "WHAT HAVE YOU NOTICED?"
+        //
+        // §12 of the spec: the user must be able to inspect what the AI
+        // has worked out about him. Inspecting it on a screen is not
+        // enough when the phone is in a pocket, and a pattern engine you
+        // cannot interrogate is one you cannot correct.
+        if ["what have you noticed", "what do you know about me",
+            "what patterns", "what are my habits", "my habits"].contains(c) {
+            let hs = ChappyPatterns.habits().filter { $0.strength != .noise }
+            if hs.isEmpty {
+                speak("Nothing solid yet. I need a few weeks of the same places before I'd call anything a pattern.")
+                return
+            }
+            let lines = hs.prefix(3).map { $0.spoken }.filter { !$0.isEmpty }
+            speak("From watching where you go, not from anything you've told me: "
+                  + lines.joined(separator: "; ") + ".")
+            return
+        }
+
+        // BUILD 207 — the tests, out loud. §18's acceptance criteria are
+        // useless if running them requires a Mac.
+        if ["self test", "selftest", "run the tests", "run self test",
+            "test yourself", "diagnostics"].contains(c) {
+            let cases = ChappySelfTest.run()
+            ChappySelfTest.printAll(cases)
+            speak(ChappySelfTest.spokenSummary(cases))
             return
         }
 
@@ -6280,6 +6387,33 @@ final class ChappyStandby: NSObject, ObservableObject {
             if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
             return true
 
+        case "currency":
+            // BUILD 207 — §11 for the one tool that can answer entirely
+            // offline. It used to gather an amount and a currency and
+            // then open a screen, which is the exact failure this whole
+            // exercise exists to remove: all the questions, none of the
+            // answer.
+            let amountText = (values["amount"] ?? "").filter { $0.isNumber || $0 == "." }
+            guard let amount = Double(amountText), amount > 0 else { return false }
+            let from = (values["currency"] ?? ChappyFXLite.home).uppercased()
+            let to = ChappyFXLite.home.uppercased()
+            let here = ContextEngine.shared.snapshot.country
+                ?? ContextEngine.shared.snapshot.countryCode
+            let other = here.flatMap { ChappyFX.currency(forCountry: $0) } ?? ""
+            // If he named his own currency, he wants it in the local one;
+            // if he named a local one, he wants it in his own. Nobody
+            // asks to convert dollars into dollars.
+            let target = (from == to && !other.isEmpty && other != to) ? other : to
+            guard let out = ChappyFXLite.convert(amount, from: from, to: target) else {
+                speak("I don't have a rate for \(from) yet.")
+                return true
+            }
+            let line = "\(ChappyFX.money(amount, from)) is \(ChappyFX.money(out, target))\(ChappyFXLite.ageNote)."
+            ChappyRouterLog.shared.add(heard: amountText, tier: "flow", tool: "currency",
+                                       outcome: "converted offline", ms: 1)
+            speak(line)
+            return true
+
         case "food", "attractions":
             // BUILD 200 — this used to hand a search string to the router
             // and read back whatever it drove to. One place, no reason, no
@@ -7068,7 +7202,11 @@ final class ContextEngine: NSObject, CLLocationManagerDelegate {
             bits.append("weather \(w), \(Int(t.rounded())) degrees C")
         }
         if let m = snapshot.motion { bits.append("the user is \(m)") }
+        // BUILD 212: the first time anything Chappy has NOTICED reaches
+        // the thing that reasons. Empty until there are patterns worth
+        // stating, so nothing changes on day one.
         return bits.joined(separator: "; ") + "."
+            + ChappyPatterns.digest(lat: snapshot.latitude, lon: snapshot.longitude)
     }
 
     /// NAV PRECISION: street-corner accuracy while navigating, battery-light
@@ -15428,6 +15566,15 @@ extension Notification.Name {
     /// BUILD 199 — "food" and "somewhere to eat" have no screen; the
     /// name exists so the matcher can route them into their tool.
     static let chappyOpenFood = Notification.Name("chappyOpenFood")
+    /// AUDIT (208) — navigate had NO trigger words at all.
+    ///
+    /// Found by auditing coverage tool-by-tool rather than by trying
+    /// phrases I expected to work. The ladder has always handled "take me
+    /// to X" and "directions to X", so a destination-carrying sentence
+    /// worked — but a bare "Chappy, navigate" reached nothing, and the
+    /// interview that exists to ask "where to?" could never be started by
+    /// name. Seventeen tools and I checked sixteen.
+    static let chappyOpenNavigate = Notification.Name("chappyOpenNavigate")
     /// AUDIT (199): attractions first shared .chappyOpenPlaces, which meant
     /// saying "places" — his own saved list — started a "what sort of
     /// thing?" interview instead of showing it. Two different intents were
@@ -15480,11 +15627,14 @@ enum ChappyTiles {
              note: .chappyOpenFlights, say: "Flights."),
         Tile(words: ["translate", "translator", "translation", "interpreter"],
              note: .chappyOpenTranslate, say: "Translate. What language?"),
-        Tile(words: ["weather", "forecast", "weather station"],
+        // AUDIT (208): three words each was thin for the tools he uses
+        // daily. Widened to how they actually get said out loud.
+        Tile(words: ["weather", "forecast", "weather station", "what's it like out",
+                     "whats it like out", "is it going to rain"],
              note: .chappyOpenWeather, say: "Weather."),
         Tile(words: ["atlas", "trip map", "my map", "where i've been", "where ive been"],
              note: .chappyOpenAtlasMap, say: "Atlas."),
-        Tile(words: ["visas", "visa", "visa desk"],
+        Tile(words: ["visas", "visa", "visa desk", "entry rules", "how long can i stay"],
              note: .chappyOpenVisa, say: "Visas."),
         Tile(words: ["currency", "exchange rate", "rates", "convert", "money", "fx"],
              note: .chappyOpenFX, say: "Currency."),
@@ -15503,10 +15653,13 @@ enum ChappyTiles {
              note: .chappyOpenUpcoming, say: "Upcoming."),
         Tile(words: ["dictate", "dictation", "take a note", "notes"],
              note: .chappyOpenDictate, say: "Dictate."),
-        Tile(words: ["trip options", "options", "compare trips"],
+        Tile(words: ["trip options", "options", "compare trips", "which trip"],
              note: .chappyOpenOptions, say: "Trip options."),
         // BUILD 199: the two that act rather than open. They have no
         // screen of their own, so they route by name into their tool.
+        Tile(words: ["navigate", "navigation", "directions", "route",
+                     "take me somewhere", "guide me", "navigate me"],
+             note: .chappyOpenNavigate, say: "Right."),
         Tile(words: ["food", "eat", "somewhere to eat", "restaurant", "restaurants",
                      "dinner", "lunch", "breakfast", "hungry", "a feed"],
              note: .chappyOpenFood, say: "Right."),
@@ -19380,6 +19533,15 @@ enum ChappyAudio {
         }
 
         do {
+            // BUILD 208: stamp the upheaval BEFORE the change, not when the
+            // route-change notification eventually arrives. The notification
+            // is asynchronous, and Live AI reads the input format
+            // immediately — so the window that is supposed to protect it
+            // opened after it had already looked. Claiming the Ray-Ban HFP
+            // link is the slowest route change there is; it must count as
+            // upheaval from the instant we ask for it.
+            let changing = s.category != .playAndRecord || s.categoryOptions != opts || s.mode != mode
+            if changing { ChappyStandby.lastAudioUpheavalAt = Date() }
             try s.setCategory(.playAndRecord, mode: mode, options: opts)
             try s.setActive(true)
             return true
@@ -19422,6 +19584,27 @@ enum ChappyAudio {
 
 extension ChappyFX {
 
+    /// BUILD 208 — HOW OLD IS THAT NUMBER?
+    ///
+    /// 207 added "yesterday's rate" to spoken conversions. Every other
+    /// converted figure in the app — a true cost, a budget check, a deal
+    /// grade — is built on the same table and said nothing about its age.
+    /// A stale number presented as current is the one class of error that
+    /// looks exactly like a correct answer, and this app makes spending
+    /// decisions out of these.
+    ///
+    /// Empty string when the table is fresh, so nothing changes on a
+    /// normal day.
+    nonisolated static var rateAge: String {
+        guard let at = UserDefaults.standard.object(forKey: "chappy_fx_at") as? Date else {
+            return " (no rate table yet)"
+        }
+        let days = Int(Date().timeIntervalSince(at) / 86400)
+        if days <= 1 { return "" }
+        if days < 8 { return " (\(days)-day-old rate)" }
+        return " (rate over a week old)"
+    }
+
     /// A price, the way it's written on the thing you're buying.
     /// "Rp 1,450,000 ($138)"
     static func pair(_ amount: Double, local: String, home: String) -> String {
@@ -19433,7 +19616,7 @@ extension ChappyFX {
             // No rate — say the true thing rather than a converted guess.
             return localPart
         }
-        return "\(localPart) (\(money(converted, h)))"
+        return "\(localPart) (\(money(converted, h)))\(rateAge)"
     }
 
     /// A total, where the dollars are the decision and the local figure is
@@ -19444,7 +19627,7 @@ extension ChappyFX {
         guard let converted = shared.convert(amount, from: h, to: l) else {
             return money(amount, h)
         }
-        return "\(money(amount, h)) · \(money(converted, l))"
+        return "\(money(amount, h)) · \(money(converted, l))\(rateAge)"
     }
 
     /// Spoken. Rounded hard, because "one million four hundred and fifty
@@ -28584,6 +28767,56 @@ enum ChappySlots {
 ///
 /// This reads the SAME keys the isolated versions write. It is not a
 /// second source of truth; it is the same truth, read from the side.
+/// BUILD 207 — the rate table, read the same way the profile is.
+///
+/// ChappyFX is @MainActor and the router is not, and the rates are a
+/// plain dictionary in UserDefaults, so this is the identical trick:
+/// same keys, same truth, read from the side. It exists so a currency
+/// question can be ANSWERED rather than answered-with-a-screen — the
+/// arithmetic is trivial and entirely offline, which is exactly the
+/// condition it gets asked in.
+enum ChappyFXLite {
+
+    static var home: String {
+        UserDefaults.standard.string(forKey: "chappy_fx_home") ?? "AUD"
+    }
+
+    /// 1 unit of home = rates[code] units of code.
+    static var rates: [String: Double] {
+        (UserDefaults.standard.dictionary(forKey: "chappy_fx_rates") as? [String: Double]) ?? [:]
+    }
+
+    static var fetchedAt: Date? {
+        UserDefaults.standard.object(forKey: "chappy_fx_at") as? Date
+    }
+
+    static func convert(_ amount: Double, from: String, to: String) -> Double? {
+        let f = from.uppercased(), t = to.uppercased()
+        if f == t { return amount }
+        let base = home.uppercased()
+        let table = rates
+        let inBase: Double
+        if f == base { inBase = amount }
+        else if let r = table[f], r != 0 { inBase = amount / r }
+        else { return nil }
+        if t == base { return inBase }
+        guard let r2 = table[t] else { return nil }
+        return inBase * r2
+    }
+
+    /// How old the table is, said the way a person would. A rate from
+    /// last week is still useful; a rate from last week presented as
+    /// today's is not.
+    static var ageNote: String {
+        guard let at = fetchedAt else { return " — no rate table yet" }
+        let days = Int(Date().timeIntervalSince(at) / 86400)
+        if days <= 0 { return "" }
+        if days == 1 { return " — yesterday's rate" }
+        if days < 8 { return " — \(days)-day-old rate" }
+        return " — rate is over a week old"
+    }
+}
+
 enum ChappyProfileLite {
 
     /// ARCHIVE FIX 2 (204) — ITS OWN STRUCT, ON PURPOSE.
@@ -28673,6 +28906,33 @@ struct ChappyTool {
     /// destruct— deletes something; confirm, always, explicitly.
     let permission: Permission
 
+    // BUILD 207 — §4's remaining required fields. They were skipped in
+    // 197 because nothing consumed them, which is a bad reason: a
+    // contract you only half-write is one the next person assumes is
+    // complete.
+    //
+    /// How long this tool may take before it has to say something.
+    /// Not a network timeout — those live in the calls. This is the
+    /// budget for the WHOLE tool, and anything over it owes the wearer
+    /// a word, because silence and failure are indistinguishable when
+    /// the phone is in a pocket.
+    var timeout: TimeInterval = 8
+
+    /// The ways this tool is known to fail, in plain words, so the
+    /// router can say something true rather than "something went
+    /// wrong". §12 asks for exactly this and it was hand-waved.
+    var errors: [String] = []
+
+    /// What tends to be worth doing next. §9 reads it as a hint; it is
+    /// declared here so a new tool arrives with its follow-up already
+    /// thought about rather than bolted on later.
+    var followUp: String = ""
+
+    /// Bumped when a tool's slots or meaning change. §17 asks for
+    /// versioning; this is the cheapest honest form of it — enough to
+    /// tell a stale shortcut from a current one.
+    var version: Int = 1
+
     enum Permission { case search, act, destructive }
 }
 
@@ -28701,7 +28961,15 @@ enum ChappyRegistry {
                 ChappySlot(id: "airlines", ask: "Any airline preference?", kind: .text,
                            optional: true, prefill: .airlines),
             ],
-            permission: .search),
+            permission: .search,
+            timeout: 12,
+            // The honest list. There is no fares API left that a solo
+            // developer can reach — Amadeus is decommissioned and the
+            // rest are partner-only — so the last failure below is not a
+            // bug and never will be fixed by building harder.
+            errors: ["no signal", "airport not recognised",
+                     "no live fares available anywhere"],
+            followUp: "visa for the destination"),
 
         ChappyTool(
             id: "travel",
@@ -28734,7 +29002,10 @@ enum ChappyRegistry {
                 ChappySlot(id: "passport", ask: "Which passport?", kind: .text,
                            optional: true, prefill: .nationality),
             ],
-            permission: .search),
+            permission: .search,
+            timeout: 6,
+            errors: ["country not recognised", "rules unknown for that passport"],
+            followUp: "onward ticket rule"),
 
         ChappyTool(
             id: "currency",
@@ -28809,7 +29080,10 @@ enum ChappyRegistry {
                 ChappySlot(id: "diet", ask: "Anything you're avoiding?", kind: .text,
                            optional: true, prefill: .diet),
             ],
-            permission: .search),
+            permission: .search,
+            timeout: 10,
+            errors: ["no location fix", "nothing rated nearby", "no signal"],
+            followUp: "take me there"),
 
         ChappyTool(
             id: "attractions",
@@ -28927,6 +29201,7 @@ enum ChappyRegistry {
         // than giving them a screen they don't have.
         if n == .chappyOpenFood { return tool(id: "food") }
         if n == .chappyOpenAttractions { return tool(id: "attractions") }
+        if n == .chappyOpenNavigate { return tool(id: "navigate") }
         return tools.first { $0.screen == n }
     }
 }
@@ -29981,31 +30256,129 @@ enum ChappyOrchestrator {
 //
 enum ChappyNext {
 
+    // BUILD 206 — A SUGGESTION THAT KNOWS SOMETHING.
+    //
+    // 198's version was one hardcoded line per tool, offered whenever
+    // that tool finished. The blueprint asks for relevance and for
+    // suggestions to be genuinely optional, and a line that fires
+    // regardless of the hour, the country or whether you have already
+    // said no twice is neither.
+    //
+    // Four gates, in order of how cheap they are to check:
+    //
+    //   1. Have you turned two of these down in a row? Then stop. Two
+    //      refusals is a preference, not a coincidence, and it lasts
+    //      the rest of the day.
+    //   2. Have I offered this exact thing already? Then don't repeat.
+    //   3. Does it follow from what just happened AND from where and
+    //      when you are? A fuel stop at 3am is not a suggestion.
+    //   4. Is there actually something useful to say? Silence is a
+    //      perfectly good answer and it is the default.
+
     private static var lastOffered: String?
+    private static var declines = 0
+    private static var declinedOn: Date?
+
+    /// Called when he says no, or simply moves on to something else.
+    static func declined() {
+        declines += 1
+        declinedOn = Date()
+    }
+
+    /// Called when he takes one up — the count resets, because a person
+    /// who accepts is a person who wants them.
+    static func accepted() {
+        declines = 0
+        declinedOn = nil
+    }
+
+    private static var muted: Bool {
+        guard declines >= 2, let d = declinedOn else { return false }
+        // Until tomorrow, then try again. A permanent mute from two
+        // shrugs is its own kind of wrong.
+        return Calendar.current.isDateInToday(d)
+    }
+
+    private static var hour: Int { Calendar.current.component(.hour, from: Date()) }
+
+    /// Abroad changes what is worth mentioning. A visa suggestion at
+    /// home is admin; the same line in Denpasar is the reason you are
+    /// carrying the thing.
+    private static var abroad: Bool {
+        let code = ContextEngine.shared.snapshot.countryCode?.uppercased()
+        guard let code, !code.isEmpty else { return false }
+        return code != "AU"
+    }
 
     static func after(_ toolID: String, values: [String: String]) -> String? {
+        guard !muted else { return nil }
+
         let suggestion: String?
         switch toolID {
+
         case "flights":
-            let to = values["to"].flatMap { ChappyPorts.byIATA($0)?.country } ?? ""
-            suggestion = to.isEmpty ? "Want me to check the bags on that?"
-                                    : "Want me to check what \(to) wants for a visa?"
+            // The visa is the thing that stops you boarding. Say it
+            // first, and only when we know where he is going.
+            if let to = values["to"], let country = ChappyPorts.byIATA(to)?.country,
+               !country.isEmpty {
+                suggestion = "Want me to check what \(country) wants for a visa?"
+            } else if values["oneway"] == "yes" {
+                // One-way is his default, and an onward ticket is what
+                // gets asked for at the counter.
+                suggestion = "Want the onward-ticket rule for that one?"
+            } else {
+                suggestion = "Want me to check the bags on that?"
+            }
+
         case "travel":
             suggestion = values["when"] == nil
                 ? "Want me to look at the weather for those months?"
                 : "Want me to price the flights for those dates?"
+
         case "visas":
             suggestion = "Want the onward-ticket rule for that one?"
+
+        case "navigate":
+            // The blueprint's own navigation examples, gated on the hour
+            // rather than offered blindly. Nobody wants a lunch
+            // suggestion at four in the afternoon.
+            if hour >= 11 && hour <= 14 { suggestion = "Want somewhere to eat near there?" }
+            else if hour >= 18 && hour <= 21 { suggestion = "Want somewhere to eat near there?" }
+            else if hour >= 22 || hour <= 5 { suggestion = nil }
+            else { suggestion = nil }
+
+        case "food", "attractions":
+            // BUILD 212: the first suggestion that knows something about
+            // him. If he is standing in a place he keeps coming back to,
+            // saying so is more useful than offering directions to
+            // somewhere he already knows the way to — and it says WHY,
+            // which is the rule that stops this reading as surveillance.
+            let snap = ContextEngine.shared.snapshot
+            if let h = ChappyPatterns.here(lat: snap.latitude ?? 0, lon: snap.longitude ?? 0),
+               h.strength == .habit {
+                suggestion = "You've been here \(h.visits) times — want the usual sort of thing?"
+            } else {
+                suggestion = "Say take me there and I'll run it."
+            }
+
         case "weather":
-            suggestion = nil        // a forecast is a complete thought
-        case "currency":
+            // A forecast is a complete thought — except on a travel day
+            // abroad, when it is half of one.
+            suggestion = abroad && (hour >= 5 && hour <= 9)
+                ? "Want what's on today?"
+                : nil
+
+        case "currency", "memory", "search", "atlas", "briefs", "upcoming",
+             "dictate", "options", "translate", "reminders":
             suggestion = nil
+
         default:
             suggestion = nil
         }
-        guard let s = suggestion, s != lastOffered else { return nil }
-        lastOffered = s
-        return s
+
+        guard let sug = suggestion, sug != lastOffered else { return nil }
+        lastOffered = sug
+        return sug
     }
 
     static func clear() { lastOffered = nil }
@@ -30044,5 +30417,470 @@ enum ChappyGate {
         case .destructive:
             return .confirm("That will delete it and I can't undo it. Say yes to go ahead.")
         }
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY SELF TEST (Build 207) — §17, §18
+// =====================================================================
+//
+// "Make tools independently testable. Build automated tests for common
+// phrases, ambiguous phrases, multi-intent requests and missing
+// information."
+//
+// There is no test target in this project and adding one means editing
+// the Xcode project file, which this week has demonstrated is a
+// genuinely dangerous thing to do casually. So the tests live in the
+// app and run on demand: "Chappy, self test".
+//
+// That is a real trade and worth naming. What this catches: every
+// parser, matcher, ranking and confidence rule, against the exact
+// phrasings that matter. What it CANNOT catch is what actually broke
+// this week — a property declared in the wrong struct, a nested type's
+// isolation, a stray character typed into a file. Those are compiler
+// problems and only a compiler finds them.
+//
+// So this is not a substitute for a test target. It is the coverage
+// that can exist today, and every check below is one I have otherwise
+// been running by hand in a simulator beside the app, which proves
+// nothing about the code that ships.
+//
+enum ChappySelfTest {
+
+    struct Case {
+        let name: String
+        let ok: Bool
+        let detail: String
+    }
+
+    static func run() -> [Case] {
+        var out: [Case] = []
+
+        func check(_ name: String, _ got: String?, _ want: String?) {
+            let ok = got == want
+            out.append(Case(name: name, ok: ok,
+                            detail: ok ? (got ?? "nil")
+                                       : "got \(got ?? "nil"), wanted \(want ?? "nil")"))
+        }
+
+        func checkTile(_ said: String, _ wantToolID: String?) {
+            let got = ChappyTiles.match(said)
+                .flatMap { ChappyRegistry.tool(forScreen: $0.note)?.id }
+                ?? ChappyTiles.leading(said)
+                    .flatMap { ChappyRegistry.tool(forScreen: $0.tile.note)?.id }
+            check("route: \(said)", got, wantToolID)
+        }
+
+        // ---- common phrasings -------------------------------------
+        checkTile("run flights", "flights")
+        checkTile("hey chappy run flights", "flights")
+        checkTile("i need flights", "flights")
+        checkTile("open travel desk", "travel")
+        checkTile("check the weather", "weather")
+        checkTile("do visas", "visas")
+        checkTile("give me currency", "currency")
+
+        // ---- misspellings and mishearings -------------------------
+        checkTile("transalte", "translate")
+        checkTile("travle desk", "travel")
+
+        // ---- phrases that must NOT be claimed ----------------------
+        // Navigation owns these. A tile matcher that takes them is worse
+        // than one that takes nothing.
+        checkTile("take me to the beach", nil)
+        checkTile("open maps", nil)
+        checkTile("find a chemist", nil)
+
+        // ---- a name with the details attached ----------------------
+        checkTile("flights to bali on the seventh", "flights")
+        checkTile("visa indonesia", "visas")
+
+        // ---- dates: the ones that must resolve --------------------
+        let sept7 = ChappySlots.parse("the seventh of september", as: .date)
+        out.append(Case(name: "date: the seventh of september",
+                        ok: sept7?.hasSuffix("-09-07") == true,
+                        detail: sept7 ?? "nil"))
+        check("date: tomorrow is not nil",
+              ChappySlots.parse("tomorrow", as: .date) == nil ? nil : "ok", "ok")
+
+        // ---- dates: the ones that must REFUSE ---------------------
+        // This is the most important test in the file. A search built on
+        // a guessed date is worse than another question.
+        check("date refuses 'september'", ChappySlots.parse("september", as: .date), nil)
+        check("date refuses 'next month'", ChappySlots.parse("next month", as: .date), nil)
+        check("date refuses 'sometime soon'", ChappySlots.parse("sometime soon", as: .date), nil)
+
+        // ---- airports, including the ones with no airport ----------
+        check("airport: brisbane", ChappySlots.parse("brisbane", as: .airport), "BNE")
+        check("airport: bali", ChappySlots.parse("bali", as: .airport), "DPS")
+        check("airport: ubud resolves to Denpasar",
+              ChappySlots.parse("ubud", as: .airport), "DPS")
+        check("airport: filler stripped",
+              ChappySlots.parse("um, brisbane i think", as: .airport), "BNE")
+        check("airport: window match",
+              ChappySlots.parse("bali on the seventh", as: .airport), "DPS")
+        check("airport refuses nonsense",
+              ChappySlots.parse("narnia", as: .airport), nil)
+
+        // ---- the other kinds --------------------------------------
+        check("count: just the two of us", ChappySlots.parse("just the two of us", as: .count), "2")
+        check("count: just me", ChappySlots.parse("just me", as: .count), "1")
+        check("nights: about two months", ChappySlots.parse("about two months", as: .nights), "60")
+        check("nights: six weeks", ChappySlots.parse("six weeks", as: .nights), "42")
+        check("money: five grand", ChappySlots.parse("five grand", as: .money), "5000")
+        check("yes: yeah same as usual", ChappySlots.parse("yeah, same as usual", as: .yesNo), "yes")
+        check("no: nah", ChappySlots.parse("nah", as: .yesNo), "no")
+        check("mode: motorbike is scooter", ChappySlots.parse("motorbike", as: .mode), "scooter")
+        check("mode: gojek is grab", ChappySlots.parse("gojek", as: .mode), "grab")
+        check("price: warung is cheap", ChappySlots.parse("warung food", as: .priceBand), "cheap")
+
+        // ---- confidence bands -------------------------------------
+        check("band 0.9 executes",
+              String(describing: ChappyOrchestrator.band(0.9)), "execute")
+        check("band 0.6 clarifies",
+              String(describing: ChappyOrchestrator.band(0.6)), "clarify")
+        check("band 0.2 asks",
+              String(describing: ChappyOrchestrator.band(0.2)), "ask")
+
+        // ---- ranking: the five-star trap --------------------------
+        // Eleven reviews at 5.0 must not beat nine hundred at 4.6. This
+        // is the rule every "best of" list on the internet gets wrong.
+        let trap = [
+            ChappyResult.Option(title: "Eleven Reviews", subtitle: "", score: 0, why: "",
+                                stars: 5.0, reviews: 11, open: true, metres: 200),
+            ChappyResult.Option(title: "Nine Hundred", subtitle: "", score: 0, why: "",
+                                stars: 4.6, reviews: 912, open: true, metres: 400),
+        ]
+        let defended = ChappyResult.defence([trap[1], trap[0]])
+        out.append(Case(name: "ranking explains a lost five-star",
+                        ok: defended.contains("11 reviews"),
+                        detail: defended.isEmpty ? "said nothing" : defended))
+
+        // ---- the never-interviewed set ----------------------------
+        for word in ["emergency", "stop", "cancel"] {
+            out.append(Case(name: "never interviewed: \(word)",
+                            ok: ChappyRegistry.neverInterviewed.contains(word),
+                            detail: word))
+        }
+
+        // ---- BUILD 212: the pattern engine's rules ------------------
+        // A habit needs evidence. These assert the thresholds rather than
+        // the data, because the data is his and a test cannot depend on
+        // where he happened to go this week.
+        let sample = ChappyPatterns.habits()
+        out.append(Case(name: "patterns: nothing weak is called a habit",
+                        ok: sample.allSatisfy { $0.strength != .habit || ($0.visits >= 5 && $0.days >= 3) },
+                        detail: "\(sample.count) clusters"))
+        out.append(Case(name: "patterns: confidence stays in range",
+                        ok: sample.allSatisfy { $0.confidence >= 0 && $0.confidence <= 1 },
+                        detail: sample.first.map { String(format: "top %.2f", $0.confidence) } ?? "none yet"))
+        out.append(Case(name: "patterns: digest is wording, not a dump",
+                        ok: ChappyPatterns.digest(lat: nil, lon: nil).count < 400,
+                        detail: "digest length"))
+        // Hoisted out of the argument: an immediately-invoked closure in
+        // a call argument is what timed out the type checker in 191.
+        let digestText = ChappyPatterns.digest(lat: nil, lon: nil)
+        let flagged = digestText.isEmpty || digestText.contains("never confirmed by him")
+        out.append(Case(name: "patterns: digest flags itself as observed",
+                        ok: flagged, detail: "provenance wording"))
+
+        // ---- AUDIT (208): every tool must be reachable BY NAME -----
+        // navigate had no trigger words for two builds and nothing
+        // noticed, because I kept testing phrases I expected to work
+        // rather than checking coverage tool by tool. A test that
+        // enumerates the registry cannot miss one.
+        for tool in ChappyRegistry.tools {
+            let reachable = ChappyTiles.all.contains { tile in
+                ChappyRegistry.tool(forScreen: tile.note)?.id == tool.id
+            }
+            out.append(Case(name: "reachable by name: \(tool.id)",
+                            ok: reachable,
+                            detail: reachable ? "" : "no trigger words"))
+        }
+
+        // ---- registry integrity -----------------------------------
+        let ids = Set(ChappyRegistry.tools.map { $0.id })
+        out.append(Case(name: "registry: no duplicate tool ids",
+                        ok: ids.count == ChappyRegistry.tools.count,
+                        detail: "\(ChappyRegistry.tools.count) tools"))
+        let overAsked = ChappyRegistry.tools.filter { $0.slots.filter { !$0.optional }.count > 3 }
+        out.append(Case(name: "registry: nothing asks more than 3 questions",
+                        ok: overAsked.isEmpty,
+                        detail: overAsked.map { $0.id }.joined(separator: ", ")))
+
+        return out
+    }
+
+    /// Spoken, because it gets run with the phone in a pocket.
+    static func spokenSummary(_ cases: [Case]) -> String {
+        let failed = cases.filter { !$0.ok }
+        if failed.isEmpty { return "All \(cases.count) checks passed." }
+        let names = failed.prefix(3).map { $0.name }.joined(separator: ", ")
+        return "\(failed.count) of \(cases.count) failed: \(names)."
+    }
+
+    /// Printed, because the detail is what you actually fix from.
+    static func printAll(_ cases: [Case]) {
+        print("🧪 [SelfTest] \(cases.filter { $0.ok }.count)/\(cases.count) passed")
+        for c in cases where !c.ok {
+            print("   ❌ \(c.name) — \(c.detail)")
+        }
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY PATTERNS (Build 212) — THE THING THAT NOTICES
+// =====================================================================
+//
+// Chappy has logged where he goes for ninety days and reasoned from
+// none of it. The Atlas counts visits per stop to decide how big to
+// draw a pin, and that was the entire behavioural awareness in the app.
+//
+// This is the pattern engine the spec asks for, and the reason it comes
+// first is that §2, §3, §4 and §7 are all impossible without it —
+// suggestive reasoning, prediction, adaptation and foresight every one
+// need something that has already noticed.
+//
+// Three deliberate choices:
+//
+//   * PURE ARITHMETIC. No model, no network, no vector index. It reads
+//     JSON the trail already writes and counts. It works on a bus in
+//     Laos, which is where it has to work.
+//
+//   * READS FROM DISK, NOT FROM ChappyTrail. That class is @MainActor
+//     and this runs in the router, which is not — the crossing that has
+//     cost three archive cycles this week. It decodes the same files
+//     into its own structs, exactly as ChappyProfileLite does. Nested
+//     types inside an isolated class are an argument I am not having
+//     again.
+//
+//   * A HABIT NEEDS EVIDENCE. Three visits before anything is called a
+//     pattern, and confidence rises with observations and falls with
+//     silence. One dinner is not a routine, and the fastest way to make
+//     an assistant feel stupid is to tell someone they "always" do
+//     something they did once.
+//
+enum ChappyPatterns {
+
+    // ---------------------------------------------------------------- data
+    /// Mirrors ChappyTrail's on-disk shape. Deliberately separate: see
+    /// the isolation note above.
+    private struct DiskVisit: Codable {
+        var arrive: Date
+        var depart: Date?
+        var lat: Double
+        var lon: Double
+        var name: String?
+    }
+    private struct DiskDay: Codable {
+        var visits: [DiskVisit]?
+    }
+
+    /// A place he keeps going back to, and what is true about when.
+    struct Habit: Identifiable {
+        var id: String { key }
+        let key: String
+        var name: String
+        var lat: Double
+        var lon: Double
+        /// How many separate visits, across how many distinct days.
+        var visits: Int
+        var days: Int
+        var firstSeen: Date
+        var lastSeen: Date
+        /// Hours of the day it happens, 0-23, most common first.
+        var hours: [Int]
+        /// Weekdays, 1 = Sunday, most common first.
+        var weekdays: [Int]
+        /// Typical time spent, in minutes. Nil when departures are unknown.
+        var typicalMinutes: Int?
+
+        /// 0-1. Evidence, recency and regularity — in that order of
+        /// weight, because the spec is right that repeated observation
+        /// matters more than anything else.
+        var confidence: Double {
+            let evidence = min(Double(visits), 12) / 12          // saturates
+            let spread = min(Double(days), 8) / 8                // across days
+            let quiet = Date().timeIntervalSince(lastSeen) / 86400
+            // Decay: full weight for a fortnight, then falls away over
+            // six weeks. A habit that stopped is not a habit.
+            let recency = quiet <= 14 ? 1.0 : max(0, 1 - (quiet - 14) / 42)
+            return min(1, (evidence * 0.5 + spread * 0.3) * (0.4 + 0.6 * recency))
+        }
+
+        /// The spec's four tiers, named rather than numbered, because a
+        /// number is not something you can say out loud.
+        enum Strength: String { case habit, tendency, weak, noise }
+        var strength: Strength {
+            if visits >= 5, days >= 3, confidence >= 0.55 { return .habit }
+            if visits >= 3, confidence >= 0.35 { return .tendency }
+            if visits >= 2 { return .weak }
+            return .noise
+        }
+
+        /// How it gets said. Never "you always" — that is the sentence
+        /// that makes an assistant sound like it is guessing, because it
+        /// usually is.
+        var spoken: String {
+            let when: String
+            if let h = hours.first {
+                switch h {
+                case 5...10:  when = "in the mornings"
+                case 11...14: when = "around lunch"
+                case 15...17: when = "in the afternoons"
+                case 18...21: when = "in the evenings"
+                default:      when = "late"
+                }
+            } else { when = "" }
+            switch strength {
+            case .habit:    return "you're at \(name) \(when), \(visits) times now"
+            case .tendency: return "you've been to \(name) \(visits) times"
+            case .weak:     return "you've been to \(name) before"
+            case .noise:    return ""
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- read
+    private static var dirURL: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("ChappyTrail", isDirectory: true)
+    }
+
+    private static func loadVisits(days: Int) -> [DiskVisit] {
+        guard let dir = dirURL else { return [] }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        let cal = Calendar.current
+        var out: [DiskVisit] = []
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .deferredToDate
+        for back in 0..<max(1, days) {
+            guard let d = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
+            let u = dir.appendingPathComponent(f.string(from: d) + ".json")
+            guard let data = try? Data(contentsOf: u),
+                  let day = try? dec.decode(DiskDay.self, from: data),
+                  let vs = day.visits else { continue }
+            out.append(contentsOf: vs)
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- build
+    /// Recomputed on demand and cached for ten minutes. Ninety days of
+    /// visits is a few thousand records; this is milliseconds, but it is
+    /// called from a spoken path and milliseconds add up.
+    private static var cache: [Habit] = []
+    private static var cachedAt = Date.distantPast
+
+    static func habits(days: Int = 90, force: Bool = false) -> [Habit] {
+        if !force, Date().timeIntervalSince(cachedAt) < 600, !cache.isEmpty { return cache }
+        let visits = loadVisits(days: days)
+        guard visits.count >= 2 else { cache = []; cachedAt = Date(); return [] }
+
+        // Cluster by proximity — 250 m, the same radius the Atlas uses to
+        // decide two visits are the same place. Consistency matters more
+        // than the exact number here.
+        var clusters: [[DiskVisit]] = []
+        for v in visits {
+            var placed = false
+            for i in clusters.indices {
+                let c = clusters[i][0]
+                if metres(c.lat, c.lon, v.lat, v.lon) < 250 {
+                    clusters[i].append(v); placed = true; break
+                }
+            }
+            if !placed { clusters.append([v]) }
+        }
+
+        let cal = Calendar.current
+        var out: [Habit] = []
+        for c in clusters where c.count >= 2 {
+            let named = c.compactMap { $0.name }.first ?? "somewhere"
+            let arrivals = c.map { $0.arrive }.sorted()
+            let dayKeys = Set(c.map { cal.startOfDay(for: $0.arrive) })
+            var hourCount: [Int: Int] = [:]
+            var dayCount: [Int: Int] = [:]
+            var minutes: [Int] = []
+            for v in c {
+                hourCount[cal.component(.hour, from: v.arrive), default: 0] += 1
+                dayCount[cal.component(.weekday, from: v.arrive), default: 0] += 1
+                if let d = v.depart {
+                    minutes.append(max(1, Int(d.timeIntervalSince(v.arrive) / 60)))
+                }
+            }
+            out.append(Habit(
+                key: String(format: "%.3f,%.3f", c[0].lat, c[0].lon),
+                name: named,
+                lat: c[0].lat, lon: c[0].lon,
+                visits: c.count,
+                days: dayKeys.count,
+                firstSeen: arrivals.first ?? Date(),
+                lastSeen: arrivals.last ?? Date(),
+                hours: hourCount.sorted { $0.value > $1.value }.map { $0.key },
+                weekdays: dayCount.sorted { $0.value > $1.value }.map { $0.key },
+                typicalMinutes: minutes.isEmpty ? nil : minutes.sorted()[minutes.count / 2]))
+        }
+        out.sort { $0.confidence > $1.confidence }
+        cache = out
+        cachedAt = Date()
+        return out
+    }
+
+    static func metres(_ aLat: Double, _ aLon: Double, _ bLat: Double, _ bLon: Double) -> Double {
+        ChappyPorts.km(aLat, aLon, bLat, bLon) * 1000
+    }
+
+    // ---------------------------------------------------------------- ask
+    /// Anything he is standing in the middle of right now.
+    static func here(lat: Double, lon: Double, within: Double = 250) -> Habit? {
+        habits().first { metres($0.lat, $0.lon, lat, lon) < within && $0.strength != .noise }
+    }
+
+    /// What usually happens around now, wherever he is. Used for
+    /// foresight later; used for the context digest today.
+    static func usualAboutNow(withinHours: Int = 1) -> [Habit] {
+        let h = Calendar.current.component(.hour, from: Date())
+        let wd = Calendar.current.component(.weekday, from: Date())
+        return habits().filter { hab in
+            guard hab.strength == .habit || hab.strength == .tendency else { return false }
+            guard let top = hab.hours.first else { return false }
+            let closeInTime = abs(top - h) <= withinHours
+            let sameDay = hab.weekdays.first == wd
+            return closeInTime || (sameDay && abs(top - h) <= 3)
+        }
+    }
+
+    /// BUILD 212 — the line the brain finally gets to read.
+    ///
+    /// Deliberately SHORT. The spec is explicit that retrieval should be
+    /// context-aware rather than dumping history into the prompt, and
+    /// the fastest way to make a model worse is to bury the question
+    /// under a biography.
+    static func digest(lat: Double?, lon: Double?) -> String {
+        let all = habits()
+        guard !all.isEmpty else { return "" }
+        var bits: [String] = []
+        if let la = lat, let lo = lon, let h = here(lat: la, lon: lo) {
+            bits.append("he is somewhere he has been \(h.visits) times before"
+                        + (h.typicalMinutes.map { ", usually about \($0) minutes" } ?? ""))
+        }
+        let regulars = all.filter { $0.strength == .habit }.prefix(3)
+        if !regulars.isEmpty {
+            bits.append("places he returns to: " + regulars.map { $0.name }.joined(separator: ", "))
+        }
+        let now = usualAboutNow().prefix(2)
+        if !now.isEmpty {
+            bits.append("around this time he is often at " + now.map { $0.name }.joined(separator: " or "))
+        }
+        guard !bits.isEmpty else { return "" }
+        // Flagged as OBSERVED, not stated. The spec's rule about never
+        // presenting an inference as something he said starts here, in
+        // the wording handed to the model.
+        return " Observed patterns (inferred from his own movements, never confirmed by him): "
+            + bits.joined(separator: "; ") + "."
     }
 }
