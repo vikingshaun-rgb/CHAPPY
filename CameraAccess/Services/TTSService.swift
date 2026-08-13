@@ -8,6 +8,7 @@ import Foundation
 import AVFoundation
 import NaturalLanguage
 import CryptoKit
+import Security   // BUILD 175: errSecInteractionNotAllowed
 
 /// BUILD 125 — ONE VOICE.
 ///
@@ -311,6 +312,12 @@ class TTSService: NSObject, ObservableObject {
             return "The voice is set to System in Settings — that's Apple's voice by choice, not a fault."
         }
         if (APIKeyManager.shared.getGoogleAPIKey() ?? "").isEmpty {
+            // BUILD 175: tell the two apart. "No key" is a setup problem the
+            // wearer can fix; "the phone was locked" is the bug that made
+            // every startup robotic, and it now repairs itself.
+            if APIKeyManager.lastKeychainStatus == errSecInteractionNotAllowed {
+                return "The key couldn't be read because the phone was locked. That's the old startup fault - it repairs itself the next time you open Chappy unlocked."
+            }
             return "There's no Google key, so only Apple's voice is available."
         }
         if geminiVoiceGaveUp {
@@ -465,6 +472,10 @@ class TTSService: NSObject, ObservableObject {
         setSpeaking(false, since: nil)
         speakingWatchdog?.cancel()
         speakingWatchdog = nil
+        // BUILD 180: hand the music back. This is the single funnel every
+        // speaking path exits through (they all `defer` to it), so there is
+        // no route out of speech that can leave the duck stuck on.
+        ChappyAudio.releaseAfterSpeech()
     }
 
     /// Resume the system-TTS continuation exactly once, from any thread.
@@ -516,13 +527,23 @@ class TTSService: NSObject, ObservableObject {
             //
             // Leave an existing playAndRecord configuration exactly as it is.
             // Only configure the session when nobody else has.
-            if session.category == .playAndRecord {
+            // BUILD 180 — DUCK ONLY WHILE ACTUALLY SPEAKING.
+            //
+            // This asked for .duckOthers on every spoken line and then left
+            // it there, so the wearer's music stayed held down for as long
+            // as Chappy was open rather than for the two seconds Chappy was
+            // talking. Paired with the same option on the wake-word ear, it
+            // is the whole reason Apple Music went quiet the moment the app
+            // came up and came back the moment it closed.
+            //
+            // A live conversation (Live AI, Translate) still owns the route
+            // outright — .voiceChat there is what gives them hardware echo
+            // cancellation, and reconfiguring underneath one is the bug this
+            // guard was originally written to stop.
+            if session.mode == .voiceChat || ChappyAudio.conversationActive {
                 try session.setActive(true)
             } else {
-                try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.duckOthers, .allowBluetooth,
-                                                  .allowBluetoothA2DP, .defaultToSpeaker])
-                try session.setActive(true)
+                ChappyAudio.apply(.speaking)
             }
         } catch {
             print("⚠️ [TTS] Audio session configuration failed: \(error.localizedDescription) — continuing")
@@ -535,14 +556,71 @@ class TTSService: NSObject, ObservableObject {
     /// that flag drifts out of truth and nothing ever corrects it — the exact
     /// mistake already fixed in LiveTranslateService, where the comment reads
     /// "the code trusted its own Bool". Ask the engine.
-    private func startPlaybackEngine() {
-        guard let playbackEngine, !playbackEngine.isRunning else { return }
-        do {
-            try playbackEngine.start()
-            isPlaybackEngineRunning = true
-        } catch {
-            print("❌ [TTS] Playback engine failed to start: \(error)")
-            isPlaybackEngineRunning = false
+    // BUILD 175 — THE COLD-START SURRENDER.
+    //
+    // This gave up on the FIRST failure, and playPCM immediately threw, and a
+    // throw means Apple's voice. At launch that first failure is close to
+    // guaranteed: the wake-word ear is claiming the input node in the same
+    // moment, the audio session has just been activated, and the route is
+    // still settling. AVAudioEngine.start() is entitled to refuse for a few
+    // hundred milliseconds and then work perfectly.
+    //
+    // So the very first thing Chappy said on every launch went out in the
+    // robot voice, and nothing anywhere recorded why.
+    //
+    // Now: if it refuses, rebuild the graph (the usual real cause is a node
+    // left detached by an earlier route change) and try once more. Returns
+    // whether the engine is actually running, so the caller stops guessing.
+    @discardableResult
+    private func startPlaybackEngine() -> Bool {
+        if let e = playbackEngine, e.isRunning { return true }
+        for attempt in 0..<2 {
+            if playbackEngine == nil || playerNode?.engine == nil {
+                setupPlaybackEngine()
+            }
+            guard let engine = playbackEngine else { continue }
+            do {
+                try engine.start()
+                isPlaybackEngineRunning = true
+                if attempt > 0 {
+                    print("🔊 [TTS] Playback engine started on the retry - the real voice was saved")
+                }
+                return true
+            } catch {
+                isPlaybackEngineRunning = false
+                print("⚠️ [TTS] Playback engine refused (attempt \(attempt + 1)): \(error.localizedDescription)")
+                // Give the session a moment to settle, then rebuild the graph
+                // outright rather than restarting an engine iOS has invalidated.
+                Thread.sleep(forTimeInterval: 0.12)
+                configureAudioSession()
+                playbackEngine = nil
+                playerNode = nil
+            }
+        }
+        print("❌ [TTS] Playback engine would not start twice - falling back for this line only")
+        Self.lastFallbackReason = "the audio output would not start"
+        Self.lastFallbackAt = Date()
+        return false
+    }
+
+    /// BUILD 175 — PRIME THE PATH BEFORE THE FIRST WORD.
+    ///
+    /// Everything above is a rescue. This is the prevention: bring the session
+    /// and the engine up once, quietly, a moment after launch, so the line the
+    /// wearer is actually waiting on is never the one paying the setup cost.
+    /// Makes no sound and holds nothing open.
+    func primeVoicePath() {
+        Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            await MainActor.run {
+                guard let self else { return }
+                guard !self.isSpeaking else { return }
+                self.configureAudioSession()
+                if self.startPlaybackEngine() {
+                    self.stopPlaybackEngine()
+                    print("🔊 [TTS] Voice path primed - first line goes out in Chappy's own voice")
+                }
+            }
         }
     }
 
@@ -978,7 +1056,17 @@ class TTSService: NSObject, ObservableObject {
                     }
                 }
             } else if googleKey.isEmpty {
-                print("🔊 [TTS] No Gemini key — using system TTS")
+                // BUILD 175: this was the quietest failure in the whole app.
+                // An empty key here almost never means "the wearer never set
+                // one" - it means the Keychain refused the read because the
+                // phone was locked. Say which, so the voice status line and
+                // the self-test stop shrugging.
+                let locked = APIKeyManager.lastKeychainStatus == errSecInteractionNotAllowed
+                Self.lastFallbackReason = locked
+                    ? "the phone was locked when the key was read"
+                    : "no Gemini key is set"
+                Self.lastFallbackAt = Date()
+                print("⚠️ [TTS] No Gemini key available (\(Self.lastFallbackReason)) - system TTS for this line")
             }
 
             // 3. LAST RESORT.
@@ -1138,6 +1226,8 @@ class TTSService: NSObject, ObservableObject {
     ///   make the teardown conditional — see AUDIT P0 (TTS-STALE) below.
     private func playPCM(_ audioData: Data, gen: Int) async throws {
         configureAudioSession()
+        // BUILD 175: startPlaybackEngine now rebuilds and retries, and reports
+        // honestly. Nothing below can succeed if it says no.
         startPlaybackEngine()
         guard let playbackEngine, playbackEngine.isRunning,
               let playbackFormat = playbackFormat,
