@@ -700,7 +700,34 @@ class GeminiLiveService: NSObject {
             // install (the crash in the 11 Aug .ips). Treat "the audio world
             // moved in the last beat" exactly like "format not ready": defer.
             let settling = Date().timeIntervalSince(ChappyStandby.lastAudioUpheavalAt) < 0.7
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0, !settling else {
+
+            // BUILD 208 — THE CRASH BUILD 196 INTRODUCED.
+            //
+            // installTap's precondition is literally
+            //     format.sampleRate == hwFormat.sampleRate
+            // and it is an Objective-C exception, so the do/catch around
+            // this whole block does NOT catch it. The app dies.
+            //
+            // Until 196 the wake-word ear held the BUILT-IN microphone, so
+            // opening Live AI switched to the glasses cleanly. 196 moved
+            // the ear onto the Ray-Bans deliberately — which means Live AI
+            // now starts on top of a Bluetooth HFP session whose hardware
+            // rate is 8 or 16 kHz while the engine's node may still report
+            // 48. That is the precondition, exactly.
+            //
+            // The existing guards check the node's format is SANE. This
+            // one checks it AGREES with the session, which is the actual
+            // condition that kills the process. Free to check, and it
+            // turns a crash into a half-second wait.
+            let session = AVAudioSession.sharedInstance()
+            let hwRate = session.sampleRate
+            let disagrees = hwRate > 0 && abs(hwRate - inputFormat.sampleRate) > 1
+
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
+                  !settling, !disagrees else {
+                if disagrees {
+                    print("⚠️ [Gemini] Node says \(inputFormat.sampleRate) Hz, session says \(hwRate) Hz — deferring rather than crashing")
+                }
                 formatDeferrals += 1
                 guard formatDeferrals <= Self.maxFormatDeferrals else {
                     formatDeferrals = 0
