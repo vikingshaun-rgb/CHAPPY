@@ -1011,298 +1011,310 @@ struct TurboMetaHomeView: View {
     // ================================================================
 
     /// BUILD 193: The avatar, its listening pulse and the greeting line.
-    private var orbHeader: some View {
-                        VStack(spacing: 8) {
-                            // THE AVATAR — Chappy's living face. Eight styles,
-                            // theme-matched by default, chosen in Settings →
-                            // Appearance → Avatar. Pure code: GPU-composited,
-                            // home-screen only, zero cost to the AI pipeline.
-                            // BUILD 149 — THE LISTENING PULSE. While a command
-                            // is being taken, rings radiate from the avatar —
-                            // visible proof Chappy is hearing you, Siri-style.
-                            ZStack {
-                                if standby.awake {
-                                    ForEach(0..<2, id: \.self) { i in
-                                        Circle()
-                                            .stroke(theme.accent.opacity(0.5), lineWidth: 2)
-                                            .frame(width: 96, height: 96)
-                                            .scaleEffect(pulseOn ? 1.55 : 1.0)
-                                            .opacity(pulseOn ? 0 : 0.7)
-                                            .animation(.easeOut(duration: 1.1)
-                                                .repeatForever(autoreverses: false)
-                                                .delay(Double(i) * 0.55), value: pulseOn)
+    private var orbHeader: AnyView {
+        AnyView(
+                            VStack(spacing: 8) {
+                                // THE AVATAR — Chappy's living face. Eight styles,
+                                // theme-matched by default, chosen in Settings →
+                                // Appearance → Avatar. Pure code: GPU-composited,
+                                // home-screen only, zero cost to the AI pipeline.
+                                // BUILD 149 — THE LISTENING PULSE. While a command
+                                // is being taken, rings radiate from the avatar —
+                                // visible proof Chappy is hearing you, Siri-style.
+                                ZStack {
+                                    if standby.awake {
+                                        ForEach(0..<2, id: \.self) { i in
+                                            Circle()
+                                                .stroke(theme.accent.opacity(0.5), lineWidth: 2)
+                                                .frame(width: 96, height: 96)
+                                                .scaleEffect(pulseOn ? 1.55 : 1.0)
+                                                .opacity(pulseOn ? 0 : 0.7)
+                                                .animation(.easeOut(duration: 1.1)
+                                                    .repeatForever(autoreverses: false)
+                                                    .delay(Double(i) * 0.55), value: pulseOn)
+                                        }
                                     }
+                                    ChappyAvatarView(theme: theme, live: liveAIManager.isRunning)
                                 }
-                                ChappyAvatarView(theme: theme, live: liveAIManager.isRunning)
+                                .onChange(of: standby.awake) { _, on in pulseOn = on }
+                                // BUILD 148 — THE WORDMARK. SF Rounded heavy with
+                                // the theme's own colour poured through the
+                                // letters. The name finally dresses like the app.
+                                Text("Chappy")
+                                    .font(.system(size: 34, weight: .heavy, design: .rounded))
+                                    .tracking(0.5)
+                                    .foregroundStyle(
+                                        LinearGradient(
+                                            colors: [theme.accent, theme.textPrimary],
+                                            startPoint: .topLeading, endPoint: .bottomTrailing))
+                                    .shadow(color: theme.accent.opacity(0.35), radius: 12, y: 2)
+                                Text(liveAIManager.isRunning ? "Listening — just talk"
+                                     : (continuousVision.isRunning ? "Watching — say chappy stop to end"
+                                        : "Ready when you are"))
+                                    .font(.subheadline)
+                                    .foregroundColor(theme.textSecondary)
                             }
-                            .onChange(of: standby.awake) { _, on in pulseOn = on }
-                            // BUILD 148 — THE WORDMARK. SF Rounded heavy with
-                            // the theme's own colour poured through the
-                            // letters. The name finally dresses like the app.
-                            Text("Chappy")
-                                .font(.system(size: 34, weight: .heavy, design: .rounded))
-                                .tracking(0.5)
-                                .foregroundStyle(
-                                    LinearGradient(
-                                        colors: [theme.accent, theme.textPrimary],
-                                        startPoint: .topLeading, endPoint: .bottomTrailing))
-                                .shadow(color: theme.accent.opacity(0.35), radius: 12, y: 2)
-                            Text(liveAIManager.isRunning ? "Listening — just talk"
-                                 : (continuousVision.isRunning ? "Watching — say chappy stop to end"
-                                    : "Ready when you are"))
-                                .font(.subheadline)
-                                .foregroundColor(theme.textSecondary)
-                        }
-                        .padding(.top, 18)
+                            .padding(.top, 18)
+        )
     }
 
     /// BUILD 193: The thin row of state chips under the header.
-    private var statusStrip: some View {
-                        HStack(spacing: 8) {
-                            StatusChip(label: "Glasses", on: streamViewModel.hasActiveDevice)
-                            StatusChip(label: "Camera", on: streamViewModel.streamingStatus == .streaming)
-                            StatusChip(label: "Live AI", on: liveAIManager.isRunning)
-                            StatusChip(label: "Standby", on: standby.isListening)
-                        }
+    private var statusStrip: AnyView {
+        AnyView(
+                            HStack(spacing: 8) {
+                                StatusChip(label: "Glasses", on: streamViewModel.hasActiveDevice)
+                                StatusChip(label: "Camera", on: streamViewModel.streamingStatus == .streaming)
+                                StatusChip(label: "Live AI", on: liveAIManager.isRunning)
+                                StatusChip(label: "Standby", on: standby.isListening)
+                            }
+        )
     }
 
     /// BUILD 193: The turn-by-turn card. Only on screen while navigating, so it is
     /// a bare `if` and needs @ViewBuilder.
-    @ViewBuilder
-    private var navCard: some View {
-                        if navEngine.isNavigating {
-                            VStack(alignment: .leading, spacing: 10) {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "location.north.circle.fill")
-                                        .font(.title)
-                                        .foregroundColor(.green)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("→ \(navEngine.destinationName)")
+    private var navCard: AnyView {
+        AnyView(Group {
+                            if navEngine.isNavigating {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "location.north.circle.fill")
+                                            .font(.title)
+                                            .foregroundColor(.green)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("→ \(navEngine.destinationName)")
+                                                .font(.headline)
+                                                .foregroundColor(theme.textPrimary)
+                                            Text(navEngine.nextInstruction)
+                                                .font(.subheadline)
+                                                .foregroundColor(theme.textPrimary.opacity(0.85))
+                                                .lineLimit(2)
+                                        }
+                                        Spacer()
+                                        Text(navEngine.distanceText)
                                             .font(.headline)
-                                            .foregroundColor(theme.textPrimary)
-                                        Text(navEngine.nextInstruction)
-                                            .font(.subheadline)
-                                            .foregroundColor(theme.textPrimary.opacity(0.85))
-                                            .lineLimit(2)
+                                            .foregroundColor(.green)
                                     }
-                                    Spacer()
-                                    Text(navEngine.distanceText)
-                                        .font(.headline)
-                                        .foregroundColor(.green)
+                                    HStack(spacing: 10) {
+                                        Button { showNavMap = true } label: {
+                                            Label("Map", systemImage: "map")
+                                                .frame(maxWidth: .infinity)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.blue)
+                                        // Straight to Google Maps mid-route, without
+                                        // opening Chappy's map first. Chappy keeps
+                                        // speaking the turns either way.
+                                        Button {
+                                            NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                                        } label: {
+                                            Label("Google", systemImage: "arrow.triangle.turn.up.right.diamond")
+                                                .frame(maxWidth: .infinity)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.green)
+                                        Button { navEngine.stop(announce: true) } label: {
+                                            Label("Stop", systemImage: "xmark.circle")
+                                                .frame(maxWidth: .infinity)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(.red)
+                                    }
                                 }
-                                HStack(spacing: 10) {
-                                    Button { showNavMap = true } label: {
-                                        Label("Map", systemImage: "map")
-                                            .frame(maxWidth: .infinity)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.blue)
-                                    // Straight to Google Maps mid-route, without
-                                    // opening Chappy's map first. Chappy keeps
-                                    // speaking the turns either way.
-                                    Button {
-                                        NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
-                                    } label: {
-                                        Label("Google", systemImage: "arrow.triangle.turn.up.right.diamond")
-                                            .frame(maxWidth: .infinity)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.green)
-                                    Button { navEngine.stop(announce: true) } label: {
-                                        Label("Stop", systemImage: "xmark.circle")
-                                            .frame(maxWidth: .infinity)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.red)
+                                .padding(14)
+                                .background(RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial))
+                                .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.green.opacity(0.5), lineWidth: 1))
+                                .sheet(isPresented: $showNavMap) {
+                                    NavMapSheet(navEngine: navEngine)
                                 }
                             }
-                            .padding(14)
-                            .background(RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial))
-                            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.green.opacity(0.5), lineWidth: 1))
-                            .sheet(isPresented: $showNavMap) {
-                                NavMapSheet(navEngine: navEngine)
-                            }
-                        }
+        })
     }
 
     /// BUILD 193: The four big mode buttons.
-    private var modeStack: some View {
-                        VStack(spacing: 12) {
-                            HStack(spacing: 12) {
-                                ModeTile(title: "Talk",
-                                         subtitle: "Live AI — eyes, ears and answers",
-                                         icon: "waveform.circle.fill",
-                                         accent: theme.accent,
-                                         active: liveAIManager.isRunning) {
-                                    // AUDIT FIX (LA-H9): stop() forgets Standby was
-                                    // ever listening, so closing Live AI left the
-                                    // wake word dead until the user dug the phone
-                                    // out. handOff() remembers and comes back.
-                                    if standby.isListening { standby.handOff() }
-                                    showLiveAI = true
+    private var modeStack: AnyView {
+        AnyView(
+                            VStack(spacing: 12) {
+                                HStack(spacing: 12) {
+                                    ModeTile(title: "Talk",
+                                             subtitle: "Live AI — eyes, ears and answers",
+                                             icon: "waveform.circle.fill",
+                                             accent: theme.accent,
+                                             active: liveAIManager.isRunning) {
+                                        // AUDIT FIX (LA-H9): stop() forgets Standby was
+                                        // ever listening, so closing Live AI left the
+                                        // wake word dead until the user dug the phone
+                                        // out. handOff() remembers and comes back.
+                                        if standby.isListening { standby.handOff() }
+                                        showLiveAI = true
+                                    }
+                                    ModeTile(title: "Look",
+                                             subtitle: "One snap, one answer",
+                                             icon: "eye.circle.fill",
+                                             accent: .purple,
+                                             active: false) {
+                                        showQuickVision = true
+                                    }
                                 }
-                                ModeTile(title: "Look",
-                                         subtitle: "One snap, one answer",
-                                         icon: "eye.circle.fill",
-                                         accent: .purple,
-                                         active: false) {
-                                    showQuickVision = true
-                                }
-                            }
-                            HStack(spacing: 12) {
-                                ModeTile(title: "Translate",
-                                         subtitle: "Two-way interpreter",
-                                         icon: "globe",
-                                         accent: .teal,
-                                         active: false) {
-                                    // AUDIT FIX: mic handoff — two engines on
-                                    // one input node crashed the translator
-                                    if standby.isListening { standby.handOff() }
-                                    showLiveTranslate = true
-                                }
-                                ModeTile(title: "Go",
-                                         subtitle: navEngine.isNavigating
-                                            ? "Navigating — tap for map"
-                                            : (standby.isListening ? "Tap, then say where to" : "Tap to arm, then say where to"),
-                                         icon: "location.circle.fill",
-                                         accent: .blue,
-                                         active: navEngine.isNavigating) {
-                                    // AUDIT FIX (NAV-TILE): tapping this used to
-                                    // silently open a METERED Live AI session,
-                                    // which is not what a button labelled
-                                    // "Navigate" should do and is not what
-                                    // anyone expects. Navigation is a free,
-                                    // on-device Standby command — so arm the
-                                    // ear and ask, instead of burning a session.
-                                    if navEngine.isNavigating {
-                                        showNavMap = true
-                                    } else {
-                                        ChappyStandby.shared.promptForDestination()
+                                HStack(spacing: 12) {
+                                    ModeTile(title: "Translate",
+                                             subtitle: "Two-way interpreter",
+                                             icon: "globe",
+                                             accent: .teal,
+                                             active: false) {
+                                        // AUDIT FIX: mic handoff — two engines on
+                                        // one input node crashed the translator
+                                        if standby.isListening { standby.handOff() }
+                                        showLiveTranslate = true
+                                    }
+                                    ModeTile(title: "Go",
+                                             subtitle: navEngine.isNavigating
+                                                ? "Navigating — tap for map"
+                                                : (standby.isListening ? "Tap, then say where to" : "Tap to arm, then say where to"),
+                                             icon: "location.circle.fill",
+                                             accent: .blue,
+                                             active: navEngine.isNavigating) {
+                                        // AUDIT FIX (NAV-TILE): tapping this used to
+                                        // silently open a METERED Live AI session,
+                                        // which is not what a button labelled
+                                        // "Navigate" should do and is not what
+                                        // anyone expects. Navigation is a free,
+                                        // on-device Standby command — so arm the
+                                        // ear and ask, instead of burning a session.
+                                        if navEngine.isNavigating {
+                                            showNavMap = true
+                                        } else {
+                                            ChappyStandby.shared.promptForDestination()
+                                        }
                                     }
                                 }
                             }
-                        }
+        )
     }
 
     /// BUILD 193: The small three-across action grid — Ear On and friends.
-    private var actionGrid: some View {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9)],
-                                  spacing: 9) {
-                            QuickActionButton(icon: "camera.fill", label: "Snap",
-                                              tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
-                                ChappyStandby.shared.snapSilently()
-                                journalTick += 1
-                            }
-                            // HOLD Snap for the burst: ~20 frames sampled,
-                            // sharpest kept. Apple/Top-Shot style.
-                            .simultaneousGesture(
-                                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                                    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-                                    ChappyBurst.shared.fire()
+    private var actionGrid: AnyView {
+        AnyView(
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9)],
+                                      spacing: 9) {
+                                QuickActionButton(icon: "camera.fill", label: "Snap",
+                                                  tint: Color(red: 0.35, green: 0.85, blue: 1.0)) {
+                                    ChappyStandby.shared.snapSilently()
                                     journalTick += 1
-                                })
-                            QuickActionButton(icon: "video.fill", label: "Video",
-                                              tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
-                                TTSService.shared.speak("Rolling - about twenty seconds.")
-                                ChappyClip.shared.record()
-                                journalTick += 1
-                            }
-                            QuickActionButton(icon: "mic.fill", label: "Dictate",
-                                              tint: Color(red: 0.98, green: 0.55, blue: 0.35)) {
-                                dictateAutoStart = true
-                                showDictate = true
-                            }
-                            QuickActionButton(icon: "mappin.circle.fill", label: "Remember",
-                                              tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
-                                ChappyStandby.shared.rememberSpotByVoice()
-                                journalTick += 1
-                                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                            }
-                            QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
-                                              label: continuousVision.isRunning ? "Stop" : "Watch",
-                                              tint: Color(red: 0.85, green: 0.45, blue: 1.0),
-                                              active: continuousVision.isRunning) {
-                                if continuousVision.isRunning {
-                                    continuousVision.stop()
-                                } else {
-                                    if standby.isListening { standby.handOff() }
-                                    continuousVision.start(streamViewModel: streamViewModel)
+                                }
+                                // HOLD Snap for the burst: ~20 frames sampled,
+                                // sharpest kept. Apple/Top-Shot style.
+                                .simultaneousGesture(
+                                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                                        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                                        ChappyBurst.shared.fire()
+                                        journalTick += 1
+                                    })
+                                QuickActionButton(icon: "video.fill", label: "Video",
+                                                  tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
+                                    TTSService.shared.speak("Rolling - about twenty seconds.")
+                                    ChappyClip.shared.record()
+                                    journalTick += 1
+                                }
+                                QuickActionButton(icon: "mic.fill", label: "Dictate",
+                                                  tint: Color(red: 0.98, green: 0.55, blue: 0.35)) {
+                                    dictateAutoStart = true
+                                    showDictate = true
+                                }
+                                QuickActionButton(icon: "mappin.circle.fill", label: "Remember",
+                                                  tint: Color(red: 1.0, green: 0.68, blue: 0.25)) {
+                                    ChappyStandby.shared.rememberSpotByVoice()
+                                    journalTick += 1
+                                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                }
+                                QuickActionButton(icon: continuousVision.isRunning ? "eye.slash.fill" : "eye.fill",
+                                                  label: continuousVision.isRunning ? "Stop" : "Watch",
+                                                  tint: Color(red: 0.85, green: 0.45, blue: 1.0),
+                                                  active: continuousVision.isRunning) {
+                                    if continuousVision.isRunning {
+                                        continuousVision.stop()
+                                    } else {
+                                        if standby.isListening { standby.handOff() }
+                                        continuousVision.start(streamViewModel: streamViewModel)
+                                    }
+                                }
+                                QuickActionButton(icon: standby.isListening ? "ear.fill" : "ear",
+                                                  label: standby.isListening ? "Ear On" : "Standby",
+                                                  tint: Color(red: 0.35, green: 0.95, blue: 0.70),
+                                                  active: standby.isListening) {
+                                    standby.toggle()
+                                }
+                                QuickActionButton(icon: "map.fill", label: "Map",
+                                                  tint: Color(red: 0.45, green: 0.65, blue: 1.0)) {
+                                    ContextEngine.shared.start()
+                                    showMapSheet = true
+                                }
+                                .sheet(isPresented: $showMapSheet) {
+                                    if navEngine.isNavigating {
+                                        NavMapSheet(navEngine: navEngine)
+                                    } else {
+                                        TodayMapSheet()
+                                    }
                                 }
                             }
-                            QuickActionButton(icon: standby.isListening ? "ear.fill" : "ear",
-                                              label: standby.isListening ? "Ear On" : "Standby",
-                                              tint: Color(red: 0.35, green: 0.95, blue: 0.70),
-                                              active: standby.isListening) {
-                                standby.toggle()
-                            }
-                            QuickActionButton(icon: "map.fill", label: "Map",
-                                              tint: Color(red: 0.45, green: 0.65, blue: 1.0)) {
-                                ContextEngine.shared.start()
-                                showMapSheet = true
-                            }
-                            .sheet(isPresented: $showMapSheet) {
-                                if navEngine.isNavigating {
-                                    NavMapSheet(navEngine: navEngine)
-                                } else {
-                                    TodayMapSheet()
-                                }
-                            }
-                        }
+        )
     }
 
     /// BUILD 193: Today's journal counts. Tap opens the Diary.
-    private var journalRow: some View {
-                        HStack {
-                            Image(systemName: "book.closed.fill")
-                                .foregroundColor(theme.textSecondary)
-                            Text("Today: \(TripRecorder.shared.crumbs.count) points · \(TripRecorder.shared.spots.filter { Calendar.current.isDateInToday($0.t) }.count) spots · \(TripRecorder.shared.notes.count) notes")
-                                .font(.footnote)
-                                .foregroundColor(theme.textSecondary)
-                            Spacer()
-                        }
-                        .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
-                        .id(journalTick) // refresh counts when Remember fires
+    private var journalRow: AnyView {
+        AnyView(
+                            HStack {
+                                Image(systemName: "book.closed.fill")
+                                    .foregroundColor(theme.textSecondary)
+                                Text("Today: \(TripRecorder.shared.crumbs.count) points · \(TripRecorder.shared.spots.filter { Calendar.current.isDateInToday($0.t) }.count) spots · \(TripRecorder.shared.notes.count) notes")
+                                    .font(.footnote)
+                                    .foregroundColor(theme.textSecondary)
+                                Spacer()
+                            }
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 14).fill(.ultraThinMaterial))
+                            .id(journalTick) // refresh counts when Remember fires
+        )
     }
 
     /// BUILD 193: BUILD 163's "your notifications are off" banner — a bare `if`,
     /// so it needs @ViewBuilder too.
-    @ViewBuilder
-    private var notifBanner: some View {
-                        if notifsOff {
-                            Button {
-                                // BUILD 172: the doctor first — it shows WHY,
-                                // and iOS Settings is one tap from there.
-                                showNotifDoctor = true
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: "bell.slash.fill")
-                                        .foregroundStyle(.orange)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Notifications are off")
-                                            .font(.subheadline).fontWeight(.semibold)
-                                            .foregroundColor(theme.textPrimary)
-                                        Text("Reminders, warn times and flight alerts can't reach you. Tap to turn them on.")
-                                            .font(.caption2)
-                                            .foregroundColor(theme.textSecondary)
-                                            .multilineTextAlignment(.leading)
+    private var notifBanner: AnyView {
+        AnyView(Group {
+                            if notifsOff {
+                                Button {
+                                    // BUILD 172: the doctor first — it shows WHY,
+                                    // and iOS Settings is one tap from there.
+                                    showNotifDoctor = true
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "bell.slash.fill")
+                                            .foregroundStyle(.orange)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Notifications are off")
+                                                .font(.subheadline).fontWeight(.semibold)
+                                                .foregroundColor(theme.textPrimary)
+                                            Text("Reminders, warn times and flight alerts can't reach you. Tap to turn them on.")
+                                                .font(.caption2)
+                                                .foregroundColor(theme.textSecondary)
+                                                .multilineTextAlignment(.leading)
+                                        }
+                                        Spacer(minLength: 0)
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption2).foregroundColor(theme.textSecondary)
                                     }
-                                    Spacer(minLength: 0)
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2).foregroundColor(theme.textSecondary)
+                                    .padding(13)
+                                    .background(RoundedRectangle(cornerRadius: 15)
+                                        .fill(Color.orange.opacity(0.14)))
+                                    .overlay(RoundedRectangle(cornerRadius: 15)
+                                        .stroke(Color.orange.opacity(0.5), lineWidth: 1))
                                 }
-                                .padding(13)
-                                .background(RoundedRectangle(cornerRadius: 15)
-                                    .fill(Color.orange.opacity(0.14)))
-                                .overlay(RoundedRectangle(cornerRadius: 15)
-                                    .stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                                .buttonStyle(ChappyPressStyle())
+                                .padding(.horizontal, 16)
                             }
-                            .buttonStyle(ChappyPressStyle())
-                            .padding(.horizontal, 16)
-                        }
+        })
     }
 
     /// BUILD 193: The two-column colour-coded tile grid — the largest single
@@ -1331,28 +1343,30 @@ struct TurboMetaHomeView: View {
     /// weather is doing, what is next, and what trip is open. All
     /// three lines already existed as tile subtitles — they were just
     /// buried among nineteen others.
-    private var nowCard: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack {
-                Text("Now")
-                    .font(.system(size: 12, weight: .heavy, design: .rounded))
-                    .foregroundColor(theme.textSecondary)
-                    .tracking(1.1)
-                Spacer()
+    private var nowCard: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Text("Now")
+                        .font(.system(size: 12, weight: .heavy, design: .rounded))
+                        .foregroundColor(theme.textSecondary)
+                        .tracking(1.1)
+                    Spacer()
+                }
+                nowLine("cloud.sun.fill", weatherDetailLine)
+                nowLine("calendar", upcomingDetailLine)
+                nowLine("map.fill", travelDetailLine)
             }
-            nowLine("cloud.sun.fill", weatherDetailLine)
-            nowLine("calendar", upcomingDetailLine)
-            nowLine("map.fill", travelDetailLine)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.06))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(theme.accent.opacity(0.22), lineWidth: 1)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(theme.accent.opacity(0.22), lineWidth: 1)
+            )
         )
     }
 
@@ -1367,32 +1381,34 @@ struct TurboMetaHomeView: View {
     /// It also replaces the "What can I say?" tile's job — an empty
     /// field asking what you want is a better answer to that question
     /// than a screen listing commands.
-    private var askField: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(theme.textSecondary)
-            TextField("What do you want to do?", text: $askText)
-                .font(.subheadline)
-                .foregroundColor(theme.textPrimary)
-                .submitLabel(.go)
-                .onSubmit { runAsk() }
-            if !askText.isEmpty {
-                Button {
-                    askText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 15))
-                        .foregroundColor(theme.textSecondary)
+    private var askField: AnyView {
+        AnyView(
+            HStack(spacing: 9) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(theme.textSecondary)
+                TextField("What do you want to do?", text: $askText)
+                    .font(.subheadline)
+                    .foregroundColor(theme.textPrimary)
+                    .submitLabel(.go)
+                    .onSubmit { runAsk() }
+                if !askText.isEmpty {
+                    Button {
+                        askText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 15))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 11)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(Color.white.opacity(0.06))
+            .padding(.horizontal, 13)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
         )
     }
 
@@ -1465,440 +1481,498 @@ struct TurboMetaHomeView: View {
         .buttonStyle(.plain)
     }
 
-    private var group_travel: some View {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9)],
-                                  spacing: 9) {
-                            ChappyMiniTile(icon: "map.fill", title: "Travel Desk",
-                                       detail: travelDetailLine,
-                                       tint: Color(red: 0.42, green: 0.86, blue: 0.62), live: true) {
-                                showTravel = true
-                            }
-                            ChappyMiniTile(icon: "airplane", title: "Flights",
-                                       detail: flightsDetailLine,
-                                       tint: Color(red: 0.30, green: 0.75, blue: 1.0), live: true) {
-                                showFlights = true
-                            }
-                            ChappyMiniTile(icon: "globe.asia.australia.fill", title: "Visas",
-                                       detail: visaDetailLine,
-                                       tint: Color(red: 0.98, green: 0.55, blue: 0.42), live: true) {
-                                showVisas = true
-                            }
-                            ChappyMiniTile(icon: "dollarsign.arrow.circlepath", title: "Currency",
-                                       detail: "Convert anything, works offline",
-                                       tint: Color(red: 0.96, green: 0.80, blue: 0.35)) {
-                                showCurrency = true
-                            }
-                            ChappyMiniTile(icon: "globe.asia.australia.fill", title: "Atlas",
-                                       detail: ChappyAtlas.shared.summary.isEmpty
-                                            ? "Everywhere you've been, mapped"
-                                            : ChappyAtlas.shared.summary,
-                                       tint: Color(red: 0.35, green: 0.85, blue: 1.0), live: true) {
-                                atlasTarget = nil; atlasLayer = nil
-                                showAtlas = true
-                            }
-                            ChappyMiniTile(icon: "mappin.and.ellipse", title: "Places",
-                                       detail: placesDetailLine,
-                                       tint: Color(red: 1.0, green: 0.68, blue: 0.25), live: true) {
-                                showPlaces = true
-                            }
-                            // AUDIT: the subtitle counted ChappyFlights.watches
-                            // (the 176 status store) while the tile now opens a
-                            // screen backed by ChappyWatch.watches. Two separate
-                            // stores — so it could read "3 routes watched" and
-                            // then show you nothing.
-                        }
-    }
-
-    private var group_day: some View {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9)],
-                                  spacing: 9) {
-                            ChappyMiniTile(icon: "book.closed.fill", title: "Diary",
-                                       detail: remindersDetailLine,
-                                       tint: Color(red: 0.68, green: 0.5, blue: 1.0), live: true) {
-                                showReminders = true
-                            }
-                            ChappyMiniTile(icon: "calendar", title: "Upcoming",
-                                       detail: upcomingDetailLine,
-                                       tint: Color(red: 0.72, green: 0.55, blue: 1.0), live: true) {
-                                showUpcoming = true
-                            }
-                            ChappyMiniTile(icon: "brain", title: "Memory",
-                                       detail: memoryDetailLine,
-                                       tint: Color(red: 0.55, green: 0.45, blue: 1.0), live: true) {
-                                showMemory = true
-                            }
-                            ChappyMiniTile(icon: "mic.fill", title: "Dictate",
-                                       detail: "Talk it out — get clean, professional text",
-                                       tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
-                                dictateAutoStart = false
-                                showDictate = true
-                            }
-                        }
-    }
-
-    private var group_ask: some View {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9)],
-                                  spacing: 9) {
-                            ChappyMiniTile(icon: "magnifyingglass.circle.fill", title: "Look it up",
-                                       detail: "Search the web \u{2014} spoken, with sources",
-                                       tint: Color(red: 0.68, green: 0.60, blue: 0.98)) {
-                                showSearch = true
-                            }
-                            ChappyMiniTile(icon: "cloud.sun.fill", title: "Weather",
-                                       detail: weatherDetailLine,
-                                       tint: Color(red: 0.35, green: 0.78, blue: 1.0), live: true) {
-                                showWeather = true
-                            }
-                            // BUILD 177 — the Travel Desk, the converter
-                            // and the web look-up.
-                            ChappyMiniTile(icon: "questionmark.bubble.fill", title: "What can I say?",
-                                       detail: "Every voice command, searchable",
-                                       tint: Color(red: 0.25, green: 0.85, blue: 0.72)) {
-                                showCommands = true
-                            }
-                            ChappyMiniTile(icon: "sun.horizon.fill", title: "Briefs",
-                                       detail: "How your daily brief is built — and when",
-                                       tint: Color(red: 1.0, green: 0.72, blue: 0.35)) {
-                                showBriefs = true
-                            }
-                        }
-    }
-
-    private var group_setup: some View {
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9),
-                                            GridItem(.flexible(), spacing: 9)],
-                                  spacing: 9) {
-                            // BUILD 209: only when they are OFF. A tile that reports
-
-                            // "on" is one you will never tap in your life.
-
-                            if notifsOff {
-
-                                ChappyMiniTile(icon: "bell.badge.fill", title: "Notifications",
-                                           detail: notifsOff ? "OFF — tap to see why"
-                                                             : "Check what iOS is holding or hiding",
-                                           tint: notifsOff ? Color(red: 1.0, green: 0.55, blue: 0.2)
-                                                           : Color(red: 0.35, green: 0.95, blue: 0.70)) {
-                                    showNotifDoctor = true
+    private var group_travel: AnyView {
+        AnyView(
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9)],
+                                      spacing: 9) {
+                                ChappyMiniTile(icon: "map.fill", title: "Travel Desk",
+                                           detail: travelDetailLine,
+                                           tint: Color(red: 0.42, green: 0.86, blue: 0.62), live: true) {
+                                    showTravel = true
                                 }
-
+                                ChappyMiniTile(icon: "airplane", title: "Flights",
+                                           detail: flightsDetailLine,
+                                           tint: Color(red: 0.30, green: 0.75, blue: 1.0), live: true) {
+                                    showFlights = true
+                                }
+                                ChappyMiniTile(icon: "globe.asia.australia.fill", title: "Visas",
+                                           detail: visaDetailLine,
+                                           tint: Color(red: 0.98, green: 0.55, blue: 0.42), live: true) {
+                                    showVisas = true
+                                }
+                                ChappyMiniTile(icon: "dollarsign.arrow.circlepath", title: "Currency",
+                                           detail: "Convert anything, works offline",
+                                           tint: Color(red: 0.96, green: 0.80, blue: 0.35)) {
+                                    showCurrency = true
+                                }
+                                ChappyMiniTile(icon: "globe.asia.australia.fill", title: "Atlas",
+                                           detail: ChappyAtlas.shared.summary.isEmpty
+                                                ? "Everywhere you've been, mapped"
+                                                : ChappyAtlas.shared.summary,
+                                           tint: Color(red: 0.35, green: 0.85, blue: 1.0), live: true) {
+                                    atlasTarget = nil; atlasLayer = nil
+                                    showAtlas = true
+                                }
+                                ChappyMiniTile(icon: "mappin.and.ellipse", title: "Places",
+                                           detail: placesDetailLine,
+                                           tint: Color(red: 1.0, green: 0.68, blue: 0.25), live: true) {
+                                    showPlaces = true
+                                }
+                                // AUDIT: the subtitle counted ChappyFlights.watches
+                                // (the 176 status store) while the tile now opens a
+                                // screen backed by ChappyWatch.watches. Two separate
+                                // stores — so it could read "3 routes watched" and
+                                // then show you nothing.
                             }
-                            ChappyMiniTile(icon: "cross.circle.fill", title: "Emergency",
-                                       detail: emergencyContactText.isEmpty
-                                            ? "Set the WhatsApp number" : "Saved — tap to change",
-                                       tint: Color(red: 1.0, green: 0.35, blue: 0.38), live: true) {
-                                showEmergencyContact = true
-                            }
-                            // BUILD 211: OpenClaw moved to Settings. It is a bridge to a
+        )
+    }
 
-                            // computer at home — not something you reach for on a scooter
-
-                            // in Ubud, which is the only place this screen has to be good.
-                            // The old experimental tools, only when asked for.
-                            if showAdvancedTools {
-                                ChappyMiniTile(icon: "antenna.radiowaves.left.and.right",
-                                           title: "RTMP", detail: "Experimental streaming",
-                                           tint: .gray) { showRTMPStreaming = true }
-                                ChappyMiniTile(icon: "video.fill", title: "Screen Stream",
-                                           detail: "Record and stream",
-                                           tint: .gray) { showLiveStream = true }
-                                ChappyMiniTile(icon: "chart.bar.fill", title: "LeanEat",
-                                           detail: "Food analysis",
-                                           tint: .gray) { showLeanEat = true }
+    private var group_day: AnyView {
+        AnyView(
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9)],
+                                      spacing: 9) {
+                                ChappyMiniTile(icon: "book.closed.fill", title: "Diary",
+                                           detail: remindersDetailLine,
+                                           tint: Color(red: 0.68, green: 0.5, blue: 1.0), live: true) {
+                                    showReminders = true
+                                }
+                                ChappyMiniTile(icon: "calendar", title: "Upcoming",
+                                           detail: upcomingDetailLine,
+                                           tint: Color(red: 0.72, green: 0.55, blue: 1.0), live: true) {
+                                    showUpcoming = true
+                                }
+                                ChappyMiniTile(icon: "brain", title: "Memory",
+                                           detail: memoryDetailLine,
+                                           tint: Color(red: 0.55, green: 0.45, blue: 1.0), live: true) {
+                                    showMemory = true
+                                }
+                                ChappyMiniTile(icon: "mic.fill", title: "Dictate",
+                                           detail: "Talk it out — get clean, professional text",
+                                           tint: Color(red: 1.0, green: 0.42, blue: 0.55)) {
+                                    dictateAutoStart = false
+                                    showDictate = true
+                                }
                             }
-                        }
+        )
+    }
+
+    private var group_ask: AnyView {
+        AnyView(
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9)],
+                                      spacing: 9) {
+                                ChappyMiniTile(icon: "magnifyingglass.circle.fill", title: "Look it up",
+                                           detail: "Search the web \u{2014} spoken, with sources",
+                                           tint: Color(red: 0.68, green: 0.60, blue: 0.98)) {
+                                    showSearch = true
+                                }
+                                ChappyMiniTile(icon: "cloud.sun.fill", title: "Weather",
+                                           detail: weatherDetailLine,
+                                           tint: Color(red: 0.35, green: 0.78, blue: 1.0), live: true) {
+                                    showWeather = true
+                                }
+                                // BUILD 177 — the Travel Desk, the converter
+                                // and the web look-up.
+                                ChappyMiniTile(icon: "questionmark.bubble.fill", title: "What can I say?",
+                                           detail: "Every voice command, searchable",
+                                           tint: Color(red: 0.25, green: 0.85, blue: 0.72)) {
+                                    showCommands = true
+                                }
+                                ChappyMiniTile(icon: "sun.horizon.fill", title: "Briefs",
+                                           detail: "How your daily brief is built — and when",
+                                           tint: Color(red: 1.0, green: 0.72, blue: 0.35)) {
+                                    showBriefs = true
+                                }
+                            }
+        )
+    }
+
+    private var group_setup: AnyView {
+        AnyView(
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9),
+                                                GridItem(.flexible(), spacing: 9)],
+                                      spacing: 9) {
+                                // BUILD 209: only when they are OFF. A tile that reports
+
+                                // "on" is one you will never tap in your life.
+
+                                if notifsOff {
+
+                                    ChappyMiniTile(icon: "bell.badge.fill", title: "Notifications",
+                                               detail: notifsOff ? "OFF — tap to see why"
+                                                                 : "Check what iOS is holding or hiding",
+                                               tint: notifsOff ? Color(red: 1.0, green: 0.55, blue: 0.2)
+                                                               : Color(red: 0.35, green: 0.95, blue: 0.70)) {
+                                        showNotifDoctor = true
+                                    }
+
+                                }
+                                ChappyMiniTile(icon: "cross.circle.fill", title: "Emergency",
+                                           detail: emergencyContactText.isEmpty
+                                                ? "Set the WhatsApp number" : "Saved — tap to change",
+                                           tint: Color(red: 1.0, green: 0.35, blue: 0.38), live: true) {
+                                    showEmergencyContact = true
+                                }
+                                // BUILD 211: OpenClaw moved to Settings. It is a bridge to a
+
+                                // computer at home — not something you reach for on a scooter
+
+                                // in Ubud, which is the only place this screen has to be good.
+                                // The old experimental tools, only when asked for.
+                                if showAdvancedTools {
+                                    ChappyMiniTile(icon: "antenna.radiowaves.left.and.right",
+                                               title: "RTMP", detail: "Experimental streaming",
+                                               tint: .gray) { showRTMPStreaming = true }
+                                    ChappyMiniTile(icon: "video.fill", title: "Screen Stream",
+                                               detail: "Record and stream",
+                                               tint: .gray) { showLiveStream = true }
+                                    ChappyMiniTile(icon: "chart.bar.fill", title: "LeanEat",
+                                               detail: "Food analysis",
+                                               tint: .gray) { showLeanEat = true }
+                                }
+                            }
+        )
     }
 
     /// What used to be the wall. Same tiles, same actions, same
     /// colours — sorted, and mostly folded away.
-    private var tileGrid: some View {
-        VStack(spacing: 10) {
-            askField
-            nowCard
-            groupHeader("travel", "Travel", "airplane", 6)
-            if openGroup == "travel" { group_travel }
-            groupHeader("day", "Your day", "sun.max.fill", 4)
-            if openGroup == "day" { group_day }
-            groupHeader("ask", "Ask", "questionmark.circle.fill", 4)
-            if openGroup == "ask" { group_ask }
-            groupHeader("setup", "Set up", "gearshape.fill", 3 + (showAdvancedTools ? 3 : 0))
-            if openGroup == "setup" { group_setup }
-        }
-        .padding(.bottom, 30)
+    private var tileGrid: AnyView {
+        AnyView(
+            VStack(spacing: 10) {
+                askField
+                nowCard
+                groupHeader("travel", "Travel", "airplane", 6)
+                if openGroup == "travel" { group_travel }
+                groupHeader("day", "Your day", "sun.max.fill", 4)
+                if openGroup == "day" { group_day }
+                groupHeader("ask", "Ask", "questionmark.circle.fill", 4)
+                if openGroup == "ask" { group_ask }
+                groupHeader("setup", "Set up", "gearshape.fill", 3 + (showAdvancedTools ? 3 : 0))
+                if openGroup == "setup" { group_setup }
+            }
+            .padding(.bottom, 30)
+        )
     }
 
-    private var homeStack: some View {
-            ZStack {
-                // THE FACE (Phase 4.9): dark-first, one accent, big targets.
-                // Re-skin only — every action fires the exact same wiring
-                // as the old grid (no-breakage law).
-                LinearGradient(
-                    colors: [theme.bgTop, theme.bgBottom],
-                    startPoint: .top, endPoint: .bottom
-                )
-                .ignoresSafeArea()
+    private var homeStack: AnyView {
+        AnyView(
+                ZStack {
+                    // THE FACE (Phase 4.9): dark-first, one accent, big targets.
+                    // Re-skin only — every action fires the exact same wiring
+                    // as the old grid (no-breakage law).
+                    LinearGradient(
+                        colors: [theme.bgTop, theme.bgBottom],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .ignoresSafeArea()
 
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        // ORB HEADER — glows when Chappy is live
-                        orbHeader
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 16) {
+                            // ORB HEADER — glows when Chappy is live
+                            orbHeader
 
-                        // STATUS STRIP
-                        statusStrip
+                            // STATUS STRIP
+                            statusStrip
 
-                        // NAVIGATION CARD — appears only while navigating
-                        navCard
+                            // NAVIGATION CARD — appears only while navigating
+                            navCard
 
-                        // THE FOUR MODES
-                        modeStack
+                            // THE FOUR MODES
+                            modeStack
 
-                        // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
-                        // cramped single row. Seven actions never fitted
-                        // across one line on a phone; now they breathe, each
-                        // in its own colour, and Ear On lights up when live.
-                        actionGrid
+                            // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
+                            // cramped single row. Seven actions never fitted
+                            // across one line on a phone; now they breathe, each
+                            // in its own colour, and Ear On lights up when live.
+                            actionGrid
 
-                        // TODAY — journal glance
-                        journalRow
+                            // TODAY — journal glance
+                            journalRow
 
-                        // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
-                        //
-                        // Every ping, warn time and flight alert in Chappy
-                        // goes through iOS notifications. If permission was
-                        // never granted — or was granted once and later
-                        // switched off, or Focus is eating them — the app has
-                        // no way to tell you and everything just silently
-                        // stops. That is indistinguishable from "the feature
-                        // is broken", which is exactly how it felt.
-                        //
-                        // So: check on every appearance, and if they're off,
-                        // SAY SO, right here, with the button that fixes it.
-                        notifBanner
+                            // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
+                            //
+                            // Every ping, warn time and flight alert in Chappy
+                            // goes through iOS notifications. If permission was
+                            // never granted — or was granted once and later
+                            // switched off, or Focus is eating them — the app has
+                            // no way to tell you and everything just silently
+                            // stops. That is indistinguishable from "the feature
+                            // is broken", which is exactly how it felt.
+                            //
+                            // So: check on every appearance, and if they're off,
+                            // SAY SO, right here, with the button that fixes it.
+                            notifBanner
 
-                        // BUILD 140 — THE GLANCE. The day, on the home screen,
-                        // before you've opened anything: next events, next
-                        // reminders, one line of counts. Tap = the full Diary.
-                        todayGlanceCard.chappyScrollFX()
+                            // BUILD 140 — THE GLANCE. The day, on the home screen,
+                            // before you've opened anything: next events, next
+                            // reminders, one line of counts. Tap = the full Diary.
+                            todayGlanceCard.chappyScrollFX()
 
-                        // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
-                        // voice-only in 134 and nobody could find it. Three
-                        // buttons now: look at the thing, tap the verb.
-                        readerCard.chappyScrollFX()
+                            // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
+                            // voice-only in 134 and nobody could find it. Three
+                            // buttons now: look at the thing, tap the verb.
+                            readerCard.chappyScrollFX()
 
-                        // BUILD 157 — THE TILE GRID. Nine identical grey rows
-                        // became a two-column grid of colour-coded tiles, each
-                        // with its own hue, glowing icon chip and gradient
-                        // edge. Apple's Control Center and Samsung's One UI
-                        // both proved the same thing: the eye finds a colour
-                        // faster than it reads a word, and a grid halves the
-                        // scroll. RTMP / Screen Stream / LeanEat moved behind
-                        // the "advanced tools" switch in Settings — they were
-                        // leftovers from the app this was built on.
-                        tileGrid
+                            // BUILD 157 — THE TILE GRID. Nine identical grey rows
+                            // became a two-column grid of colour-coded tiles, each
+                            // with its own hue, glowing icon chip and gradient
+                            // edge. Apple's Control Center and Samsung's One UI
+                            // both proved the same thing: the eye finds a colour
+                            // faster than it reads a word, and a grid halves the
+                            // scroll. RTMP / Screen Stream / LeanEat moved behind
+                            // the "advanced tools" switch in Settings — they were
+                            // leftovers from the app this was built on.
+                            tileGrid
+                        }
+                        .padding(.horizontal, 18)
                     }
-                    .padding(.horizontal, 18)
                 }
-            }
-            .navigationBarHidden(true)
-            .fullScreenCover(isPresented: $showLiveAI) {
-                LiveAIView(streamViewModel: streamViewModel, apiKey: apiKey)
-            }
-            .fullScreenCover(isPresented: $showLiveStream) {
-                SimpleLiveStreamView(streamViewModel: streamViewModel)
-            }
-            .fullScreenCover(isPresented: $showRTMPStreaming) {
-                RTMPStreamingView(streamViewModel: streamViewModel)
-            }
-            .fullScreenCover(isPresented: $showLeanEat) {
-                StreamView(viewModel: streamViewModel, wearablesVM: wearablesViewModel)
-            }
-            .fullScreenCover(isPresented: $showQuickVision) {
-                QuickVisionView(streamViewModel: streamViewModel, apiKey: apiKey)
-            }
-            .fullScreenCover(isPresented: $showLiveTranslate) {
-                LiveTranslateView(streamViewModel: streamViewModel)
-            }
-            .fullScreenCover(isPresented: $showOpenClaw) {
-                OpenClawChatView(streamViewModel: streamViewModel)
-            }
-            .fullScreenCover(isPresented: $showMemory) {
-                // BUILD 130: the new browser — map view, detail cards with
-                // navigate-back, and an ambient filter so Pulse frames don't
-                // bury the photos he actually chose to take.
-                ChappyMemoryBrowser()
-            }
-            .sheet(isPresented: $showCommands) {
-                WhatCanISayView(theme: theme)
-            }
-            .fullScreenCover(isPresented: $showAtlas) {
-                AtlasView(initialTarget: atlasTarget, initialLayer: atlasLayer)
-            }
-            .fullScreenCover(isPresented: $showDictate) {
-                DictateView(autoStart: dictateAutoStart)
-            }
-            .fullScreenCover(isPresented: $showPlaces) {
-                PlacesView()
-            }
-            .fullScreenCover(isPresented: $showUpcoming) {
-                UpcomingView()
-            }
-            .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
-            .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
-            .fullScreenCover(isPresented: $showTravel) { TravelDeskView() }
-            .fullScreenCover(isPresented: $showAtlasMap) { TripAtlasView() }
-            .sheet(isPresented: $showVisas) { VisaDeskView() }
-            .sheet(isPresented: $showOptions) { TripOptionsSheet() }
-            .sheet(isPresented: $showIntake) { IntakeSheet() }
+                .navigationBarHidden(true)
+                .fullScreenCover(isPresented: $showLiveAI) {
+                    LiveAIView(streamViewModel: streamViewModel, apiKey: apiKey)
+                }
+                .fullScreenCover(isPresented: $showLiveStream) {
+                    SimpleLiveStreamView(streamViewModel: streamViewModel)
+                }
+                .fullScreenCover(isPresented: $showRTMPStreaming) {
+                    RTMPStreamingView(streamViewModel: streamViewModel)
+                }
+                .fullScreenCover(isPresented: $showLeanEat) {
+                    StreamView(viewModel: streamViewModel, wearablesVM: wearablesViewModel)
+                }
+                .fullScreenCover(isPresented: $showQuickVision) {
+                    QuickVisionView(streamViewModel: streamViewModel, apiKey: apiKey)
+                }
+                .fullScreenCover(isPresented: $showLiveTranslate) {
+                    LiveTranslateView(streamViewModel: streamViewModel)
+                }
+                .fullScreenCover(isPresented: $showOpenClaw) {
+                    OpenClawChatView(streamViewModel: streamViewModel)
+                }
+                .fullScreenCover(isPresented: $showMemory) {
+                    // BUILD 130: the new browser — map view, detail cards with
+                    // navigate-back, and an ambient filter so Pulse frames don't
+                    // bury the photos he actually chose to take.
+                    ChappyMemoryBrowser()
+                }
+                .sheet(isPresented: $showCommands) {
+                    WhatCanISayView(theme: theme)
+                }
+                .fullScreenCover(isPresented: $showAtlas) {
+                    AtlasView(initialTarget: atlasTarget, initialLayer: atlasLayer)
+                }
+                .fullScreenCover(isPresented: $showDictate) {
+                    DictateView(autoStart: dictateAutoStart)
+                }
+                .fullScreenCover(isPresented: $showPlaces) {
+                    PlacesView()
+                }
+                .fullScreenCover(isPresented: $showUpcoming) {
+                    UpcomingView()
+                }
+                .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
+                .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
+                .fullScreenCover(isPresented: $showTravel) { TravelDeskView() }
+                .fullScreenCover(isPresented: $showAtlasMap) { TripAtlasView() }
+                .sheet(isPresented: $showVisas) { VisaDeskView() }
+                .sheet(isPresented: $showOptions) { TripOptionsSheet() }
+                .sheet(isPresented: $showIntake) { IntakeSheet() }
+        )
     }
 
     /// The first half of the notification wiring — open Options, Intake,
     /// Visas, Atlas, Travel, FX, Search, Weather, Briefs, Doctor,
     /// Upcoming — hung off the stack above.
-    private var homeStackEventsA: some View {
-        homeStack
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenOptions)) { _ in
-                showOptions = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenIntake)) { _ in
-                showIntake = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenVisa)) { _ in
-                showVisas = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlasMap)) { _ in
-                showAtlasMap = true
-            }
-            .sheet(isPresented: $showCurrency) { CurrencyView() }
-            .sheet(isPresented: $showSearch) { WebSearchView() }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenTravel)) { _ in
-                showTravel = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFX)) { _ in
-                showCurrency = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenSearch)) { _ in
-                showSearch = true
-            }
-            .sheet(isPresented: $showBriefs) { BriefStudio() }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenWeather)) { _ in
-                showWeather = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenBriefs)) { _ in
-                showBriefs = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenNotifDoctor)) { _ in
-                showNotifDoctor = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
-                showUpcoming = true
-            }
-            // BUILD 196: Flights could only ever be opened by tapping the
-            // tile — no voice route existed, which is no use at all with
-            // the phone pocketed and the glasses on.
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFlights)) { _ in
-                showFlights = true
-            }
-            // BUILD 202 — SIRI'S WAY IN.
-            //
-            // An App Intent posts this from outside the app entirely:
-            // "Hey Siri, Chappy flights", the Action button, a Shortcut,
-            // Spotlight. It carries the tool and whatever detail the
-            // shortcut supplied, and the interview asks for the rest.
-            .onReceive(NotificationCenter.default.publisher(for: .chappyStartTool)) { note in
-                guard let id = note.userInfo?["tool"] as? String else { return }
-                let values = (note.userInfo?["values"] as? [String: String]) ?? [:]
-                ChappyStandby.shared.startTool(id: id, values: values)
-            }
+    private var homeStackEventsA: AnyView {
+        AnyView(
+            homeStack
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenOptions)) { _ in
+                    showOptions = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenIntake)) { _ in
+                    showIntake = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenVisa)) { _ in
+                    showVisas = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlasMap)) { _ in
+                    showAtlasMap = true
+                }
+                .sheet(isPresented: $showCurrency) { CurrencyView() }
+                .sheet(isPresented: $showSearch) { WebSearchView() }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenTravel)) { _ in
+                    showTravel = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFX)) { _ in
+                    showCurrency = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenSearch)) { _ in
+                    showSearch = true
+                }
+                .sheet(isPresented: $showBriefs) { BriefStudio() }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenWeather)) { _ in
+                    showWeather = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenBriefs)) { _ in
+                    showBriefs = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenNotifDoctor)) { _ in
+                    showNotifDoctor = true
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
+                    showUpcoming = true
+                }
+                // BUILD 196: Flights could only ever be opened by tapping the
+                // tile — no voice route existed, which is no use at all with
+                // the phone pocketed and the glasses on.
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenFlights)) { _ in
+                    showFlights = true
+                }
+                // BUILD 202 — SIRI'S WAY IN.
+                //
+                // An App Intent posts this from outside the app entirely:
+                // "Hey Siri, Chappy flights", the Action button, a Shortcut,
+                // Spotlight. It carries the tool and whatever detail the
+                // shortcut supplied, and the interview asks for the rest.
+                .onReceive(NotificationCenter.default.publisher(for: .chappyStartTool)) { note in
+                    guard let id = note.userInfo?["tool"] as? String else { return }
+                    let values = (note.userInfo?["values"] as? [String: String]) ?? [:]
+                    ChappyStandby.shared.startTool(id: id, values: values)
+                }
+        )
     }
 
     /// The second half: the standby re-arm handlers that hand the
     /// microphone back when a mic-owning cover closes, and "Chappy
     /// reset", which shuts every sheet from anywhere.
-    private var homeStackEventsB: some View {
-        homeStackEventsA
-            // BUILD 160 — RE-ARM ON THE WAY OUT. Standby only ever armed on
-            // launch and on foreground, so closing a screen that had taken
-            // the microphone left the ear shut until you backgrounded the
-            // app and came back. Every mic-owning cover now hands it back.
-            .onChange(of: showDictate) { _, open in
-                if !open {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-                        armStandbyIfClear(reason: "dictate closed")
+    private var homeStackEventsB: AnyView {
+        AnyView(
+            homeStackEventsA
+                // BUILD 160 — RE-ARM ON THE WAY OUT. Standby only ever armed on
+                // launch and on foreground, so closing a screen that had taken
+                // the microphone left the ear shut until you backgrounded the
+                // app and came back. Every mic-owning cover now hands it back.
+                .onChange(of: showDictate) { _, open in
+                    if !open {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                            armStandbyIfClear(reason: "dictate closed")
+                        }
                     }
                 }
-            }
-            .onChange(of: showQuickVision) { _, open in
-                if !open {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-                        armStandbyIfClear(reason: "quick vision closed")
+                .onChange(of: showQuickVision) { _, open in
+                    if !open {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                            armStandbyIfClear(reason: "quick vision closed")
+                        }
                     }
                 }
-            }
-            .onChange(of: showLiveAI) { _, open in
-                if !open {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
-                        armStandbyIfClear(reason: "live ai closed")
+                .onChange(of: showLiveAI) { _, open in
+                    if !open {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
+                            armStandbyIfClear(reason: "live ai closed")
+                        }
                     }
                 }
-            }
-            .onChange(of: showLiveTranslate) { _, open in
-                if !open {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
-                        armStandbyIfClear(reason: "translate closed")
+                .onChange(of: showLiveTranslate) { _, open in
+                    if !open {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
+                            armStandbyIfClear(reason: "translate closed")
+                        }
                     }
                 }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenPlaces)) { _ in
-                showPlaces = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlas)) { note in
-                atlasTarget = note.userInfo?["target"] as? String
-                atlasLayer = (note.userInfo?["layer"] as? String).flatMap { ChappyAtlas.Layer(rawValue: $0) }
-                showAtlas = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictate)) { _ in
-                dictateAutoStart = true
-                showDictate = true
-            }
-            // BUILD 168: text is already loaded (a scan) — open, don't record.
-            .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictateQuiet)) { _ in
-                dictateAutoStart = false
-                showDictate = true
-            }
-            // BUILD 170 — "CHAPPY RESET": close every sheet and cover, from
-            // wherever you are, and come back to this screen.
-            .onReceive(NotificationCenter.default.publisher(for: .chappyCloseEverything)) { _ in
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    showLiveAI = false;      showLiveTranslate = false
-                    showQuickVision = false; showLiveStream = false
-                    showRTMPStreaming = false; showOpenClaw = false
-                    showLeanEat = false;     showMemory = false
-                    showAtlas = false;       showPlaces = false
-                    showUpcoming = false;    showDictate = false
-                    showWeather = false;     showBriefs = false
-                    showTravel = false;      showCurrency = false
-                    showSearch = false;      showVisas = false
-                    showAtlasMap = false
-                    showOptions = false;     showIntake = false
-                    showNotifDoctor = false
-                    showFlights = false;     showCommands = false
-                    showReminders = false;   showMapSheet = false
-                    showEmergencyContact = false
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenPlaces)) { _ in
+                    showPlaces = true
                 }
-                // The ear may have been handed to a module that just closed.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    armStandbyIfClear(reason: "reset")
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenAtlas)) { note in
+                    atlasTarget = note.userInfo?["target"] as? String
+                    atlasLayer = (note.userInfo?["layer"] as? String).flatMap { ChappyAtlas.Layer(rawValue: $0) }
+                    showAtlas = true
                 }
-            }
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictate)) { _ in
+                    dictateAutoStart = true
+                    showDictate = true
+                }
+                // BUILD 168: text is already loaded (a scan) — open, don't record.
+                .onReceive(NotificationCenter.default.publisher(for: .chappyOpenDictateQuiet)) { _ in
+                    dictateAutoStart = false
+                    showDictate = true
+                }
+                // BUILD 170 — "CHAPPY RESET": close every sheet and cover, from
+                // wherever you are, and come back to this screen.
+                .onReceive(NotificationCenter.default.publisher(for: .chappyCloseEverything)) { _ in
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showLiveAI = false;      showLiveTranslate = false
+                        showQuickVision = false; showLiveStream = false
+                        showRTMPStreaming = false; showOpenClaw = false
+                        showLeanEat = false;     showMemory = false
+                        showAtlas = false;       showPlaces = false
+                        showUpcoming = false;    showDictate = false
+                        showWeather = false;     showBriefs = false
+                        showTravel = false;      showCurrency = false
+                        showSearch = false;      showVisas = false
+                        showAtlasMap = false
+                        showOptions = false;     showIntake = false
+                        showNotifDoctor = false
+                        showFlights = false;     showCommands = false
+                        showReminders = false;   showMapSheet = false
+                        showEmergencyContact = false
+                    }
+                    // The ear may have been handed to a module that just closed.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        armStandbyIfClear(reason: "reset")
+                    }
+                }
+        )
     }
 
+    // ================================================================
+    // BUILD 214 — THE REAL CRASH, AND IT WAS NEVER THE MICROPHONE.
+    //
+    // The crash report finally arrived and it says something completely
+    // different from everything I have been fixing:
+    //
+    //     EXC_BAD_ACCESS (SIGSEGV)
+    //     KERN_PROTECTION_FAILURE at a Stack Guard region
+    //     "Could not determine thread index for stack guard region"
+    //
+    // That is a STACK OVERFLOW. And the stack that overflowed is not
+    // Chappy's — it is Swift's own runtime, recursing through
+    //
+    //     TypeDecoder::decodeMangledType
+    //       -> decodeGenericArgs -> decodeMangledType -> decodeGenericArgs
+    //       ... dozens of frames, elided by the crash reporter as
+    //           recursive ...
+    //     swift_getTypeByMangledNameInContextImpl
+    //     NavigationView.init(content:)
+    //     ViewBodyAccessor.updateBody
+    //
+    // The home screen's view type had become a generic so deeply nested
+    // that the runtime blew the main thread's stack DEMANGLING ITS OWN
+    // TYPE NAME, before drawing a single pixel.
+    //
+    // And it is the same root cause as the type-checker timeout that
+    // cost us builds 191 to 194. Splitting the body into computed
+    // properties fixed the COMPILE, because each `some View` gave the
+    // checker a boundary — but at runtime those opaque types still
+    // compose into one enormous nested generic. I made the compiler's
+    // job easier and the runtime's job no easier at all, then kept
+    // adding to it: the groups in 199, the Now card, the ask field and
+    // twenty tiles in 209.
+    //
+    // AnyView is the cure, and it is the standard one: it erases the
+    // type, so each boundary becomes a flat opaque box instead of
+    // another layer of generic nesting. It costs a little diffing
+    // performance and it ends this class of crash outright.
+    //
+    // Seventeen properties erased. This one matters most — it is the
+    // node everything else hangs from.
+    // ================================================================
     var body: some View {
         NavigationView {
             homeStackEventsB
