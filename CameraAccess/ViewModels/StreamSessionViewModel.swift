@@ -180,8 +180,30 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  /// BUILD 218 — one start at a time.
+  ///
+  /// Nothing guarded this, and startSession opens by tearing down
+  /// whatever was there. Two overlapping starts therefore destroyed each
+  /// other's session — which is exactly what happens when a view's
+  /// onAppear fires while a voice command is already bringing the camera
+  /// up. LiveAIManager's own start path has checked this since build
+  /// 145; this one never did.
+  private var isStarting = false
+
+  /// BUILD 218 — set by the state watcher, polled by the bounded wait.
+  /// nil while still unknown, so "never answered" and "answered no" stay
+  /// distinguishable.
+  private var startedProbe: Bool?
+
   func startSession() async {
     logger.info("🚀 startSession START")
+
+    if isStarting {
+      logger.info("🚀 startSession ignored — one already in flight")
+      return
+    }
+    isStarting = true
+    defer { isStarting = false }
 
     // Reset to unlimited time when starting a new stream
     activeTimeLimit = .noLimit
@@ -190,6 +212,26 @@ class StreamSessionViewModel: ObservableObject {
 
     // Reset frame state
     hasReceivedFirstFrame = false
+
+    // BUILD 218 — THE FREEZE.
+    //
+    // This line is the whole bug. currentVideoFrame was never cleared
+    // here, so the frame left over from the session about to be torn
+    // down stayed on screen while the new one came up — and if the new
+    // one failed to come up, it stayed there forever.
+    //
+    // That is what "Live AI opens but freezes, no movement" was. Not a
+    // frozen video: a photograph of the last thing the previous session
+    // saw, held up in front of him with the audio working normally
+    // behind it. Silence and failure looking identical again.
+    currentVideoFrame = nil
+
+    // Both of these are process-wide and were never reset, so a
+    // conversion that died mid-flight left the gate shut for the life of
+    // the app — preview dead, audio fine, watchdog none the wiser
+    // because it watches ARRIVAL, not conversion.
+    Self.frameConversionBusy = false
+    Self.lastConvertAt = .distantPast
 
     // Tear down any previous session (sessions are single-use in 0.7)
     await teardownSession()
@@ -223,14 +265,45 @@ class StreamSessionViewModel: ObservableObject {
       logger.info("🚀 Starting device session…")
       try session.start()
 
-      // Wait for the session to reach .started before adding capabilities
-      for await state in session.stateStream() {
-        if state == .started { break }
-        if state == .stopped {
-          logger.error("❌ Session stopped before starting")
-          showError("Couldn't connect to the glasses. Please try again.")
-          return
+      // BUILD 218 — WAIT, BUT NOT FOREVER.
+      //
+      // This loop had no timeout. A session that never reaches .started
+      // parked here indefinitely: addStream never ran, no frames were
+      // ever subscribed to, status stayed .waiting, and the screen kept
+      // showing whatever was there before. Combined with the stale frame
+      // above, that is a permanent, convincing freeze.
+      //
+      // Twenty seconds is the same budget LiveAIManager already uses for
+      // the equivalent wait, so this now behaves the same way whichever
+      // door the camera is opened through.
+      // Everything here stays on the main actor deliberately: the
+      // session object is not Sendable, so racing it through a task
+      // group would mean shipping it across an isolation boundary. A
+      // probe property and a polled deadline do the same job with none
+      // of that.
+      startedProbe = nil
+      let waiter = Task { @MainActor [weak self] in
+        for await state in session.stateStream() {
+          if state == .started { self?.startedProbe = true; return }
+          if state == .stopped { self?.startedProbe = false; return }
         }
+        self?.startedProbe = false
+      }
+      let deadline = Date().addingTimeInterval(20)
+      while startedProbe == nil, Date() < deadline {
+        try? await Task.sleep(nanoseconds: 100_000_000)
+      }
+      waiter.cancel()
+
+      guard startedProbe == true else {
+        logger.error("❌ Session never reached .started")
+        // AUDIT: the old early returns left streamingStatus on .waiting,
+        // so anything polling for .streaming hung to its own timeout and
+        // the idle timer stayed disabled for the rest of the session.
+        streamingStatus = .stopped
+        currentVideoFrame = nil
+        showError("The glasses didn't wake up. Check they're on your face and connected, then try again.")
+        return
       }
       logger.info("🚀 Device session started")
 
@@ -240,6 +313,9 @@ class StreamSessionViewModel: ObservableObject {
       // NSLocalNetworkUsageDescription permission was added (that was the
       // actual camera fix, not the API).
       guard let stream = try session.addStream(config: makeStreamConfiguration()) else {
+        // BUILD 218: was leaving the status on .waiting forever.
+        streamingStatus = .stopped
+        currentVideoFrame = nil
         showError("Couldn't start the camera stream. Please try again.")
         return
       }
@@ -318,8 +394,11 @@ class StreamSessionViewModel: ObservableObject {
         while !Task.isCancelled {
           try? await Task.sleep(nanoseconds: 3_000_000_000)
           guard let self, let stream = self.stream else { continue }
-          if self.hasReceivedFirstFrame,
-             Date().timeIntervalSince(self.lastFrameAt) > 6 {
+          // BUILD 218: the `hasReceivedFirstFrame` condition meant the
+          // watchdog only protected a stream that had ALREADY worked. The
+          // case he actually hit — opened, never moved — was the one case
+          // it could not see. Now it kicks either way.
+          if Date().timeIntervalSince(self.lastFrameAt) > 6 {
             self.stallKicks += 1
             if self.stallKicks >= 3 {
               // Two kicks didn't revive it — the transport is wedged.
@@ -342,6 +421,9 @@ class StreamSessionViewModel: ObservableObject {
 
     } catch {
       logger.error("❌ startSession failed: \(error.localizedDescription)")
+      // BUILD 218: never leave a dead frame up after a failed start.
+      currentVideoFrame = nil
+      streamingStatus = .stopped
       showError(Self.describe(error))
       streamingStatus = .stopped
     }
