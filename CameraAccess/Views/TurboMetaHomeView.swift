@@ -666,8 +666,22 @@ struct TurboMetaHomeView: View {
         ChappyStandby.shared.autoArmIfWanted(reason: reason)
     }
 
-    var body: some View {
-        NavigationView {
+    // ================================================================
+    // BUILD 192 — THE CHAIN THAT BROKE THE TYPE CHECKER.
+    //
+    // "The compiler is unable to type-check this expression in
+    // reasonable time." Forty-five modifiers hung off one ZStack, and
+    // each one rewrites the expression's type, so Swift was solving a
+    // forty-five-deep inference problem in one pass. It had been at the
+    // limit for several builds; the Flights sheet in 190 tipped it over.
+    //
+    // Each computed property below returns `some View`, and an opaque
+    // return type is an inference boundary — the checker solves each
+    // piece and then forgets how it got there. Four small problems
+    // instead of one enormous one. The modifiers still apply in the
+    // same order to the same view; nothing about the screen changes.
+    // ================================================================
+    private var homeStack: some View {
             ZStack {
                 // THE FACE (Phase 4.9): dark-first, one accent, big targets.
                 // Re-skin only — every action fires the exact same wiring
@@ -1161,6 +1175,13 @@ struct TurboMetaHomeView: View {
             .sheet(isPresented: $showVisas) { VisaDeskView() }
             .sheet(isPresented: $showOptions) { TripOptionsSheet() }
             .sheet(isPresented: $showIntake) { IntakeSheet() }
+    }
+
+    /// The first half of the notification wiring — open Options, Intake,
+    /// Visas, Atlas, Travel, FX, Search, Weather, Briefs, Doctor,
+    /// Upcoming — hung off the stack above.
+    private var homeStackEventsA: some View {
+        homeStack
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenOptions)) { _ in
                 showOptions = true
             }
@@ -1197,6 +1218,13 @@ struct TurboMetaHomeView: View {
             .onReceive(NotificationCenter.default.publisher(for: .chappyOpenUpcoming)) { _ in
                 showUpcoming = true
             }
+    }
+
+    /// The second half: the standby re-arm handlers that hand the
+    /// microphone back when a mic-owning cover closes, and "Chappy
+    /// reset", which shuts every sheet from anywhere.
+    private var homeStackEventsB: some View {
+        homeStackEventsA
             // BUILD 160 — RE-ARM ON THE WAY OUT. Standby only ever armed on
             // launch and on foreground, so closing a screen that had taken
             // the microphone left the ear shut until you backgrounded the
@@ -1271,6 +1299,11 @@ struct TurboMetaHomeView: View {
                     armStandbyIfClear(reason: "reset")
                 }
             }
+    }
+
+    var body: some View {
+        NavigationView {
+            homeStackEventsB
             // BUILD 190: the tile now opens the route screen — segments,
             // true cost, the price journal, nearby airports, connection
             // verdicts. The 176 status view is still there and is still
