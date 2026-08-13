@@ -1252,6 +1252,21 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var command = ""
     private var lastWordAt = Date()
     private var routeWork: DispatchWorkItem?
+    /// BUILD 198 — §16's medium band. Chappy asked "did you mean visas?"
+    /// and is holding the answer it would have run. Yes starts it; no
+    /// drops it; anything else is treated as a fresh command, because a
+    /// clarification you ignore should never become a trap.
+    private var pendingPlanTool: String?
+    private var pendingPlanValues: [String: String] = [:]
+    private var pendingPlanAskedAt = Date.distantPast
+    /// BUILD 203: the runner-up offered alongside it, so "the second one"
+    /// and naming it outright both work.
+    private var pendingPlanRival: String?
+    /// BUILD 196: set when a bare wake word opens the door, cleared the
+    /// moment any real command arrives. The delayed "Yes?" checks it and
+    /// stays quiet if the sentence turned up while it was waiting.
+    private var emptyPromptAt: Date?
+    private var emptyPromptWork: DispatchWorkItem?
     private var strikes = 0
     private var busy = false
     private var coachCount = 0
@@ -1725,10 +1740,15 @@ final class ChappyStandby: NSObject, ObservableObject {
         // as reported. Now the ear listens without demanding silence, and
         // the duck happens only while Chappy is speaking.
         ChappyAudio.apply(.listening)
-        // Prefer the phone's own mic explicitly — A2DP alone still lets iOS
-        // pick a headset input on some routes.
-        if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
-            try? session.setPreferredInput(builtIn)
+        // BUILD 196: the glasses first, the phone only as a fallback. This
+        // was the reverse. Order matters — .headsetMic covers wired, the
+        // two Bluetooth ports cover the Ray-Bans, and builtInMic is what
+        // you get when nothing is on your head.
+        let earOrder: [AVAudioSession.Port] = [.bluetoothHFP, .headsetMic, .bluetoothLE, .builtInMic]
+        let inputs = session.availableInputs ?? []
+        if let chosen = earOrder.compactMap({ p in inputs.first { $0.portType == p } }).first {
+            try? session.setPreferredInput(chosen)
+            print("👂 [Standby] Listening on \(chosen.portName) [\(chosen.portType.rawValue)]")
         }
 
         // BUILD 160 — THE SILENT FAILURE THAT ATE THE STARTUP VOICE.
@@ -2787,6 +2807,10 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// sentence becomes your command.
     private var followUpOpenedAt = Date.distantPast
     static let followUpSeconds: TimeInterval = 12
+    /// BUILD 197: mid-interview the door stays open much longer. Twelve
+    /// seconds is right for "anything else?" and completely wrong for
+    /// "when are you travelling?", which is a question people think about.
+    static let flowFollowUpSeconds: TimeInterval = 75
     static let followUpMaxRun: TimeInterval = 45
 
     /// Speech that carries no instruction. Hearing these should HOLD the door
@@ -3478,6 +3502,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         let debounce: Double
         if Self.looksUnfinished(cleanTail) {
             debounce = 3.0
+        } else if Self.isFinishedName(cleanTail) {
+            // BUILD 202: an exact screen name. Nothing it could grow into
+            // changes the answer, so stop waiting for silence.
+            debounce = 0.05
         } else if Self.extendableCommands.contains(cleanTail) {
             // BUILD 90: 0.40s was too tight for "translate … to Indonesian".
             // The tail arrives as a separate recogniser partial and any natural
@@ -3612,6 +3640,27 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// Everything here is verified to have a handler in route(). "look",
     /// "navigate" and "go" previously did NOT and fell through to the either/or
     /// prompt, which then poisoned the next command for 45 seconds.
+    /// BUILD 202 — A SCREEN NAME IS A FINISHED SENTENCE.
+    ///
+    /// The debounce ladder waits 650ms of silence on a two-word command
+    /// before it does anything, and that pause is now the largest single
+    /// cost on the fast path — bigger than the routing, bigger than the
+    /// speech. The realtime assistants beat it by deciding on partial
+    /// transcripts.
+    ///
+    /// The safe half of that: a phrase that EXACTLY names a screen and
+    /// nothing else is complete the moment it lands. "Chappy, flights"
+    /// cannot become anything other than flights by waiting longer. So it
+    /// fires immediately, like "stop" always has.
+    ///
+    /// Exact only — a fuzzy match still waits, because "travel" could
+    /// still be growing into "travel desk to Bali".
+    static func isFinishedName(_ tail: String) -> Bool {
+        guard !tail.isEmpty, tail.split(separator: " ").count <= 2 else { return false }
+        guard let t = ChappyTiles.match(tail) else { return false }
+        return t.words.contains(tail)
+    }
+
     static let extendableCommands: Set<String> = [
         "translate", "snap", "photo", "take a photo", "take a picture",
         "map", "remember", "remember this spot", "watch", "keep watching",
@@ -3658,6 +3707,26 @@ final class ChappyStandby: NSObject, ObservableObject {
             resetRecognition()
             return
         }
+        // BUILD 202 — BARGE-IN.
+        //
+        // Google and Alexa both let you talk over an answer, and it matters
+        // most exactly where Chappy is used: walking, moving, hands full,
+        // phone pocketed. Until now a second command arriving mid-answer
+        // got "one thing at a time" — technically true and completely
+        // wrong, because the work was FINISHED and Chappy was only still
+        // talking about it.
+        //
+        // Speaking is not working. If the voice is running, the new
+        // sentence wins: cut the audio, drop the task, take the command.
+        // If it is genuinely still thinking, the old behaviour stands.
+        if busy, TTSService.shared.isSpeaking {
+            TTSService.shared.stop()
+            routeTask?.cancel()
+            busy = false
+            ChappyHaptics.shared.straightStep()
+            print("🗣️ [Standby] Barge-in — took over mid-answer")
+        }
+
         guard !busy else {
             // AUDIT P1 (SB-BUSY): this dropped the command with no speech and no
             // haptic. Wearing glasses with the phone pocketed, "heard and
@@ -3691,10 +3760,39 @@ final class ChappyStandby: NSObject, ObservableObject {
             // what a follow-up window is for. Answering the name opens the door.
             followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
             followUpOpenedAt = Date()
-            TTSService.shared.speak(ChappyVoice.line("yes", ["Yes?", "Go on.", "I'm here."]))
+            // BUILD 196 — DON'T ANSWER AN EMPTY COMMAND. WAIT FOR IT.
+            //
+            // This spoke immediately, and that is why "Chappy, what time is
+            // it" so often came back as "I'm here" followed by a long pause
+            // and then the time. The command was not missing, it was late:
+            // the recogniser had delivered the wake word and was still
+            // working on the rest. Answering instantly guaranteed talking
+            // over the very sentence being waited for.
+            //
+            // Now the door opens silently — a haptic, no speech — and the
+            // greeting only arrives if nothing has landed after a real
+            // pause. If the words turn up in that window they route
+            // normally and this never speaks at all.
+            ChappyHaptics.shared.straightStep()
+            let openedAt = Date()
+            emptyPromptAt = openedAt
+            let waitWork = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                // Something arrived and reset the marker — stay quiet.
+                guard self.emptyPromptAt == openedAt else { return }
+                guard !self.busy else { return }
+                TTSService.shared.speak(ChappyVoice.line("yes", ["Yes?", "Go on.", "I'm here."]))
+            }
+            emptyPromptWork?.cancel()
+            emptyPromptWork = waitWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: waitWork)
             resetRecognition()
             return
         }
+        // BUILD 196: a real command cancels the pending "Yes?" — otherwise
+        // it fires mid-answer, which is worse than firing early.
+        emptyPromptAt = nil
+        emptyPromptWork?.cancel(); emptyPromptWork = nil
         print("👂➡️ [Standby] Command: \(cmd)")
         busy = true
         routeTask?.cancel()
@@ -3746,6 +3844,145 @@ final class ChappyStandby: NSObject, ObservableObject {
         // hook doesn't recognise a command it returns false and the router
         // below runs exactly as it always has.
         if await ChappyRouterHook.intercept(c) { return }
+
+        // BUILD 197 — A LIVE FLOW OWNS THE NEXT SENTENCE.
+        //
+        // Once Chappy has asked "where are you flying from?", the next
+        // thing said is an answer, not a command. Routing it normally is
+        // how a conversation collapses back into a wall: "Brisbane" matches
+        // nothing and comes back as "Brisbane - find you one nearby, or
+        // tell you about it?".
+        //
+        // The flow gets first refusal and can hand the sentence back — if
+        // what arrived is clearly a different command, it cancels itself
+        // and lets the router have it. Being in a conversation must never
+        // trap you in one.
+        // BUILD 198 — the answer to "did you mean visas?"
+        if let pending = pendingPlanTool,
+           Date().timeIntervalSince(pendingPlanAskedAt) < 30 {
+            let vals = pendingPlanValues
+            let rival = pendingPlanRival
+            pendingPlanTool = nil; pendingPlanValues = [:]
+            pendingPlanRival = nil
+            pendingPlanAskedAt = .distantPast
+            // BUILD 203: when two were offered, the answer is usually the
+            // NAME of one of them rather than a yes. "Visas" is a perfectly
+            // good answer to "did you mean visas, or travel desk?" and used
+            // to be parsed as neither.
+            if let r = rival {
+                for candidate in [pending, r] {
+                    guard let t = ChappyRegistry.tool(id: candidate) else { continue }
+                    let name = t.title.lowercased()
+                    guard c == name || c.contains(name)
+                            || ChappyTiles.match(c).flatMap({ ChappyRegistry.tool(forScreen: $0.note)?.id }) == candidate
+                    else { continue }
+                    if let screen = t.screen {
+                        NotificationCenter.default.post(name: screen, object: nil)
+                    }
+                    let line = ChappyFlow.shared.startWith(t, values: vals)
+                    if !line.isEmpty { speak(line) }
+                    followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                    return
+                }
+            }
+            if let yn = ChappySlots.parse(c, as: .yesNo) {
+                if yn == "no" { speak("Fair enough."); return }
+                if let t = ChappyRegistry.tool(id: pending) {
+                    // AUDIT (200): this path serves two callers — a medium
+                    // confidence "did you mean X?" and a permission gate
+                    // waiting on a yes. The gate's caller had everything it
+                    // needed and this still handed it back to the interview,
+                    // so a confirmed .act never reached its engine. It runs
+                    // now, but ONLY when nothing is still owed — otherwise a
+                    // clarified guess would search for the word "food".
+                    if ChappyRegistry.isComplete(t, vals),
+                       await runTool(t, values: vals) { return }
+                    if let screen = t.screen {
+                        NotificationCenter.default.post(name: screen, object: nil)
+                    }
+                    let opening = ChappyFlow.shared.startWith(t, values: vals)
+                    if !opening.isEmpty { speak(opening) }
+                    followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                    return
+                }
+            }
+            // Not an answer — it is a new command. Fall through and route
+            // it, rather than making him answer a question he has moved on
+            // from.
+        }
+
+        // BUILD 202 — A REFERENCE TO WHAT IT JUST SAID.
+        //
+        // Above the flow gate on purpose: "take me there" during a food
+        // interview is about the result, not an answer to the question.
+        // Below the ladder, so "stop" still outranks everything.
+        if ChappyLastResult.looksLikeReference(c),
+           let picked = ChappyLastResult.shared.referenced(c) {
+            ChappyFlow.shared.cancel()
+            ChappyRouterLog.shared.add(heard: c, tier: "reference", tool: "places",
+                                       outcome: "resolved to \(picked.title)", ms: 1)
+            if ChappyLastResult.want(c) == .describe {
+                // Everything in `why` is a fact — a rating, a review count,
+                // a distance, an opening state. Reading it back is an
+                // answer, not a recommendation dressed as one.
+                speak("\(picked.title) — \(picked.why).")
+                return
+            }
+            let driving = c.contains("drive") || c.contains("ride") || c.contains("car")
+            speak("\(picked.title).")
+            let reply = await NavEngine.shared.navigate(to: picked.title, driving: driving)
+            speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+            return
+        }
+
+        // BUILD 203 — "WHERE WERE WE?"
+        if ["where were we", "carry on", "keep going", "continue", "go on then",
+            "back to that", "finish that", "as i was saying"].contains(c) {
+            if let back = ChappyFlow.shared.resume() {
+                speak(back)
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                return
+            }
+            speak("Nothing left hanging.")
+            return
+        }
+
+        if ChappyFlow.shared.isActive {
+            switch await ChappyFlow.shared.answer(c) {
+            case .say(let line):
+                speak(line)
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                return
+            case .finished(let line, let tool, let values):
+                speak(line)
+                // BUILD 199: two of these actually DO something rather than
+                // open a screen and leave him to it. Gathering five answers
+                // and then presenting a form is the failure mode this whole
+                // exercise exists to remove.
+                // AUDIT (199): the permission gate was only consulted
+                // inside a multi-step plan, so a single interview ending in
+                // .act — a reminder, which writes something of his —
+                // completed without ever asking. A safety layer with a way
+                // round it is decoration.
+                if case .confirm(let ask) = ChappyGate.check(tool, values: values) {
+                    pendingPlanTool = tool.id
+                    pendingPlanValues = values
+                    pendingPlanAskedAt = Date()
+                    speak(ask)
+                    followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                    return
+                }
+                if await runTool(tool, values: values) { return }
+                ChappyFlow.shared.deliver(tool: tool, values: values)
+                return
+            case .cancelled(let line):
+                if !line.isEmpty { speak(line) }
+                return
+            case .passthrough:
+                break   // not an answer — fall through and route it properly
+            }
+        }
 
         // ---------- SAFETY FIRST — emergency outranks everything ----------
         // AUDIT FIX (P0): "Chappy, emergency" used to fall through to a 25s
@@ -3825,6 +4062,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         // closes every sheet on screen, and re-arms the ear. It never
         // deletes anything — reset means "put the tools down", not
         // "forget".
+        // BUILD 203: reset means put the tools down — including anything
+        // parked. Leaving a half-finished interview alive through a reset
+        // is exactly the surprise reset exists to prevent.
+        if c.contains("chappy reset") || c.contains("close everything") {
+            ChappyFlow.shared.dropEverything()
+        }
         if c.contains("chappy reset") || c.contains("chappy close")
             || c.contains("close everything") || c.contains("close it all")
             || c.contains("shut it all down") || c.contains("stop everything")
@@ -5536,6 +5779,78 @@ final class ChappyStandby: NSObject, ObservableObject {
             if await runIntent(guess, utterance: c) { return }
         }
 
+        // BUILD 197 — CHEAPEST AND MOST CERTAIN FIRST, MODEL LAST.
+        //
+        // 196 put these above the place-guess. They were still BELOW the
+        // Flash classifier, so asking the time opened a network call with
+        // a four-second ceiling before the offline clock — 200ms, no
+        // signal needed — was ever consulted. That is most of "why is it
+        // so slow", and it is exactly what the blueprint's own developer
+        // requirements warn against: don't route deterministic work
+        // through the model.
+        //
+        // (Original 196 note follows, because the reasoning still holds.)
+        // THE THREE THINGS THAT HAPPEN BEFORE WE GUESS.
+        //
+        // This block used to be the first thing a short phrase met, and it
+        // is the least informed thing in the router. "time" is in
+        // ChappyPocket's clock list and never reached it. "translate" is a
+        // screen and never reached that either. Both were answered with
+        // "Time - find you one nearby, or tell you about it?", which is
+        // the exact sentence that made this feel stupid.
+        //
+        // So: the free local answers first, then the screens, and only
+        // then the guess — and the guess now has to look like a place.
+
+        // 3a. Free, offline, instant: the clock, the date, arithmetic,
+        //     conversions, the weather already in the snapshot.
+        if let pocket = ChappyPocket.answer(c) {
+            speak(pocket)
+            return
+        }
+
+        // 3b. A screen, said out loud, however he happened to say it.
+        if let tile = ChappyTiles.match(c) {
+            ChappyEarcon.shared.done()
+            NotificationCenter.default.post(name: tile.note, object: nil)
+            // BUILD 197: opening the screen is the least a screen can do.
+            // If it has an interview, run it — "Chappy, flights" should
+            // start a conversation, not just put a form in front of a man
+            // with the phone in his pocket.
+            if let tool = ChappyRegistry.tool(forScreen: tile.note) {
+                // BUILD 203: naming the same tool again continues rather
+                // than restarting. Being made to say Brisbane twice is how
+                // an assistant loses an argument with a paper notebook.
+                if let back = ChappyFlow.shared.resumeIfMatches(tool) {
+                    speak(back)
+                    followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                    return
+                }
+                let opening = ChappyFlow.shared.start(tool, from: c)
+                if !opening.isEmpty { speak(opening) }
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                return
+            }
+            speak(tile.say)
+            return
+        }
+
+        // 3b-ii. BUILD 198: the screen name with the details already on the
+        // end — "flights to Bali on the seventh". The head names the tool,
+        // the tail is harvested by the interview, and none of it touches
+        // the network.
+        if let lead = ChappyTiles.leading(c),
+           let tool = ChappyRegistry.tool(forScreen: lead.tile.note) {
+            ChappyEarcon.shared.done()
+            NotificationCenter.default.post(name: lead.tile.note, object: nil)
+            ChappyRouterLog.shared.add(heard: c, tier: "tiles", tool: tool.id,
+                                       outcome: "named the screen and the details", ms: 1)
+            let opening = ChappyFlow.shared.start(tool, from: c)
+            if !opening.isEmpty { speak(opening) }
+            followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+            return
+        }
+
         // ================= TIER 3: FLASH INTENT (moved up) =================
         // AUDIT P1: this used to sit at the very END of route(), BELOW the
         // three-word either/or gate — so exactly the short rephrasings it
@@ -5545,13 +5860,118 @@ final class ChappyStandby: NSObject, ObservableObject {
         // AUDIT P2: Tier 3 can take up to 4s on bad signal, and it did so in
         // total silence — indistinguishable from not being heard, so he repeats
         // himself. A tone costs nothing and closes the loop.
+        // BUILD 198 — TWO ROUTERS, ONE WAIT.
+        //
+        // AUDIT (198, found reviewing my own build): adding the planner
+        // below the classifier meant a general question paid for BOTH —
+        // classify with a four-second ceiling, then plan with another. Up
+        // to eight seconds of "thinking" for a sentence that was always
+        // going to end at the general brain. That is not a router, that is
+        // a queue.
+        //
+        // They ask different questions and neither depends on the other's
+        // answer, so they go out together and we wait once. The classifier
+        // keeps its jobs — navigate, photo, look, watch, live_ai — because
+        // it is better at those than a registry lookup and it is proven.
+        // The planner picks up whatever it declines.
         ChappyEarcon.shared.tap()
         ChappyEarcon.shared.startThinking()
-        if let intent = await ChappyIntent.classify(c), intent.action != "ask" {
+        let planStarted = Date()
+        async let plannedTask = ChappyOrchestrator.plan(c)
+        let intent = await ChappyIntent.classify(c)
+        let planned = await plannedTask
+        let planMs = Int(Date().timeIntervalSince(planStarted) * 1000)
         ChappyEarcon.shared.stopThinking()
+
+        if let intent, intent.action != "ask" {
             print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
             CostMeter.shared.addTTSChars(c.count) // AUDIT P2: was invisible to "cost check"
+            ChappyRouterLog.shared.add(heard: c, tier: "intent", tool: intent.action,
+                                       outcome: "classifier took it", ms: planMs)
             if await runIntent(intent, utterance: c) { return }
+        }
+
+        // ================= TIER 3.5: THE PLAN (BUILD 198) =================
+        //
+        // Blueprint §8 and §16. One call, registry-driven, one or more
+        // steps, a confidence for each. It runs AFTER the eleven-action
+        // classifier — that one is better at navigate/photo/look than any
+        // registry lookup, and it is already proven — and BEFORE the guess.
+        //
+        // Nothing here invents a slot. The model is told, in the prompt,
+        // to omit rather than guess, and every step that lands short goes
+        // into the interview to be asked about properly.
+        if let plan = planned, !plan.steps.isEmpty {
+            let top = plan.steps[0]
+            switch ChappyOrchestrator.band(top.confidence) {
+
+            case .ask:
+                // §16: low confidence asks. It does not have a go.
+                ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: top.toolID,
+                                           confidence: top.confidence,
+                                           outcome: "too unsure — asked", ms: planMs)
+                // BUILD 203: if something is parked, offering it costs one
+                // clause and is far more useful than admitting defeat into
+                // silence. This is also the only place parkedTitle is read —
+                // a property nothing consults is a promise, not a feature.
+                if let waiting = ChappyFlow.shared.parkedTitle {
+                    speak("I'm not sure what you're after. We were mid-way through \(waiting.lowercased()) — carry on with that?")
+                } else {
+                    speak("I'm not sure what you're after there. Say it another way?")
+                }
+                return
+
+            case .clarify:
+                // §16: medium confidence checks before acting. One
+                // question, answerable with a word.
+                guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
+                ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
+                                           confidence: top.confidence,
+                                           outcome: "clarifying", ms: planMs)
+                pendingPlanTool = t.id
+                pendingPlanValues = top.values
+                pendingPlanAskedAt = Date()
+                // BUILD 203: offer the runner-up when the planner had one
+                // of near-equal confidence. "Did you mean visas?" invites
+                // a no and then a silence; naming both invites an answer.
+                let rival = plan.steps.dropFirst().first(where: {
+                    abs($0.confidence - top.confidence) < 0.15
+                }).flatMap { ChappyRegistry.tool(id: $0.toolID) }
+                if let r = rival, r.id != t.id {
+                    pendingPlanRival = r.id
+                    speak("Did you mean \(t.title.lowercased()), or \(r.title.lowercased())?")
+                } else if let pair = ChappyTiles.tied(c),
+                          let a = ChappyRegistry.tool(forScreen: pair.0.note),
+                          let b = ChappyRegistry.tool(forScreen: pair.1.note), a.id != b.id {
+                    pendingPlanTool = a.id
+                    pendingPlanRival = b.id
+                    speak("Did you mean \(a.title.lowercased()), or \(b.title.lowercased())?")
+                } else {
+                    speak("Did you mean \(t.title.lowercased())?")
+                }
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                return
+
+            case .execute:
+                if plan.steps.count > 1 {
+                    // §8: say what the stages are before starting them.
+                    // A multi-step answer that arrives in silence reads as
+                    // a hang, not as work.
+                    if let p = plan.preamble { speak(p) }
+                    await runPlan(plan, heard: c, ms: planMs)
+                    return
+                }
+                guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
+                ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
+                                           confidence: top.confidence,
+                                           outcome: "executing", ms: planMs)
+                if let screen = t.screen {
+                    NotificationCenter.default.post(name: screen, object: nil)
+                }
+                speak(ChappyFlow.shared.startWith(t, values: top.values))
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                return
+            }
         }
 
         // AUDIT P1 (SB-LOOP2): the ANSWER branch used to sit BELOW the ask, so a
@@ -5585,7 +6005,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
 
         let words = c.split(separator: " ")
+        // 3c. Only now, and only for something place-shaped. A word that
+        //     names a screen, a verb, or anything Chappy owns is not a
+        //     place, and asking "find you one nearby?" about it is how a
+        //     mis-heard command turned into nonsense.
         if words.count <= 3, !c.contains("?"),
+           !ChappyTiles.looksLikeOurs(c),
            !c.hasPrefix("what"), !c.hasPrefix("how"), !c.hasPrefix("who"),
            !c.hasPrefix("when"), !c.hasPrefix("where"), !c.hasPrefix("why"),
            !c.hasPrefix("is "), !c.hasPrefix("are "), !c.hasPrefix("can ") {
@@ -5616,10 +6041,8 @@ final class ChappyStandby: NSObject, ObservableObject {
         // in the snapshot, "how are you". Answered locally in ~200ms, free,
         // and they work with no signal at all. Anything Pocket can't answer
         // falls through to the paid brain exactly as before.
-        if let pocket = ChappyPocket.answer(c) {
-            speak(pocket)
-            return
-        }
+        // (BUILD 196: Pocket now runs above, before the place guess. It
+        // used to sit here, below a branch that swallowed "time".)
         await quickAsk(c)
     }
 
@@ -5783,6 +6206,122 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// handlers the string ladder uses — no second implementation to drift.
     /// Returns false if we couldn't action it, so the caller can fall through
     /// to a plain answer rather than pretending.
+    /// BUILD 198 — §8. Steps in order, each inheriting the entities the
+    /// last one settled, each stopping to ask for whatever it still
+    /// needs. A step that cannot be completed does not kill the plan; it
+    /// says so and the rest carries on, because "the visa check failed"
+    /// is not a reason to throw away the weather you already had.
+    private func runPlan(_ plan: ChappyOrchestrator.Plan, heard: String, ms: Int) async {
+        var carried: [String: String] = [:]
+        for (i, step) in plan.steps.enumerated() {
+            guard let t = ChappyRegistry.tool(id: step.toolID) else { continue }
+            var values = step.values
+            ChappyOrchestrator.carry(carried, into: &values)
+
+            switch ChappyGate.check(t, values: values) {
+            case .confirm(let ask):
+                speak(ask)
+                pendingPlanTool = t.id
+                pendingPlanValues = values
+                pendingPlanAskedAt = Date()
+                return                      // the rest waits on a yes
+            case .go:
+                break
+            }
+
+            ChappyRouterLog.shared.add(heard: heard, tier: "plan",
+                                       tool: t.id, confidence: step.confidence,
+                                       outcome: "step \(i + 1) of \(plan.steps.count)", ms: i == 0 ? ms : 0)
+            if let screen = t.screen {
+                NotificationCenter.default.post(name: screen, object: nil)
+            }
+            for (k, v) in values { carried[k] = v }
+
+            // The last step gets the interview if it is short of anything;
+            // earlier steps are run with what is known and not laboured,
+            // because stopping to interview in the middle of a plan is how
+            // a helpful answer turns into a form.
+            if i == plan.steps.count - 1 {
+                speak(ChappyFlow.shared.startWith(t, values: values))
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+            } else {
+                ChappyFlow.shared.deliver(tool: t, values: values)
+                speak(ChappyFlow.summary(t, values))
+            }
+        }
+    }
+
+    /// BUILD 202 — the entry point Siri uses. Public because it is
+    /// reached from a notification posted by an App Intent, from outside
+    /// this class and outside the voice loop entirely.
+    func startTool(id: String, values: [String: String]) {
+        guard let t = ChappyRegistry.tool(id: id) else { return }
+        if let screen = t.screen {
+            NotificationCenter.default.post(name: screen, object: nil)
+        }
+        let line = ChappyFlow.shared.startWith(t, values: values)
+        if !line.isEmpty { speak(line) }
+        followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+        ChappyRouterLog.shared.add(heard: "siri:\(id)", tier: "intent", tool: id,
+                                   outcome: "started from outside the app", ms: 0)
+    }
+
+    /// BUILD 199 — the tools with an engine behind them. Returns true
+    /// when it handled the thing itself; false means "this one is a
+    /// screen, post the notification as usual".
+    private func runTool(_ tool: ChappyTool, values: [String: String]) async -> Bool {
+        switch tool.id {
+
+        case "navigate":
+            guard let to = values["to"], !to.isEmpty else { return false }
+            let driving = (values["mode"] ?? "walk") != "walk"
+            let reply = await NavEngine.shared.navigate(to: to, driving: driving)
+            speak(NavEngine.shared.spokenRouteSummary ?? reply)
+            if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+            return true
+
+        case "food", "attractions":
+            // BUILD 200 — this used to hand a search string to the router
+            // and read back whatever it drove to. One place, no reason, no
+            // alternatives. The places engine already returns ratings from
+            // two independent sources, review counts, price level and an
+            // opening state, and none of it was ever spoken.
+            let asked = values["kind"] ?? (tool.id == "food" ? "food" : "things to do")
+            let kind = ChappyPlaces.kindFor(asked, price: values["price"], tool: tool.id)
+            let snap = ContextEngine.shared.snapshot
+            let lat = snap.latitude ?? 0, lon = snap.longitude ?? 0
+            guard lat != 0 || lon != 0 else {
+                speak("I don't have a location fix yet, so I can't look around you.")
+                return true
+            }
+            let where_ = (values["near"].flatMap { $0.lowercased() == "yes" ? nil : $0 })
+                ?? snap.city ?? ""
+            speak("Looking.")
+            // ChappyPlaces is @MainActor and this is not, so both the call
+            // and the read hop deliberately. Nested types do not inherit
+            // isolation, which is why Spot itself crosses freely — the same
+            // rule that cost eight compile errors in 191.
+            await ChappyPlaces.shared.search(near: lat, lon: lon, place: where_, kind: kind)
+            let spots = await ChappyPlaces.shared.results
+            let result = ChappyResult.from(spots, kind: kind,
+                                           near: lat, lon: lon, asked: asked)
+            ChappyRouterLog.shared.add(heard: asked, tier: "flow", tool: tool.id,
+                                       outcome: result.ok
+                                           ? "\(result.options.count) ranked"
+                                           : "nothing usable",
+                                       ms: 0)
+            NotificationCenter.default.post(name: .chappyOpenPlaces, object: nil)
+            // BUILD 202: hold it, so "the second one" and "take me there"
+            // mean something for the next two minutes.
+            ChappyLastResult.shared.remember(result)
+            speak(result.spoken)
+            return true
+
+        default:
+            return false
+        }
+    }
+
     private func runIntent(_ intent: ChappyIntent.Result, utterance: String) async -> Bool {
         let p = intent.parameter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         switch intent.action {
@@ -14232,7 +14771,35 @@ final class ChappyAtlas: ObservableObject {
         // home and photo counts.
         var stops: [Stop] = []
         let spots = TripRecorder.shared.spots
-        let mems = ChappyMemory.shared.recent.filter { $0.lat != nil && $0.lon != nil }
+
+        // BUILD 195 — THE CAMERA BADGE THAT MEANT NOTHING.
+        //
+        // This was `recent.filter { lat != nil }` and the match below was
+        // proximity only. A photo taken at a beach in June therefore put a
+        // camera on every stop within 300m of that beach for the rest of
+        // the year — including a drive-through on a day when the camera
+        // never woke up. The badge looked like "you photographed here" and
+        // actually meant "something was once photographed near here".
+        //
+        // Photos now have to match the visit in PLACE and in DAY.
+        //
+        // The 30-day horizon is worth stating out loud: `recent` is the hot
+        // window, older days live on disk. So on the Year and All-time spans
+        // a stop older than a month cannot carry a badge — not because
+        // nothing was shot there, but because the evidence isn't loaded.
+        // That is the honest behaviour: no badge rather than a wrong one.
+        // (`cal` is already in scope from the day walk above.)
+        let photoMems = ChappyMemory.shared.recent.filter {
+            $0.lat != nil && $0.lon != nil && ($0.kind == .photo || $0.kind == .video)
+        }
+        /// Photos shot at this place, on this day. Both, or it doesn't count.
+        func photoCount(at here: CLLocation, on day: Date) -> Int {
+            photoMems.filter { m in
+                guard let la = m.lat, let lo = m.lon else { return false }
+                guard cal.isDate(m.at, inSameDayAs: day) else { return false }
+                return here.distance(from: CLLocation(latitude: la, longitude: lo)) < 300
+            }.count
+        }
         for v in visits {
             let here = CLLocation(latitude: v.lat, longitude: v.lon)
             if let i = stops.firstIndex(where: {
@@ -14241,17 +14808,19 @@ final class ChappyAtlas: ObservableObject {
                 stops[i].visits += 1
                 if v.arrive > stops[i].lastAt { stops[i].lastAt = v.arrive }
                 if stops[i].name == "Stop", let n = v.name { stops[i].name = n }
+                // BUILD 195: this branch used to bump the visit count and
+                // leave. Photos were counted once, for whichever visit
+                // happened to create the stop, so a place you return to
+                // weekly reported one day's photographs forever. Every
+                // visit now contributes its own day.
+                stops[i].photos += photoCount(at: here, on: v.arrive)
                 continue
             }
             let spot = spots.first { s in
                 here.distance(from: CLLocation(latitude: s.lat, longitude: s.lon)) < 250
             }
             let name = spot?.name ?? v.name ?? "Stop"
-            let photos = mems.filter { m in
-                guard let la = m.lat, let lo = m.lon else { return false }
-                return here.distance(from: CLLocation(latitude: la, longitude: lo)) < 300
-                    && (m.kind == .photo || m.kind == .video)
-            }.count
+            let photos = photoCount(at: here, on: v.arrive)
             var starred = false
             if let mid = spot?.memID {
                 starred = ChappyMemory.shared.recent.first { $0.id == mid }?.pinned ?? false
@@ -14852,6 +15421,246 @@ extension Notification.Name {
     static let chappyOpenPlaces = Notification.Name("chappyOpenPlaces")
     /// BUILD 163 — open the 30-day Upcoming view.
     static let chappyOpenUpcoming = Notification.Name("chappyOpenUpcoming")
+    /// BUILD 202 — a tool started from outside the app: Siri, Spotlight,
+    /// Shortcuts, the Action button. userInfo carries the tool id and any
+    /// values the shortcut supplied.
+    static let chappyStartTool = Notification.Name("chappyStartTool")
+    /// BUILD 199 — "food" and "somewhere to eat" have no screen; the
+    /// name exists so the matcher can route them into their tool.
+    static let chappyOpenFood = Notification.Name("chappyOpenFood")
+    /// AUDIT (199): attractions first shared .chappyOpenPlaces, which meant
+    /// saying "places" — his own saved list — started a "what sort of
+    /// thing?" interview instead of showing it. Two different intents were
+    /// wearing one name.
+    static let chappyOpenAttractions = Notification.Name("chappyOpenAttractions")
+    /// BUILD 197 — a finished interview, with every slot it gathered in
+    /// userInfo. Any screen can listen; nothing is obliged to.
+    static let chappyFlowResult = Notification.Name("chappyFlowResult")
+    /// BUILD 196 — the Flights screen had no voice route at all. It could
+    /// only ever be reached by tapping the tile, which is no use with the
+    /// phone in a pocket and the glasses on.
+    static let chappyOpenFlights = Notification.Name("chappyOpenFlights")
+}
+
+// =====================================================================
+// MARK: - CHAPPY TILES (Build 196) — SAY IT ANY WAY YOU LIKE
+// =====================================================================
+//
+// The router is eighteen hundred lines of hand-written string matching.
+// It is thorough and it is brittle in exactly one way: a phrase either
+// appears in it verbatim or it does not exist. "Open travel desk" is in
+// there. "Travel desk", "open the travel desk", "traveldesk" and
+// whatever the recogniser makes of it through a jacket are not.
+//
+// This is the last stop before Chappy starts guessing. It knows the
+// names of the screens and it matches them the way a person would —
+// ignoring filler words, tolerating a wrong letter or two, and refusing
+// to answer when two screens are equally plausible.
+//
+// Deliberately NOT a model call. It runs offline, in well under a
+// millisecond, and it costs nothing — which matters for the single most
+// common thing anyone says to an assistant: the name of the thing they
+// want.
+//
+enum ChappyTiles {
+
+    struct Tile {
+        let words: [String]
+        let note: Notification.Name
+        let say: String
+    }
+
+    /// The first spelling in each list is the canonical one. The rest are
+    /// the ways it actually gets said and the ways it gets misheard.
+    static let all: [Tile] = [
+        Tile(words: ["travel desk", "travel", "traveldesk", "trip planner", "travel agent",
+                     "holiday", "itinerary"],
+             note: .chappyOpenTravel, say: "Travel desk."),
+        Tile(words: ["flights", "flight", "fly", "airfare", "airfares", "my flights"],
+             note: .chappyOpenFlights, say: "Flights."),
+        Tile(words: ["translate", "translator", "translation", "interpreter"],
+             note: .chappyOpenTranslate, say: "Translate. What language?"),
+        Tile(words: ["weather", "forecast", "weather station"],
+             note: .chappyOpenWeather, say: "Weather."),
+        Tile(words: ["atlas", "trip map", "my map", "where i've been", "where ive been"],
+             note: .chappyOpenAtlasMap, say: "Atlas."),
+        Tile(words: ["visas", "visa", "visa desk"],
+             note: .chappyOpenVisa, say: "Visas."),
+        Tile(words: ["currency", "exchange rate", "rates", "convert", "money", "fx"],
+             note: .chappyOpenFX, say: "Currency."),
+        Tile(words: ["places", "saved places", "my places", "spots"],
+             note: .chappyOpenPlaces, say: "Places."),
+        Tile(words: ["search", "web search", "look it up", "google it"],
+             note: .chappyOpenSearch, say: "Search."),
+        Tile(words: ["briefs", "brief", "brief studio", "briefings"],
+             note: .chappyOpenBriefs, say: "Briefs."),
+        Tile(words: ["memory", "memories", "diary", "journal", "my memory"],
+             note: .chappyOpenMemory, say: "Memory."),
+        Tile(words: ["reminders", "reminder", "my reminders"],
+             note: .chappyOpenReminders, say: "Reminders."),
+        Tile(words: ["upcoming", "what's coming up", "whats coming up", "my calendar",
+                     "calendar", "agenda"],
+             note: .chappyOpenUpcoming, say: "Upcoming."),
+        Tile(words: ["dictate", "dictation", "take a note", "notes"],
+             note: .chappyOpenDictate, say: "Dictate."),
+        Tile(words: ["trip options", "options", "compare trips"],
+             note: .chappyOpenOptions, say: "Trip options."),
+        // BUILD 199: the two that act rather than open. They have no
+        // screen of their own, so they route by name into their tool.
+        Tile(words: ["food", "eat", "somewhere to eat", "restaurant", "restaurants",
+                     "dinner", "lunch", "breakfast", "hungry", "a feed"],
+             note: .chappyOpenFood, say: "Right."),
+        Tile(words: ["attractions", "something to do", "things to do", "sights"],
+             note: .chappyOpenAttractions, say: "Right."),
+    ]
+
+    /// Words that only ever mean "open the thing" and carry no meaning of
+    /// their own. Stripped before matching so "open the travel desk" and
+    /// "travel desk" are the same request.
+    private static let filler: Set<String> = [
+        "open", "show", "show me", "go", "go to", "goto", "launch", "start",
+        "bring", "bring up", "let's", "lets", "let", "me", "the", "my", "a",
+        "up", "screen", "page", "please", "chappy", "to", "see", "view",
+        // BUILD 197: the words people actually put in front of a module
+        // name. "Run flights" was the literal phrasing he asked for and it
+        // matched nothing, because "run" was not on this list — a good
+        // illustration of why a fixed vocabulary is never finished.
+        "run", "do", "check", "pull", "get", "need", "want", "would", "like",
+        "some", "for", "hey", "ok", "okay", "i", "i'd", "im", "i'm", "us",
+        "can", "you", "give", "find", "load", "begin", "on", "into", "with",
+    ]
+
+    private static func normalise(_ raw: String) -> String {
+        let stripped = raw.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " '")).inverted)
+            .joined()
+        let kept = stripped.split(separator: " ").map(String.init).filter { !filler.contains($0) }
+        return kept.joined(separator: " ").trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Levenshtein, iterative, two rows. Small strings only — the longest
+    /// thing in the table is "where i've been".
+    private static func distance(_ a: String, _ b: String) -> Int {
+        if a == b { return 0 }
+        let x = Array(a), y = Array(b)
+        if x.isEmpty { return y.count }
+        if y.isEmpty { return x.count }
+        var prev = Array(0...y.count)
+        var cur = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            cur[0] = i
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            }
+            prev = cur
+        }
+        return prev[y.count]
+    }
+
+    /// How wrong a word is allowed to be before it stops being that word.
+    /// Scaled to length, because one wrong letter in "fly" is a different
+    /// word and one wrong letter in "translation" is a typo.
+    private static func tolerance(_ word: String) -> Int {
+        switch word.count {
+        case 0...4:  return 0
+        case 5...7:  return 1
+        case 8...11: return 2
+        default:     return 3
+        }
+    }
+
+    /// The screen he asked for, or nil. Nil is a real answer here: two
+    /// equally close matches means we don't know, and guessing between
+    /// two screens is worse than falling through.
+    /// BUILD 203 — THE SECOND GUESS.
+    ///
+    /// match() returns nil on a tie, which is right — guessing between
+    /// two screens is worse than not guessing. But it then threw away
+    /// the two candidates it had, so "did you mean visas?" could never
+    /// become "did you mean visas, or travel desk?". Chappy knew and
+    /// said nothing, which is the same failure as the ranking one.
+    static func tied(_ raw: String) -> (Tile, Tile)? {
+        let q = normalise(raw)
+        guard !q.isEmpty, q.split(separator: " ").count <= 4 else { return nil }
+        var scored: [(Tile, Int)] = []
+        for tile in all {
+            var bestForTile: Int?
+            for w in tile.words {
+                let d = distance(q, w)
+                if d <= tolerance(w), bestForTile.map({ d < $0 }) ?? true { bestForTile = d }
+            }
+            if let d = bestForTile { scored.append((tile, d)) }
+        }
+        guard scored.count >= 2 else { return nil }
+        scored.sort { $0.1 < $1.1 }
+        guard scored[0].1 == scored[1].1 else { return nil }
+        return (scored[0].0, scored[1].0)
+    }
+
+    static func match(_ raw: String) -> Tile? {
+        let q = normalise(raw)
+        guard !q.isEmpty, q.split(separator: " ").count <= 4 else { return nil }
+
+        var best: (tile: Tile, score: Int)?
+        var runnerUp: Int?
+
+        for tile in all {
+            var bestForTile: Int?
+            for w in tile.words {
+                let d = distance(q, w)
+                if d <= tolerance(w), bestForTile.map({ d < $0 }) ?? true { bestForTile = d }
+            }
+            guard let d = bestForTile else { continue }
+            if let b = best {
+                if d < b.score { runnerUp = b.score; best = (tile, d) }
+                else if runnerUp.map({ d < $0 }) ?? true { runnerUp = d }
+            } else {
+                best = (tile, d)
+            }
+        }
+
+        guard let b = best else { return nil }
+        // A tie between two screens is not a match. Say nothing and let the
+        // rest of the router have it.
+        if let r = runnerUp, r == b.score { return nil }
+        return b.tile
+    }
+
+    /// True when the phrase names something Chappy owns. Used to stop the
+    /// place-or-fact prompt asking whether he'd like directions to the
+    /// word "translate".
+    static func looksLikeOurs(_ raw: String) -> Bool {
+        match(raw) != nil || leading(raw) != nil
+    }
+
+    /// BUILD 198 — A SCREEN NAME WITH THE ANSWERS ALREADY ATTACHED.
+    ///
+    /// Found in simulation: "flights to Bali on the seventh" fell past the
+    /// matcher — four words after filler, and nothing that close to any
+    /// entry — so it needed the network to work out it was about flights.
+    /// That is a paid call to understand a sentence that opens with the
+    /// word "flights".
+    ///
+    /// So: match the FRONT of the phrase and hand the rest back. The flow
+    /// harvests the tail itself, which it already knows how to do. Offline,
+    /// instant, and it turns the most natural way to ask — the module name
+    /// followed by the details — into the fastest path rather than the
+    /// slowest.
+    static func leading(_ raw: String) -> (tile: Tile, tail: String)? {
+        let q = normalise(raw)
+        let parts = q.split(separator: " ").map(String.init)
+        guard parts.count >= 2 else { return nil }
+        // Longest head first: "travel desk to bali" must beat "travel".
+        for take in stride(from: min(3, parts.count - 1), through: 1, by: -1) {
+            let head = parts.prefix(take).joined(separator: " ")
+            guard let t = match(head) else { continue }
+            let tail = parts.dropFirst(take).joined(separator: " ")
+            guard !tail.isEmpty else { continue }
+            return (t, tail)
+        }
+        return nil
+    }
 }
 
 // =====================================================================
@@ -16486,6 +17295,27 @@ final class ChappyPlaces: ObservableObject {
     /// set "Nothing found", and its defer cleared `loading` that the NEW
     /// request had just set. The screen said nothing was there while the
     /// thing it was looking for was still in flight.
+    /// BUILD 200 — what he asked for, in the vocabulary this engine
+    /// already speaks. Offline, and it is the difference between a warung
+    /// and a restaurant, which in Indonesia is the difference between
+    /// three dollars and thirty.
+    nonisolated static func kindFor(_ asked: String, price: String?, tool: String) -> Kind {
+        let a = asked.lowercased()
+        if a.contains("massage") || a.contains("spa") { return .massage }
+        if a.contains("gym") || a.contains("yoga") || a.contains("muay")
+            || a.contains("train") { return .gyms }
+        if a.contains("ice bath") || a.contains("sauna") || a.contains("recovery")
+            || a.contains("physio") || a.contains("stretch") { return .recovery }
+        if a.contains("beach club") || a.contains("beachclub") { return .beachClubs }
+        if a.contains("dive") || a.contains("scuba") || a.contains("snorkel") { return .dive }
+        if a.contains("hotel") || a.contains("stay") || a.contains("villa")
+            || a.contains("room") { return .hotels }
+        if tool == "attractions" { return .attractions }
+        if a.contains("warung") || a.contains("street") || a.contains("local")
+            || price == "cheap" { return .cheapEats }
+        return .restaurants
+    }
+
     func search(near lat: Double, lon: Double, place: String, kind: Kind) async {
         searchToken &+= 1
         let token = searchToken
@@ -18517,6 +19347,26 @@ enum ChappyAudio {
             // NOT .spokenAudio. That mode is built to suppress other audio,
             // which is the opposite of what an ambient ear should do.
             mode = .default
+            // BUILD 196 — THE EAR MOVES TO THE GLASSES.
+            //
+            // .allowBluetooth is what makes the Ray-Ban microphone
+            // available as an input at all; without it iOS can only offer
+            // the phone. Standby withheld it deliberately so that "Hey
+            // Meta" kept its exclusive claim on the HFP link — a real
+            // consideration, and the wrong call. It meant every command
+            // spoken while wearing the glasses was heard by a phone in a
+            // pocket: late, in fragments, or not at all. Chappy was not
+            // stupid, it was deaf, and being deaf looks exactly like being
+            // stupid from the outside.
+            //
+            // Two consequences, both accepted knowingly:
+            //   * "Hey Meta" will not answer while Chappy is armed.
+            //   * Audio OUT to the glasses drops to HFP quality while the
+            //     link is held, so music through the glasses will sound
+            //     narrower than over A2DP.
+            // If either one bites, the honest fix is a switch, not a
+            // retreat to the phone microphone.
+            opts.insert(.allowBluetooth)
             if p == "always" { opts.insert(.duckOthers) } else { opts.insert(.mixWithOthers) }
 
         case .speaking:
@@ -18524,8 +19374,6 @@ enum ChappyAudio {
             if p == "never" { opts.insert(.mixWithOthers) } else { opts.insert(.duckOthers) }
 
         case .conversation:
-            // .allowBluetooth (HFP) only here — Standby deliberately leaves
-            // the glasses' mic alone so "Hey Meta" keeps working.
             mode = .voiceChat
             opts.insert(.allowBluetooth)
             if p == "never" { opts.insert(.mixWithOthers) } else { opts.insert(.duckOthers) }
@@ -27327,5 +28175,1805 @@ extension ChappyTravel {
         let url = dir.appendingPathComponent(name)
         do { try flightsHTML(trip).data(using: .utf8)?.write(to: url); return url }
         catch { return nil }
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY SLOTS (Build 197) — TURNING AN ANSWER INTO A VALUE
+// =====================================================================
+//
+// A conversation is only as good as its ability to understand a reply.
+// "Brisbane", "the seventh", "just the two of us", "yeah" and "about two
+// months" all have to become values something can act on.
+//
+// Local first, and by a wide margin. Dates, airports, counts and yes/no
+// are the overwhelming majority of what gets said in answer to a
+// question, they are completely determinable offline, and offline is the
+// condition Chappy is actually used in — a bus in Laos, a ferry to
+// Gili, an airport with captive wifi. The model is the fallback for the
+// genuinely woolly answer, not the front door.
+//
+enum ChappySlots {
+
+    enum Kind {
+        case text        // anything, taken as said
+        case place       // a town, an area, a landmark
+        case airport     // resolved against the 327-port table
+        case date        // a specific day, or nothing
+        case count       // people
+        case yesNo
+        case nights      // "two months" -> 60
+        case money
+        case language
+        /// BUILD 199: how you're getting there. In Bali this changes the
+        /// route, the time and whether the answer is any use at all —
+        /// a car route up a footpath is worse than no route.
+        case mode        // walk | drive | scooter | grab
+        /// Cheap / mid / nice. Deliberately three, because nobody thinks
+        /// in five price bands and a slider is not a conversation.
+        case priceBand
+        /// month | 3 months | year | all
+        case span
+    }
+
+    // ---------------------------------------------------------------- yes/no
+    private static let yeses: Set<String> = [
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "correct", "right",
+        "that's right", "thats right", "affirmative", "please", "yes please",
+        "do it", "go on", "go ahead", "same as usual", "as usual", "same",
+        "same as last time", "of course", "definitely", "aye",
+    ]
+    private static let nos: Set<String> = [
+        "no", "nope", "nah", "negative", "not really", "no thanks", "no thank you",
+        "don't", "dont", "leave it", "skip", "skip it", "neither",
+    ]
+
+    // ---------------------------------------------------------------- numbers
+    private static let numberWords: [String: Int] = [
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+        "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+        "ninety": 90, "a couple": 2, "couple": 2, "a few": 3, "both": 2,
+    ]
+
+    private static let months: [String: Int] = [
+        "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+        "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+        "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+        "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+    ]
+
+    private static let weekdays: [String: Int] = [
+        "sunday": 1, "monday": 2, "tuesday": 3, "wednesday": 4,
+        "thursday": 5, "friday": 6, "saturday": 7,
+    ]
+
+    private static let languages: [String: String] = [
+        "indonesian": "Indonesian", "bahasa": "Indonesian", "thai": "Thai",
+        "vietnamese": "Vietnamese", "khmer": "Khmer", "cambodian": "Khmer",
+        "lao": "Lao", "japanese": "Japanese", "korean": "Korean",
+        "mandarin": "Mandarin", "chinese": "Mandarin", "cantonese": "Cantonese",
+        "tagalog": "Tagalog", "filipino": "Tagalog", "spanish": "Spanish",
+        "french": "French", "german": "German", "italian": "Italian",
+        "portuguese": "Portuguese", "russian": "Russian", "arabic": "Arabic",
+        "hindi": "Hindi", "turkish": "Turkish", "greek": "Greek",
+        "dutch": "Dutch", "malay": "Malay", "english": "English",
+    ]
+
+    private static func clean(_ raw: String) -> String {
+        raw.lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+    }
+
+    /// Filler that carries no answer. Stripped so "um, Brisbane I think"
+    /// resolves to Brisbane rather than failing and asking again — which
+    /// is the single most infuriating thing a voice interface does.
+    private static let noise: Set<String> = [
+        "um", "uh", "er", "well", "so", "like", "i", "think", "reckon", "guess",
+        "maybe", "probably", "it's", "its", "it", "is", "the", "a", "we", "we're",
+        "were", "from", "to", "in", "at", "on", "about", "around", "just",
+        "please", "chappy", "let's", "lets", "say", "make", "put",
+    ]
+
+    private static func meat(_ raw: String) -> String {
+        clean(raw).split(separator: " ").map(String.init)
+            .filter { !noise.contains($0) }
+            .joined(separator: " ")
+    }
+
+    // ================================================================ parse
+    /// The value, or nil when the answer genuinely doesn't contain one.
+    /// Nil is not failure — it is the signal to ask a better question.
+    static func parse(_ raw: String, as kind: Kind) -> String? {
+        let c = clean(raw)
+        guard !c.isEmpty else { return nil }
+        switch kind {
+        case .yesNo:
+            if yeses.contains(c) { return "yes" }
+            if nos.contains(c) { return "no" }
+            if yeses.contains(where: { c.hasPrefix($0 + " ") }) { return "yes" }
+            if nos.contains(where: { c.hasPrefix($0 + " ") }) { return "no" }
+            return nil
+
+        case .count:
+            if c.contains("just me") || c.contains("only me") || c.contains("myself") { return "1" }
+            if let n = firstNumber(in: c), n >= 1, n <= 20 { return String(n) }
+            return nil
+
+        case .nights:
+            return nightsIn(c).map(String.init)
+
+        case .money:
+            let digits = c.filter { $0.isNumber || $0 == "." }
+            guard let v = Double(digits), v > 0 else { return nil }
+            // "five grand" and "5k" are how people actually say budgets.
+            if c.contains("grand") || c.hasSuffix("k") { return String(Int(v * 1000)) }
+            return String(Int(v))
+
+        case .date:
+            return dateIn(c)
+
+        case .airport:
+            // BUILD 198 — found in simulation. "bali on the seventh" was
+            // handed to the port table whole and resolved to nothing,
+            // because that is not a place. A spoken answer carries its
+            // neighbours with it, so try the phrase, then every adjacent
+            // pair, then every word — longest first, so "gold coast" wins
+            // over "coast" and "ho chi minh" is never read as "minh".
+            let m = meat(raw)
+            guard m.count >= 2 else { return nil }
+            if let a = ChappyPorts.resolve(place: m) { return a.iata }
+            let words = m.split(separator: " ").map(String.init)
+            if words.count > 1 {
+                for width in stride(from: min(3, words.count), through: 1, by: -1) {
+                    var i = 0
+                    while i + width <= words.count {
+                        let window = words[i..<(i + width)].joined(separator: " ")
+                        if window.count >= 3, let a = ChappyPorts.resolve(place: window) {
+                            return a.iata
+                        }
+                        i += 1
+                    }
+                }
+            }
+            if let a = ChappyPorts.resolve(place: clean(raw)) { return a.iata }
+            return nil
+
+        case .language:
+            let m = meat(raw)
+            if let hit = languages.first(where: { m.contains($0.key) })?.value { return hit }
+            return nil
+
+        case .mode:
+            if c.contains("walk") || c.contains("on foot") { return "walk" }
+            if c.contains("scooter") || c.contains("bike") || c.contains("motorbike") { return "scooter" }
+            if c.contains("grab") || c.contains("gojek") || c.contains("taxi")
+                || c.contains("uber") { return "grab" }
+            if c.contains("driv") || c.contains("car") { return "drive" }
+            return nil
+
+        case .priceBand:
+            if c.contains("cheap") || c.contains("budget") || c.contains("warung")
+                || c.contains("street") { return "cheap" }
+            if c.contains("nice") || c.contains("fancy") || c.contains("smart")
+                || c.contains("splash") || c.contains("special") { return "nice" }
+            if c.contains("mid") || c.contains("normal") || c.contains("anything")
+                || c.contains("whatever") { return "mid" }
+            return nil
+
+        case .span:
+            if c.contains("month") && !c.contains("three") && !c.contains("3") { return "month" }
+            if c.contains("three month") || c.contains("3 month") { return "3 months" }
+            if c.contains("year") { return "year" }
+            if c.contains("ever") || c.contains("all") { return "all time" }
+            return nil
+
+        case .place, .text:
+            let m = meat(raw)
+            guard m.count >= 2 else { return nil }
+            return m.capitalized
+        }
+    }
+
+    // ---------------------------------------------------------------- numbers
+    private static func firstNumber(in c: String) -> Int? {
+        for w in c.split(separator: " ") {
+            if let n = Int(w.filter { $0.isNumber }), !w.filter({ $0.isNumber }).isEmpty { return n }
+        }
+        for (w, n) in numberWords where c == w || c.hasPrefix(w + " ") || c.contains(" " + w) {
+            return n
+        }
+        return nil
+    }
+
+    /// "two months" -> 60, "six weeks" -> 42, "ten days" -> 10.
+    private static func nightsIn(_ c: String) -> Int? {
+        guard let n = firstNumber(in: c) else { return nil }
+        if c.contains("month") { return n * 30 }
+        if c.contains("week") { return n * 7 }
+        if c.contains("night") || c.contains("day") { return n }
+        // A bare number in answer to "how long?" is nights.
+        return n
+    }
+
+    // ---------------------------------------------------------------- dates
+    //
+    // Deliberately refuses the vague. "September" and "next month" return
+    // nil, because a flight search built on a guessed date is worse than
+    // one more question. The blueprint says the same thing in its own
+    // words: never silently guess a date.
+    //
+    private static func dateIn(_ c: String) -> String? {
+        let cal = Calendar.current
+        let now = Date()
+        if c.contains("today") || c.contains("tonight") { return iso(now) }
+        if c.contains("tomorrow") {
+            return cal.date(byAdding: .day, value: 1, to: now).map(iso)
+        }
+        if c.contains("day after tomorrow") {
+            return cal.date(byAdding: .day, value: 2, to: now).map(iso)
+        }
+        // "in three weeks", "in ten days"
+        if c.hasPrefix("in "), let n = firstNumber(in: c) {
+            if c.contains("week") { return cal.date(byAdding: .day, value: n * 7, to: now).map(iso) }
+            if c.contains("day") { return cal.date(byAdding: .day, value: n, to: now).map(iso) }
+            if c.contains("month") { return cal.date(byAdding: .month, value: n, to: now).map(iso) }
+        }
+        // a weekday name -> the next one
+        for (name, index) in weekdays where c.contains(name) {
+            var d = now
+            for _ in 0..<8 {
+                guard let next = cal.date(byAdding: .day, value: 1, to: d) else { break }
+                d = next
+                if cal.component(.weekday, from: d) == index { return iso(d) }
+            }
+        }
+        // a day and a month, in either order
+        guard let hit = months.first(where: { pair in
+            c == pair.key || c.hasPrefix(pair.key + " ")
+                || c.hasSuffix(" " + pair.key) || c.contains(" " + pair.key + " ")
+        }) else { return nil }
+        let month = hit.value
+        guard let day = dayNumber(in: c), day >= 1, day <= 31 else { return nil }
+        var comps = DateComponents()
+        comps.year = cal.component(.year, from: now)
+        comps.month = month
+        comps.day = day
+        guard var d = cal.date(from: comps) else { return nil }
+        // A date already gone means next year — nobody books backwards.
+        if d < cal.startOfDay(for: now) {
+            comps.year = (comps.year ?? 2026) + 1
+            guard let next = cal.date(from: comps) else { return nil }
+            d = next
+        }
+        return iso(d)
+    }
+
+    /// The day number, ignoring anything that is obviously a year.
+    private static func dayNumber(in c: String) -> Int? {
+        for w in c.split(separator: " ") {
+            let digits = w.filter { $0.isNumber }
+            guard !digits.isEmpty, let n = Int(digits) else { continue }
+            if n >= 1 && n <= 31 { return n }
+        }
+        for (w, n) in numberWords where n >= 1 && n <= 31 {
+            if c.contains(w) { return n }
+        }
+        return nil
+    }
+
+    private static func iso(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: d)
+    }
+
+    /// "2026-09-07" -> "Monday 7 September". Spoken form, not a form field.
+    static func spokenDate(_ iso: String) -> String {
+        let inF = DateFormatter()
+        inF.locale = Locale(identifier: "en_US_POSIX")
+        inF.dateFormat = "yyyy-MM-dd"
+        guard let d = inF.date(from: iso) else { return iso }
+        let out = DateFormatter()
+        out.dateFormat = "EEEE d MMMM"
+        return out.string(from: d)
+    }
+
+    // ================================================================ model
+    //
+    // Only reached when the local parsers have said nil twice. One tiny
+    // call, one value back, no prose. If there's no signal it returns nil
+    // and the flow asks a plainer question — which is the correct
+    // behaviour on a bus in Laos, and the reason the local tier exists.
+    //
+    static func modelParse(_ raw: String, as kind: Kind, question: String) async -> String? {
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty, raw.count > 1,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+
+        let want: String
+        switch kind {
+        case .date:     want = "a single calendar date as yyyy-MM-dd. If the answer names no specific day, return null."
+        case .airport:  want = "the city or airport name in plain words, nothing else."
+        case .count:    want = "a whole number of people as digits."
+        case .nights:   want = "a whole number of nights as digits."
+        case .money:    want = "a whole number, no currency symbol, no commas."
+        case .yesNo:    want = "exactly \"yes\" or \"no\"."
+        case .language: want = "the language name in English."
+        case .place:    want = "the place name in plain words."
+        case .text:     want = "the answer in plain words."
+        case .mode:     want = "exactly one of: walk, drive, scooter, grab."
+        case .priceBand:want = "exactly one of: cheap, mid, nice."
+        case .span:     want = "exactly one of: month, 3 months, year, all time."
+        }
+        let prompt = """
+        You are extracting ONE value from a spoken answer. Today is \(iso(Date())).
+        The question asked was: "\(question)"
+        Reply with ONLY a JSON object: {"value": ...}
+        value must be \(want)
+        If the answer does not contain the value, return {"value": null}. Never guess.
+        """
+        let body: [String: Any] = [
+            "systemInstruction": ["parts": [["text": prompt]]],
+            "contents": [["role": "user", "parts": [["text": raw]]]],
+            "generationConfig": [
+                "temperature": 0,
+                "maxOutputTokens": 400,
+                "responseMimeType": "application/json",
+            ],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 4
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let text = parts.first?["text"] as? String,
+              let d = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+        else { return nil }
+
+        if let sv = obj["value"] as? String, !sv.isEmpty, sv.lowercased() != "null" {
+            // An airport still has to resolve against our own table — the
+            // model names a city, the table decides what that means.
+            if kind == .airport { return ChappyPorts.resolve(place: sv)?.iata }
+            return sv
+        }
+        if let nv = obj["value"] as? Int { return String(nv) }
+        return nil
+    }
+}
+
+// =====================================================================
+// MARK: - THE TOOL REGISTRY (Build 197)
+// =====================================================================
+//
+// Every screen that can hold a conversation declares what it needs, in
+// one place, in a form something else can read. That is the whole point
+// of a registry: adding a tool must not mean editing a prompt string in
+// one file and a switch statement in another and hoping they agree.
+//
+// What a tool does NOT declare is how it works. It declares what it
+// needs and what it is called. The screen behind it stays exactly as it
+// was — the reliable specialist worker, unchanged.
+//
+struct ChappySlot {
+    let id: String
+    /// Asked out loud, so it has to sound like a person. "Where are you
+    /// flying from?" — not "Origin".
+    let ask: String
+    let kind: ChappySlots.Kind
+    /// Optional slots are offered once and never chased.
+    var optional = false
+    /// Where a sensible default comes from, so Chappy stops asking
+    /// questions it already knows the answer to. The blueprint calls
+    /// this out specifically and it is the difference between an
+    /// interview and an interrogation.
+    var prefill: Prefill = .none
+
+    /// BUILD 200: the profile holds a dozen things about how he travels
+    /// and the interview read four of them. Cabin, style, diet and the
+    /// airlines he actually flies were sitting there being ignored while
+    /// Chappy asked questions it already had answers to.
+    enum Prefill {
+        case none, homeAirport, party, oneWay, homeCurrency
+        case cabin, style, diet, airlines, nationality
+    }
+}
+
+struct ChappyTool {
+    let id: String
+    let title: String
+    /// The screen to put on the phone while the conversation runs.
+    let screen: Notification.Name?
+    /// What Chappy says as the interview opens.
+    let opening: String
+    let slots: [ChappySlot]
+    /// search  — no consequences, run it.
+    /// act     — changes something of his; confirm first.
+    /// destruct— deletes something; confirm, always, explicitly.
+    let permission: Permission
+
+    enum Permission { case search, act, destructive }
+}
+
+enum ChappyRegistry {
+
+    static let tools: [ChappyTool] = [
+
+        ChappyTool(
+            id: "flights",
+            title: "Flights",
+            screen: .chappyOpenFlights,
+            opening: "Flights.",
+            slots: [
+                ChappySlot(id: "from", ask: "Where are you flying from?",
+                           kind: .airport, prefill: .homeAirport),
+                ChappySlot(id: "to", ask: "And where to?", kind: .airport),
+                ChappySlot(id: "when", ask: "What day?", kind: .date),
+                ChappySlot(id: "party", ask: "How many of you?",
+                           kind: .count, prefill: .party),
+                ChappySlot(id: "oneway", ask: "One-way, as usual?",
+                           kind: .yesNo, prefill: .oneWay),
+                // BUILD 200: filled from the profile and therefore never
+                // asked. It exists so the summary and the search carry it.
+                ChappySlot(id: "cabin", ask: "Which cabin?", kind: .text,
+                           optional: true, prefill: .cabin),
+                ChappySlot(id: "airlines", ask: "Any airline preference?", kind: .text,
+                           optional: true, prefill: .airlines),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "travel",
+            title: "Travel desk",
+            screen: .chappyOpenTravel,
+            opening: "Travel desk.",
+            slots: [
+                ChappySlot(id: "to", ask: "Where are you thinking?", kind: .place),
+                ChappySlot(id: "nights", ask: "How long for?", kind: .nights),
+                ChappySlot(id: "when", ask: "Starting when?", kind: .date, optional: true),
+                ChappySlot(id: "party", ask: "How many of you?",
+                           kind: .count, prefill: .party),
+                ChappySlot(id: "budget", ask: "Working to a budget?",
+                           kind: .money, optional: true),
+                ChappySlot(id: "style", ask: "What sort of trip?", kind: .text,
+                           optional: true, prefill: .style),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "visas",
+            title: "Visas",
+            screen: .chappyOpenVisa,
+            opening: "Visas.",
+            slots: [
+                ChappySlot(id: "country", ask: "Which country?", kind: .place),
+                ChappySlot(id: "nights", ask: "How long are you staying?", kind: .nights),
+                // Never asked. A visa answer that ignores which passport
+                // you hold is not an answer.
+                ChappySlot(id: "passport", ask: "Which passport?", kind: .text,
+                           optional: true, prefill: .nationality),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "currency",
+            title: "Currency",
+            screen: .chappyOpenFX,
+            opening: "Currency.",
+            slots: [
+                ChappySlot(id: "amount", ask: "How much?", kind: .money),
+                ChappySlot(id: "currency", ask: "In what?", kind: .text,
+                           prefill: .homeCurrency),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "translate",
+            title: "Translate",
+            screen: .chappyOpenTranslate,
+            opening: "Translate.",
+            slots: [
+                ChappySlot(id: "language", ask: "Into what language?", kind: .language),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "weather",
+            title: "Weather",
+            screen: .chappyOpenWeather,
+            opening: "Weather.",
+            slots: [
+                ChappySlot(id: "where", ask: "Where?", kind: .place, optional: true),
+            ],
+            permission: .search),
+
+        // =============================================================
+        // BUILD 199 — THE REST OF THEM.
+        //
+        // The engine never knew anything about flights; it reads what a
+        // tool declares. So most of this is data. Two rules held while
+        // writing it:
+        //
+        //   * NEVER more than three questions before something happens.
+        //     Five questions to find lunch is worse than none. Almost
+        //     everything below is one or two, and the rest are optional.
+        //   * Some things must NEVER be interviewed. Emergency, stop,
+        //     cancel and close are absent from this list on purpose and
+        //     stay in the ladder above, where they fire instantly. An
+        //     assistant that asks a follow-up question during an
+        //     emergency is worse than no assistant.
+        // =============================================================
+
+        ChappyTool(
+            id: "navigate",
+            title: "Navigation",
+            screen: nil,                     // this one acts, it doesn't open
+            opening: "Right.",
+            slots: [
+                ChappySlot(id: "to", ask: "Where to?", kind: .place),
+                ChappySlot(id: "mode", ask: "Walking, riding, or a car?", kind: .mode),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "food",
+            title: "Somewhere to eat",
+            screen: nil,
+            opening: "Right.",
+            slots: [
+                ChappySlot(id: "kind", ask: "What are you after?", kind: .text),
+                ChappySlot(id: "price", ask: "Cheap, middling, or somewhere nice?",
+                           kind: .priceBand, optional: true),
+                ChappySlot(id: "near", ask: "Near you?", kind: .place, optional: true),
+                ChappySlot(id: "diet", ask: "Anything you're avoiding?", kind: .text,
+                           optional: true, prefill: .diet),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "attractions",
+            title: "Something to do",
+            screen: nil,
+            opening: "Right.",
+            slots: [
+                ChappySlot(id: "kind", ask: "What sort of thing?", kind: .text),
+                ChappySlot(id: "near", ask: "Around here?", kind: .place, optional: true),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "reminders",
+            title: "Reminders",
+            screen: .chappyOpenReminders,
+            opening: "Reminders.",
+            slots: [
+                ChappySlot(id: "what", ask: "Remind you to do what?", kind: .text),
+                ChappySlot(id: "when", ask: "When?", kind: .date),
+            ],
+            permission: .act),        // it writes something of his — §10
+
+        ChappyTool(
+            id: "dictate",
+            title: "Dictate",
+            screen: .chappyOpenDictate,
+            opening: "Dictate.",
+            slots: [
+                // A note, an email and a message want different cleanups,
+                // and asking once is cheaper than fixing it afterwards.
+                ChappySlot(id: "purpose", ask: "A note, an email, or a message?",
+                           kind: .text, optional: true),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "memory",
+            title: "Memory",
+            screen: .chappyOpenMemory,
+            opening: "Memory.",
+            slots: [
+                ChappySlot(id: "what", ask: "What are you looking for?", kind: .text),
+                ChappySlot(id: "span", ask: "Over what period?", kind: .span, optional: true),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "search",
+            title: "Look it up",
+            screen: .chappyOpenSearch,
+            opening: "Look it up.",
+            slots: [
+                ChappySlot(id: "question", ask: "What do you want to know?", kind: .text),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "atlas",
+            title: "Atlas",
+            screen: .chappyOpenAtlasMap,
+            opening: "Atlas.",
+            slots: [
+                ChappySlot(id: "span", ask: "How far back?", kind: .span, optional: true),
+            ],
+            permission: .search),
+
+        ChappyTool(
+            id: "briefs",
+            title: "Briefs",
+            screen: .chappyOpenBriefs,
+            opening: "Briefs.",
+            slots: [],
+            permission: .search),
+
+        ChappyTool(
+            id: "upcoming",
+            title: "Upcoming",
+            screen: .chappyOpenUpcoming,
+            opening: "Upcoming.",
+            slots: [],
+            permission: .search),
+
+        ChappyTool(
+            id: "options",
+            title: "Trip options",
+            screen: .chappyOpenOptions,
+            opening: "Trip options.",
+            slots: [],
+            permission: .search),
+    ]
+
+    /// BUILD 199 — the never-interview list, written down so it survives
+    /// the next person who adds a tool. These are answered by the ladder
+    /// long before anything here runs, and nothing in the registry may
+    /// ever claim them.
+    static let neverInterviewed: Set<String> = [
+        "emergency", "sos", "stop", "cancel", "close", "chappy reset",
+    ]
+
+    static func tool(id: String) -> ChappyTool? { tools.first { $0.id == id } }
+
+    /// AUDIT (200): every required slot present. Used to decide whether a
+    /// confirmed plan can run straight away or still owes questions —
+    /// without it, saying "yes" to "did you mean somewhere to eat?" ran a
+    /// search for the word "food" instead of asking what he wanted.
+    static func isComplete(_ t: ChappyTool, _ values: [String: String]) -> Bool {
+        t.slots.allSatisfy { $0.optional || !(values[$0.id] ?? "").isEmpty }
+    }
+
+    static func tool(forScreen n: Notification.Name?) -> ChappyTool? {
+        guard let n else { return nil }
+        // BUILD 199: navigate and food have no screen of their own, so
+        // the matcher hands over a placeholder name. Map it here rather
+        // than giving them a screen they don't have.
+        if n == .chappyOpenFood { return tool(id: "food") }
+        if n == .chappyOpenAttractions { return tool(id: "attractions") }
+        return tools.first { $0.screen == n }
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY FLOW (Build 197) — THE INTERVIEW
+// =====================================================================
+//
+// One engine, every tool. It asks for what is missing and nothing else,
+// takes answers in any order, fills what it already knows from the
+// profile, and gets out of the way the moment the sentence stops being
+// an answer.
+//
+// Three rules it will not bend:
+//
+//   * It never invents a value. A vague date gets another question, not
+//     a guess — a flight search built on the wrong day is worse than an
+//     extra sentence.
+//   * It never traps you. Any recognised command, and any of the exit
+//     words, ends the interview immediately.
+//   * It expires. Ninety seconds of silence and the interview is over,
+//     because a half-finished conversation you have forgotten about is
+//     a trap of a different kind.
+//
+final class ChappyFlow {
+
+    static let shared = ChappyFlow()
+    private init() {}
+
+    enum Outcome {
+        case say(String)
+        case finished(String, ChappyTool, [String: String])
+        case cancelled(String)
+        /// Not an answer at all — hand it back to the router untouched.
+        case passthrough
+    }
+
+    private(set) var tool: ChappyTool?
+    private(set) var values: [String: String] = [:]
+    private var currentSlot: String?
+    private var lastTouched = Date.distantPast
+    private var misses = 0
+    /// BUILD 202: the slot whose guessed value is waiting on a yes.
+    private var awaitingConfirm: String?
+
+    private static let lifetime: TimeInterval = 90
+
+    var isActive: Bool {
+        guard tool != nil else { return false }
+        if Date().timeIntervalSince(lastTouched) < Self.lifetime { return true }
+        // BUILD 203: the window closed. Park it on the way out rather than
+        // letting it evaporate — this is case 4, and it is the one that
+        // felt worst.
+        park()
+        return false
+    }
+
+    private static let exits: Set<String> = [
+        "stop", "cancel", "never mind", "nevermind", "forget it", "leave it",
+        "quit", "done", "that's enough", "thats enough", "not now", "later",
+    ]
+
+    // ---------------------------------------------------------------- start
+    func start(_ t: ChappyTool, from utterance: String) -> String {
+        // AUDIT (199): the never-interview list existed as a comment with
+        // a Set attached and nothing ever read it. Documentation that the
+        // code does not consult is a promise, not a guarantee.
+        let bare = utterance.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if ChappyRegistry.neverInterviewed.contains(bare) {
+            cancel()
+            return ""
+        }
+        tool = t
+        values = [:]
+        misses = 0
+        lastTouched = Date()
+
+        // Anything already said counts. "Chappy, flights to Bali on the
+        // seventh" should not then be asked where he's going.
+        harvest(utterance, into: t)
+        applyPrefills(t)
+
+        guard let next = nextSlot(t) else {
+            // Everything was already known. Say it back and act — this
+            // path used to announce "running it" and then run nothing.
+            let v = values
+            tool = nil; currentSlot = nil; values = [:]
+            deliver(tool: t, values: v)
+            return "\(t.opening) \(Self.summary(t, v)) Running it."
+        }
+        currentSlot = next.id
+        return "\(t.opening) \(next.ask)"
+    }
+
+    /// BUILD 198: start an interview that already knows some answers —
+    /// the planner having lifted them out of the sentence. Same rules;
+    /// it simply has less to ask.
+    func startWith(_ t: ChappyTool, values known: [String: String]) -> String {
+        tool = t
+        values = [:]
+        misses = 0
+        lastTouched = Date()
+        for (k, v) in known where t.slots.contains(where: { $0.id == k }) {
+            // An airport arrives as a city name from the model and has to
+            // survive our own table before it counts.
+            if t.slots.first(where: { $0.id == k })?.kind == .airport {
+                if let a = ChappyPorts.resolve(place: v) { values[k] = a.iata }
+            } else {
+                values[k] = v
+            }
+        }
+        applyPrefills(t)
+        guard let next = nextSlot(t) else {
+            let v = values
+            tool = nil; currentSlot = nil; values = [:]
+            deliver(tool: t, values: v)
+            var line = "\(Self.summary(t, v)) Running it."
+            if let n = ChappyNext.after(t.id, values: v) { line += " \(n)" }
+            return line
+        }
+        currentSlot = next.id
+        return "\(t.opening) \(next.ask)"
+    }
+
+    // ---------------------------------------------------------------- answer
+    func answer(_ raw: String) async -> Outcome {
+        guard let t = tool else { return .passthrough }
+        let c = raw.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+
+        if Self.exits.contains(c) {
+            // An explicit exit is a decision. Nothing is kept.
+            dropEverything()
+            return .cancelled("Dropped it.")
+        }
+        // A different screen named out loud is a new instruction, not an
+        // answer. Let the router have it — being mid-interview must never
+        // mean you cannot change your mind.
+        if let other = ChappyTiles.match(c), ChappyRegistry.tool(forScreen: other.note)?.id != t.id {
+            // BUILD 203: parked, not binned. He changed subject; he did not
+            // say the first thing no longer matters.
+            park()
+            return .passthrough
+        }
+
+        lastTouched = Date()
+
+        // BUILD 200 — §7's missing half: CHANGING YOUR MIND.
+        //
+        // The document asks for "same as last time", "add one more
+        // person" and "change the destination" without restarting the
+        // workflow. Until now every one of those was treated as an answer
+        // to whatever question was on the table, which is how a
+        // conversation turns into a form you cannot edit.
+        if let out = amend(c, t) { return out }
+
+        guard let slotID = currentSlot, let slot = t.slots.first(where: { $0.id == slotID }) else {
+            cancel()
+            return .passthrough
+        }
+
+        var got = ChappySlots.parse(raw, as: slot.kind)
+        // Everything else he happened to mention lands too.
+        harvest(raw, into: t, excluding: slot.id)
+
+        var fromModel = false
+        if got == nil, misses >= 1 {
+            got = await ChappySlots.modelParse(raw, as: slot.kind, question: slot.ask)
+            fromModel = got != nil
+        }
+
+        // BUILD 202 — Alexa's rule, and it is a good one: confirm a slot
+        // only when getting it wrong would be expensive. Rather than a
+        // fixed list of "important" slots, confirm the ones that were
+        // GUESSED — a local parse of "Brisbane" or "the seventh" is
+        // deterministic and does not need checking, and a model's reading
+        // of "early September-ish" very much does.
+        if fromModel, let v = got, slot.kind == .date || slot.kind == .airport {
+            let readable = slot.kind == .date ? ChappySlots.spokenDate(v)
+                                              : (ChappyPorts.byIATA(v)?.city ?? v)
+            values[slot.id] = v
+            currentSlot = slot.id
+            awaitingConfirm = slot.id
+            return .say("\(readable) — right?")
+        }
+
+        // The answer to that confirmation.
+        if let pendingSlot = awaitingConfirm {
+            awaitingConfirm = nil
+            if ChappySlots.parse(raw, as: .yesNo) == "no" {
+                values[pendingSlot] = nil
+                currentSlot = pendingSlot
+                misses = 0
+                return .say(t.slots.first(where: { $0.id == pendingSlot })
+                                .map { Self.retry($0, attempt: 2) } ?? "Again?")
+            }
+            if ChappySlots.parse(raw, as: .yesNo) == "yes" { return advance(t) }
+            // Not yes or no — treat it as a fresh answer to the same slot.
+        }
+
+        guard let value = got else {
+            misses += 1
+            if slot.optional {
+                values[slot.id] = ""          // offered once, never chased
+                return advance(t)
+            }
+            if misses >= 3 {
+                cancel()
+                return .cancelled("Let's come back to that one.")
+            }
+            return .say(Self.retry(slot, attempt: misses))
+        }
+
+        misses = 0
+        values[slot.id] = value
+        return advance(t)
+    }
+
+    /// The words people say when they are editing rather than answering.
+    /// Nil means "this is a normal answer, carry on".
+    private func amend(_ c: String, _ t: ChappyTool) -> Outcome? {
+
+        // "same as usual" — take every default there is and stop asking
+        // about the optional ones. This is the single most common thing a
+        // regular traveller says and it used to be parsed as a place name.
+        if ["same", "same as usual", "as usual", "usual", "same as last time",
+            "the usual", "like last time", "same again"].contains(c) {
+            applyPrefills(t)
+            for slot in t.slots where slot.optional && values[slot.id] == nil {
+                values[slot.id] = ""
+            }
+            return advance(t)
+        }
+
+        if ["start again", "start over", "from the top", "scrap that"].contains(c) {
+            let again = t
+            cancel()
+            return .say(startWith(again, values: [:]))
+        }
+
+        // "add one more", "one less", "make it four"
+        if c.contains("one more") || c.contains("another one") || c.contains("one less")
+            || c.hasPrefix("make it ") || c.hasPrefix("change it to ") {
+            if let partySlot = t.slots.first(where: { $0.kind == .count }) {
+                let current = Int(values[partySlot.id] ?? "") ?? ChappyProfile.shared.party
+                var updated: Int?
+                if c.contains("one more") || c.contains("another one") { updated = current + 1 }
+                if c.contains("one less"), current > 1 { updated = current - 1 }
+                if let n = updated {
+                    values[partySlot.id] = String(n)
+                    // AUDIT (200): this returned "3 of you." plus whatever
+                    // nextAsk gave, and nextAsk returns an empty string when
+                    // there is nothing left to ask — so amending the last
+                    // slot acknowledged the change and then sat there
+                    // forever. Acknowledge, then carry on properly.
+                    switch advance(t) {
+                    case .say(let q):
+                        return .say("\(n) of you. \(q)")
+                    case .finished(let line, let tool, let vals):
+                        return .finished("\(n) of you. \(line)", tool, vals)
+                    case let other:
+                        return other
+                    }
+                }
+            }
+            // "make it X" with no count slot is a correction to whatever is
+            // on the table — fall through and let it be parsed as one.
+            return nil
+        }
+
+        // "change the destination to Bali", "make the date the ninth"
+        let named: [(String, [String])] = [
+            ("to", ["destination", "where we're going", "where im going", "where i'm going"]),
+            ("from", ["origin", "departure", "where we're leaving", "start"]),
+            ("when", ["date", "day", "when"]),
+            ("nights", ["length", "how long", "nights"]),
+            ("party", ["people", "party", "how many", "travellers"]),
+            ("budget", ["budget", "money", "spend"]),
+            ("country", ["country"]),
+            ("language", ["language"]),
+        ]
+        guard c.hasPrefix("change") || c.hasPrefix("actually") || c.hasPrefix("no ")
+                || c.hasPrefix("no,") || c.hasPrefix("i meant") else { return nil }
+
+        for (slotID, words) in named {
+            guard t.slots.contains(where: { $0.id == slotID }),
+                  words.contains(where: { c.contains($0) }) else { continue }
+            guard let slot = t.slots.first(where: { $0.id == slotID }) else { continue }
+            // Everything after the last "to" is the new value; failing that,
+            // hand the whole sentence to the parser and let it find one.
+            let tailStart = c.range(of: " to ", options: .backwards)?.upperBound
+            let tail = tailStart.map { String(c[$0...]) } ?? c
+            if let v = ChappySlots.parse(tail, as: slot.kind) {
+                values[slotID] = v
+                currentSlot = nil
+                return advance(t)
+            }
+            values[slotID] = nil
+            currentSlot = slotID
+            return .say(slot.ask)
+        }
+
+        // "actually, Bali" — a correction to the slot currently on the
+        // table, with the correction word stripped off the front.
+        if let slotID = currentSlot, let slot = t.slots.first(where: { $0.id == slotID }) {
+            var tail = c
+            for lead in ["actually ", "no, ", "no ", "i meant ", "change it to ", "change "] {
+                if tail.hasPrefix(lead) { tail = String(tail.dropFirst(lead.count)); break }
+            }
+            if let v = ChappySlots.parse(tail, as: slot.kind) {
+                values[slotID] = v
+                return advance(t)
+            }
+        }
+        return nil
+    }
+
+    private func advance(_ t: ChappyTool) -> Outcome {
+        guard let next = nextSlot(t) else {
+            let v = values
+            // BUILD 198 — §9. ONE suggestion, only when it follows
+            // obviously, never the same one twice running.
+            var line = "\(Self.summary(t, v)) Running it."
+            if let n = ChappyNext.after(t.id, values: v) { line += " \(n)" }
+            tool = nil; currentSlot = nil; values = [:]
+            return .finished(line, t, v)
+        }
+        currentSlot = next.id
+        return .say(next.ask)
+    }
+
+    // BUILD 203 — SOMEWHERE TO PUT AN INTERRUPTED CONVERSATION.
+    //
+    // §12 asks for enough state to resume an interrupted workflow. Three
+    // of the fifteen heavy workflows died for want of exactly this, and
+    // the worst of them is the ordinary one: you start a flight search,
+    // you get on a scooter, ninety seconds pass, and the answer you give
+    // lands in an empty room.
+    //
+    // Parked, not saved. It lives for twenty minutes in memory and never
+    // touches disk — a half-finished conversation you have forgotten
+    // about is its own kind of trap, and one you find again next week is
+    // worse than none.
+    private struct Parked {
+        let tool: ChappyTool
+        let values: [String: String]
+        let slot: String?
+        let at: Date
+    }
+    private var parked: Parked?
+    private static let parkLife: TimeInterval = 1200
+
+    /// True when there is something to come back to.
+    var hasParked: Bool {
+        guard let p = parked else { return false }
+        return Date().timeIntervalSince(p.at) < Self.parkLife
+    }
+
+    var parkedTitle: String? { hasParked ? parked?.tool.title : nil }
+
+    /// Set aside rather than thrown away. Called when something else
+    /// takes over and when the window expires — NOT when he says "never
+    /// mind", because that is a decision and it deserves respect.
+    func park() {
+        guard let t = tool, !values.isEmpty else { cancel(); return }
+        parked = Parked(tool: t, values: values, slot: currentSlot, at: Date())
+        tool = nil; currentSlot = nil; values = [:]; misses = 0
+        awaitingConfirm = nil
+        lastTouched = .distantPast
+    }
+
+    /// Pick it up where it stopped. Returns what to say, or nil.
+    func resume() -> String? {
+        guard hasParked, let p = parked else { return nil }
+        parked = nil
+        tool = p.tool
+        values = p.values
+        currentSlot = p.slot
+        misses = 0
+        awaitingConfirm = nil
+        lastTouched = Date()
+        guard let next = nextSlot(p.tool) else {
+            let v = values
+            tool = nil; currentSlot = nil; values = [:]
+            deliver(tool: p.tool, values: v)
+            return "Picking that back up. \(Self.summary(p.tool, v)) Running it."
+        }
+        currentSlot = next.id
+        // Say what it already has, so he is not made to remember it.
+        let so_far = Self.summary(p.tool, values)
+        return "Picking that back up — \(so_far) \(next.ask)"
+    }
+
+    /// Resume only if the parked interview is the tool being asked for.
+    /// Saying "flights" again should continue, not start over.
+    func resumeIfMatches(_ t: ChappyTool) -> String? {
+        guard hasParked, parked?.tool.id == t.id else { return nil }
+        return resume()
+    }
+
+    func cancel() {
+        tool = nil; currentSlot = nil; values = [:]; misses = 0
+        awaitingConfirm = nil
+        lastTouched = .distantPast
+    }
+
+    /// An explicit "never mind" clears the park too. He said no.
+    func dropEverything() {
+        parked = nil
+        cancel()
+    }
+
+    // ---------------------------------------------------------------- helpers
+    private func nextSlot(_ t: ChappyTool) -> ChappySlot? {
+        t.slots.first { values[$0.id] == nil }
+    }
+
+    /// Pull anything the sentence already answers. Only fills slots that
+    /// are still empty, and only when the parse is unambiguous — a
+    /// harvest that guesses is worse than no harvest at all.
+    private func harvest(_ utterance: String, into t: ChappyTool, excluding: String? = nil) {
+        // "brisbane to bali" — the word "to" is the only reliable divider
+        // in a spoken route, and it is worth handling explicitly because
+        // it is how everyone says it.
+        let low = utterance.lowercased()
+        if t.slots.contains(where: { $0.id == "from" }), values["from"] == nil,
+           let r = low.range(of: " to ") {
+            let head = String(low[low.startIndex..<r.lowerBound])
+            let tail = String(low[r.upperBound...])
+            if let a = ChappySlots.parse(head, as: .airport) { values["from"] = a }
+            if values["to"] == nil, let b = ChappySlots.parse(tail, as: .airport) { values["to"] = b }
+        }
+        for slot in t.slots where values[slot.id] == nil && slot.id != excluding {
+            switch slot.kind {
+            case .date, .nights, .count, .money, .language:
+                if let v = ChappySlots.parse(utterance, as: slot.kind) { values[slot.id] = v }
+            default:
+                break   // never harvest free text — too easy to be wrong
+            }
+        }
+    }
+
+    private func applyPrefills(_ t: ChappyTool) {
+        for slot in t.slots where values[slot.id] == nil {
+            switch slot.prefill {
+            case .none: break
+            case .homeAirport:
+                let p = ChappyProfile.shared
+                if !p.homeAirport.isEmpty { values[slot.id] = p.homeAirport }
+                else if !p.homeCity.isEmpty,
+                        let a = ChappyPorts.resolve(place: p.homeCity) { values[slot.id] = a.iata }
+            case .party:
+                values[slot.id] = String(ChappyProfile.shared.party)
+            case .oneWay:
+                values[slot.id] = "yes"
+            case .homeCurrency:
+                values[slot.id] = ChappyFX.shared.home
+            case .cabin:
+                let v = ChappyProfile.shared.data.cabinPreference
+                if !v.isEmpty { values[slot.id] = v }
+            case .style:
+                let v = ChappyProfile.shared.data.styleLevel
+                if !v.isEmpty { values[slot.id] = v }
+            case .diet:
+                let v = ChappyProfile.shared.data.dietary
+                if !v.isEmpty { values[slot.id] = v }
+            case .airlines:
+                let v = ChappyProfile.shared.data.preferredAirlines
+                if !v.isEmpty { values[slot.id] = v.joined(separator: ", ") }
+            case .nationality:
+                let v = ChappyProfile.shared.data.nationality
+                if !v.isEmpty { values[slot.id] = v }
+            }
+        }
+    }
+
+    /// A second attempt should not be the same question louder. It should
+    /// be a narrower question.
+    private static func retry(_ slot: ChappySlot, attempt: Int) -> String {
+        switch slot.kind {
+        case .date:     return attempt == 1 ? "Which day exactly?" : "Give me a date — the seventh of September, say."
+        case .airport:  return attempt == 1 ? "Which city?" : "Say the city or the airport code."
+        case .count:    return "How many people?"
+        case .nights:   return "How many nights?"
+        case .money:    return "Roughly how much?"
+        case .yesNo:    return "Yes or no?"
+        case .language: return "Which language?"
+        case .mode:     return "Walking, riding, or a car?"
+        case .priceBand:return "Cheap, middling, or somewhere nice?"
+        case .span:     return "Over what — a month, three months, a year?"
+        default:        return slot.ask
+        }
+    }
+
+    /// Read the whole thing back before acting. Cheap, and it catches a
+    /// misheard destination before it becomes a search for the wrong
+    /// country.
+    static func summary(_ t: ChappyTool, _ v: [String: String]) -> String {
+        switch t.id {
+        case "flights":
+            var bits: [String] = []
+            // Read back CITIES, not codes. "BNE to DPS" is a booking
+            // reference; "Brisbane to Bali" is what he said and what he
+            // can check. The codes still go to the search.
+            if let f = v["from"], let to = v["to"] {
+                let fc = ChappyPorts.byIATA(f)?.city ?? f
+                let tc = ChappyPorts.byIATA(to)?.city ?? to
+                bits.append("\(fc) to \(tc)")
+            }
+            if let d = v["when"], !d.isEmpty { bits.append(ChappySlots.spokenDate(d)) }
+            if let p = v["party"], p != "1" { bits.append("\(p) of you") }
+            if v["oneway"] == "yes" { bits.append("one-way") }
+            return bits.isEmpty ? "Flights." : bits.joined(separator: ", ") + "."
+        case "travel":
+            var bits: [String] = []
+            if let to = v["to"] { bits.append(to) }
+            if let n = v["nights"], !n.isEmpty { bits.append("\(n) nights") }
+            if let b = v["budget"], !b.isEmpty { bits.append("around \(b)") }
+            return bits.isEmpty ? "Travel desk." : bits.joined(separator: ", ") + "."
+        case "reminders":
+            let what = v["what"] ?? "that"
+            let when = v["when"].map { ChappySlots.spokenDate($0) } ?? "later"
+            return "Remind you to \(what.lowercased()) on \(when)."
+        case "navigate":
+            return "\(v["to"] ?? "there"), \(v["mode"] ?? "walking")."
+        case "food", "attractions":
+            return [v["price"], v["kind"]].compactMap { $0 }.joined(separator: " ") + "."
+        case "visas":
+            let where_ = v["country"] ?? ""
+            let n = v["nights"] ?? ""
+            return n.isEmpty ? "\(where_)." : "\(where_), \(n) nights."
+        default:
+            return t.title + "."
+        }
+    }
+
+    /// Hand the finished set to whoever can act on it. The flow gathers;
+    /// the screen executes. Keeping those apart is what stops the
+    /// conversation layer from quietly becoming the app.
+    func deliver(tool: ChappyTool, values: [String: String]) {
+        var info: [String: Any] = ["tool": tool.id]
+        for (k, val) in values { info[k] = val }
+        NotificationCenter.default.post(name: .chappyFlowResult, object: nil, userInfo: info)
+        if let screen = tool.screen {
+            NotificationCenter.default.post(name: screen, object: nil, userInfo: info)
+        }
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY RESULT (Build 198) — ONE SHAPE FOR EVERY ANSWER
+// =====================================================================
+//
+// Blueprint §11: every agent returns a predictable structured result,
+// and the assistant summarises, compares and recommends rather than
+// dumping raw output.
+//
+// The important line in that section is the last one — always clearly
+// distinguish facts from recommendations. Chappy's travel reports have
+// done that from the start (findings in one colour, the verdict in
+// another, "we think" never dressed as "it is"). This brings the same
+// discipline to everything spoken.
+//
+struct ChappyResult {
+
+    struct Option {
+        let title: String
+        let subtitle: String
+        /// 0-100. Comparable ONLY within one result set.
+        let score: Int
+        /// Why this one, in the wearer's terms. Never a number on its own.
+        let why: String
+        // BUILD 203: the raw facts the ranking used, kept so it can
+        // explain itself. A recommendation that cannot say why it beat
+        // the obvious answer is asking to be trusted rather than
+        // believed, and the obvious answer here is always the biggest
+        // number of stars.
+        var stars: Double = 0
+        var reviews: Int = 0
+        var open: Bool?
+        var metres: Double?
+    }
+
+    let toolID: String
+    let ok: Bool
+    /// One sentence, spoken. This is the whole answer for someone with
+    /// the phone in a pocket.
+    let headline: String
+    /// The longer version, for the screen.
+    let detail: String
+    /// Ranked best-first. Empty is fine and means "nothing to choose".
+    let options: [Option]
+    let error: String?
+
+    static func failed(_ toolID: String, _ why: String) -> ChappyResult {
+        ChappyResult(toolID: toolID, ok: false,
+                     headline: why, detail: "", options: [], error: why)
+    }
+
+    /// BUILD 203 — WHY THE OBVIOUS ANSWER LOST.
+    ///
+    /// If something in the list has visibly more stars than the winner,
+    /// the wearer will notice on screen and conclude the ranking is
+    /// broken. It is not — it is weighting evidence, opening hours and
+    /// distance — but silence is indistinguishable from a bug.
+    ///
+    /// One clause, only when there IS a higher-rated option, and only
+    /// naming the fact that actually decided it.
+    static func defence(_ options: [Option]) -> String {
+        guard let winner = options.first, options.count > 1 else { return "" }
+        let better = options.dropFirst().max(by: { $0.stars < $1.stars })
+        guard let b = better, b.stars > winner.stars + 0.15 else { return "" }
+        let rounded = String(format: "%.1f", b.stars)
+        if b.open == false {
+            return " The \(rounded) is closed."
+        }
+        if b.reviews > 0, b.reviews < 60, winner.reviews >= b.reviews * 3 {
+            return " The \(rounded) only has \(b.reviews) reviews."
+        }
+        if let bm = b.metres, let wm = winner.metres, bm > wm * 2.5, bm > 900 {
+            return " The \(rounded) is \(String(format: "%.1f", bm / 1000)) km away."
+        }
+        if b.reviews > 0, b.reviews < 60 {
+            return " The \(rounded) only has \(b.reviews) reviews."
+        }
+        return ""
+    }
+
+    /// What gets said out loud. Best option, why, and how many others —
+    /// never a list read aloud, because nobody can hold six flights in
+    /// their head at a bus stop.
+    var spoken: String {
+        guard ok else { return headline }
+        guard let best = options.first else { return headline }
+        var line = "\(headline) \(best.title) — \(best.why)."
+        if options.count > 1 {
+            line += " \(options.count - 1) other\(options.count == 2 ? "" : "s") on screen."
+        }
+        return line
+    }
+}
+
+extension ChappyResult {
+
+    // =================================================================
+    // BUILD 200 — THE CONTRACT STOPS BEING DECORATION.
+    //
+    // §11 was declared in 198 and filled in by nothing, so Chappy
+    // gathered five answers beautifully and then said "running it".
+    // This is the first tool that actually returns the shape, and it
+    // is the right one to start with: places is what gets asked for
+    // most, and it is the only source in the app carrying two
+    // independent ratings, a review count, a price level and an
+    // opening state.
+    //
+    // The ranking rule, and the reason for it: a 5.0 from eleven
+    // reviews is not better than a 4.6 from nine hundred. Rating alone
+    // ranks noise to the top, which is exactly how every "best of"
+    // list on the internet goes wrong. So the rating is weighted by
+    // how much evidence sits behind it, and the weight saturates —
+    // past a few hundred reviews more reviews stop telling you
+    // anything new.
+    //
+    // §11's last line is the one that matters most: always clearly
+    // distinguish facts from recommendations. Every `why` below is
+    // made only of things that are true — a number, a distance, an
+    // opening time. The recommendation is the ORDER, and the order is
+    // ours to defend.
+    // =================================================================
+    static func from(_ spots: [ChappyPlaces.Spot],
+                     kind: ChappyPlaces.Kind,
+                     near lat: Double, lon: Double,
+                     asked: String) -> ChappyResult {
+
+        guard !spots.isEmpty else {
+            return ChappyResult(toolID: "places", ok: false,
+                                headline: "Nothing came back for \(asked) around here.",
+                                detail: "", options: [], error: "empty")
+        }
+
+        func metres(_ s: ChappyPlaces.Spot) -> Double? {
+            guard lat != 0 || lon != 0, s.lat != 0 || s.lon != 0 else { return nil }
+            return ChappyPorts.km(lat, lon, s.lat, s.lon) * 1000
+        }
+
+        func distanceLine(_ m: Double) -> String {
+            m < 950 ? "\(Int((m / 50).rounded()) * 50) metres"
+                    : String(format: "%.1f km", m / 1000)
+        }
+
+        var options: [Option] = []
+        for sp in spots {
+            // Evidence-weighted rating. Both sources count; the one with
+            // more reviews behind it counts for more.
+            var weighted = 0.0, weight = 0.0
+            if let r = sp.rating {
+                let w = min(Double(sp.reviews ?? 0), 400) / 400
+                weighted += r * (0.35 + 0.65 * w); weight += (0.35 + 0.65 * w)
+            }
+            if let g = sp.googleRating {
+                let w = min(Double(sp.googleCount ?? 0), 400) / 400
+                weighted += g * (0.35 + 0.65 * w); weight += (0.35 + 0.65 * w)
+            }
+            guard weight > 0 else { continue }
+            let stars = weighted / weight
+            var score = (stars / 5.0) * 100
+
+            // Being open beats being marginally better rated. You are
+            // standing outside it.
+            if sp.openNow == true { score += 6 }
+            if sp.openNow == false { score -= 22 }
+
+            // Distance is a real cost on foot in the heat. Gentle, so it
+            // never buries a much better place two streets further on.
+            var whyBits: [String] = []
+            let count = max(sp.reviews ?? 0, sp.googleCount ?? 0)
+            whyBits.append(count > 0
+                ? String(format: "%.1f from %d reviews", stars, count)
+                : String(format: "%.1f", stars))
+            if let m = metres(sp) {
+                score -= min(m / 1000, 3.0) * 4
+                whyBits.append(distanceLine(m))
+            }
+            if sp.openNow == true { whyBits.append("open now") }
+            if sp.openNow == false { whyBits.append("closed") }
+            if !sp.priceLevel.isEmpty { whyBits.append(sp.priceLevel) }
+            // The disagreement between the two sources is the most useful
+            // sentence in the whole app and it costs nothing to say.
+            if let note = sp.divergenceNote { whyBits.append(note) }
+
+            options.append(Option(title: sp.name,
+                                  subtitle: sp.address,
+                                  score: Int(score.rounded()),
+                                  why: whyBits.joined(separator: ", "),
+                                  stars: stars,
+                                  reviews: count,
+                                  open: sp.openNow,
+                                  metres: metres(sp)))
+        }
+
+        options.sort { $0.score > $1.score }
+        guard !options.isEmpty else {
+            return ChappyResult(toolID: "places", ok: false,
+                                headline: "Found some places, but none of them are rated.",
+                                detail: "", options: [], error: "unrated")
+        }
+        return ChappyResult(toolID: "places", ok: true,
+                            headline: "\(kind.label).\(Self.defence(options))",
+                            detail: options.map { "\($0.title) — \($0.why)" }
+                                           .joined(separator: "\n"),
+                            options: options, error: nil)
+    }
+}
+
+// =====================================================================
+// MARK: - WHAT IT JUST SAID (Build 202)
+// =====================================================================
+//
+// "The second one." "That one." "Take me there." "How far is it?"
+//
+// Every assistant worth comparing to resolves a reference to what it
+// just told you, and Chappy could not — so the fifteen-workflow run
+// ended with him repeating a warung's name back to the app that had
+// just named it. That is the moment a conversation stops being one.
+//
+// Deliberately small and deliberately short-lived: the last result
+// set, for two minutes. A reference to something said an hour ago is
+// not a reference, it is a guess.
+//
+final class ChappyLastResult {
+
+    static let shared = ChappyLastResult()
+    private init() {}
+
+    private(set) var result: ChappyResult?
+    private var at = Date.distantPast
+    private static let lifetime: TimeInterval = 120
+
+    var isFresh: Bool {
+        result != nil && Date().timeIntervalSince(at) < Self.lifetime
+    }
+
+    func remember(_ r: ChappyResult) {
+        guard r.ok, !r.options.isEmpty else { return }
+        result = r
+        at = Date()
+    }
+
+    func clear() { result = nil; at = .distantPast }
+
+    private static let ordinals: [(String, Int)] = [
+        ("first", 0), ("1st", 0), ("one", 0),
+        ("second", 1), ("2nd", 1), ("two", 1),
+        ("third", 2), ("3rd", 2), ("three", 2),
+        ("fourth", 3), ("4th", 3), ("fifth", 4), ("5th", 4),
+        ("last", -1),
+    ]
+
+    /// The option he means, or nil. "That one" and "it" mean the one
+    /// that was named out loud, which is always the first.
+    func referenced(_ c: String) -> ChappyResult.Option? {
+        guard isFresh, let r = result else { return nil }
+        for (word, index) in Self.ordinals where c.contains(word) {
+            let i = index < 0 ? r.options.count - 1 : index
+            guard i >= 0, i < r.options.count else { return nil }
+            return r.options[i]
+        }
+        if c.contains("that one") || c.contains("that place") || c.contains(" it")
+            || c.hasSuffix(" there") || c.contains("the one you said") {
+            return r.options.first
+        }
+        return nil
+    }
+
+    /// Does this sentence read as a reference at all? Kept separate so a
+    /// sentence that merely CONTAINS "it" doesn't hijack the router.
+    /// AUDIT (202): the first cut treated every reference as a request to
+    /// GO there, so "tell me about it" started navigating. Wanting to know
+    /// about a place and wanting to stand in it are different sentences.
+    enum Want { case go, describe }
+
+    static func want(_ c: String) -> Want? {
+        let goVerbs = ["take me", "navigate", "go there", "walk me", "ride me",
+                       "drive me", "directions", "get me to"]
+        let askVerbs = ["how far", "tell me about", "what about", "which one",
+                        "what's it like", "whats it like", "is it open", "how good"]
+        let nouns = ["one", "that", "there", "it"]
+        guard nouns.contains(where: { c.contains($0) }) else { return nil }
+        if askVerbs.contains(where: { c.contains($0) }) { return .describe }
+        if goVerbs.contains(where: { c.contains($0) }) { return .go }
+        return nil
+    }
+
+    static func looksLikeReference(_ c: String) -> Bool { want(c) != nil }
+}
+
+// =====================================================================
+// MARK: - THE ROUTER LOG (Build 198) — §17
+// =====================================================================
+//
+// "Log intent, selected tool, inputs, confidence, result and errors for
+// debugging, subject to privacy requirements."
+//
+// In memory only, capped, never written to disk and never sent
+// anywhere. The privacy requirement here is not a footnote: this
+// buffer sees everything said to Chappy, so it lives and dies with the
+// process and holds a hundred lines at most.
+//
+final class ChappyRouterLog {
+
+    static let shared = ChappyRouterLog()
+    private init() {}
+
+    struct Entry {
+        let at: Date
+        let heard: String
+        let tier: String         // pocket | tiles | flow | intent | plan | ask
+        let tool: String?
+        let confidence: Double?
+        let outcome: String
+        let ms: Int
+    }
+
+    private(set) var entries: [Entry] = []
+    private static let cap = 100
+
+    func add(heard: String, tier: String, tool: String? = nil,
+             confidence: Double? = nil, outcome: String, ms: Int) {
+        entries.append(Entry(at: Date(), heard: heard, tier: tier, tool: tool,
+                             confidence: confidence, outcome: outcome, ms: ms))
+        if entries.count > Self.cap { entries.removeFirst(entries.count - Self.cap) }
+        let c = confidence.map { String(format: " %.2f", $0) } ?? ""
+        print("🧭 [Route] \(ms)ms \(tier)\(c) \(tool ?? "-") — \(outcome)")
+    }
+
+    /// Spoken answer to "what did you just do" — the debugging tool that
+    /// works when the phone is in a pocket.
+    func lastLine() -> String {
+        guard let e = entries.last else { return "Nothing yet." }
+        return "\(e.tier) handled it in \(e.ms) milliseconds: \(e.outcome)."
+    }
+}
+
+// =====================================================================
+// MARK: - THE ORCHESTRATOR (Build 198) — §5, §8, §16
+// =====================================================================
+//
+// One model call that reads the registry rather than a hand-written
+// prompt, returns one or more steps with a confidence for each, and
+// never invents a slot value.
+//
+// The registry is generated into the prompt at call time. That is the
+// entire reason the registry exists: adding a tool must not mean
+// remembering to edit a prompt somewhere else. If those two ever
+// disagree the assistant lies about what it can do, and that is a
+// worse failure than not understanding.
+//
+enum ChappyOrchestrator {
+
+    struct Step {
+        let toolID: String
+        var values: [String: String]
+        let confidence: Double
+    }
+
+    struct Plan {
+        var steps: [Step]
+        /// What Chappy says before a multi-step plan runs. §8: keep the
+        /// user informed when a task has stages.
+        var preamble: String?
+    }
+
+    /// §16, verbatim: high executes, medium clarifies, low asks.
+    enum Band { case execute, clarify, ask }
+    static func band(_ c: Double) -> Band {
+        if c >= 0.80 { return .execute }
+        if c >= 0.50 { return .clarify }
+        return .ask
+    }
+
+    /// The tool contracts, rendered for the model. Derived, never typed
+    /// twice.
+    private static var contracts: String {
+        ChappyRegistry.tools.map { t in
+            let slots = t.slots.map { s -> String in
+                let kind: String
+                switch s.kind {
+                case .airport:  kind = "city or airport name"
+                case .place:    kind = "place name"
+                case .date:     kind = "yyyy-MM-dd, only if a specific day was said"
+                case .count:    kind = "whole number of people"
+                case .nights:   kind = "whole number of nights"
+                case .money:    kind = "whole number"
+                case .yesNo:    kind = "yes or no"
+                case .language: kind = "language name"
+                case .text:     kind = "plain words"
+                case .mode:     kind = "walk, drive, scooter or grab"
+                case .priceBand:kind = "cheap, mid or nice"
+                case .span:     kind = "month, 3 months, year or all time"
+                }
+                return "\(s.id) (\(kind))\(s.optional ? " [optional]" : "")"
+            }.joined(separator: ", ")
+            return "- \(t.id): \(t.title). slots: \(slots)"
+        }.joined(separator: "\n")
+    }
+
+    static func plan(_ utterance: String) async -> Plan? {
+        let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
+        guard !key.isEmpty, utterance.count > 3,
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+        else { return nil }
+
+        let system = """
+        You are the router for a wearable assistant called Chappy, worn by an Australian traveller in Asia.
+        Decide which of these tools the request needs. A request may need more than one, in order.
+
+        TOOLS
+        \(contracts)
+
+        Reply with ONLY this JSON:
+        {"steps":[{"tool":"...","values":{"slot":"value"},"confidence":0.0}],"preamble":"..."}
+
+        Rules:
+        - Only include a slot you were actually told. NEVER invent a destination, a date, a number of people or a budget.
+        - Omit a slot rather than guess it. Something else will ask for it.
+        - confidence is your own honest estimate that this tool is what was meant, 0 to 1.
+        - If the request needs nothing from this list, return {"steps":[]}.
+        - preamble is one short sentence, only when there is more than one step. Otherwise "".
+        - Do not answer the question. You are choosing tools, not replying.
+        """
+        let body: [String: Any] = [
+            "systemInstruction": ["parts": [["text": system]]],
+            "contents": [["role": "user", "parts": [["text": utterance]]]],
+            "generationConfig": [
+                "temperature": 0,
+                "maxOutputTokens": 700,
+                "responseMimeType": "application/json",
+            ],
+        ]
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Same ceiling as the old classifier. A router that makes you wait
+        // is worse than one that gives up — there is always a tier behind.
+        req.timeoutInterval = 4
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cands = json["candidates"] as? [[String: Any]],
+              let content = cands.first?["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let text = parts.first?["text"] as? String,
+              let d = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let rawSteps = obj["steps"] as? [[String: Any]]
+        else { return nil }
+
+        var steps: [Step] = []
+        for r in rawSteps {
+            guard let id = r["tool"] as? String, ChappyRegistry.tool(id: id) != nil else { continue }
+            var vals: [String: String] = [:]
+            if let v = r["values"] as? [String: Any] {
+                for (k, any) in v {
+                    if let sv = any as? String, !sv.isEmpty, sv.lowercased() != "null" { vals[k] = sv }
+                    if let iv = any as? Int { vals[k] = String(iv) }
+                }
+            }
+            let conf = (r["confidence"] as? Double) ?? 0.6
+            steps.append(Step(toolID: id, values: vals, confidence: conf))
+        }
+        guard !steps.isEmpty else { return Plan(steps: [], preamble: nil) }
+        let pre = (obj["preamble"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Plan(steps: steps, preamble: (pre?.isEmpty ?? true) ? nil : pre)
+    }
+
+    /// §8: pass what one step learned into the next. Deliberately narrow —
+    /// only the entities that genuinely mean the same thing everywhere.
+    /// "to" on a flight and "country" on a visa are the same place; "when"
+    /// and "nights" travel with it. Everything else stays where it was,
+    /// because a shared bag of loose values is how one wrong answer
+    /// contaminates a whole plan.
+    static func carry(_ from: [String: String], into next: inout [String: String]) {
+        let place = from["to"] ?? from["country"] ?? from["where"]
+        for key in ["to", "country", "where"] where next[key] == nil {
+            // AUDIT (200): `if let place,` is Swift 5.7 shorthand. It compiles
+            // on every Xcode this project has seen, and writing it out costs
+            // nothing — which is the correct trade on a file that has already
+            // cost two archive cycles.
+            if let placeValue = place,
+               ChappyRegistry.tools.contains(where: { $0.slots.contains { $0.id == key } }) {
+                next[key] = placeValue
+            }
+        }
+        for key in ["when", "nights", "party"] where next[key] == nil {
+            if let v = from[key] { next[key] = v }
+        }
+    }
+}
+
+// =====================================================================
+// MARK: - WHAT NEXT (Build 198) — §9
+// =====================================================================
+//
+// "Suggestions must be relevant, concise and optional — never spam."
+//
+// So: one suggestion, only after something actually completed, only
+// when it follows obviously from what was just done, and never twice
+// for the same thing in a row. A suggestion you have already declined
+// is not a suggestion, it is nagging.
+//
+enum ChappyNext {
+
+    private static var lastOffered: String?
+
+    static func after(_ toolID: String, values: [String: String]) -> String? {
+        let suggestion: String?
+        switch toolID {
+        case "flights":
+            let to = values["to"].flatMap { ChappyPorts.byIATA($0)?.country } ?? ""
+            suggestion = to.isEmpty ? "Want me to check the bags on that?"
+                                    : "Want me to check what \(to) wants for a visa?"
+        case "travel":
+            suggestion = values["when"] == nil
+                ? "Want me to look at the weather for those months?"
+                : "Want me to price the flights for those dates?"
+        case "visas":
+            suggestion = "Want the onward-ticket rule for that one?"
+        case "weather":
+            suggestion = nil        // a forecast is a complete thought
+        case "currency":
+            suggestion = nil
+        default:
+            suggestion = nil
+        }
+        guard let s = suggestion, s != lastOffered else { return nil }
+        lastOffered = s
+        return s
+    }
+
+    static func clear() { lastOffered = nil }
+}
+
+// =====================================================================
+// MARK: - THE PERMISSION GATE (Build 198) — §10
+// =====================================================================
+//
+// "The orchestrator should distinguish between find, suggest, prepare
+// and execute. Never book, purchase or send something merely because
+// the user mentioned it casually."
+//
+// An honest note about this one. Every tool in the registry today is
+// .search — Chappy cannot spend your money, because there is no
+// booking API left that a solo developer can reach: Amadeus is
+// decommissioned, Airbnb's closed in 2019, the rest are partner-only.
+// So this gate currently gates nothing.
+//
+// It is here anyway, and it is here NOW rather than later, because the
+// moment a tool is added that deletes a trip file or sends a message,
+// the gate has to already exist and already be the path everything
+// travels down. A safety layer bolted on afterwards is one that gets
+// bypassed by whatever was written before it.
+//
+enum ChappyGate {
+
+    enum Verdict { case go, confirm(String) }
+
+    static func check(_ tool: ChappyTool, values: [String: String]) -> Verdict {
+        switch tool.permission {
+        case .search:
+            return .go
+        case .act:
+            return .confirm("\(ChappyFlow.summary(tool, values)) Shall I?")
+        case .destructive:
+            return .confirm("That will delete it and I can't undo it. Say yes to go ahead.")
+        }
     }
 }
