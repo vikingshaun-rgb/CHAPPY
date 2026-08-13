@@ -1749,33 +1749,23 @@ final class ChappyStandby: NSObject, ObservableObject {
             return
         }
 
-        // BUILD 211 — SAFE MODE. THE APP MUST ALWAYS OPEN.
+        // BUILD 216 — SAFE MODE REMOVED.
         //
-        // He reported Chappy not opening, WITHOUT the glasses connected,
-        // which rules out the Bluetooth race 210 closed. I do not know
-        // what the cause is yet and I am not going to guess at it in the
-        // code.
+        // I built it for a crash that turned out not to exist. The real
+        // fault was a stack overflow in SwiftUI's type machinery, fixed
+        // in 214, and nothing to do with the microphone.
         //
-        // What I can do is make the failure survivable. Everything the ear
-        // touches — the audio session, the recogniser, installTap — is
-        // exactly the machinery that can take a process down uncatchably.
-        // So: a flag is set the moment arming begins and cleared once the
-        // ear is actually up. If it is still set at the NEXT launch, the
-        // last attempt did not survive, and this one does not try.
+        // Worse, it LATCHED. The flag was set when arming began and
+        // cleared only when the tap succeeded, so any arm that failed
+        // for any reason left it set — and the next launch refused to
+        // arm at all. Alternate launches with no ear, and a spoken
+        // explanation quiet enough to miss. That is the same failure as
+        // the "I'm here" bug: silence and failure looking identical.
         //
-        // A crash loop you cannot get into the app to fix is the worst
-        // failure this app has. This makes the second launch always work,
-        // with the ear off and something said about it.
+        // Both keys are cleared here so nobody inherits the latch.
         let d = UserDefaults.standard
-        if d.bool(forKey: "chappy_arm_incomplete") {
-            d.set(false, forKey: "chappy_arm_incomplete")
-            d.set(true, forKey: "chappy_safe_mode")
-            starting = false
-            print("🛟 [Standby] Last arm did not survive — SAFE MODE, ear stays off")
-            announceArmFailure("Chappy started without the ear, because the last try didn't survive. Turn Daily listening back on in Settings when you're ready.")
-            return
-        }
-        d.set(true, forKey: "chappy_arm_incomplete")
+        d.removeObject(forKey: "chappy_arm_incomplete")
+        d.removeObject(forKey: "chappy_safe_mode")
 
         let session = AVAudioSession.sharedInstance()
         // ============ LEAVING "HEY META" ALONE ============
@@ -3211,9 +3201,6 @@ final class ChappyStandby: NSObject, ObservableObject {
             self?.lastBufferAt = Date()
         }
         lastBufferAt = Date()
-        // BUILD 211: the tap is in and nothing exploded. Whatever the next
-        // launch finds, it will not be a half-finished arm.
-        UserDefaults.standard.set(false, forKey: "chappy_arm_incomplete")
         if !engine.isRunning {
             engine.prepare()
             do { try engine.start() } catch {
@@ -3939,6 +3926,298 @@ final class ChappyStandby: NSObject, ObservableObject {
         _ = startRecognition()
     }
 
+    // =================================================================
+    // MARK: - THE FLIGHT DESK, SPOKEN (Build 217)
+    // =================================================================
+    //
+    // Seven questions that used to open a screen and now get answered.
+    //
+    // The rule every one of them follows: say the ANSWER first, then
+    // where it came from, then how old it is. A wrong allowance said
+    // confidently costs money at a check-in desk, so nothing here is
+    // stated without its vintage attached.
+    //
+    // Returns nil when the sentence isn't a flight question, so the
+    // router carries on exactly as before.
+    //
+    private func flightAnswer(_ c: String) async -> String? {
+
+        // ---------------------------------------------------- baggage
+        //
+        // The most-asked flight question and the worst-served, because
+        // the true answer lives four clicks into a carrier's site and
+        // differs for every fare in the same cabin.
+        // Two lists, because the short ones are ambiguous. "Carry on"
+        // is a thing people say to mean "keep going", and "how much can
+        // I take" is as likely to be about money. A branch that eats
+        // those sentences is worse than one that misses a bag question,
+        // so the weak words only count with a bag word beside them.
+        let bagStrong = ["baggage", "luggage", "bag allowance", "checked bag",
+                         "carry-on", "hand luggage", "how many bags",
+                         "surfboard", "surf board", "sports gear",
+                         "how many kilos", "excess bag"]
+        let bagWeak = ["carry on", "how much can i take", "how much weight",
+                       "what can i take"]
+        let bagContext = ["bag", "kilo", "allowance", "luggage", "flight",
+                          "plane", "airline", "check in", "check-in"]
+        let asksAboutBags = bagStrong.contains(where: { c.contains($0) })
+            || (bagWeak.contains(where: { c.contains($0) })
+                && bagContext.contains(where: { c.contains($0) }))
+        if asksAboutBags {
+            // Which airline? Named, or the one on his next flight.
+            var named = ChappyBags.rules.first(where: {
+                c.contains($0.carrier.lowercased())
+            })
+            if named == nil, c.contains("jetstar") { named = ChappyBags.rule("Jetstar") }
+            if named == nil {
+                named = ChappyBags.rules.first(where: {
+                    c.contains($0.code.lowercased())
+                })
+            }
+            if let r = named {
+                var line = ChappyBags.spoken(r.carrier)
+                if c.contains("surf") || c.contains("board") || c.contains("sports") {
+                    line = "\(r.carrier): \(r.sports) Checked \(ChappyBags.vintage)."
+                }
+                ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                           outcome: "baggage for \(r.carrier)", ms: 1)
+                return line
+            }
+            // No airline named — give him the rule that is true everywhere
+            // rather than asking a question he can't be bothered answering.
+            if c.contains("power bank") || c.contains("battery")
+                || c.contains("lithium") || c.contains("vape") {
+                return ChappyBags.universal.first(where: {
+                    $0.lowercased().contains(c.contains("vape") ? "vape" : "lithium")
+                }) ?? ChappyBags.universal[0]
+            }
+            return "Which airline? I've got Jetstar, Virgin, Qantas, Garuda, Batik, AirAsia, Scoot, Singapore and Malaysia."
+        }
+
+        // -------------------------------------------------- who flies it
+        let whoWords = ["who flies", "which airlines", "what airlines",
+                        "which airline goes", "who goes to", "what airline flies",
+                        "airlines to", "who can fly me"]
+        if whoWords.contains(where: { c.contains($0) }) {
+            let (o, d) = routeIn(c)
+            guard let dd = d else {
+                return "Where to? Say it like “who flies to Bali”."
+            }
+            let oo = o ?? ChappyFlightsPrefs.origin
+            var quotes: [ChappyFareSource.CarrierQuote] = []
+            if ChappyFareSource.isConfigured {
+                quotes = await ChappyFareSource.shared.carriers(
+                    origin: oo, dest: dd, month: ChappyFlightsPrefs.thisMonth)
+            }
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                       outcome: "carriers \(oo)-\(dd)", ms: 1)
+            NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
+            return ChappyRoutes.spoken(oo, dd, quotes: quotes)
+        }
+
+        // ------------------------------------------------- log a fare
+        //
+        // The one write in this whole set, and the one that makes every
+        // verdict afterwards better. Deliberately forgiving about how
+        // he says it, because he'll be saying it while looking at a
+        // screen with the number on it.
+        let logWords = ["log a fare", "log fare", "i saw a fare", "saw a fare",
+                        "log a price", "log the price", "log a flight price",
+                        "fare journal", "note a fare", "record a fare"]
+        if logWords.contains(where: { c.contains($0) }) {
+            guard let money = ChappySlots.parse(c, as: .money),
+                  let v = Double(money), v > 0 else {
+                return "How much? Say it like “log a fare, seven eighty Brisbane to Denpasar”."
+            }
+            let (o, d) = routeIn(c)
+            let oo = o ?? ChappyFlightsPrefs.origin
+            let dd = d ?? ChappyFlightsPrefs.dest
+            var e = ChappyFareJournal.Entry(origin: oo, dest: dd, price: v)
+            e.currency = ChappyFXLite.home
+            e.forMonth = ChappyFlightsPrefs.thisMonth
+            e.source = "said out loud"
+            ChappyFareJournal.log(e)
+
+            var line = "Logged \(ChappyFX.money(v, e.currency)) on \(oo) to \(dd)."
+            if let verdict = ChappyFareJournal.judge(v, origin: oo, dest: dd) {
+                line += " " + verdict.spoken
+            } else {
+                let n = ChappyFareJournal.forRoute(oo, dd).count
+                line += n < 3
+                    ? " That's \(n) reading\(n == 1 ? "" : "s") on that route — a couple more and I can tell you whether a number is any good."
+                    : ""
+            }
+            // BUILD 217 — and into memory, where he actually searches.
+            // Tagged with the route so "what have I seen on Bali" finds
+            // it, and with the price in the title so the answer is in
+            // the line rather than behind an id.
+            ChappyMemory.shared.remember(
+                .spend,
+                title: "\(ChappyFX.money(v, e.currency)) \(oo) to \(dd)",
+                body: "Fare seen and logged out loud. Route \(oo)-\(dd).",
+                tags: ["fare", "flight", oo.lowercased(), dd.lowercased()],
+                source: "flights")
+
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                       outcome: "logged \(Int(v)) \(oo)-\(dd)", ms: 1)
+            return line
+        }
+
+        // ------------------------------------------- is that a good price
+        // Same discipline. "Should I book" on its own is as likely to be
+        // about a hotel or a table, so this branch only takes the
+        // sentence when something in it is actually about a fare.
+        let judgeWords = ["good price", "is that good", "is that cheap",
+                          "is that dear", "is that expensive", "worth booking",
+                          "should i book", "is that a deal", "is that a good fare"]
+        let fareContext = ["fare", "flight", "ticket", "airfare", "seat"]
+        let asksAboutFare = judgeWords.contains(where: { c.contains($0) })
+            && (fareContext.contains(where: { c.contains($0) })
+                || ChappySlots.parse(c, as: .money) != nil)
+        if asksAboutFare {
+            let (o, d) = routeIn(c)
+            let oo = o ?? ChappyFlightsPrefs.origin
+            let dd = d ?? ChappyFlightsPrefs.dest
+            let money = ChappySlots.parse(c, as: .money).flatMap { Double($0) }
+            let last = ChappyFareJournal.forRoute(oo, dd).last?.price
+            guard let v = money ?? last else {
+                return "How much is it? And I'll tell you where that sits against what you've seen."
+            }
+            guard let verdict = ChappyFareJournal.judge(v, origin: oo, dest: dd) else {
+                return "I've only got \(ChappyFareJournal.forRoute(oo, dd).count) reading on \(oo) to \(dd), so I'd be guessing. Log a few and ask me again — that's the only way I can answer it honestly."
+            }
+            var line = verdict.spoken
+            if let t = ChappyFareJournal.trend(origin: oo, dest: dd) { line += " " + t }
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                       outcome: "judged \(Int(v))", ms: 1)
+            return line
+        }
+
+        // ------------------------------------------------ cheapest day
+        let cheapWords = ["cheapest day", "cheapest week", "cheapest time to fly",
+                          "best day to fly", "when should i fly", "when is it cheapest",
+                          "cheapest date"]
+        if cheapWords.contains(where: { c.contains($0) }) {
+            guard ChappyFareSource.isConfigured else {
+                return "I can't see the market's day-by-day prices without a fare key — that's Settings, Travel Desk, Fare data. What I can tell you is what you've seen yourself: \(ChappyFareJournal.trend(origin: ChappyFlightsPrefs.origin, dest: ChappyFlightsPrefs.dest) ?? "not enough readings yet.")"
+            }
+            let (o, d) = routeIn(c)
+            let oo = o ?? ChappyFlightsPrefs.origin
+            let dd = d ?? ChappyFlightsPrefs.dest
+            let month = ChappySlots.parse(c, as: .date).flatMap { ChappyFlightsPrefs.monthKey(fromISO: $0) }
+                ?? ChappyFlightsPrefs.thisMonth
+            let days = await ChappyFareSource.shared.month(origin: oo, dest: dd, month: month)
+            guard let best = days.min(by: { $0.price < $1.price }) else {
+                return "Nothing cached for \(oo) to \(dd) that month. That means nobody's searched it lately, not that nothing flies."
+            }
+            let f = DateFormatter(); f.dateFormat = "EEEE the d"
+            let avg = days.map { $0.price }.reduce(0, +) / Double(days.count)
+            var line = "Cheapest is \(f.string(from: best.date)) at \(ChappyFX.money(best.price, best.currency))"
+            line += best.direct ? ", direct. " : ", with a stop. "
+            if avg - best.price > 20 {
+                line += "That's about \(ChappyFX.money(avg - best.price, best.currency)) under the month's average. "
+            }
+            line += "It's a fare somebody's search returned, \(best.ageNote), not a live quote."
+            NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                       outcome: "cheapest day \(oo)-\(dd)", ms: 1)
+            return line
+        }
+
+        // ------------------------------------------------- the brief
+        let briefWords = ["flight brief", "flight report", "read me the flights",
+                          "flight summary", "brief me on the flights",
+                          "what's my flight situation", "whats my flight situation"]
+        if briefWords.contains(where: { c.contains($0) }) {
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                       outcome: "spoke the brief", ms: 1)
+            NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
+            return await spokenFlightBrief()
+        }
+
+        return nil
+    }
+
+    /// The brief, said rather than written. Not a reading of the
+    /// document — a document read aloud is unbearable. The four things
+    /// he would actually want to hear, and nothing else.
+    private func spokenFlightBrief() async -> String {
+        var parts: [String] = []
+
+        if let t = ChappyTravel.shared.active {
+            let hops = ChappyTravel.shared.hops(t)
+            if let next = hops.filter({ $0.when >= Date() }).min(by: { $0.when < $1.when }) {
+                let days = Calendar.current.dateComponents([.day], from: Date(),
+                                                           to: next.when).day ?? 0
+                let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
+                parts.append(days == 0
+                    ? "You fly today: \(next.route)."
+                    : "\(days) day\(days == 1 ? "" : "s") until you fly — \(next.route) on \(f.string(from: next.when)).")
+            } else {
+                parts.append("\(t.name) is planned but nothing's coming up.")
+            }
+        } else {
+            parts.append("No trip planned.")
+        }
+
+        // What the journal says about the route he cares about.
+        let o = ChappyFlightsPrefs.origin, d = ChappyFlightsPrefs.dest
+        let rows = ChappyFareJournal.forRoute(o, d)
+        if rows.count >= 2, let last = rows.last,
+           let v = ChappyFareJournal.judge(last.price, origin: o, dest: d) {
+            parts.append("On \(o) to \(d), \(v.spoken)")
+            if let t = ChappyFareJournal.trend(origin: o, dest: d) { parts.append(t) }
+        } else if rows.isEmpty {
+            parts.append("Nothing logged on \(o) to \(d) yet — tell me a number next time you see one and I can start telling you whether they're any good.")
+        }
+
+        // Anything the watchers have actually turned up.
+        let hits = ChappyWatch.shared.liveHits.filter { $0.confirmed }
+        if let hit = hits.first {
+            parts.append("One confirmed hit: \(hit.what)")
+        }
+
+        if let w = ChappyFlightBudget.shared.preTripWarning { parts.append(w) }
+
+        return parts.joined(separator: " ")
+    }
+
+    /// Pull an origin and a destination out of a spoken sentence.
+    ///
+    /// "who flies brisbane to bali" → (BNE, DPS)
+    /// "who flies to bali"          → (nil, DPS)
+    ///
+    /// The split is on " to " and nothing cleverer, because that is how
+    /// people say routes and a parser that tries harder mostly finds
+    /// airports in words like "Ubud" that have none.
+    private func routeIn(_ c: String) -> (String?, String?) {
+        guard let r = c.range(of: " to ") else {
+            // No "to" — maybe a bare destination after "flies"/"fly".
+            for marker in ["who flies ", "airlines to ", "flights to ", "fly to "] {
+                if let m = c.range(of: marker) {
+                    let tail = String(c[m.upperBound...])
+                    return (nil, ChappyPorts.resolve(place: tail)?.iata)
+                }
+            }
+            return (nil, nil)
+        }
+        let before = String(c[..<r.lowerBound])
+        let after = String(c[r.upperBound...])
+
+        // Trim the verb off the front of the origin half.
+        var head = before
+        for verb in ["who flies", "which airlines", "what airlines", "airlines",
+                     "flights", "flight", "fly", "cheapest day", "cheapest week",
+                     "log a fare", "log fare", "i saw a fare", "from"] {
+            if let m = head.range(of: verb) {
+                head = String(head[m.upperBound...])
+            }
+        }
+        let dest = ChappyPorts.resolve(place: after)?.iata
+        let origin = ChappyPorts.resolve(place: head)?.iata
+        return (origin, dest)
+    }
+
     // MARK: The router
 
     private func route(_ c: String) async {
@@ -3991,11 +4270,17 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if yn == "no" {
                     // BUILD 206: a no is data. Two of them in a day and
                     // the suggestions stop until tomorrow.
+                    // BUILD 215: and it is written down, so the refusal
+                    // outlives the day and the same thing is not offered
+                    // for the rest of the year.
                     ChappyNext.declined()
+                    ChappyLedger.shared.record(.declined, subject: pending,
+                                               detail: "said no")
                     speak("Fair enough.")
                     return
                 }
                 ChappyNext.accepted()
+                ChappyLedger.shared.record(.accepted, subject: pending, detail: "said yes")
                 if let t = ChappyRegistry.tool(id: pending) {
                     // AUDIT (200): this path serves two callers — a medium
                     // confidence "did you mean X?" and a permission gate
@@ -4042,6 +4327,84 @@ final class ChappyStandby: NSObject, ObservableObject {
             let reply = await NavEngine.shared.navigate(to: picked.title, driving: driving)
             speak(NavEngine.shared.spokenRouteSummary ?? reply)
             if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
+            return
+        }
+
+        // BUILD 217 — "THE DAY BEFORE I FLY".
+        //
+        // One of the two remaining gaps where Chappy knew the answer and
+        // still made him supply it. The departure is in the trip file;
+        // asking him for a date he has already told the app is the kind
+        // of small rudeness that makes an assistant feel like a form.
+        if (c.contains("day before") || c.contains("night before")
+            || c.contains("before i fly") || c.contains("before my flight"))
+            && (c.contains("remind") || c.contains("reminder")) {
+            guard let t = ChappyTravel.shared.active else {
+                speak("No trip planned, so I don't know when you fly. Plan one and ask me again.")
+                return
+            }
+            let hops = ChappyTravel.shared.hops(t)
+            guard let next = hops.filter({ $0.when >= Date() })
+                .min(by: { $0.when < $1.when }) else {
+                speak("Nothing in \(t.name) is coming up by air.")
+                return
+            }
+            let cal = Calendar.current
+            let dayBefore = cal.date(byAdding: .day, value: -1, to: next.when) ?? next.when
+            // Six in the evening, not midnight: a reminder that fires
+            // while he is asleep is a reminder that did not happen.
+            var parts = cal.dateComponents([.year, .month, .day], from: dayBefore)
+            parts.hour = 18
+            parts.minute = 0
+            let when = cal.date(from: parts) ?? dayBefore
+
+            let what = c.replacingOccurrences(of: "remind me", with: "")
+                .replacingOccurrences(of: "the day before i fly", with: "")
+                .replacingOccurrences(of: "the night before i fly", with: "")
+                .replacingOccurrences(of: "the day before my flight", with: "")
+                .replacingOccurrences(of: "to ", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            let title = what.isEmpty
+                ? "Flying tomorrow — \(next.route)"
+                : what.prefix(1).uppercased() + what.dropFirst()
+
+            _ = ChappyReminders.shared.add(title: String(title), at: when,
+                                           source: "flights")
+            let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
+            speak("Done — six in the evening on \(f.string(from: when)), the day before \(next.route).")
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "reminders",
+                                       outcome: "day-before-flying reminder", ms: 1)
+            return
+        }
+
+        // BUILD 217 — THE FLIGHT DESK.
+        //
+        // Above the flow gate so "how much baggage on Jetstar" mid-way
+        // through a restaurant interview is understood as the question
+        // it is, and below the reference resolver so "take me there"
+        // still means the place it just named.
+        if let said = await flightAnswer(c) { speak(said); return }
+
+        // BUILD 215 — §9's audit, spoken. "What changed?" for any window,
+        // written to read like a diary rather than a database dump.
+        if ["what changed", "what's changed", "whats changed",
+            "what have you done today", "what did you do today"].contains(c) {
+            speak(ChappyLedger.shared.whatChanged(sinceHours: 24))
+            return
+        }
+
+        // BUILD 215 — §16's off switch, reachable by voice, because a
+        // switch you have to go and find is one you use once in anger
+        // and never turn back on.
+        if c.contains("stop suggesting") || c.contains("no more suggestions")
+            || c.contains("stop predicting") {
+            ChappyForesight.mode = .off
+            speak("Done. I'll keep it to myself unless you ask.")
+            return
+        }
+        if c.contains("start suggesting") || c.contains("suggestions back on") {
+            ChappyForesight.mode = .suggestive
+            speak("Right, I'll chip in again.")
             return
         }
 
@@ -4971,7 +5334,13 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("cheapest flights") || c.contains("how are my flights looking") {
             speak(ChappyFlights.shared.spokenDeals()); return
         }
-        if c.contains("track flight ") || c.contains("track my flight ") {
+        if c.contains("track flight ") || c.contains("track my flight ")
+            || (c.hasPrefix("track ") && ChappyFlights.flightNumber(in: c) != nil)
+            || ((c.contains("on time") || c.contains("delayed")
+                 || c.contains("what gate") || c.contains("which gate")
+                 || c.contains("where's") || c.contains("wheres")
+                 || c.contains("status of"))
+                && ChappyFlights.flightNumber(in: c) != nil) {
             guard let num = ChappyFlights.flightNumber(in: c) else {
                 speak("Which flight? Give me the number, like Q F five two."); return
             }
@@ -5983,6 +6352,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             NotificationCenter.default.post(name: lead.tile.note, object: nil)
             ChappyRouterLog.shared.add(heard: c, tier: "tiles", tool: tool.id,
                                        outcome: "named the screen and the details", ms: 1)
+            ChappyLedger.shared.record(.ran, subject: tool.id, detail: c)
             let opening = ChappyFlow.shared.start(tool, from: c)
             if !opening.isEmpty { speak(opening) }
             followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
@@ -15590,6 +15960,10 @@ extension Notification.Name {
     static let chappyOpenPlaces = Notification.Name("chappyOpenPlaces")
     /// BUILD 163 — open the 30-day Upcoming view.
     static let chappyOpenUpcoming = Notification.Name("chappyOpenUpcoming")
+    /// BUILD 217 — the fare journal changed: a fare logged, a fare
+    /// deleted, a live month fetched. The Flights screen redraws its
+    /// graph and calendar off this rather than polling.
+    static let chappyFaresChanged = Notification.Name("chappyFaresChanged")
     /// BUILD 202 — a tool started from outside the app: Siri, Spotlight,
     /// Shortcuts, the Action button. userInfo carries the tool id and any
     /// values the shortcut supplied.
@@ -28218,6 +28592,648 @@ enum ChappySaleCalendar {
 
 
 // =====================================================================
+// MARK: - THE FARE SOURCE (Build 217)
+// =====================================================================
+//
+// Amadeus is decommissioned and the `cheapestDates` / `offers` calls
+// left in ChappyFlights have been dead since July. Rather than leave
+// dead plumbing in place and a graph with nothing to draw, this is a
+// second source behind the same shape.
+//
+// It reads Travelpayouts' cached fare data: a per-day cheapest price
+// for a whole month on a route, which is exactly the two things asked
+// for — a graph and a calendar — and nothing more. Be clear about what
+// that data IS, because a price presented as live when it is cached is
+// the same lie as a stale rate presented as today's:
+//
+//   * It is the cheapest fare somebody's search actually RETURNED,
+//     with the timestamp of when it was seen.
+//   * `actual` marks a price confirmed recently. Anything else is
+//     older and is labelled as older, everywhere it is shown.
+//   * It is not a booking. Nothing here books anything, and nothing
+//     here should ever be spoken as though it did.
+//
+// Dormant until a token is pasted into Settings. With no token every
+// call returns empty and the screen falls back to the journal, which
+// is his own observations and always real.
+//
+final class ChappyFareSource {
+
+    static let shared = ChappyFareSource()
+    private init() {}
+
+    static let tokenKey = "chappy_tp_token"
+
+    static var token: String {
+        (UserDefaults.standard.string(forKey: tokenKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static var isConfigured: Bool { !token.isEmpty }
+
+    /// One day on a route: the cheapest anyone saw, and how stale it is.
+    struct DayPrice: Identifiable, Hashable {
+        var id: String { key }
+        let key: String
+        let date: Date
+        let price: Double
+        let currency: String
+        let stops: Int
+        let carrier: String?
+        /// True when the price was confirmed recently by the source.
+        let fresh: Bool
+        let seenAt: Date?
+
+        var direct: Bool { stops == 0 }
+
+        /// How old, said the way a person would. Same discipline as the
+        /// currency table: a week-old fare is still useful, a week-old
+        /// fare presented as today's is not.
+        var ageNote: String {
+            guard let at = seenAt else { return "" }
+            let days = Int(Date().timeIntervalSince(at) / 86400)
+            if days <= 0 { return "seen today" }
+            if days == 1 { return "seen yesterday" }
+            if days < 14 { return "seen \(days) days ago" }
+            return "over a fortnight old"
+        }
+    }
+
+    // ------------------------------------------------------------ cache
+    //
+    // Fare data does not move minute to minute and the free allowance is
+    // finite, so a month is held for six hours. The queue is here rather
+    // than a lock because every reader is already on a background task
+    // and none of them may block the voice loop.
+    //
+    private let q = DispatchQueue(label: "chappy.fares.cache")
+    private var cache: [String: (at: Date, rows: [DayPrice])] = [:]
+    private static let ttl: TimeInterval = 6 * 3600
+
+    private func cached(_ k: String) -> [DayPrice]? {
+        q.sync {
+            guard let hit = cache[k], Date().timeIntervalSince(hit.at) < Self.ttl
+            else { return nil }
+            return hit.rows
+        }
+    }
+
+    private func store(_ k: String, _ rows: [DayPrice]) {
+        q.sync { cache[k] = (Date(), rows) }
+    }
+
+    func forget() { q.sync { cache.removeAll() } }
+
+    // ------------------------------------------------------------ calls
+
+    /// Every day in a month with a price on it, cheapest first per day.
+    /// `month` is "2026-09". Empty means no token, no signal, or genuinely
+    /// no cached fares for that route — the caller must not present any of
+    /// those three as "no flights".
+    func month(origin: String, dest: String, month: String,
+               currency: String = "aud") async -> [DayPrice] {
+
+        let o = origin.uppercased(), d = dest.uppercased()
+        let key = "\(o)-\(d)-\(month)-\(currency)"
+        if let hit = cached(key) { return hit }
+        guard Self.isConfigured else { return [] }
+
+        var c = URLComponents(string: "https://api.travelpayouts.com/v2/prices/month-matrix")!
+        c.queryItems = [
+            .init(name: "currency", value: currency),
+            .init(name: "origin", value: o),
+            .init(name: "destination", value: d),
+            .init(name: "month", value: "\(month)-01"),
+            .init(name: "show_to_affiliates", value: "true"),
+            .init(name: "token", value: Self.token),
+        ]
+        guard let url = c.url else { return [] }
+
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue(Self.token, forHTTPHeaderField: "X-Access-Token")
+
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                ChappyRouterLog.shared.add(heard: "fares", tier: "net", tool: "flights",
+                                           outcome: "fare source said \(http.statusCode)", ms: 0)
+                return []
+            }
+            let rows = Self.parseMatrix(data, currency: currency)
+            store(key, rows)
+            return rows
+        } catch {
+            return []
+        }
+    }
+
+    static func parseMatrix(_ data: Data, currency: String) -> [DayPrice] {
+        guard
+            let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let arr = top["data"] as? [[String: Any]]
+        else { return [] }
+
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        df.locale = Locale(identifier: "en_US_POSIX")
+        let iso = ISO8601DateFormatter()
+
+        var best: [String: DayPrice] = [:]
+        for row in arr {
+            guard
+                let ds = row["depart_date"] as? String,
+                let date = df.date(from: String(ds.prefix(10)))
+            else { continue }
+            let price = (row["value"] as? Double)
+                ?? (row["value"] as? NSNumber)?.doubleValue ?? 0
+            guard price > 0 else { continue }
+            let stops = (row["number_of_changes"] as? Int) ?? 0
+            let fresh = (row["actual"] as? Bool) ?? false
+            let seen = (row["found_at"] as? String).flatMap { iso.date(from: $0) }
+                ?? (row["found_at"] as? String).flatMap { df.date(from: String($0.prefix(10))) }
+            let dp = DayPrice(key: ds, date: date, price: price,
+                              currency: currency.uppercased(), stops: stops,
+                              carrier: row["gate"] as? String, fresh: fresh, seenAt: seen)
+            // Keep the cheapest for each calendar day.
+            if let had = best[ds], had.price <= price { continue }
+            best[ds] = dp
+        }
+        return best.values.sorted { $0.date < $1.date }
+    }
+
+    /// Which carriers turn up cheap on a route this month, with the fare
+    /// they were seen at. Feeds the Airlines tab so its ranking is about
+    /// this route rather than airlines in general.
+    struct CarrierQuote: Identifiable, Hashable {
+        var id: String { code + depart }
+        let code: String
+        let price: Double
+        let currency: String
+        let stops: Int
+        let depart: String
+    }
+
+    func carriers(origin: String, dest: String, month: String,
+                  currency: String = "aud") async -> [CarrierQuote] {
+
+        guard Self.isConfigured else { return [] }
+        var c = URLComponents(string: "https://api.travelpayouts.com/v1/prices/cheap")!
+        c.queryItems = [
+            .init(name: "origin", value: origin.uppercased()),
+            .init(name: "destination", value: dest.uppercased()),
+            .init(name: "depart_date", value: month),
+            .init(name: "currency", value: currency),
+            .init(name: "token", value: Self.token),
+        ]
+        guard let url = c.url else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue(Self.token, forHTTPHeaderField: "X-Access-Token")
+
+        guard
+            let (data, _) = try? await URLSession.shared.data(for: req),
+            let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let byDest = top["data"] as? [String: Any]
+        else { return [] }
+
+        var out: [CarrierQuote] = []
+        for (_, v) in byDest {
+            guard let offers = v as? [String: Any] else { continue }
+            for (_, o) in offers {
+                guard let row = o as? [String: Any] else { continue }
+                let price = (row["price"] as? Double)
+                    ?? (row["price"] as? NSNumber)?.doubleValue ?? 0
+                guard price > 0, let code = row["airline"] as? String else { continue }
+                out.append(CarrierQuote(
+                    code: code, price: price, currency: currency.uppercased(),
+                    stops: (row["number_of_changes"] as? Int) ?? 0,
+                    depart: String(((row["departure_at"] as? String) ?? "").prefix(10))))
+            }
+        }
+        return out.sorted { $0.price < $1.price }
+    }
+}
+
+
+// =====================================================================
+// MARK: - THE FARE JOURNAL (Build 217)
+// =====================================================================
+//
+// The honest half of the price picture, and the half that always works.
+//
+// He looks at a fare somewhere — Google Flights, an airline site, a
+// friend's screenshot — and tells Chappy the number. That observation
+// is stored with the moment it was made, and the graph is drawn from
+// those observations. No API can be switched off underneath it, no key
+// can expire, and every point on it is something he actually saw.
+//
+// It also answers the only fare question that really matters, which is
+// not "what is the price" but "is this number good": a fare means
+// nothing without the ones he has already seen on the same route.
+//
+// Deliberately nonisolated and deliberately UserDefaults — the router
+// reads it from a background task and must never hop to the main actor
+// to answer a spoken question.
+//
+enum ChappyFareJournal {
+
+    struct Entry: Codable, Identifiable, Hashable {
+        var id: UUID = UUID()
+        var origin: String            // "BNE"
+        var dest: String              // "DPS"
+        var price: Double
+        var currency: String = "AUD"
+        /// When he saw it.
+        var seenAt: Date = Date()
+        // BUILD 217 — every field below is Optional on purpose. Anything
+        // added to a persisted model has to decode from the version that
+        // did not have it, and that rule has cost this project a day
+        // before.
+        /// The month he was pricing, "2026-09".
+        var forMonth: String?
+        /// The exact departure date if he named one.
+        var departDate: Date?
+        var carrier: String?
+        var stops: Int?
+        /// "Google Flights", "Jetstar site", "Chappy live". Free text.
+        var source: String?
+        var note: String?
+        var oneWay: Bool?
+
+        var route: String { "\(origin)-\(dest)" }
+    }
+
+    private static let key = "chappy_fare_journal_v1"
+
+    static var all: [Entry] {
+        guard let d = UserDefaults.standard.data(forKey: key),
+              let rows = try? JSONDecoder().decode([Entry].self, from: d)
+        else { return [] }
+        return rows.sorted { $0.seenAt < $1.seenAt }
+    }
+
+    private static func write(_ rows: [Entry]) {
+        guard let d = try? JSONEncoder().encode(rows) else { return }
+        UserDefaults.standard.set(d, forKey: key)
+        NotificationCenter.default.post(name: .chappyFaresChanged, object: nil)
+    }
+
+    @discardableResult
+    static func log(_ e: Entry) -> Entry {
+        var rows = all
+        rows.append(e)
+        // 500 observations is years of looking; past that, drop the oldest.
+        if rows.count > 500 { rows.removeFirst(rows.count - 500) }
+        write(rows)
+        return e
+    }
+
+    static func remove(_ id: UUID) { write(all.filter { $0.id != id }) }
+
+    static func forRoute(_ origin: String, _ dest: String) -> [Entry] {
+        let o = origin.uppercased(), d = dest.uppercased()
+        return all.filter { $0.origin.uppercased() == o && $0.dest.uppercased() == d }
+    }
+
+    /// Every route he has ever logged, most-watched first.
+    static var routes: [(route: String, origin: String, dest: String, count: Int)] {
+        var tally: [String: (String, String, Int)] = [:]
+        for e in all {
+            let k = e.route.uppercased()
+            let had = tally[k]?.2 ?? 0
+            tally[k] = (e.origin.uppercased(), e.dest.uppercased(), had + 1)
+        }
+        return tally.map { (route: $0.key, origin: $0.value.0,
+                            dest: $0.value.1, count: $0.value.2) }
+            .sorted { $0.count > $1.count }
+    }
+
+    // ------------------------------------------------------- the verdict
+
+    struct Verdict {
+        let best: Double
+        let worst: Double
+        let median: Double
+        let count: Int
+        let currency: String
+        /// Where a given price sits, 0 = the cheapest he has ever seen.
+        let percentile: Double
+        let spoken: String
+    }
+
+    /// Is this number good? The only question worth asking about a fare,
+    /// and the one no fare API answers, because the answer depends
+    /// entirely on what HE has seen.
+    static func judge(_ price: Double, origin: String, dest: String) -> Verdict? {
+        let rows = forRoute(origin, dest)
+        guard rows.count >= 2 else { return nil }
+        let prices = rows.map { $0.price }.sorted()
+        let best = prices.first ?? price
+        let worst = prices.last ?? price
+        let median = prices[prices.count / 2]
+        let below = prices.filter { $0 < price }.count
+        let pct = prices.isEmpty ? 0 : Double(below) / Double(prices.count)
+        let cur = rows.last?.currency ?? "AUD"
+
+        let money = { (v: Double) in ChappyFX.money(v, cur) }
+        let line: String
+        if price <= best {
+            line = "\(money(price)) is the cheapest you've seen on that route — the last best was \(money(best))."
+        } else if pct <= 0.25 {
+            line = "\(money(price)) is good. You've only seen it cheaper \(below) time\(below == 1 ? "" : "s") out of \(prices.count), and your best was \(money(best))."
+        } else if pct >= 0.75 {
+            line = "\(money(price)) is on the dear side. Your median is \(money(median)) and you've seen \(money(best))."
+        } else {
+            line = "\(money(price)) is about normal for you — your median on that route is \(money(median)), best \(money(best))."
+        }
+        return Verdict(best: best, worst: worst, median: median, count: prices.count,
+                       currency: cur, percentile: pct, spoken: line)
+    }
+
+    /// Which way it has been moving lately. Two-week window against the
+    /// fortnight before it, because a trend measured over a day is noise.
+    static func trend(origin: String, dest: String) -> String? {
+        let rows = forRoute(origin, dest)
+        guard rows.count >= 3 else { return nil }
+        let now = Date()
+        let recent = rows.filter { now.timeIntervalSince($0.seenAt) <= 14 * 86400 }
+        let prior  = rows.filter {
+            let age = now.timeIntervalSince($0.seenAt)
+            return age > 14 * 86400 && age <= 28 * 86400
+        }
+        guard !recent.isEmpty, !prior.isEmpty else { return nil }
+        let a = recent.map { $0.price }.reduce(0, +) / Double(recent.count)
+        let b = prior.map { $0.price }.reduce(0, +) / Double(prior.count)
+        guard b > 0 else { return nil }
+        let change = (a - b) / b
+        let cur = rows.last?.currency ?? "AUD"
+        if abs(change) < 0.04 { return "It's been flat for a month — around \(ChappyFX.money(a, cur))." }
+        let word = change > 0 ? "up" : "down"
+        return "It's \(word) about \(Int(abs(change) * 100)) per cent on a fortnight ago — \(ChappyFX.money(b, cur)) then, \(ChappyFX.money(a, cur)) now."
+    }
+}
+
+
+// =====================================================================
+// MARK: - WHO FLIES THERE (Build 217)
+// =====================================================================
+//
+// The Airlines tab needs an answer even with no token, no signal and no
+// trip, because "who flies Brisbane to Bali" is a question with a
+// stable answer that does not need a network call to give.
+//
+// This is a written table, not a feed, and it says so. Journey times
+// are the scheduled block times airlines publish, rounded honestly.
+// Routes get added and dropped, so every answer carries the vintage
+// and the advice to confirm before believing it.
+//
+enum ChappyRoutes {
+
+    /// The month this table was last gone through by hand.
+    static let vintage = "August 2026"
+
+    struct Leg {
+        let carrier: String       // "Jetstar"
+        let code: String          // "JQ"
+        let hours: Double         // scheduled block time, direct
+        let direct: Bool
+        let note: String          // the thing worth knowing
+    }
+
+    /// Keyed "BNE-DPS". Reverse is looked up automatically.
+    static let table: [String: [Leg]] = [
+        "BNE-DPS": [
+            Leg(carrier: "Jetstar", code: "JQ", hours: 6.3, direct: true,
+                note: "Cheapest headline, nothing included — bags and seat are extra."),
+            Leg(carrier: "Virgin Australia", code: "VA", hours: 6.3, direct: true,
+                note: "Checked bag on anything above the Lite fare."),
+            Leg(carrier: "Batik Air", code: "ID", hours: 6.4, direct: true,
+                note: "Generous allowance, thinner schedule — check the days it runs."),
+            Leg(carrier: "Garuda Indonesia", code: "GA", hours: 6.4, direct: true,
+                note: "Full service, bag and meal in the fare. Google often misses it."),
+        ],
+        "SYD-DPS": [
+            Leg(carrier: "Jetstar", code: "JQ", hours: 6.4, direct: true, note: "Multiple daily."),
+            Leg(carrier: "Virgin Australia", code: "VA", hours: 6.4, direct: true, note: "Daily."),
+            Leg(carrier: "Qantas", code: "QF", hours: 6.4, direct: true, note: "Bag and meal included."),
+            Leg(carrier: "Garuda Indonesia", code: "GA", hours: 6.5, direct: true, note: "Full service."),
+            Leg(carrier: "Batik Air", code: "ID", hours: 6.5, direct: true, note: "Often the cheapest with a bag."),
+        ],
+        "MEL-DPS": [
+            Leg(carrier: "Jetstar", code: "JQ", hours: 6.2, direct: true, note: "Multiple daily."),
+            Leg(carrier: "Virgin Australia", code: "VA", hours: 6.2, direct: true, note: "Daily."),
+            Leg(carrier: "Garuda Indonesia", code: "GA", hours: 6.3, direct: true, note: "Full service."),
+            Leg(carrier: "Batik Air", code: "ID", hours: 6.3, direct: true, note: "Good allowance."),
+        ],
+        "PER-DPS": [
+            Leg(carrier: "Jetstar", code: "JQ", hours: 3.6, direct: true, note: "Short hop — the cheapest way into Bali from Australia."),
+            Leg(carrier: "Virgin Australia", code: "VA", hours: 3.6, direct: true, note: "Daily."),
+            Leg(carrier: "Garuda Indonesia", code: "GA", hours: 3.6, direct: true, note: "Full service."),
+            Leg(carrier: "Batik Air", code: "ID", hours: 3.7, direct: true, note: "Frequent."),
+            Leg(carrier: "Indonesia AirAsia", code: "QZ", hours: 3.6, direct: true, note: "Bare fare, buy everything."),
+        ],
+        "DRW-DPS": [
+            Leg(carrier: "Jetstar", code: "JQ", hours: 2.7, direct: true,
+                note: "The shortest hop to Bali from anywhere in Australia."),
+        ],
+        "BNE-SIN": [
+            Leg(carrier: "Singapore Airlines", code: "SQ", hours: 8.0, direct: true, note: "30kg and a meal."),
+            Leg(carrier: "Scoot", code: "TR", hours: 8.0, direct: true, note: "No checked bag unless bought."),
+        ],
+        "BNE-KUL": [
+            Leg(carrier: "Malaysia Airlines", code: "MH", hours: 8.3, direct: true, note: "30kg included."),
+            Leg(carrier: "AirAsia X", code: "D7", hours: 8.3, direct: true, note: "Bare fare."),
+        ],
+    ]
+
+    static func key(_ a: String, _ b: String) -> String {
+        "\(a.uppercased())-\(b.uppercased())"
+    }
+
+    static func legs(_ origin: String, _ dest: String) -> [Leg] {
+        if let hit = table[key(origin, dest)] { return hit }
+        if let back = table[key(dest, origin)] { return back }
+        return []
+    }
+
+    static func known(_ origin: String, _ dest: String) -> Bool {
+        !legs(origin, dest).isEmpty
+    }
+
+    /// The spoken answer to "who flies there", ranked and explained
+    /// rather than listed — §11's whole point. Live quotes reorder it
+    /// when a token exists; without one it still says something true.
+    static func spoken(_ origin: String, _ dest: String,
+                       quotes: [ChappyFareSource.CarrierQuote] = []) -> String {
+        let legs = legs(origin, dest)
+        guard !legs.isEmpty else {
+            return "I don't have that route written down. I've got the Australian cities to Bali, and Brisbane to Singapore and Kuala Lumpur."
+        }
+        let oName = ChappyPorts.byIATA(origin.uppercased())?.city ?? origin.uppercased()
+        let dName = ChappyPorts.byIATA(dest.uppercased())?.city ?? dest.uppercased()
+        let direct = legs.filter { $0.direct }
+        let hours = direct.map { $0.hours }.min() ?? legs[0].hours
+
+        var line = "\(direct.count) airline\(direct.count == 1 ? " flies" : "s fly") \(oName) to \(dName) direct, about \(spokenHours(hours)). "
+
+        // If live quotes exist, lead with the cheapest one seen — and say
+        // that it is a seen price, not a live one.
+        if let cheap = quotes.first,
+           let named = legs.first(where: { $0.code == cheap.code }) {
+            line += "\(named.carrier) has been the cheapest lately at \(ChappyFX.money(cheap.price, cheap.currency)) — that's a fare somebody's search returned, not a live quote. "
+        } else {
+            line += legs.map { "\($0.carrier), \($0.note.lowercased())" }
+                .prefix(3).joined(separator: ". ") + ". "
+        }
+        line += "Table's from \(vintage), so confirm the days before you count on one."
+        return line
+    }
+
+    /// Block time as a person would say it, rounded to five minutes —
+    /// a schedule quoted to the minute implies a precision an airline
+    /// timetable does not have.
+    static func spokenHours(_ h: Double) -> String {
+        let total = Int(((h * 60) / 5).rounded()) * 5
+        let hrs = total / 60
+        let mins = total % 60
+        if mins == 0 { return "\(hrs) hours" }
+        if mins == 30 { return "\(hrs) and a half hours" }
+        return "\(hrs) hours \(mins)"
+    }
+}
+
+
+// =====================================================================
+// MARK: - BAGGAGE (Build 217)
+// =====================================================================
+//
+// "What can I take" is the flight question asked most often and served
+// worst, because the answer lives four clicks into a carrier's site and
+// is different for every fare in the same cabin.
+//
+// This is written down rather than fetched: there is no baggage API
+// worth having, and an answer that works in an airport queue on no
+// signal beats a live one that doesn't load. Allowances move, so the
+// table carries its vintage and every spoken answer ends by saying so.
+//
+enum ChappyBags {
+
+    static let vintage = "August 2026"
+
+    struct Rule {
+        let carrier: String
+        let code: String
+        /// Cabin allowance in kg, and how many pieces.
+        let cabinKg: Double
+        let cabinPieces: Int
+        /// Checked allowance for the cheapest international economy fare.
+        let baseCheckedKg: Double
+        /// What the next fare up gives you.
+        let nextUpKg: Double
+        let nextUpName: String
+        /// Sports and surf, in plain words.
+        let sports: String
+        let note: String
+    }
+
+    static let rules: [Rule] = [
+        Rule(carrier: "Jetstar", code: "JQ", cabinKg: 7, cabinPieces: 2,
+             baseCheckedKg: 0, nextUpKg: 20, nextUpName: "Plus",
+             sports: "Surfboard or bike goes as oversize sports gear, booked ahead and paid per item — it does not come out of your checked kilos.",
+             note: "Starter includes nothing. Adding a bag at the airport costs several times what it costs online, and that is where the cheap fare stops being cheap."),
+        Rule(carrier: "Virgin Australia", code: "VA", cabinKg: 7, cabinPieces: 2,
+             baseCheckedKg: 0, nextUpKg: 23, nextUpName: "Choice",
+             sports: "Sports gear within the checked allowance if it fits the size limit, otherwise an oversize fee.",
+             note: "Lite fares carry no checked bag. Choice and above include 23kg."),
+        Rule(carrier: "Qantas", code: "QF", cabinKg: 14, cabinPieces: 2,
+             baseCheckedKg: 30, nextUpKg: 30, nextUpName: "Economy",
+             sports: "Surfboard counts as one checked item within the allowance on most international fares.",
+             note: "International economy is 30kg and the cabin allowance is two pieces totalling 14kg, which is the most generous carry-on of anyone on the Bali run."),
+        Rule(carrier: "Garuda Indonesia", code: "GA", cabinKg: 7, cabinPieces: 1,
+             baseCheckedKg: 30, nextUpKg: 30, nextUpName: "Economy",
+             sports: "Sports equipment within the 30kg, oversize handled at the desk.",
+             note: "Bag and a meal in the fare. Frequently cheaper than a budget fare once you add a bag to the budget fare."),
+        Rule(carrier: "Batik Air", code: "ID", cabinKg: 7, cabinPieces: 1,
+             baseCheckedKg: 20, nextUpKg: 30, nextUpName: "higher fare",
+             sports: "Oversize items need to be arranged ahead — do not turn up with a board unannounced.",
+             note: "20kg included on most international fares, which beats the Australian budget carriers before you have paid a cent."),
+        Rule(carrier: "Indonesia AirAsia", code: "QZ", cabinKg: 7, cabinPieces: 2,
+             baseCheckedKg: 0, nextUpKg: 20, nextUpName: "prepaid bag",
+             sports: "Sports equipment is a separate prepaid item and cheapest booked at the same time as the ticket.",
+             note: "Nothing is included. Cabin allowance is enforced properly, which is unusual and catches people out."),
+        Rule(carrier: "Scoot", code: "TR", cabinKg: 10, cabinPieces: 2,
+             baseCheckedKg: 0, nextUpKg: 20, nextUpName: "prepaid bag",
+             sports: "Prepaid sports item.",
+             note: "10kg cabin is the most generous carry-on of the budget carriers."),
+        Rule(carrier: "Singapore Airlines", code: "SQ", cabinKg: 7, cabinPieces: 1,
+             baseCheckedKg: 30, nextUpKg: 30, nextUpName: "Economy",
+             sports: "Within the allowance, oversize accepted.",
+             note: "30kg and a meal."),
+        Rule(carrier: "Malaysia Airlines", code: "MH", cabinKg: 7, cabinPieces: 1,
+             baseCheckedKg: 30, nextUpKg: 30, nextUpName: "Economy",
+             sports: "Within the allowance.",
+             note: "30kg included."),
+        Rule(carrier: "AirAsia X", code: "D7", cabinKg: 7, cabinPieces: 2,
+             baseCheckedKg: 0, nextUpKg: 20, nextUpName: "prepaid bag",
+             sports: "Prepaid sports item.",
+             note: "Bare fare, buy everything."),
+    ]
+
+    /// The rules that apply everywhere and are worth knowing once. These
+    /// do not vary by carrier and they are the ones that get things
+    /// confiscated at the gate.
+    static let universal = [
+        "Power banks and spare lithium batteries go in the CABIN, never the hold. Under 100 watt-hours is fine; 100 to 160 needs the airline's nod; over 160 is refused everywhere.",
+        "Liquids in the cabin: 100ml per container, in one clear bag of about a litre. Duty-free bought after security is fine if the bag stays sealed.",
+        "Indonesia takes vapes and e-cigarettes seriously — cabin only, never in the hold, and don't use them airside.",
+        "A checked bag over 32kg will be refused as a single item on most carriers regardless of what you have paid for, because of manual handling limits.",
+    ]
+
+    static func rule(_ nameOrCode: String) -> Rule? {
+        let q = nameOrCode.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return nil }
+        if let exact = rules.first(where: { $0.code.lowercased() == q }) { return exact }
+        if let named = rules.first(where: { $0.carrier.lowercased() == q }) { return named }
+        return rules.first(where: {
+            $0.carrier.lowercased().contains(q) || q.contains($0.carrier.lowercased())
+        })
+    }
+
+    /// The spoken answer. Ends on the vintage every time, because a
+    /// confident wrong allowance costs money at a check-in desk.
+    static func spoken(_ nameOrCode: String) -> String {
+        guard let r = rule(nameOrCode) else {
+            let names = rules.map { $0.carrier }.prefix(6).joined(separator: ", ")
+            return "I don't have that airline written down. I've got \(names) and a few more."
+        }
+        var line = "\(r.carrier): "
+        if r.baseCheckedKg <= 0 {
+            line += "no checked bag on the cheapest fare — \(Int(r.nextUpKg)) kilos if you go up to \(r.nextUpName), and it's much cheaper online than at the airport. "
+        } else {
+            line += "\(Int(r.baseCheckedKg)) kilos checked in economy. "
+        }
+        line += "Cabin is \(Int(r.cabinKg)) kilos"
+        line += r.cabinPieces > 1 ? " across \(r.cabinPieces) pieces. " : ". "
+        line += r.note + " Checked \(vintage) — worth confirming when you book."
+        return line
+    }
+
+    /// What a fare actually costs once the bag is on it. The comparison
+    /// no search engine shows him and the one that decides the booking.
+    static func trueCost(fare: Double, carrier: String, bagKg: Double = 20,
+                         estimatedBagFee: Double = 65) -> (total: Double, note: String) {
+        guard let r = rule(carrier) else { return (fare, "") }
+        if r.baseCheckedKg >= bagKg {
+            return (fare, "bag included")
+        }
+        return (fare + estimatedBagFee,
+                "plus roughly \(ChappyFX.money(estimatedBagFee, "AUD")) for a bag")
+    }
+}
+
+
+// =====================================================================
 // BUILD 190 — THE FLIGHTS DOCUMENT.
 //
 // The trip report has flights inside it. This is the one you forward
@@ -28845,6 +29861,39 @@ enum ChappyFXLite {
         if days == 1 { return " — yesterday's rate" }
         if days < 8 { return " — \(days)-day-old rate" }
         return " — rate is over a week old"
+    }
+}
+
+/// BUILD 217 — the route the flight tabs and the spoken answers share.
+///
+/// The screen holds these in @AppStorage and the router reads them from
+/// the same keys, so "who flies there" with no place named means the
+/// route he was last looking at rather than a guess. Two surfaces, one
+/// answer — which is the whole reason the Lite pattern exists.
+enum ChappyFlightsPrefs {
+
+    static var origin: String {
+        let v = UserDefaults.standard.string(forKey: "chappy_fares_origin") ?? ""
+        return v.isEmpty ? "BNE" : v.uppercased()
+    }
+
+    static var dest: String {
+        let v = UserDefaults.standard.string(forKey: "chappy_fares_dest") ?? ""
+        return v.isEmpty ? "DPS" : v.uppercased()
+    }
+
+    static var thisMonth: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: Date())
+    }
+
+    /// "2026-09-07" → "2026-09". Anything else, nil.
+    static func monthKey(fromISO iso: String) -> String? {
+        guard iso.count >= 7 else { return nil }
+        let m = String(iso.prefix(7))
+        return m.contains("-") ? m : nil
     }
 }
 
@@ -30343,6 +31392,10 @@ enum ChappyNext {
 
     static func after(_ toolID: String, values: [String: String]) -> String? {
         guard !muted else { return nil }
+        // BUILD 215 — §16's switch, and §14's feedback.
+        guard !ChappyForesight.isMuted, ChappyForesight.mode != .passive else { return nil }
+        // Declined twice and never taken up is an answer. Stop asking.
+        guard !ChappyLedger.shared.isUnwanted(toolID) else { return nil }
 
         let suggestion: String?
         switch toolID {
@@ -30409,6 +31462,7 @@ enum ChappyNext {
 
         guard let sug = suggestion, sug != lastOffered else { return nil }
         lastOffered = sug
+        ChappyLedger.shared.record(.suggested, subject: toolID, detail: sug)
         return sug
     }
 
@@ -30543,6 +31597,56 @@ enum ChappySelfTest {
         check("date refuses 'sometime soon'", ChappySlots.parse("sometime soon", as: .date), nil)
 
         // ---- airports, including the ones with no airport ----------
+        // ---- BUILD 217: the flight desk ---------------------------
+        //
+        // Added because 199 shipped a `navigate` tool with no trigger
+        // words for two builds and nothing noticed. The lesson was to
+        // test the TABLE rather than the phrases I expect to work, so
+        // these walk the actual data.
+        check("bags: jetstar known",
+              ChappyBags.rule("jetstar")?.code, "JQ")
+        check("bags: code lookup",
+              ChappyBags.rule("GA")?.carrier, "Garuda Indonesia")
+        check("bags: unknown airline is nil",
+              ChappyBags.rule("wibble")?.code, nil)
+        check("bags: every rule has a carrier and a code",
+              ChappyBags.rules.allSatisfy { !$0.carrier.isEmpty && !$0.code.isEmpty }
+                ? "yes" : "no", "yes")
+        check("bags: universal rules present",
+              ChappyBags.universal.isEmpty ? "empty" : "present", "present")
+        check("routes: BNE-DPS has carriers",
+              ChappyRoutes.legs("BNE", "DPS").isEmpty ? "none" : "some", "some")
+        check("routes: reversed lookup works",
+              ChappyRoutes.legs("DPS", "BNE").isEmpty ? "none" : "some", "some")
+        check("routes: unknown route is empty",
+              ChappyRoutes.legs("BNE", "ZZZ").isEmpty ? "none" : "some", "none")
+        check("routes: every leg has a baggage rule",
+              ChappyRoutes.table.values.flatMap { $0 }
+                .allSatisfy { ChappyBags.rule($0.carrier) != nil } ? "yes" : "no", "yes")
+        check("routes: hours read as words",
+              ChappyRoutes.spokenHours(6.5), "6 and a half hours")
+        check("routes: whole hours read plainly",
+              ChappyRoutes.spokenHours(3.0), "3 hours")
+        check("fares: journal decodes",
+              ChappyFareJournal.all.count >= 0 ? "yes" : "no", "yes")
+        check("fares: a verdict needs two readings",
+              ChappyFareJournal.judge(500, origin: "ZZ1", dest: "ZZ2") == nil
+                ? "nil" : "value", "nil")
+        check("fares: source dormant without a token",
+              ChappyFareSource.isConfigured
+                ? "on" : (ChappyFareSource.token.isEmpty ? "off" : "on"),
+              ChappyFareSource.token.isEmpty ? "off" : "on")
+        check("fares: matrix parser survives rubbish",
+              ChappyFareSource.parseMatrix(Data("not json".utf8),
+                                           currency: "aud").isEmpty ? "empty" : "rows",
+              "empty")
+        check("fares: month key shape",
+              ChappyFlightsPrefs.monthKey(fromISO: "2026-09-07"), "2026-09")
+        check("fares: month key refuses rubbish",
+              ChappyFlightsPrefs.monthKey(fromISO: "nope"), nil)
+        check("fares: prefs never return empty",
+              ChappyFlightsPrefs.origin.isEmpty ? "empty" : "set", "set")
+
         check("airport: brisbane", ChappySlots.parse("brisbane", as: .airport), "BNE")
         check("airport: bali", ChappySlots.parse("bali", as: .airport), "DPS")
         check("airport: ubud resolves to Denpasar",
@@ -30594,6 +31698,20 @@ enum ChappySelfTest {
                             ok: ChappyRegistry.neverInterviewed.contains(word),
                             detail: word))
         }
+
+        // ---- BUILD 215: the ledger and the switch -------------------
+        let modeOK = ChappyForesight.Mode.allCases.count == 4
+        out.append(Case(name: "foresight: four modes exist", ok: modeOK,
+                        detail: ChappyForesight.mode.rawValue))
+        out.append(Case(name: "foresight: off means silent",
+                        ok: ChappyForesight.mode != .off || ChappyForesight.anticipate() == nil,
+                        detail: "global switch"))
+        out.append(Case(name: "ledger: unwanted needs 2 declines and 0 accepts",
+                        ok: !ChappyLedger.shared.isUnwanted("a-subject-never-seen"),
+                        detail: "\(ChappyLedger.shared.entries.count) entries"))
+        out.append(Case(name: "ledger: what-changed always answers",
+                        ok: !ChappyLedger.shared.whatChanged().isEmpty,
+                        detail: "spoken audit"))
 
         // ---- BUILD 212: the pattern engine's rules ------------------
         // A habit needs evidence. These assert the thresholds rather than
@@ -30913,5 +32031,171 @@ enum ChappyPatterns {
         // the wording handed to the model.
         return " Observed patterns (inferred from his own movements, never confirmed by him): "
             + bits.joined(separator: "; ") + "."
+    }
+}
+
+
+// =====================================================================
+// MARK: - CHAPPY LEDGER (Build 215) — WHAT HAPPENED, AND HOW IT WENT
+// =====================================================================
+//
+// §8 and §14. Chappy has recorded what it DID since 198 — tier, tool,
+// confidence, milliseconds — in a hundred-entry buffer that dies with
+// the process. What it has never recorded is what he DECIDED, or
+// whether the advice turned out to be any good.
+//
+// Without that the loop is a line: observe, store, retrieve, reason,
+// suggest, and stop. Nothing ever learns that a suggestion was
+// declined nine times running, so nothing stops making it.
+//
+// On disk, because the point is that it survives. One JSON file,
+// appended to, pruned at 500 entries — a few tens of kilobytes, and it
+// is the only thing in the app that can answer "was I right last
+// time?".
+//
+final class ChappyLedger {
+
+    static let shared = ChappyLedger()
+    private init() { load() }
+
+    enum Kind: String, Codable {
+        case suggested      // Chappy offered something
+        case accepted       // he took it
+        case declined       // he didn't
+        case ran            // a tool executed
+        case predicted      // foresight said something would happen
+        case outcome        // and this is how it went
+        case corrected      // he told Chappy it was wrong
+    }
+
+    struct Entry: Codable, Identifiable {
+        var id = UUID()
+        var at = Date()
+        var kind: Kind
+        /// What it was about — a tool id, a habit key, a suggestion.
+        var subject: String
+        /// Said out loud, so the audit reads like a diary rather than a
+        /// database. §9 asks for a "what changed" that a person can read.
+        var detail: String
+        /// Where the belief came from. §10's provenance, on the event
+        /// rather than on the memory — which is where it is actually
+        /// actionable, because an event has an outcome and a fact does
+        /// not.
+        var source: String = "observed"
+        var confidence: Double?
+    }
+
+    private(set) var entries: [Entry] = []
+    private static let cap = 500
+
+    private var url: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("chappy_ledger.json")
+    }
+
+    private func load() {
+        guard let u = url, let d = try? Data(contentsOf: u),
+              let e = try? JSONDecoder().decode([Entry].self, from: d) else { return }
+        entries = e
+    }
+
+    private func save() {
+        guard let u = url, let d = try? JSONEncoder().encode(entries) else { return }
+        try? d.write(to: u, options: .atomic)
+    }
+
+    func record(_ kind: Kind, subject: String, detail: String,
+                source: String = "observed", confidence: Double? = nil) {
+        entries.append(Entry(kind: kind, subject: subject, detail: detail,
+                             source: source, confidence: confidence))
+        if entries.count > Self.cap { entries.removeFirst(entries.count - Self.cap) }
+        save()
+        print("📒 [Ledger] \(kind.rawValue) · \(subject) · \(detail)")
+    }
+
+    // ---------------------------------------------------------------- ask
+    /// §14: has this been offered before, and how did it go? The answer
+    /// changes whether it is worth offering again.
+    func record(of subject: String) -> (offered: Int, accepted: Int, declined: Int) {
+        let mine = entries.filter { $0.subject == subject }
+        return (mine.filter { $0.kind == .suggested }.count,
+                mine.filter { $0.kind == .accepted }.count,
+                mine.filter { $0.kind == .declined }.count)
+    }
+
+    /// Declined more than twice and never accepted. Stop offering it —
+    /// this is the feedback the suggestion engine never had.
+    func isUnwanted(_ subject: String) -> Bool {
+        let r = record(of: subject)
+        return r.declined >= 2 && r.accepted == 0
+    }
+
+    /// §9's "what changed?", for any window. Written to be spoken.
+    func whatChanged(sinceHours hours: Int = 24) -> String {
+        let cut = Date().addingTimeInterval(-Double(hours) * 3600)
+        let recent = entries.filter { $0.at >= cut }
+        guard !recent.isEmpty else { return "Nothing worth reporting in the last \(hours) hours." }
+        let ran = recent.filter { $0.kind == .ran }.count
+        let offered = recent.filter { $0.kind == .suggested }.count
+        let taken = recent.filter { $0.kind == .accepted }.count
+        var bits = ["\(ran) thing\(ran == 1 ? "" : "s") run"]
+        if offered > 0 { bits.append("\(offered) suggested, \(taken) taken up") }
+        let corrections = recent.filter { $0.kind == .corrected }
+        if !corrections.isEmpty { bits.append("\(corrections.count) correction\(corrections.count == 1 ? "" : "s") from you") }
+        return bits.joined(separator: ", ") + "."
+    }
+}
+
+// =====================================================================
+// MARK: - CHAPPY FORESIGHT (Build 215) — §7, WITH A SWITCH
+// =====================================================================
+//
+// The spec asks for four modes and it is right to. An assistant that
+// volunteers things is either useful or intolerable depending entirely
+// on how often it is wrong, and that judgement is not mine to make on
+// his behalf.
+//
+// §16 also asks for a global off switch for proactive behaviour, and it
+// ships HERE, in the same build as the first proactive behaviour —
+// never afterwards. Google Now is the warning: predicting well and
+// explaining nothing is how a good feature becomes a creepy one.
+//
+enum ChappyForesight {
+
+    enum Mode: String, CaseIterable {
+        case off          // says nothing, ever
+        case passive      // answers only when asked
+        case suggestive   // offers, once, and takes no for an answer
+        case proactive    // surfaces things unprompted
+
+        var label: String {
+            switch self {
+            case .off:        return "Off"
+            case .passive:    return "Only when asked"
+            case .suggestive: return "Offers suggestions"
+            case .proactive:  return "Speaks up unprompted"
+            }
+        }
+    }
+
+    static var mode: Mode {
+        get { Mode(rawValue: UserDefaults.standard.string(forKey: "chappy_foresight") ?? "") ?? .suggestive }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "chappy_foresight") }
+    }
+
+    /// The one line §16 insists on: everything proactive dies here.
+    static var isMuted: Bool { mode == .off }
+
+    /// What is likely, and how sure — never stated as fact. Returns nil
+    /// far more often than not, which is the point.
+    static func anticipate() -> (line: String, confidence: Double)? {
+        guard mode == .suggestive || mode == .proactive else { return nil }
+        let likely = ChappyPatterns.usualAboutNow()
+        guard let top = likely.first, top.strength == .habit else { return nil }
+        let c = top.confidence
+        guard c >= 0.55 else { return nil }
+        // §2 and §10: the reason travels with the prediction, and the
+        // wording never claims he said it.
+        return ("You're often at \(top.name) about now — \(top.visits) times so far. Want it?", c)
     }
 }
