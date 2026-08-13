@@ -30,13 +30,28 @@ struct LiveAIView: View {
                 deviceNotConnectedView
             } else {
                 // Video feed (full opacity, no white mask)
-                if let videoFrame = streamViewModel.currentVideoFrame {
+                // BUILD 218 — two changes, both about honesty.
+                //
+                // hasReceivedFirstFrame: without it this drew whatever
+                // was in currentVideoFrame, including the last frame of
+                // a session that had just been torn down. That is what
+                // the "freeze" was.
+                //
+                // .fit rather than .fill: a 720p-class frame stretched
+                // to fill a 1170-point screen is roughly a 2x
+                // magnification, and magnifying a frame is the fastest
+                // way to make it look grainy. It also cropped the edges,
+                // so Chappy could see things he could not — which makes
+                // its answers baffling. Letterboxed shows him exactly
+                // what it is looking at, at the size it actually is.
+                if let videoFrame = streamViewModel.currentVideoFrame,
+                   streamViewModel.hasReceivedFirstFrame {
                     GeometryReader { geometry in
                         Image(uiImage: videoFrame)
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
                             .frame(width: geometry.size.width, height: geometry.size.height)
-                            .clipped()
                     }
                     .ignoresSafeArea()
                 }
@@ -99,10 +114,21 @@ struct LiveAIView: View {
                 return
             }
 
-            // Start the video stream
+            // Start the video stream — unless one is already running.
+            //
+            // BUILD 218: this fired unconditionally, and startSession
+            // begins by tearing down whatever was there. Opening Live AI
+            // on top of a working stream therefore killed the working
+            // stream and rebuilt it from nothing, which is both slower
+            // and the moment the stale frame appeared.
             Task {
-                print("🎥 LiveAIView: Start the video stream")
-                await streamViewModel.handleStartStreaming()
+                if streamViewModel.streamingStatus == .streaming,
+                   streamViewModel.hasReceivedFirstFrame {
+                    print("🎥 LiveAIView: stream already live — leaving it alone")
+                } else {
+                    print("🎥 LiveAIView: Start the video stream")
+                    await streamViewModel.handleStartStreaming()
+                }
             }
 
             // Auto-connect and start recording

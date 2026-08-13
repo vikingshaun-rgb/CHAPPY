@@ -2363,9 +2363,47 @@ struct FlightKeysView: View {
     @State private var apiKey = ""
     @State private var apiSecret = ""
     @State private var status = ChappyFlights.shared.isConfigured ? "Keys are saved." : ""
+    // BUILD 217 — the one on this screen that actually does something.
+    @State private var fareKey = ChappyFareSource.token
+    @State private var fareStatus = ""
 
     var body: some View {
         Form {
+            // BUILD 217 — FARE DATA.
+            //
+            // Put first, above the dead Amadeus fields, because it is the
+            // only thing on this screen that can still be switched on. It
+            // buys the price graph's market line and the cheapest-day
+            // grid; without it the graph still runs on the fares you log
+            // yourself, which is the half that is unarguably real.
+            Section {
+                SecureField("Paste the token", text: $fareKey)
+                Button("Save") {
+                    let k = fareKey.trimmingCharacters(in: .whitespaces)
+                    UserDefaults.standard.set(k, forKey: ChappyFareSource.tokenKey)
+                    ChappyFareSource.shared.forget()
+                    fareStatus = k.isEmpty
+                        ? "Cleared. The graph runs on your own journal now."
+                        : "Saved. Open Flights, Fares tab — the day grid fills in."
+                }
+                if !fareStatus.isEmpty {
+                    Text(fareStatus).font(.footnote).foregroundColor(.secondary)
+                }
+                HStack {
+                    Circle()
+                        .fill(ChappyFareSource.isConfigured ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text(ChappyFareSource.isConfigured
+                         ? "Fare data on"
+                         : "Journal only")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Fare data")
+            } footer: {
+                Text("Sign up free at travelpayouts.com, open the API section and copy the token. It is self-serve — no partner approval, no card. What it gives you is the cheapest fare somebody's search actually RETURNED for each day of a month, with the date it was seen. That is not a live quote and it does not book anything, and Chappy says so every time it shows you one. WITHOUT it, everything still works: the graph draws the fares you log yourself and the verdict on whether a price is any good comes from your own record, which is the only source that cannot be switched off.")
+            }
+
             Section("Amadeus API key") {
                 SecureField("API Key", text: $apiKey)
             }

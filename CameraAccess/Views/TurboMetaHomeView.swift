@@ -13828,59 +13828,951 @@ struct ChappyFlightsView: View {
 
     @ObservedObject private var desk = ChappyTravel.shared
     @ObservedObject private var watch = ChappyWatch.shared
+
+    // The route the fare tabs are looking at. Persisted, because the
+    // answer to "what am I watching" should survive closing the app.
+    @AppStorage("chappy_fares_origin") private var origin = "BNE"
+    @AppStorage("chappy_fares_dest") private var dest = "DPS"
+
+    @State private var tab: Tab = .trip
+    @State private var monthOffset = 0
+    @State private var live: [ChappyFareSource.DayPrice] = []
+    @State private var quotes: [ChappyFareSource.CarrierQuote] = []
+    @State private var loading = false
+    @State private var journal: [ChappyFareJournal.Entry] = []
     @State private var picked: ChappyTravel.Hop?
     @State private var share: URL?
     @State private var showStatus = false
+    @State private var showLog = false
+    @State private var openCarrier: String?
 
     private var trip: ChappyTravel.Trip? { desk.active }
     private var segments: [ChappyTravel.Hop] { trip.map { desk.hops($0) } ?? [] }
 
-    var body: some View {
-        NavigationView {
-            ZStack {
-                AuroraBackdrop(theme: theme)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if let t = trip {
-                            hitsSection
-                            routeSection(t)
-                            watchSection(t)
-                            meterSection
-                        } else {
-                            Text("No active trip. Plan one in the Travel Desk and the segments show up here.")
-                                .font(.subheadline).foregroundColor(theme.textSecondary)
-                                .padding(.top, 30)
-                        }
-                        Button { showStatus = true } label: {
-                            Label("Flight status & tracking", systemImage: "dot.radiowaves.left.and.right")
-                                .font(.subheadline).fontWeight(.semibold)
-                        }
-                        .buttonStyle(.plain).foregroundColor(theme.accent).padding(.top, 8)
-                    }
-                    .padding(14).padding(.bottom, 40)
-                }
+    enum Tab: String, CaseIterable, Identifiable {
+        case trip, track, fares, airlines, report
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .trip:     return "Trip"
+            case .track:    return "Track"
+            case .fares:    return "Fares"
+            case .airlines: return "Airlines"
+            case .report:   return "Report"
             }
-            .navigationTitle("Flights")
-            .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showStatus) { FlightsView(theme: theme) }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    if let t = trip {
-                        Button {
-                            share = desk.writeFlights(t)
-                        } label: { Image(systemName: "square.and.arrow.up") }
-                    }
-                }
+        }
+        var icon: String {
+            switch self {
+            case .trip:     return "suitcase.rolling"
+            case .track:    return "dot.radiowaves.left.and.right"
+            case .fares:    return "chart.line.uptrend.xyaxis"
+            case .airlines: return "airplane"
+            case .report:   return "doc.text"
             }
-            .sheet(item: $picked) { hop in
-                ChappySegmentView(hop: hop, theme: theme)
-            }
-            .sheet(item: $share) { u in ChappyShareSheet(items: [u]) }
         }
     }
 
-    // ---------------------------------------------------------- route
+    // The month being priced, as "2026-09".
+    private var monthDate: Date {
+        Calendar.current.date(byAdding: .month, value: monthOffset,
+                              to: Date()) ?? Date()
+    }
+    private var monthKey: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: monthDate)
+    }
+    private var monthName: String {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        return f.string(from: monthDate)
+    }
+
+    // =================================================================
+    // MARK: body
+    //
+    // AnyView at every level, deliberately. Build 213 died on a stack
+    // overflow inside SwiftUI's type-metadata demangler because this
+    // file nests generic view types deeply enough to blow the main
+    // thread's stack at LAUNCH. `some View` fixes compile time and does
+    // nothing for that. Erasure is the cure, and a screen with five
+    // tabs is exactly the shape that caused it.
+    // =================================================================
+
+    var body: AnyView {
+        AnyView(
+            NavigationView {
+                ZStack {
+                    AuroraBackdrop(theme: theme)
+                    VStack(spacing: 0) {
+                        tabBar
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 12) {
+                                current
+                            }
+                            .padding(14)
+                            .padding(.bottom, 40)
+                        }
+                    }
+                }
+                .navigationTitle("Flights")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Close") { dismiss() }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            if let t = trip { share = desk.writeFlights(t) }
+                        } label: { Image(systemName: "square.and.arrow.up") }
+                            .disabled(trip == nil)
+                    }
+                }
+                .sheet(isPresented: $showStatus) { FlightsView(theme: theme) }
+                .sheet(isPresented: $showLog) {
+                    ChappyLogFareSheet(theme: theme, origin: origin, dest: dest,
+                                       month: monthKey) { reload() }
+                }
+                .sheet(item: $picked) { hop in
+                    ChappySegmentView(hop: hop, theme: theme)
+                }
+                .sheet(item: $share) { u in ChappyShareSheet(items: [u]) }
+            }
+            .onAppear { reload() }
+            .onReceive(NotificationCenter.default
+                .publisher(for: .chappyFaresChanged)) { _ in reload() }
+        )
+    }
+
+    @ViewBuilder private var current: some View {
+        switch tab {
+        case .trip:     tripTab
+        case .track:    trackTab
+        case .fares:    faresTab
+        case .airlines: airlinesTab
+        case .report:   reportTab
+        }
+    }
+
+    // ----------------------------------------------------------- tabs
+
+    private var tabBar: AnyView {
+        AnyView(
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(Tab.allCases) { t in
+                        Button {
+                            withAnimation(.easeOut(duration: 0.16)) { tab = t }
+                            if t == .fares || t == .airlines { refreshLive() }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: t.icon).font(.system(size: 11, weight: .semibold))
+                                Text(t.label).font(.system(size: 13, weight: .semibold))
+                            }
+                            .padding(.horizontal, 13).padding(.vertical, 8)
+                            .background(Capsule().fill(tab == t
+                                ? theme.accent.opacity(0.20)
+                                : Color.white.opacity(0.05)))
+                            .foregroundColor(tab == t ? theme.accent : theme.textSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 9)
+            }
+        )
+    }
+
+    // =================================================================
+    // MARK: TRIP
+    // =================================================================
+
+    private var tripTab: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                if let t = trip {
+                    countdown(t)
+                    hitsSection
+                    routeSection(t)
+                    watchSection(t)
+                    meterSection
+                } else {
+                    noTripCard
+                    hitsSection
+                    meterSection
+                }
+            }
+        )
+    }
+
+    /// BUILD 217 — the empty state, doing some work for a change.
+    ///
+    /// The old one was a sentence telling him to go somewhere else. If a
+    /// screen has nothing of his to show, the least it can do is offer
+    /// the thing he would have opened it for.
+    private var noTripCard: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 10) {
+                Label("No trip planned yet", systemImage: "suitcase")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .foregroundColor(theme.textPrimary)
+                Text("The other tabs work without one. Fares graphs what you've seen on a route, Airlines says who flies it and what they let you carry, and Track follows a flight number on the day.")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 9) {
+                    Button {
+                        NotificationCenter.default.post(name: .chappyOpenTravel, object: nil)
+                        dismiss()
+                    } label: {
+                        Label("Plan a trip", systemImage: "plus.circle.fill")
+                            .font(.caption).fontWeight(.semibold)
+                    }
+                    .buttonStyle(.plain).foregroundColor(theme.accent)
+
+                    Button { withAnimation { tab = .fares } } label: {
+                        Label("Price a route", systemImage: "chart.line.uptrend.xyaxis")
+                            .font(.caption).fontWeight(.semibold)
+                    }
+                    .buttonStyle(.plain).foregroundColor(theme.accent)
+                }
+            }
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.05)))
+        )
+    }
+
+    private func countdown(_ t: ChappyTravel.Trip) -> AnyView {
+        let first = segments.map { $0.when }.min()
+        guard let when = first else { return AnyView(EmptyView()) }
+        let days = Calendar.current.dateComponents([.day], from: Date(), to: when).day ?? 0
+        guard days >= 0 else { return AnyView(EmptyView()) }
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM"
+        return AnyView(
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(days == 0 ? "Today" : "\(days) day\(days == 1 ? "" : "s")")
+                        .font(.system(size: 26, weight: .heavy, design: .rounded))
+                        .foregroundColor(theme.accent)
+                    Text("until \(f.string(from: when))")
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(t.name).font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                    Text("\(segments.count) flight\(segments.count == 1 ? "" : "s")")
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                }
+            }
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(theme.accent.opacity(0.10)))
+        )
+    }
+
+    // =================================================================
+    // MARK: TRACK
+    // =================================================================
+
+    private var trackTab: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                card(title: "Live flight status",
+                     icon: "dot.radiowaves.left.and.right") {
+                    AnyView(
+                        VStack(alignment: .leading, spacing: 9) {
+                            Text("Give me a flight number and I'll follow it: gate, terminal, delay, and a word in your ear when any of them change. It keeps working after you close the app.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button { showStatus = true } label: {
+                                Label("Track a flight", systemImage: "airplane.circle.fill")
+                                    .font(.subheadline).fontWeight(.semibold)
+                            }
+                            .buttonStyle(.plain).foregroundColor(theme.accent)
+                            Text("Or just say it: “Chappy, track QF43”.")
+                                .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.8))
+                        }
+                    )
+                }
+                meterSection
+                card(title: "On the day", icon: "clock.badge.checkmark") {
+                    AnyView(
+                        VStack(alignment: .leading, spacing: 7) {
+                            ForEach(["Three hours out — leave for the airport",
+                                     "Ninety minutes — bag drop closes soon",
+                                     "Forty-five minutes — get to the gate",
+                                     "Gate or time changes, the moment they happen"], id: \.self) { line in
+                                HStack(alignment: .top, spacing: 7) {
+                                    Image(systemName: "bell.fill")
+                                        .font(.system(size: 9)).foregroundColor(theme.accent)
+                                        .padding(.top, 3)
+                                    Text(line).font(.caption)
+                                        .foregroundColor(theme.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+        )
+    }
+
+    // =================================================================
+    // MARK: FARES
+    // =================================================================
+
+    private var faresTab: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                routeBar
+                sourceLine
+                graphCard
+                calendarCard
+                journalCard
+                saleCard
+            }
+        )
+    }
+
+    /// The route picker. Two codes and a swap, which is the whole of it —
+    /// a route is an origin and a destination and everything else is
+    /// decoration.
+    private var routeBar: AnyView {
+        AnyView(
+            HStack(spacing: 10) {
+                airportButton($origin)
+                Button {
+                    let a = origin; origin = dest; dest = a; refreshLive()
+                } label: {
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+                airportButton($dest)
+                Spacer()
+                monthStepper
+            }
+        )
+    }
+
+    private func airportButton(_ code: Binding<String>) -> AnyView {
+        let common = ["BNE", "SYD", "MEL", "PER", "DRW", "OOL", "CNS",
+                      "DPS", "SIN", "KUL", "CGK", "BKK", "HKT", "MNL", "SGN"]
+        return AnyView(
+            Menu {
+                ForEach(common, id: \.self) { c in
+                    Button {
+                        code.wrappedValue = c
+                        refreshLive()
+                    } label: {
+                        Text("\(c) — \(ChappyPorts.byIATA(c)?.city ?? c)")
+                    }
+                }
+            } label: {
+                VStack(spacing: 1) {
+                    Text(code.wrappedValue)
+                        .font(.system(size: 17, weight: .heavy, design: .rounded))
+                        .foregroundColor(theme.textPrimary)
+                    Text(ChappyPorts.byIATA(code.wrappedValue)?.city ?? " ")
+                        .font(.system(size: 9)).foregroundColor(theme.textSecondary)
+                        .lineLimit(1)
+                }
+                .frame(minWidth: 58)
+                .padding(.vertical, 7).padding(.horizontal, 9)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.white.opacity(0.06)))
+            }
+        )
+    }
+
+    private var monthStepper: AnyView {
+        AnyView(
+            HStack(spacing: 8) {
+                Button {
+                    if monthOffset > 0 { monthOffset -= 1; refreshLive() }
+                } label: {
+                    Image(systemName: "chevron.left").font(.caption)
+                        .foregroundColor(monthOffset > 0 ? theme.accent : theme.textSecondary.opacity(0.3))
+                }
+                .buttonStyle(.plain)
+                Text(monthName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(theme.textPrimary)
+                    .frame(minWidth: 92)
+                Button {
+                    if monthOffset < 11 { monthOffset += 1; refreshLive() }
+                } label: {
+                    Image(systemName: "chevron.right").font(.caption)
+                        .foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+        )
+    }
+
+    /// Where the numbers came from. Said every time, on purpose: a cached
+    /// fare shown as a live one is the same lie as a week-old exchange
+    /// rate shown as today's.
+    private var sourceLine: AnyView {
+        let on = ChappyFareSource.isConfigured
+        return AnyView(
+            HStack(spacing: 7) {
+                Circle().fill(on ? Color.green : Color.orange).frame(width: 6, height: 6)
+                Text(on
+                     ? (loading ? "Fetching seen fares…" : "Seen fares on, plus your own journal")
+                     : "Your journal only — add a fare key in Settings for the market's numbers")
+                    .font(.caption2).foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+        )
+    }
+
+    // ------------------------------------------------------------ graph
+
+    /// Points to draw: his own observations first, because those are the
+    /// ones that are unarguably real, plus the live month's cheapest as a
+    /// single reference point.
+    private var series: [(date: Date, price: Double, mine: Bool)] {
+        var pts: [(Date, Double, Bool)] = journal
+            .filter { $0.origin.uppercased() == origin && $0.dest.uppercased() == dest }
+            .map { ($0.seenAt, $0.price, true) }
+        if let best = live.min(by: { $0.price < $1.price }) {
+            pts.append((best.seenAt ?? Date(), best.price, false))
+        }
+        return pts.sorted { $0.0 < $1.0 }
+            .map { (date: $0.0, price: $0.1, mine: $0.2) }
+    }
+
+    private var graphCard: AnyView {
+        let pts = series
+        return AnyView(
+            card(title: "\(origin) → \(dest)", icon: "chart.line.uptrend.xyaxis") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 10) {
+                        if pts.count < 2 {
+                            Text(pts.isEmpty
+                                 ? "Nothing logged on this route yet. Next time you see a fare anywhere — Google, an airline site, a mate's screenshot — tell me the number and this becomes a line."
+                                 : "One point so far. Two makes a line, and about five makes the verdict worth trusting.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            ChappyFareGraph(points: pts.map { ($0.date, $0.price, $0.mine) },
+                                            accent: theme.accent)
+                                .frame(height: 132)
+                            graphLegend(pts)
+                        }
+                        if let v = ChappyFareJournal.judge(
+                            pts.last?.price ?? 0, origin: origin, dest: dest),
+                           pts.count >= 2 {
+                            Text(v.spoken).font(.caption)
+                                .foregroundColor(theme.textPrimary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let t = ChappyFareJournal.trend(origin: origin, dest: dest) {
+                            Text(t).font(.caption2).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Button { showLog = true } label: {
+                            Label("Log a fare I've seen", systemImage: "plus.circle.fill")
+                                .font(.caption).fontWeight(.semibold)
+                        }
+                        .buttonStyle(.plain).foregroundColor(theme.accent)
+                    }
+                )
+            }
+        )
+    }
+
+    private func graphLegend(_ pts: [(date: Date, price: Double, mine: Bool)]) -> AnyView {
+        let prices = pts.map { $0.price }
+        let lo = prices.min() ?? 0
+        let hi = prices.max() ?? 0
+        let cur = journal.last?.currency ?? "AUD"
+        return AnyView(
+            HStack {
+                Text("low \(ChappyFX.money(lo, cur))")
+                    .font(.system(size: 10, weight: .semibold)).foregroundColor(.green)
+                Spacer()
+                Text("\(pts.count) reading\(pts.count == 1 ? "" : "s")")
+                    .font(.system(size: 10)).foregroundColor(theme.textSecondary)
+                Spacer()
+                Text("high \(ChappyFX.money(hi, cur))")
+                    .font(.system(size: 10, weight: .semibold)).foregroundColor(.orange)
+            }
+        )
+    }
+
+    // --------------------------------------------------------- calendar
+
+    private var calendarCard: AnyView {
+        AnyView(
+            card(title: "Cheapest days — \(monthName)", icon: "calendar") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 9) {
+                        if live.isEmpty {
+                            Text(ChappyFareSource.isConfigured
+                                 ? "No fares cached for \(origin) → \(dest) that month. That means nobody has searched it lately, not that nothing flies."
+                                 : "The day grid needs a fare key. Settings → Travel Desk → Fare data. Until then the graph above runs on your own journal, which never needs one.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            ChappyFareCalendar(month: monthDate, days: live,
+                                               accent: theme.accent,
+                                               tripDays: Set(segments.map { $0.when }))
+                            calendarVerdict
+                        }
+                    }
+                )
+            }
+        )
+    }
+
+    private var calendarVerdict: AnyView {
+        guard let cheap = live.min(by: { $0.price < $1.price }) else {
+            return AnyView(EmptyView())
+        }
+        let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
+        let avg = live.map { $0.price }.reduce(0, +) / Double(live.count)
+        let saving = avg - cheap.price
+        return AnyView(
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Cheapest is \(f.string(from: cheap.date)) at \(ChappyFX.money(cheap.price, cheap.currency))\(cheap.direct ? ", direct" : ", with a stop").")
+                    .font(.caption).foregroundColor(theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if saving > 20 {
+                    Text("That's about \(ChappyFX.money(saving, cheap.currency)) under the month's average — worth moving a day for.")
+                        .font(.caption2).foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("These are fares somebody's search returned, \(cheap.ageNote). They are not live quotes and nothing here books anything.")
+                    .font(.system(size: 10)).foregroundColor(theme.textSecondary.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        )
+    }
+
+    // ---------------------------------------------------------- journal
+
+    private var journalCard: AnyView {
+        let mine = journal
+            .filter { $0.origin.uppercased() == origin && $0.dest.uppercased() == dest }
+            .sorted { $0.seenAt > $1.seenAt }
+        guard !mine.isEmpty else { return AnyView(EmptyView()) }
+        let f = DateFormatter(); f.dateFormat = "d MMM"
+        return AnyView(
+            card(title: "What you've seen", icon: "list.bullet.rectangle") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(mine.prefix(8)) { e in
+                            HStack(spacing: 9) {
+                                Text(f.string(from: e.seenAt))
+                                    .font(.system(size: 11)).foregroundColor(theme.textSecondary)
+                                    .frame(width: 46, alignment: .leading)
+                                Text(ChappyFX.money(e.price, e.currency))
+                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                    .foregroundColor(theme.textPrimary)
+                                if let c = e.carrier, !c.isEmpty {
+                                    Text(c).font(.system(size: 10))
+                                        .foregroundColor(theme.textSecondary)
+                                }
+                                Spacer()
+                                if let src = e.source, !src.isEmpty {
+                                    Text(src).font(.system(size: 9))
+                                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                                }
+                                Button {
+                                    ChappyFareJournal.remove(e.id)
+                                    reload()
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(theme.textSecondary.opacity(0.4))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.vertical, 6)
+                            Divider().opacity(0.12)
+                        }
+                    }
+                )
+            }
+        )
+    }
+
+    private var saleCard: AnyView {
+        AnyView(
+            card(title: "Sale windows", icon: "tag") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(ChappySaleCalendar.windows.prefix(5).enumerated()),
+                                id: \.offset) { _, w in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(w.name).font(.caption).fontWeight(.semibold)
+                                        .foregroundColor(theme.textPrimary)
+                                    Text(w.who).font(.system(size: 10))
+                                        .foregroundColor(theme.accent)
+                                }
+                                Text(w.when).font(.system(size: 10))
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                        }
+                        Text(ChappySaleCalendar.honestCeiling)
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary.opacity(0.75))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                )
+            }
+        )
+    }
+
+    // =================================================================
+    // MARK: AIRLINES
+    // =================================================================
+
+    private var airlinesTab: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                routeBar
+                carriersCard
+                bagRulesCard
+                universalCard
+            }
+        )
+    }
+
+    private var carriersCard: AnyView {
+        let legs = ChappyRoutes.legs(origin, dest)
+        return AnyView(
+            card(title: "Who flies it", icon: "airplane.departure") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 0) {
+                        if legs.isEmpty {
+                            Text("That route isn't in my table yet. I've got the Australian cities to Bali, and Brisbane to Singapore and Kuala Lumpur. Ask me anyway and I'll say what I do know.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            ForEach(Array(ranked(legs).enumerated()), id: \.offset) { _, row in
+                                carrierRow(row.leg, quote: row.quote)
+                                Divider().opacity(0.12)
+                            }
+                            Text("Table checked \(ChappyRoutes.vintage). Routes get added and dropped — confirm the days before you count on one.")
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.textSecondary.opacity(0.7))
+                                .padding(.top, 8)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                )
+            }
+        )
+    }
+
+    /// §11 — ranked, with the reason showing. Cheapest seen fare first
+    /// when there is one, otherwise the ones that include a bag, because
+    /// a fare without a bag is not a cheaper fare, it is a smaller one.
+    private func ranked(_ legs: [ChappyRoutes.Leg])
+        -> [(leg: ChappyRoutes.Leg, quote: ChappyFareSource.CarrierQuote?)] {
+        let byCode = Dictionary(grouping: quotes, by: { $0.code })
+        let rows = legs.map { leg -> (leg: ChappyRoutes.Leg, quote: ChappyFareSource.CarrierQuote?) in
+            (leg: leg, quote: byCode[leg.code]?.min(by: { $0.price < $1.price }))
+        }
+        return rows.sorted { a, b in
+            switch (a.quote?.price, b.quote?.price) {
+            case let (x?, y?): return x < y
+            case (_?, nil):    return true
+            case (nil, _?):    return false
+            default:
+                let ab = ChappyBags.rule(a.leg.carrier)?.baseCheckedKg ?? 0
+                let bb = ChappyBags.rule(b.leg.carrier)?.baseCheckedKg ?? 0
+                if ab != bb { return ab > bb }
+                return a.leg.hours < b.leg.hours
+            }
+        }
+    }
+
+    private func carrierRow(_ leg: ChappyRoutes.Leg,
+                            quote: ChappyFareSource.CarrierQuote?) -> AnyView {
+        let bag = ChappyBags.rule(leg.carrier)
+        let open = openCarrier == leg.code
+        return AnyView(
+            VStack(alignment: .leading, spacing: 7) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        openCarrier = open ? nil : leg.code
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(leg.carrier)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(theme.textPrimary)
+                            HStack(spacing: 6) {
+                                Text(ChappyRoutes.spokenHours(leg.hours))
+                                    .font(.system(size: 10))
+                                    .foregroundColor(theme.textSecondary)
+                                Text(leg.direct ? "direct" : "1 stop")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(leg.direct ? .green : theme.textSecondary)
+                                if let b = bag {
+                                    Text(b.baseCheckedKg > 0
+                                         ? "\(Int(b.baseCheckedKg))kg included"
+                                         : "no bag included")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(b.baseCheckedKg > 0 ? .green : .orange)
+                                }
+                            }
+                        }
+                        Spacer()
+                        if let q = quote {
+                            VStack(alignment: .trailing, spacing: 1) {
+                                Text(ChappyFX.money(q.price, q.currency))
+                                    .font(.system(size: 14, weight: .heavy, design: .rounded))
+                                    .foregroundColor(theme.accent)
+                                Text("seen").font(.system(size: 8))
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                        }
+                        Image(systemName: open ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary.opacity(0.6))
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if open {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(leg.note).font(.caption)
+                            .foregroundColor(theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let b = bag {
+                            bagDetail(b)
+                            if let q = quote {
+                                let real = ChappyBags.trueCost(fare: q.price, carrier: b.carrier)
+                                if real.total > q.price {
+                                    Text("With a bag that's about \(ChappyFX.money(real.total, q.currency)) — \(real.note).")
+                                        .font(.caption).foregroundColor(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.leading, 2)
+                }
+            }
+            .padding(.vertical, 9)
+        )
+    }
+
+    private func bagDetail(_ b: ChappyBags.Rule) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 14) {
+                    bagStat("Cabin", "\(Int(b.cabinKg))kg" + (b.cabinPieces > 1 ? " ×\(b.cabinPieces)" : ""))
+                    bagStat("Checked", b.baseCheckedKg > 0 ? "\(Int(b.baseCheckedKg))kg" : "none")
+                    if b.baseCheckedKg <= 0 {
+                        bagStat(b.nextUpName, "\(Int(b.nextUpKg))kg")
+                    }
+                }
+                Text(b.sports).font(.system(size: 10))
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        )
+    }
+
+    private func bagStat(_ label: String, _ value: String) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label.uppercased())
+                    .font(.system(size: 8, weight: .heavy)).kerning(0.6)
+                    .foregroundColor(theme.textSecondary.opacity(0.7))
+                Text(value)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundColor(theme.textPrimary)
+            }
+        )
+    }
+
+    private var bagRulesCard: AnyView {
+        AnyView(
+            card(title: "Every airline I know", icon: "suitcase.fill") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(ChappyBags.rules.enumerated()), id: \.offset) { _, r in
+                            HStack(spacing: 9) {
+                                Text(r.code)
+                                    .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(theme.accent)
+                                    .frame(width: 26, alignment: .leading)
+                                Text(r.carrier).font(.system(size: 12))
+                                    .foregroundColor(theme.textPrimary)
+                                Spacer()
+                                Text("\(Int(r.cabinKg))kg cabin")
+                                    .font(.system(size: 10)).foregroundColor(theme.textSecondary)
+                                Text(r.baseCheckedKg > 0 ? "\(Int(r.baseCheckedKg))kg hold" : "no hold bag")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(r.baseCheckedKg > 0 ? .green : .orange)
+                            }
+                            .padding(.vertical, 6)
+                            Divider().opacity(0.10)
+                        }
+                    }
+                )
+            }
+        )
+    }
+
+    private var universalCard: AnyView {
+        AnyView(
+            card(title: "True anywhere", icon: "exclamationmark.triangle") {
+                AnyView(
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(ChappyBags.universal, id: \.self) { line in
+                            HStack(alignment: .top, spacing: 7) {
+                                Image(systemName: "circle.fill")
+                                    .font(.system(size: 4)).foregroundColor(theme.accent)
+                                    .padding(.top, 5)
+                                Text(line).font(.caption)
+                                    .foregroundColor(theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                )
+            }
+        )
+    }
+
+    // =================================================================
+    // MARK: REPORT
+    // =================================================================
+
+    private var reportTab: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                card(title: "The flight brief", icon: "doc.text") {
+                    AnyView(
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("One document with everything in it: every segment as codes and times, what each fare actually costs once the bag is on it, whether the connections work, what you're allowed to carry on each carrier, what the journal has seen on those routes, the visa and onward-ticket position, and where to search for the airlines Google can't see.")
+                                .font(.caption).foregroundColor(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            ForEach(reportContents, id: \.self) { line in
+                                HStack(alignment: .top, spacing: 7) {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundColor(theme.accent).padding(.top, 2)
+                                    Text(line).font(.caption)
+                                        .foregroundColor(theme.textPrimary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            if let t = trip {
+                                Button { share = desk.writeFlights(t) } label: {
+                                    Label("Make the brief", systemImage: "square.and.arrow.up")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                }
+                                .buttonStyle(.plain).foregroundColor(theme.accent)
+                                Text("Saves, prints, emails, or drops into iCloud — it's a normal document and it opens with no signal.")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(theme.textSecondary.opacity(0.75))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } else {
+                                Text("Plan a trip first — the brief is built around your segments.")
+                                    .font(.caption).foregroundColor(.orange)
+                            }
+                        }
+                    )
+                }
+                card(title: "Ask for it out loud", icon: "waveform") {
+                    AnyView(
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(spokenExamples, id: \.self) { line in
+                                Text("“\(line)”")
+                                    .font(.caption).foregroundColor(theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    )
+                }
+            }
+        )
+    }
+
+    private var reportContents: [String] {
+        ["Segments, times and airport codes",
+         "Fare plus bag — the number that decides it",
+         "Connection verdicts, with the minimum times",
+         "Baggage per carrier, cabin and hold",
+         "What your journal has seen on these routes",
+         "Visa allowance and the onward-ticket position",
+         "Where to search for carriers Google misses"]
+    }
+
+    private var spokenExamples: [String] {
+        ["Chappy, track QF43",
+         "Who flies Brisbane to Bali",
+         "How much baggage on Jetstar",
+         "Log a fare, seven eighty Brisbane Denpasar",
+         "Is that a good price",
+         "When's the cheapest week in September",
+         "Read me the flight brief"]
+    }
+
+    // =================================================================
+    // MARK: shared pieces
+    // =================================================================
+
+    private func card(title: String, icon: String,
+                      @ViewBuilder body: () -> AnyView) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 7) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(theme.accent)
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(theme.textPrimary)
+                    Spacer()
+                }
+                body()
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.05)))
+        )
+    }
+
+    private func reload() {
+        journal = ChappyFareJournal.all
+    }
+
+    private func refreshLive() {
+        guard ChappyFareSource.isConfigured else { live = []; quotes = []; return }
+        let o = origin, d = dest, m = monthKey
+        loading = true
+        // @MainActor on the Task rather than a MainActor.run inside it: the
+        // two fetches still run off the main thread because they are
+        // nonisolated async functions, but the assignments land back here
+        // without carrying a view struct across an isolation boundary.
+        Task { @MainActor in
+            async let days = ChappyFareSource.shared.month(origin: o, dest: d, month: m)
+            async let cs = ChappyFareSource.shared.carriers(origin: o, dest: d, month: m)
+            let (dd, qq) = await (days, cs)
+            live = dd
+            quotes = qq
+            loading = false
+        }
+    }
+
+    // ------------------------------------------------- kept from before
 
     @ViewBuilder private func routeSection(_ t: ChappyTravel.Trip) -> some View {
         HStack {
@@ -13899,15 +14791,6 @@ struct ChappyFlightsView: View {
                 Button { picked = hop } label: { segmentRow(hop, t) }
                     .buttonStyle(.plain)
             }
-            let mins = segments.reduce(0) { $0 + $1.minutes }
-            HStack {
-                Text("Time in the air, all \(segments.count)")
-                    .font(.caption).foregroundColor(theme.textSecondary)
-                Spacer()
-                Text(ChappyPorts.minutesLine(max(0, mins - 35 * segments.count)))
-                    .font(.caption).fontWeight(.semibold).foregroundColor(theme.textPrimary)
-            }
-            .padding(.horizontal, 4)
         }
     }
 
@@ -13940,11 +14823,6 @@ struct ChappyFlightsView: View {
             .fill(Color.white.opacity(0.05)))
     }
 
-    // ---------------------------------------------------------- what it found
-
-    /// The top of the screen when something has actually turned up.
-    /// Every one of these has already been priced by Chappy — the feed
-    /// made a claim and Chappy went and checked it before showing him.
     @ViewBuilder private var hitsSection: some View {
         let hits = watch.liveHits
         if !hits.isEmpty {
@@ -13996,14 +14874,7 @@ struct ChappyFlightsView: View {
         }
     }
 
-    // ---------------------------------------------------------- watching
-
     @ViewBuilder private func watchSection(_ t: ChappyTravel.Trip) -> some View {
-        // AUDIT: filtering on !points.isEmpty meant that after tapping
-        // "Watch these routes" — which creates them with no points yet —
-        // the list was still empty and the button was still there. It
-        // read as a broken button. The .thin copy already says "one
-        // reading so far, three is the minimum"; let it say it.
         let mine = watch.watches.filter { $0.tripID == t.id && $0.kind == .route }
         if !mine.isEmpty {
             Text("Watching").font(.caption).fontWeight(.semibold)
@@ -14024,8 +14895,8 @@ struct ChappyFlightsView: View {
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(Color.white.opacity(0.05)))
             }
-        } else if let t2 = trip {
-            Button { watch.watchRoutes(of: t2) } label: {
+        } else {
+            Button { watch.watchRoutes(of: t) } label: {
                 Label("Watch these routes", systemImage: "plus.circle")
                     .font(.caption).fontWeight(.semibold)
             }
@@ -14035,14 +14906,264 @@ struct ChappyFlightsView: View {
 
     @ViewBuilder private var meterSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // The bar already exists and already knows the rules — no
-            // reason to invent a second way of saying the same thing.
             FlightBudgetBar(theme: theme)
             Text("Spent on the flights you've booked, not on searching. Searching is free; status isn't.")
                 .font(.caption2).foregroundColor(theme.textSecondary.opacity(0.75))
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.top, 8)
+    }
+}
+
+
+// =====================================================================
+// BUILD 217 — THE GRAPH.
+//
+// Drawn by hand rather than with a charting framework, for two reasons
+// that both cost this project real time already. One, every framework
+// view added to this file deepens the generic type nesting that blew
+// the stack at launch in 213. Two, a chart library would draw a
+// beautiful line through four points and imply a precision that four
+// points do not have.
+//
+// So: a path, a fill under it, and a dot for every reading. His own
+// observations are solid; anything from the fare source is hollow, so
+// the difference between "I saw this" and "somebody saw this" is
+// visible without reading a legend.
+// =====================================================================
+
+struct ChappyFareGraph: View {
+    let points: [(Date, Double, Bool)]
+    let accent: Color
+
+    var body: AnyView {
+        AnyView(
+            GeometryReader { geo in
+                let w = geo.size.width
+                let h = geo.size.height
+                let prices = points.map { $0.1 }
+                let lo = (prices.min() ?? 0) * 0.96
+                let hi = (prices.max() ?? 1) * 1.04
+                let span = max(hi - lo, 1)
+                let t0 = points.first?.0.timeIntervalSince1970 ?? 0
+                let t1 = points.last?.0.timeIntervalSince1970 ?? 1
+                let tspan = max(t1 - t0, 1)
+
+                let xy: [CGPoint] = points.map { p in
+                    CGPoint(
+                        x: CGFloat((p.0.timeIntervalSince1970 - t0) / tspan) * (w - 16) + 8,
+                        y: h - CGFloat((p.1 - lo) / span) * (h - 16) - 8)
+                }
+
+                ZStack {
+                    // the fill under the line
+                    Path { path in
+                        guard let f = xy.first else { return }
+                        path.move(to: CGPoint(x: f.x, y: h))
+                        for p in xy { path.addLine(to: p) }
+                        if let l = xy.last { path.addLine(to: CGPoint(x: l.x, y: h)) }
+                        path.closeSubpath()
+                    }
+                    .fill(LinearGradient(colors: [accent.opacity(0.28), accent.opacity(0.02)],
+                                         startPoint: .top, endPoint: .bottom))
+
+                    Path { path in
+                        guard let f = xy.first else { return }
+                        path.move(to: f)
+                        for p in xy.dropFirst() { path.addLine(to: p) }
+                    }
+                    .stroke(accent, style: StrokeStyle(lineWidth: 2, lineCap: .round,
+                                                       lineJoin: .round))
+
+                    ForEach(Array(xy.enumerated()), id: \.offset) { i, p in
+                        Circle()
+                            .fill(points[i].2 ? accent : Color.clear)
+                            .overlay(Circle().stroke(accent, lineWidth: 1.5))
+                            .frame(width: 7, height: 7)
+                            .position(p)
+                    }
+                }
+            }
+        )
+    }
+}
+
+
+// =====================================================================
+// BUILD 217 — THE CHEAPEST-DAY GRID.
+//
+// The one view in the app where colour carries the meaning, so it has
+// to be right: green is cheap for THIS month on THIS route, not cheap
+// in general. A grid that colours against some absolute idea of a good
+// fare would be green all over in a quiet month and red all over in a
+// school holiday, which tells him nothing either time.
+// =====================================================================
+
+struct ChappyFareCalendar: View {
+    let month: Date
+    let days: [ChappyFareSource.DayPrice]
+    let accent: Color
+    var tripDays: Set<Date> = []
+
+    private var byDay: [Int: ChappyFareSource.DayPrice] {
+        var m: [Int: ChappyFareSource.DayPrice] = [:]
+        for d in days {
+            m[Calendar.current.component(.day, from: d.date)] = d
+        }
+        return m
+    }
+
+    var body: AnyView {
+        let cal = Calendar.current
+        let start = cal.date(from: cal.dateComponents([.year, .month], from: month)) ?? month
+        let count = cal.range(of: .day, in: .month, for: start)?.count ?? 30
+        // Monday-first, which is how a week is read outside America.
+        let weekday = (cal.component(.weekday, from: start) + 5) % 7
+        let prices = days.map { $0.price }
+        let lo = prices.min() ?? 0
+        let hi = prices.max() ?? 1
+        let tripDayNumbers = Set(tripDays.compactMap { d -> Int? in
+            cal.isDate(d, equalTo: start, toGranularity: .month)
+                ? cal.component(.day, from: d) : nil
+        })
+
+        return AnyView(
+            VStack(spacing: 5) {
+                HStack(spacing: 3) {
+                    ForEach(["M", "T", "W", "T", "F", "S", "S"], id: \.self) { d in
+                        Text(d).font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.white.opacity(0.35))
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 3),
+                                         count: 7), spacing: 3) {
+                    ForEach(0..<weekday, id: \.self) { _ in
+                        Color.clear.frame(height: 34)
+                    }
+                    ForEach(1...max(count, 1), id: \.self) { day in
+                        cell(day, price: byDay[day], lo: lo, hi: hi,
+                             isTrip: tripDayNumbers.contains(day))
+                    }
+                }
+            }
+        )
+    }
+
+    private func cell(_ day: Int, price: ChappyFareSource.DayPrice?,
+                      lo: Double, hi: Double, isTrip: Bool) -> AnyView {
+        let fraction = price.map { p -> Double in
+            hi > lo ? (p.price - lo) / (hi - lo) : 0
+        }
+        let tint: Color = {
+            guard let f = fraction else { return Color.white.opacity(0.04) }
+            if f < 0.25 { return Color.green.opacity(0.30) }
+            if f < 0.55 { return Color.yellow.opacity(0.22) }
+            if f < 0.8  { return Color.orange.opacity(0.22) }
+            return Color.red.opacity(0.22)
+        }()
+        return AnyView(
+            VStack(spacing: 1) {
+                Text("\(day)")
+                    .font(.system(size: 9, weight: isTrip ? .heavy : .regular))
+                    .foregroundColor(isTrip ? accent : .white.opacity(0.55))
+                if let p = price {
+                    Text(shortMoney(p.price))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                } else {
+                    Text("–").font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.18))
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(tint))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(isTrip ? accent : Color.clear, lineWidth: 1.2))
+        )
+    }
+
+    /// $1,240 in a 40-point-wide box is unreadable, so: 1.2k.
+    private func shortMoney(_ v: Double) -> String {
+        v >= 1000 ? String(format: "%.1fk", v / 1000) : String(Int(v.rounded()))
+    }
+}
+
+
+// =====================================================================
+// BUILD 217 — LOGGING A FARE HE SAW SOMEWHERE ELSE.
+//
+// This is the sheet behind the only price data that is guaranteed real.
+// Kept to four fields, because a form that takes a minute to fill in
+// gets filled in once.
+// =====================================================================
+
+struct ChappyLogFareSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let theme: ChappyTheme
+    let origin: String
+    let dest: String
+    let month: String
+    var done: () -> Void = {}
+
+    @State private var amount = ""
+    @State private var carrier = ""
+    @State private var source = "Google Flights"
+    @State private var note = ""
+
+    private let sources = ["Google Flights", "Airline site", "Skyscanner",
+                           "Agent", "Someone told me"]
+
+    var body: AnyView {
+        AnyView(
+            NavigationView {
+                Form {
+                    Section {
+                        HStack {
+                            Text(ChappyFXLite.home).foregroundColor(.secondary)
+                            TextField("Price", text: $amount)
+                                .keyboardType(.decimalPad)
+                        }
+                        TextField("Airline (optional)", text: $carrier)
+                        Picker("Saw it on", selection: $source) {
+                            ForEach(sources, id: \.self) { Text($0) }
+                        }
+                        TextField("Note (optional)", text: $note)
+                    } header: {
+                        Text("\(origin) → \(dest), \(month)")
+                    } footer: {
+                        Text("Every fare you log makes the next verdict better. Five readings on a route is about where “is that a good price” starts being worth asking.")
+                    }
+                }
+                .navigationTitle("Log a fare")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Cancel") { dismiss() }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Save") { save() }
+                            .disabled(Double(amount.filter { $0.isNumber || $0 == "." }) == nil)
+                    }
+                }
+            }
+        )
+    }
+
+    private func save() {
+        let clean = amount.filter { $0.isNumber || $0 == "." }
+        guard let v = Double(clean), v > 0 else { return }
+        var e = ChappyFareJournal.Entry(origin: origin, dest: dest, price: v)
+        e.currency = ChappyFXLite.home
+        e.forMonth = month
+        e.carrier = carrier.isEmpty ? nil : carrier
+        e.source = source
+        e.note = note.isEmpty ? nil : note
+        ChappyFareJournal.log(e)
+        done()
+        dismiss()
     }
 }
 
