@@ -1395,7 +1395,32 @@ class GeminiLiveService: NSObject {
         guard maxSide > maxDimension, maxSide > 0 else { return image }
         let scale = maxDimension / maxSide
         let newSize = CGSize(width: size.width * scale, height: size.height * scale)
-        let renderer = UIGraphicsImageRenderer(size: newSize)
+
+        // BUILD 218 — THE GRAIN LIVED IN THIS FUNCTION.
+        //
+        // UIGraphicsImageRenderer's DEFAULT format inherits the device
+        // screen scale, which is 3 on this phone. Without the two lines
+        // below, asking for 512 produced a 512-point image at 3x — a
+        // 1536-PIXEL bitmap, upscaled from a glasses frame that is at
+        // most about 1280 pixels wide.
+        //
+        // Every consequence of that is bad:
+        //   * it is an enlargement, so the picture is soft;
+        //   * it is nine times the pixels, so it blew past the 150KB
+        //     guard below and got re-encoded at JPEG 0.4, which is
+        //     where the blockiness came from;
+        //   * it is nine times the render, encode and base64 cost, all
+        //     of it on the main thread, which is part of why the
+        //     preview stuttered.
+        //
+        // scale = 1 means one pixel per point, which is what "resize to
+        // 512" was always supposed to mean. opaque = true drops the
+        // alpha channel a camera frame never had.
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
         return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
     }
 
@@ -1439,14 +1464,20 @@ class GeminiLiveService: NSObject {
         // uploads 3-4x faster than 768px, so vision stays CURRENT even on a
         // slow/VPN connection. Fine detail comes from the on-demand high-res
         // "read this" frame, not the live drip.
+        // BUILD 218: with the scale bug fixed a 512px frame lands around
+        // 40KB at 0.8, well under the guard below — so the quality that
+        // was set low to survive an oversized image can come back up.
+        // The old 0.6/0.4 pair was compensating for a bug, not for
+        // bandwidth.
         let prepared = resizedForLive(image, maxDimension: 512)
-        guard var imageData = prepared.jpegData(compressionQuality: 0.6) else {
+        guard var imageData = prepared.jpegData(compressionQuality: 0.8) else {
             print("❌ [Gemini] Failed to compress image")
             return
         }
-        // Safety net: if still heavy, recompress harder rather than drop
+        // Safety net: if still heavy, recompress rather than drop. This
+        // should now be almost unreachable on the live path.
         if imageData.count > 150 * 1024,
-           let smaller = prepared.jpegData(compressionQuality: 0.4) {
+           let smaller = prepared.jpegData(compressionQuality: 0.6) {
             imageData = smaller
         }
         guard imageData.count <= 500 * 1024 else {
