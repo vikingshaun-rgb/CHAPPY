@@ -1,0 +1,281 @@
+CHAPPY — BUILD 190 COMBINED  (175 through 190 in one zip)
+=====================================================================
+CUMULATIVE. Everything from 175 onwards is in here — you do NOT need
+the 184 or 189 zips as well. Your repo is at 153; this brings it
+fully current in one go.
+
+Eighteen files. Six of them changed in 190; the other twelve carry
+175-189 and are unchanged since that zip.
+
+
+=====================================================================
+WHAT TO DO
+=====================================================================
+
+Upload the zip contents to GitHub, then on the Mac run these ONE AT A
+TIME. Paste one line, press enter, wait, paste the next.
+
+---------------------------------------------------------------------
+
+cd /Volumes/Macintosh_HD/Users/user951653/Desktop/chappy
+
+git fetch origin
+
+git checkout origin/main -- CameraAccess/Managers/LiveAIManager.swift
+
+git checkout origin/main -- CameraAccess/Managers/ChappyMemoryKeeper.swift
+
+git checkout origin/main -- CameraAccess/Managers/ChappyRouterHook.swift
+
+git checkout origin/main -- CameraAccess/Managers/ChappyPhotoIngest.swift
+
+git checkout origin/main -- CameraAccess/Managers/ChappyProactive.swift
+
+git checkout origin/main -- CameraAccess/Views/TurboMetaHomeView.swift
+
+git checkout origin/main -- CameraAccess/Views/SettingsView.swift
+
+git checkout origin/main -- CameraAccess/Views/GalleryView.swift
+
+git checkout origin/main -- CameraAccess/Views/LiveTranslateView.swift
+
+git checkout origin/main -- CameraAccess/Views/QuickVisionView.swift
+
+git checkout origin/main -- CameraAccess/Services/TTSService.swift
+
+git checkout origin/main -- CameraAccess/Services/GeminiLiveService.swift
+
+git checkout origin/main -- CameraAccess/Intents/QuickVisionIntent.swift
+
+git checkout origin/main -- CameraAccess/Utils/APIKeyManager.swift
+
+git checkout origin/main -- CameraAccess/TurboMetaApp.swift
+
+git checkout origin/main -- CameraAccess/Info.plist
+
+git checkout origin/main -- CameraAccess.xcodeproj/project.pbxproj
+
+git status
+
+Open Xcode. Scheme TurboMeta. Product > Archive. Build number is 190.
+
+
+=====================================================================
+1. ONE-WAY, WHICH IS HOW YOU ACTUALLY TRAVEL
+=====================================================================
+
+Your notes have said "one-way tickets each leg" since 7 August. Five
+builds got made on top of a return assumption anyway. That's fixed in
+eight places:
+
+  * A ONE-WAY SWITCH, on the Travel Desk, above the money — because it
+    decides the fare, the bags, the last day and whether you can board.
+  * The interview now asks "are you coming back, or moving on?"
+  * hops() no longer invents a flight home — that was an extra segment
+    and an hour of phantom air time on every plan.
+  * The true cost no longer adds a return baggage sector. That was
+    20kg x 2 you were never going to check.
+  * The price journal was querying "return economy airfare" as fixed
+    text — so it has been pricing the wrong product. It now asks for
+    one-way explicitly, and tells the model NOT to halve a return,
+    because one-way is roughly half on the Asian low-cost carriers and
+    seventy to ninety per cent of a return on full-service.
+  * The report said "return, per person" as fixed text.
+  * The last day of a one-way trip is no longer "keep it near the
+    airport" — you're not going home, you're moving on, and it's now
+    planned as the day to decide the next country.
+  * The planner is told not to hit a budget by thinning the trip.
+
+
+=====================================================================
+2. THE ONWARD TICKET
+=====================================================================
+
+This is the one that stops people at an airport, and it's specific to
+how you travel.
+
+Indonesia, Thailand and the Philippines require proof of onward
+travel. It's the AIRLINE that enforces it, at the check-in desk,
+because they're liable for carrying someone a country won't admit.
+Island nations reject bus and train tickets outright.
+
+Chappy had this as a seven-days-out checklist item that TICKED ITSELF
+DONE whenever any flight was booked. Having a flight is not having an
+onward ticket, and for you it's almost never the same thing.
+
+Now:
+
+  * A per-country table with how hard each one actually enforces it,
+    and whether a land ticket is accepted.
+  * YOUR METHOD IS THE DEFAULT. The temporary reservation that
+    auto-cancels — real PNR, about 48 hours, a few dollars — is what
+    the app assumes and records, not something it explains to you
+    every trip.
+  * It checks the expiry against your ARRIVAL date. A reservation
+    bought three weeks early has already cancelled itself by the time
+    you reach the desk, and that is the specific way this goes wrong.
+  * Missing onward proof where it's strictly enforced is now a HARD
+    CAP on the deal score — 32/100. Same class as the passport rule:
+    a plan you can't board isn't a 90.
+  * It never offers a generated PDF. That's document fraud, it risks
+    an entry ban, and it costs the same as the legal option.
+
+
+=====================================================================
+3. THE FLIGHTS SCREEN
+=====================================================================
+
+The airplane tile now opens the route screen instead of the 176 status
+view. The status view is still there, one tap inside.
+
+  * Every segment as codes with dates, durations and distances, with
+    the journal's Book it / Wait / Watch verdict on each.
+  * Tap a segment: the price journal with its reasoning, what the
+    carrier actually includes against your 20kg, nearby airports with
+    the distance and whether it's worth it, and the search links.
+  * SEARCH LINKS NOW GO TO SKYSCANNER FIRST. This matters: VietJet
+    Air and AirAsia X don't publish fares to Google at all. Chappy was
+    pointing you at the one search engine that can't see the cheapest
+    carrier on exactly the routes you fly. Skyscanner first, the
+    airline's own site second, Google kept for the month grid because
+    that one thing is still the best version of it.
+  * An emailable flights document — same share sheet, so Mail and
+    Files/iCloud Drive both work, same as the trip report.
+
+
+=====================================================================
+4. WHAT WILL IT BUY  (Travel Desk menu)
+=====================================================================
+
+Your $5,000 question, built.
+
+Ask for a trip on a budget and a model told to hit $5,000 will hit
+$5,000 — by thinning the trip until it fits. The deal score doesn't
+catch it either, because every line sits at the bottom of its band,
+which reads as good value.
+
+So this runs BEFORE the planner: budget, minus flights, divided by
+nights and party, against what each country actually costs. The costs
+come from the ten long-stay simulations rather than a guess.
+
+$5,000, two of you, 60 nights, one-way works out at about $66 a night
+on the ground. That fits Cambodia, Laos, Vietnam, Java, Malaysia and
+Chiang Mai. It doesn't reach Bali, the Thai islands or Japan.
+
+It advises rather than blocks. It's your money.
+
+
+=====================================================================
+5. THE WATCH ACTUALLY RUNS NOW
+=====================================================================
+
+  * BACKGROUND REFRESH. It only ever ran when you opened the app, so
+    a week without opening it was a week of nothing checked. It now
+    hangs off the background task ChappyProactive already owns —
+    rather than registering a second one, which iOS would wake less
+    often.
+  * THE DEAL FEEDS, DAILY — AND CHAPPY DOES THE WORK.
+    I Know The Pilot, Beat That Flight and Secret Flying, read once a
+    day and matched against your watched routes.
+
+    The first version of this posted a reminder saying "a feed
+    mentioned your route" and left you to go and check. That is half
+    the job — it moves the work rather than doing it.
+
+    Now, when a feed hit matches a route you're watching, Chappy
+    immediately prices that route itself and compares it against your
+    own journal. Then:
+
+      CONFIRMED    "BNE -> SGN: $389 — confirmed, cheapest I've seen"
+                   with a Book it button that goes straight to
+                   Skyscanner for that route, your dates, one-way,
+                   two adults. One tap from bookable.
+
+      UNCONFIRMED  It goes on the Flights screen with "I priced the
+                   route straight after and couldn't see it — may be
+                   sold out, or different dates, or not real. Worth
+                   thirty seconds, not more." NO notification.
+
+    You only get buzzed when it held up. A watch that cries wolf gets
+    muted inside a fortnight and is then worth nothing.
+  * A SALE CALENDAR. Jetstar's Friday Frenzy is weekly and
+    predictable; AirAsia, VietJet, Cebu and Scoot all recur. Knowing
+    when to look costs nothing.
+
+And the honest ceiling, stated in the app rather than implied away: a
+six-hour error fare will not be caught by any scheduled job. Those are
+found by people and gone before a weekly check runs. Chappy watches
+the feeds that find them. That is real and it is not the same thing.
+
+
+=====================================================================
+WHAT THE REVIEW AND THE SIMULATION CAUGHT
+=====================================================================
+
+ONE THAT WOULD NOT HAVE BUILT
+
+  * A bare assignment at the top of a @ViewBuilder body:
+    `let f = DateFormatter(); f.dateFormat = "..."`. The declaration
+    is fine; the assignment is a ()-typed statement and ViewBuilder
+    has no Void overload. It was the only one in 13,500 lines.
+
+FOUND BY REVIEW
+
+  * The "what's included" card could never appear — it used an exact
+    string match against model-written text like "Jetstar, Scoot".
+  * The Flights tile counted one watch store and opened a screen
+    backed by a different one. It could say "3 routes watched" and
+    then show you nothing.
+  * "Watch these routes" looked broken — the list filtered out
+    watches with no readings yet, which is all of them at the moment
+    you create them.
+  * The segment sheet matched a watch from ANY trip, so last year's
+    SYD-DPS showed a stale verdict against a trip six months out.
+  * The flights report dropped the onward-ticket section exactly when
+    the airports hadn't resolved — omitting the one thing that stops
+    you boarding, in the incomplete-data case.
+  * "AirAsia and AirAsia X doesn't publish fares" — duplicated
+    carrier, singular verb.
+  * The budget check never matched a REGION, so "Bali" — the literal
+    example in its own header comment — matched nothing.
+  * Dictionary iteration order made the "airline direct" button show
+    a different airline on different launches.
+  * The budget screen recomputed six times per render, allocating a
+    NumberFormatter each time — a few thousand a second on a slider
+    drag.
+
+FOUND BY SIMULATION
+
+  * THE ONE-WAY FLIGHT ALLOWANCE WAS A RETURN-SHAPED NUMBER. $620 per
+    person as a one-way base, when Brisbane to Denpasar one-way is
+    $250-400. It made every budget answer about $6 a night meaner
+    than the truth — and that landed exactly on the line between
+    Chiang Mai fitting and not fitting.
+  * BINARY FITS / DOESN'T-FIT IS TOO BLUNT. The simulation had it
+    calling Chiang Mai and Penang "SHORT" on a six per cent gap,
+    which is technically true and useless as advice. Six per cent is
+    a monthly rate and one fewer move, not a different country.
+    There's a "tight, not wrong" band now.
+
+
+=====================================================================
+WHAT TO TEST FIRST
+=====================================================================
+
+1.  Travel Desk — the one-way switch is above the money. Turn it on.
+    Watch the onward-ticket rows appear for Indonesia.
+
+2.  Tap "Record an onward ticket". Set the valid-until date to
+    something before your arrival and watch it warn you that it
+    lapses first.
+
+3.  Travel Desk menu > What will it buy. Put $5,000 and 60 nights in
+    and drag the sliders. Type "Bali" in the destination box.
+
+4.  The airplane tile on the home screen — the segments, then tap one.
+
+5.  Share the flights document from the Flights screen. Check Mail
+    and Files > iCloud Drive both appear.
+
+STILL ON YOUR LIST: the Tripadvisor key, the home currency, filling in
+Who's travelling, and deleting the six stray duplicate files.
