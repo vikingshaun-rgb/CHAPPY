@@ -1981,7 +1981,20 @@ final class ChappyStandby: NSObject, ObservableObject {
     ///   - freshEngine: replace the AVAudioEngine outright. Required after a
     ///     media-services reset, where the old instance is invalid by contract.
     ///   - attempt: retry counter; 0 is the first try.
-    private func rebuildEar(freshEngine: Bool = false, attempt: Int = 0) {
+    /// BUILD 238 — freshEngine now DEFAULTS TO TRUE.
+    ///
+    /// The ear's engine was built once at startup and only replaced when
+    /// a caller explicitly asked, which the arm path never did.
+    /// AVAudioEngine.inputNode caches the hardware format at first
+    /// touch, so the ear kept believing whatever rate was live at launch
+    /// — and arming it against a 16 kHz Bluetooth route failed with the
+    /// same kAudioUnitErr_FormatNotSupported that Translate hit as
+    /// -10868. Silently, because arming is silentArm. Grey dot, no
+    /// light, nothing said.
+    ///
+    /// The engine is cheap and its cached format cannot be refreshed any
+    /// other way. Every rebuild gets a fresh one.
+    private func rebuildEar(freshEngine: Bool = true, attempt: Int = 0) {
         // Throttle: one rebuild per 2 seconds, no matter how many notifications
         // arrive. Retries are exempt — they are deliberately spaced already.
         if attempt == 0, Date().timeIntervalSince(lastEarRebuild) < 2.0 {
