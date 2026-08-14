@@ -835,8 +835,29 @@ class LiveTranslateService: NSObject {
             // GeminiLiveService has had this exact guard since build 208
             // and it was never brought back here, even though the 0 Hz
             // guard above was borrowed in the other direction.
+            // BUILD 236 — THIS COMPARISON WAS ALWAYS WRONG.
+            //
+            // "node says 16000, session says 48000" is not a fault. It is
+            // exactly what a Bluetooth HFP microphone looks like: the
+            // hardware input runs at 16 kHz while the session reports the
+            // OUTPUT rate at 48 kHz. That is the normal, permanent state
+            // of the Ray-Bans.
+            //
+            // And installTap's precondition is
+            //     format.sampleRate == hwFormat.sampleRate
+            // where hwFormat is THE NODE'S OWN format. The audio session
+            // rate appears nowhere in it. Build 219 compared the node
+            // against the session — a number the precondition never
+            // mentions — and therefore refused a tap that would have
+            // installed perfectly well. Every time. On the glasses. By
+            // design.
+            //
+            // That is why Translate has never worked with the Ray-Bans,
+            // and build 220's unbounded retry then turned a permanent
+            // refusal into an infinite spin that took the app with it.
             let hwRate = audioSession.sampleRate
-            let disagrees = hwRate > 0 && abs(hwRate - inputFormat.sampleRate) > 1
+            let disagrees = false
+            _ = hwRate
 
             // And the same settling window every other audio path here
             // respects. Claiming the Ray-Ban link is the slowest route
@@ -897,7 +918,12 @@ class LiveTranslateService: NSObject {
             print("🎵 [Translate] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
             print("🎵 [Translate] Target format: \(targetSampleRate) Hz (will auto-resample)")
 
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            // BUILD 236: nil means "use the bus's own format", which makes
+            // installTap's precondition true BY CONSTRUCTION — there is no
+            // pair of numbers left that can disagree. The buffer arrives
+            // in the bus format either way, which is what the converter
+            // downstream reads off the buffer itself.
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
                 self?.processAudioBuffer(buffer)
             }
 
