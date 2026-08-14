@@ -1987,6 +1987,108 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyStandbyLog.note("👂 [Standby] Listening on \(chosen.portName) [\(chosen.portType.rawValue)]")
         }
 
+        // ============================================================
+        // BUILD 246 — THE GATE WE SET FOR OURSELVES.
+        //
+        // This is the whole bug, and the log named it in one line
+        // repeated forty times:
+        //
+        //     Listening on RB Meta 01JK [BluetoothHFP]
+        //     Audio still settling — deferring the tap
+        //
+        // Zero seconds apart, every single time, for 145 seconds, on
+        // the glasses AND on the built-in mic. startRecognition() was
+        // never once reached the tap — there is not a single "Node …
+        // Hz" line anywhere in the log, which is the line immediately
+        // after the gate.
+        //
+        // The mechanism: the block directly above stamps
+        // `lastAudioUpheavalAt` because choosing an input IS an
+        // upheaval (build 210, and correctly so). Then this function
+        // called startRecognition() SYNCHRONOUSLY on the next line —
+        // and the first thing startRecognition does is refuse to
+        // install a tap within 0.7s of that stamp. So the arm path
+        // set a trap and then walked into it, every time, by
+        // construction.
+        //
+        // Neither recovery path could save it:
+        //   • startRecognition's own 0.8s retry is guarded on
+        //     `isListening`, which cannot be true yet — it is set
+        //     AFTER a successful arm. Dead on arrival.
+        //   • the outer 0.8/1.5/2.2s ladder calls start() again, which
+        //     re-enters here, re-stamps, and re-traps. Three strikes,
+        //     "I couldn't open the microphone", forever.
+        //
+        // Seven builds looked for the reason the tap failed. The tap
+        // was never attempted.
+        //
+        // The fix is not to remove the gate — it is real, and it
+        // exists because installing into moving hardware is the
+        // uncatchable crash in the .ips from build 142. The fix is to
+        // WAIT for the settle we just caused, instead of treating our
+        // own upheaval as a failure to arm.
+        //
+        // `starting` deliberately stays TRUE across the wait. That is
+        // also what stops the stacked arm chains visible in the log —
+        // two auto-arms 0.27s apart, both proceeding, because the
+        // failure path had already cleared the flag.
+        // ============================================================
+        let upheavalAge = Date().timeIntervalSince(Self.lastAudioUpheavalAt)
+        let mustSettle = 0.8 - upheavalAge
+        if mustSettle > 0 {
+            ChappyStandbyLog.note(String(
+                format: "👂 [Standby] Our own input change is %.2fs old — waiting %.2fs for it to settle, then arming",
+                upheavalAge, mustSettle))
+            DispatchQueue.main.asyncAfter(deadline: .now() + mustSettle) { [weak self] in
+                guard let self else { return }
+                // BUILD 246 — `starting` IS THE CANCEL TOKEN, AND THIS GUARD
+                // IS NOT OPTIONAL.
+                //
+                // Waiting 0.8s means every check start() made is now 0.8s
+                // stale, and the world can have moved. The dangerous one:
+                // Live AI's own hand-off is guarded on
+                // `ChappyStandby.shared.isListening`, which is FALSE during
+                // this window — so Live AI does not call handOff(), does not
+                // wait for the ear to let go, and simply takes the input
+                // node. Then this block fires and installs a tap on a node
+                // Live AI is already holding. Two engines on one input is
+                // the uncatchable installTap crash, which would be a far
+                // worse bug than the deaf ear it is replacing.
+                //
+                // stop() and handOff() both clear `starting`, and nothing
+                // else clears it between here and beginSession — so it means
+                // exactly "was this arm cancelled while it waited".
+                guard self.starting,
+                      !self.isListening,
+                      !self.userTurnedOff,
+                      !LiveAIManager.shared.isRunning,
+                      !ContinuousVisionManager.shared.isRunning else {
+                    ChappyStandbyLog.note("👂 [Standby] Arm cancelled during the settle wait — something else took the microphone")
+                    self.starting = false
+                    return
+                }
+                // Backgrounded mid-wait. Without the audio background mode a
+                // mic engine started here is a termination sentence, and the
+                // didEnterBackground stand-down is guarded on isListening —
+                // which is false right now, so it no-ops and cannot catch it.
+                guard Self.backgroundAudioAllowed
+                        || UIApplication.shared.applicationState != .background else {
+                    ChappyStandbyLog.note("👂 [Standby] Went to the background during the settle wait — not starting the mic")
+                    self.starting = false
+                    return
+                }
+                self.completeArming()
+            }
+            return
+        }
+        completeArming()
+    }
+
+    /// BUILD 246 — everything `beginSession()` used to do from the tap
+    /// onwards, unchanged, so it can be reached either immediately or
+    /// after waiting out an input change. Not one line of the arm itself
+    /// is different; only WHEN it runs.
+    private func completeArming() {
         // BUILD 160 — THE SILENT FAILURE THAT ATE THE STARTUP VOICE.
         //
         // startRecognition() returns false whenever the audio session is
@@ -2189,7 +2291,10 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         // Backoff: 0.6s, 1.5s, 3s. Three misses over ~5 seconds is a real
         // failure; one miss is just iOS still settling a route.
-        let delays = [0.6, 1.5, 3.0]
+        // BUILD 246: was 0.6, which is UNDER startRecognition's 0.7s settling
+        // gate — so whenever a rebuild did touch the audio session, attempt 1
+        // was guaranteed to be thrown away before it ran. 0.8 clears the gate.
+        let delays = [0.8, 1.5, 3.0]
         if attempt < delays.count {
             ChappyStandbyLog.note("👂 [Standby] Rebuild attempt \(attempt + 1) failed — retrying in \(delays[attempt])s")
             DispatchQueue.main.asyncAfter(deadline: .now() + delays[attempt]) { [weak self] in
@@ -3516,10 +3621,21 @@ final class ChappyStandby: NSObject, ObservableObject {
         // below can't close that race; NOT INSTALLING during upheaval can.
         // A tap is never installed within a breath of a route change — wait
         // for calm, then come back.
-        if Date().timeIntervalSince(Self.lastAudioUpheavalAt) < 0.7 {
-            ChappyStandbyLog.note("👂 [Standby] Audio still settling — deferring the tap")
+        let sinceUpheaval = Date().timeIntervalSince(Self.lastAudioUpheavalAt)
+        if sinceUpheaval < 0.7 {
+            // BUILD 246: the age is logged. Without it this line said only
+            // "still settling", which is true of a stamp made 0.001s ago by
+            // the caller and a stamp made 0.69s ago by a real route change —
+            // and those are completely different problems.
+            ChappyStandbyLog.note(String(format: "👂 [Standby] Audio still settling (%.3fs since the last upheaval) — deferring the tap", sinceUpheaval))
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                guard let self, self.isListening else { return }
+                // BUILD 246: `|| starting`. This was `guard self.isListening`,
+                // and isListening is only set AFTER a successful arm — so
+                // during arming, which is the one time this gate ever fires,
+                // the retry returned immediately and did nothing. The
+                // recovery path for the deferral has never run, not once,
+                // since it was written.
+                guard let self, self.isListening || self.starting else { return }
                 _ = self.startRecognition()
             }
             return false
