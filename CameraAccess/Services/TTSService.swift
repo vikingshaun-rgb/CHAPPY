@@ -1162,6 +1162,32 @@ class TTSService: NSObject, ObservableObject {
                     // costs TWO consecutive failures, with a breath between.
                     // Transient blips retry and stay in the real voice;
                     // genuine outages still fall back exactly as before.
+                    // BUILD 248 — DON'T RETRY A TIMEOUT.
+                    //
+                    // THIS is where the 20-30 seconds comes from. The render
+                    // timeout is 20s, and on ANY failure this retried the
+                    // whole request: 20s + 0.8s + up to 20s more before the
+                    // offline voice was even considered. One dropped socket
+                    // and he waits forty seconds for a sentence.
+                    //
+                    // The retry is right for a 429, a 5xx or a dropped
+                    // connection — those are transient and a second attempt
+                    // usually works. It is pointless for a TIMEOUT: the
+                    // service already had twenty seconds and did not answer,
+                    // so asking again identically buys nothing and costs
+                    // another twenty. Fall back to the offline voice, which
+                    // is instant, and let the cooldown logic latch as before.
+                    let ns = error as NSError
+                    let timedOut = ns.domain == NSURLErrorDomain
+                        && (ns.code == NSURLErrorTimedOut
+                            || ns.code == NSURLErrorNetworkConnectionLost
+                            || ns.code == NSURLErrorNotConnectedToInternet)
+                    if timedOut {
+                        Self.geminiVoiceGaveUp = true
+                        Self.lastFallbackReason = error.localizedDescription
+                        Self.lastFallbackAt = Date()
+                        ChappyStandbyLog.note("⚠️ [TTS] Render timed out — offline voice now, not retrying (that retry was the second twenty seconds)")
+                    } else {
                     do {
                         try await Task.sleep(nanoseconds: 800_000_000)
                         if Task.isCancelled { return }
@@ -1175,6 +1201,7 @@ class TTSService: NSObject, ObservableObject {
                         Self.lastFallbackAt = Date()
                         print("⚠️ [TTS] Gemini TTS failed twice (\(error.localizedDescription)) — Apple voice until the cooldown clears")
                     }
+                    }   // BUILD 248: closes the `if timedOut { … } else {`
                 }
             } else if googleKey.isEmpty {
                 // BUILD 175: this was the quietest failure in the whole app.
@@ -1237,14 +1264,30 @@ class TTSService: NSObject, ObservableObject {
 
         for model in ttsModels {
             let audio: Data
+            // BUILD 248 — WHERE THE TWENTY SECONDS GOES.
+            //
+            // Two models are tried in order, each with its own network
+            // timeout, and until now neither the attempt nor its duration was
+            // recorded anywhere. So "the first chunk takes 20-30 seconds" had
+            // no way to be attributed: a dead first model timing out, a slow
+            // render, a slow PLAYBACK start, or the offline fallback kicking
+            // in all look identical from the outside — silence, then a voice.
+            let began = Date()
             do {
                 audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
                 try Task.checkCancellation()
+                let ms = Int(Date().timeIntervalSince(began) * 1000)
+                if ms > 1500 {
+                    ChappyStandbyLog.note("🐢 [TTS] \(model) took \(ms)ms to render \(text.count) characters")
+                }
             } catch TTSError.modelNotFound {
-                print("⚠️ [TTS] Model \(model) not found — trying next")
+                let ms = Int(Date().timeIntervalSince(began) * 1000)
+                ChappyStandbyLog.note("⚠️ [TTS] \(model) not found after \(ms)ms — trying the next one")
                 lastError = TTSError.modelNotFound
                 continue
             } catch {
+                let ms = Int(Date().timeIntervalSince(began) * 1000)
+                ChappyStandbyLog.note("⚠️ [TTS] \(model) failed after \(ms)ms: \(error.localizedDescription)")
                 throw error          // a REAL service failure — the caller may latch
             }
 
@@ -1313,6 +1356,20 @@ class TTSService: NSObject, ObservableObject {
         // every casualty fell back to the robot and latched it. Twenty
         // seconds of patience, and the wait is bearable because the cache
         // and the nav pre-render make repeated lines instant anyway.
+        // BUILD 248: LEFT AT 20 ON PURPOSE.
+        //
+        // I changed this to 8 and review caught it: 8 is the exact value
+        // BUILD 143 REMOVED, on measurement, because "Google takes 5-10s to
+        // GENERATE the audio, and this 8s guillotine was beheading half the
+        // renders — every casualty fell back to the robot and latched it."
+        // The note is still four comments up this file. Putting it back
+        // would have re-created a solved bug, on no evidence, in a build
+        // whose whole purpose is to stop doing that.
+        //
+        // The 20-30s he reports is not this number anyway. See the retry
+        // note in speak() — it is one timeout plus a second full attempt.
+        // That is what got fixed. This stays until the 🐢 lines above
+        // produce a real measurement of how long a render actually takes.
         request.timeoutInterval = 20
 
         let (data, response) = try await URLSession.shared.data(for: request)
