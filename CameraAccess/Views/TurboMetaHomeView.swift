@@ -3811,7 +3811,106 @@ struct TodayMapSheet: View {
     @ObservedObject private var trail = ChappyTrail.shared
     @State private var selectedDay = Calendar.current.startOfDay(for: Date())
 
+    // ================================================================
+    // BUILD 249 — THE MAP AND THE ATLAS, MERGED.
+    //
+    // There were two map screens and neither showed you your photos
+    // properly. This one drew the day's trail and only the memories
+    // ChappyMemory happened to be holding in its hot cache, for ONE
+    // selected day. The Atlas was a separate tile, a separate screen,
+    // a separate mental model. And every photo he has ever taken —
+    // all of them carrying a location, a caption and a thumbnail —
+    // was effectively invisible unless he happened to pick the right
+    // day.
+    //
+    // One screen now, with layers you switch between:
+    //
+    //   TRAIL   the day's path, as before
+    //   PHOTOS  every photo ever taken, across all days, from the
+    //           visual-note store rather than the memory cache —
+    //           because that store has all of them and always has
+    //   PLACES  every saved place, regardless of the selected day
+    //   ATLAS   opens the world atlas, so nothing is lost and there
+    //           is still only one place to start from
+    //
+    // The layers are additive on purpose. "Where was that warung" is
+    // answered by photos and places on the same canvas, which is the
+    // whole reason to merge them rather than tab between them.
+    // ================================================================
+    @State private var showTrail = true
+    @State private var showPhotos = false
+    @State private var showPlaces = true
+    @State private var showAtlas = false
+
     private var isToday: Bool { Calendar.current.isDateInToday(selectedDay) }
+
+    /// Every photo ever taken, wherever it was taken.
+    ///
+    /// Deliberately NOT ChappyMemory.recent — that is a hot cache of the
+    /// last few days, which is why the old map could only ever show a
+    /// sliver. TripRecorder's visual notes are the complete record, they
+    /// are already in memory, and every one carries a caption and a
+    /// coordinate.
+    private var photoPins: [RouteMapView.JournalPin] {
+        guard showPhotos else { return [] }
+        let df = DateFormatter(); df.dateFormat = "d MMM, h:mm a"
+        return TripRecorder.shared.visualNotes.compactMap { n in
+            // A note saved before the phone had a fix carries 0,0 — the
+            // Atlantic off Africa. Pinning those would drag the whole map
+            // out to sea, which is what "my map is broken" looks like.
+            guard n.lat != 0 || n.lon != 0 else { return nil }
+            return RouteMapView.JournalPin(
+                coord: CLLocationCoordinate2D(latitude: n.lat, longitude: n.lon),
+                glyph: "📷", tint: .systemIndigo,
+                title: n.caption,
+                sub: df.string(from: n.at))
+        }
+    }
+
+    private var layerBar: some View {
+        HStack(spacing: 7) {
+            layerChip("Trail", "point.topleft.down.curvedto.point.bottomright.up",
+                      on: showTrail) { showTrail.toggle() }
+            layerChip("Photos", "photo.on.rectangle",
+                      on: showPhotos) { showPhotos.toggle() }
+            layerChip("Places", "mappin.and.ellipse",
+                      on: showPlaces) { showPlaces.toggle() }
+            Spacer(minLength: 0)
+            Button {
+                showAtlas = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "globe.asia.australia.fill")
+                        .font(.system(size: 11, weight: .bold))
+                    Text("Atlas").font(.caption).fontWeight(.semibold)
+                }
+                .padding(.horizontal, 11).padding(.vertical, 7)
+                .background(Capsule().fill(Color.blue.opacity(0.85)))
+                .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 6)
+    }
+
+    private func layerChip(_ label: String, _ icon: String,
+                           on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { action() }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 11, weight: .bold))
+                Text(label).font(.caption).fontWeight(.semibold)
+            }
+            .padding(.horizontal, 11).padding(.vertical, 7)
+            .background(Capsule().fill(on ? Color.accentColor.opacity(0.9)
+                                          : Color.black.opacity(0.4)))
+            .foregroundStyle(on ? .white : .white.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+    }
 
     /// BUILD 149 — THE WEEK IN BARS. Kilometres moved per day from the
     /// Trail's own points; the selected day glows. Swift Charts, ~20 lines.
@@ -3842,9 +3941,13 @@ struct TodayMapSheet: View {
     }
 
     /// BUILD 146 — the day's memories, pinned where they happened.
+    /// BUILD 249: photos are excluded here and drawn by photoPins instead,
+    /// across all days rather than one — otherwise the same photo appears
+    /// twice whenever the Photos layer is on and today is selected.
     private var dayPins: [RouteMapView.JournalPin] {
         let tf = DateFormatter(); tf.dateFormat = "h:mm a"
         return ChappyMemory.shared.recent
+            .filter { !(showPhotos && $0.kind == .photo) }
             .filter { Calendar.current.isDate($0.at, inSameDayAs: selectedDay) }
             .compactMap { e in
                 guard let la = e.lat, let lo = e.lon else { return nil }
@@ -3884,12 +3987,17 @@ struct TodayMapSheet: View {
             VStack(spacing: 0) {
                 dayStrip
                 weekChart
+                layerBar
                 ZStack(alignment: .bottom) {
                     RouteMapView(
-                        coords: dayCoords,
+                        coords: showTrail ? dayCoords : [],
                         destination: nil,
-                        spots: isToday ? TripRecorder.shared.spots : [],
-                        journalPins: dayPins)
+                        // BUILD 249: places are no longer hidden on any day but
+                        // today. A place you saved in June is still there in
+                        // August, and a map that hides it because you happened
+                        // to be looking at a different day is lying to you.
+                        spots: showPlaces ? TripRecorder.shared.spots : [],
+                        journalPins: dayPins + photoPins)
                         .ignoresSafeArea(edges: [])
 
                     Button {
@@ -3911,6 +4019,12 @@ struct TodayMapSheet: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") { dismiss() }
                 }
+            }
+            // BUILD 249: the Atlas from inside the map, so the two are one
+            // journey rather than two tiles you have to choose between
+            // before you know which you wanted.
+            .fullScreenCover(isPresented: $showAtlas) {
+                AtlasView(initialTarget: nil, initialLayer: nil)
             }
         }
     }

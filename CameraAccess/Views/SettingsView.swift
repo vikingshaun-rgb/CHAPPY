@@ -562,6 +562,18 @@ struct SettingsView: View {
                                 .foregroundColor(AppColors.textPrimary)
                         }
                     }
+
+                    // BUILD 247: the router's own record, finally visible.
+                    NavigationLink {
+                        CommandLogView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "list.bullet.rectangle")
+                                .foregroundColor(.cyan)
+                            Text("What Chappy did")
+                                .foregroundColor(AppColors.textPrimary)
+                        }
+                    }
                 } header: {
                     Text("Voice")
                 } footer: {
@@ -2350,6 +2362,120 @@ struct LiveAICheckView: View {
                 .font(AppTypography.caption)
                 .foregroundColor(AppColors.textSecondary)
         }
+    }
+}
+
+// MARK: - What Chappy did (BUILD 247)
+//
+// ChappyRouterLog has recorded every routed sentence since build 221 — what
+// it heard, which tier claimed it, which tool ran, how confident it was,
+// what came of it, and how long it took. Twenty-five builds of the single
+// most useful record in the app, written to disk, and never once put on a
+// screen.
+//
+// This is the screen that answers "why did Chappy do THAT". When a question
+// about the weather comes back as "walking, riding, or a car?", the tier and
+// tool columns say exactly which layer claimed the sentence and which tool
+// it opened — instead of it being anyone's guess.
+struct CommandLogView: View {
+    @State private var entries: [ChappyRouterLog.Entry] = []
+    @State private var copied = false
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
+
+    private func tierColour(_ t: String) -> Color {
+        switch t {
+        case "pocket": return .green
+        case "tiles": return .cyan
+        case "flow": return .purple
+        case "intent": return .orange
+        case "plan": return .yellow
+        case "ask": return .blue
+        default: return AppColors.textSecondary
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                if entries.isEmpty {
+                    Text("Nothing routed yet. Say something to Chappy, or type it in the ask field, then come back.")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                } else {
+                    ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(Self.clock.string(from: e.at))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(AppColors.textSecondary)
+                                Text(e.tier.uppercased())
+                                    .font(.system(size: 9, weight: .heavy))
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .background(Capsule().fill(tierColour(e.tier).opacity(0.22)))
+                                    .foregroundColor(tierColour(e.tier))
+                                Spacer(minLength: 0)
+                                Text("\(e.ms)ms")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                            Text("\u{201C}\(e.heard)\u{201D}")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(AppColors.textPrimary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 5) {
+                                if let t = e.tool {
+                                    Text(t)
+                                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.cyan)
+                                }
+                                if let c = e.confidence {
+                                    Text(String(format: "%.0f%%", c * 100))
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(c < 0.5 ? .orange : AppColors.textSecondary)
+                                }
+                            }
+                            Text(e.outcome)
+                                .font(.system(size: 10.5))
+                                .foregroundColor(AppColors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 2)
+                        .textSelection(.enabled)
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Newest first")
+                    Spacer()
+                    Text("\(entries.count) routed")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            } footer: {
+                Text("TIER is which layer claimed the sentence \u{2014} pocket is a free phone action, tiles is a screen name, flow is a multi-step tool, intent and plan are the smart layers, ask is a paid question. A sentence landing in the wrong tier is why the answer felt wrong.")
+            }
+
+            Section {
+                Button {
+                    UIPasteboard.general.string = entries.map {
+                        "\(Self.clock.string(from: $0.at))  [\($0.tier)] \"\($0.heard)\" -> \($0.tool ?? "none") \($0.confidence.map { String(format: "%.2f", $0) } ?? "") : \($0.outcome) (\($0.ms)ms)"
+                    }.joined(separator: "\n")
+                    copied = true
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy the whole log",
+                          systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                }
+                .foregroundColor(copied ? .green : AppColors.textPrimary)
+            }
+        }
+        .navigationTitle("What Chappy did")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { entries = ChappyRouterLog.shared.entries.reversed() }
     }
 }
 
