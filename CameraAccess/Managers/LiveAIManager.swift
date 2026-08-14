@@ -13017,7 +13017,7 @@ enum ChappyNotify {
 
     /// Say it out loud AND post it if the voice could not have landed. One
     /// call site instead of two, so a module can never accidentally do both.
-    @MainActor
+    ///
     /// BUILD 234 — HOW MUCH CHAPPY IS ALLOWED TO SAY FIRST.
     ///
     /// Twenty call sites reach `announce`, and until now every one of
@@ -13060,6 +13060,10 @@ enum ChappyNotify {
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "chappy_unprompted") }
     }
 
+    /// BUILD 235: the @MainActor that belongs here was left stranded on
+    /// the enum above by the 234 patch. It calls two MainActor statics,
+    /// so it has to be one.
+    @MainActor
     static func announce(_ channel: Channel,
                          spoken: String,
                          title: String,
