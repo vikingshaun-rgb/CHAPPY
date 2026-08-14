@@ -5511,6 +5511,29 @@ final class ChappyStandby: NSObject, ObservableObject {
             } else { speak("No trip planned yet.") }
             return
         }
+        // BUILD 234 — SHUT UP. The moment you want it to stop talking is
+        // the moment you do not want to go hunting through Settings.
+        if c.contains("be quiet") || c.contains("stop talking")
+            || c.contains("shut up") || c.contains("stop speaking")
+            || c.contains("don't talk to me") || c.contains("dont talk to me")
+            || c.contains("quiet mode") || c.contains("stop interrupting") {
+            ChappyNotify.unprompted = .never
+            TTSService.shared.stop()
+            speak("Right. I won't speak first from now on — anything I would have said will come through as a notification instead. Say \"you can talk again\" to undo it.")
+            return
+        }
+        if c.contains("you can talk again") || c.contains("start talking again")
+            || c.contains("speak up again") || c.contains("unmute") {
+            ChappyNotify.unprompted = .important
+            speak("Back on, for the things that matter — jobs, flights, leave-by and money. Say \"tell me everything\" if you want the lot.")
+            return
+        }
+        if c.contains("tell me everything") && c.contains("out loud") {
+            ChappyNotify.unprompted = .everything
+            speak("Everything, out loud, from now on.")
+            return
+        }
+
         // BUILD 232 — THE CHECKLIST, OUT LOUD.
         if c.contains("tick off") || c.contains("tick the")
             || c.hasPrefix("tick ") || c.contains("check off")
@@ -12995,17 +13018,77 @@ enum ChappyNotify {
     /// Say it out loud AND post it if the voice could not have landed. One
     /// call site instead of two, so a module can never accidentally do both.
     @MainActor
+    /// BUILD 234 — HOW MUCH CHAPPY IS ALLOWED TO SAY FIRST.
+    ///
+    /// Twenty call sites reach `announce`, and until now every one of
+    /// them spoke whenever the app was in front of him, with no setting,
+    /// no command and no way to stop it. Build 225 made the whole
+    /// notification path work for the first time, so a feature that had
+    /// literally never fired started firing properly — on a phone that
+    /// had never had to live with it. Switching that on without also
+    /// shipping the volume control was my mistake.
+    enum Unprompted: String, CaseIterable, Identifiable {
+        case never       // Chappy never speaks first
+        case important   // jobs, flights, leave-by, money
+        case everything  // what build 232 did
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .never:      return "Only when I ask"
+            case .important:  return "Important only"
+            case .everything: return "Everything"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .never:
+                return "Chappy never speaks unless you speak first. Everything it would have said arrives as a notification instead — nothing is lost."
+            case .important:
+                return "Jobs, flights, leave-by warnings and money. Everything else becomes a banner."
+            case .everything:
+                return "Chappy speaks up whenever it has something. Loud."
+            }
+        }
+    }
+
+    static var unprompted: Unprompted {
+        get {
+            Unprompted(rawValue: UserDefaults.standard.string(forKey: "chappy_unprompted") ?? "")
+                ?? .important
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "chappy_unprompted") }
+    }
+
     static func announce(_ channel: Channel,
                          spoken: String,
                          title: String,
                          body: String? = nil,
                          critical: Bool = false,
                          opens: Notification.Name? = nil) {
+        // Would speaking even reach him? If not, it was always a banner.
         if voiceCouldNotReach() {
             post(channel, title: title, body: body ?? spoken, critical: critical, opens: opens, force: true)
-        } else {
-            TTSService.shared.speak(spoken)
+            return
         }
+
+        // BUILD 234 — allowed to speak first?
+        let allowed: Bool
+        switch unprompted {
+        case .never:      allowed = false
+        case .important:  allowed = critical
+        case .everything: allowed = true
+        }
+
+        guard allowed else {
+            // NOT DROPPED. Posted. Muting the voice must never mean
+            // missing the job — that would trade one bad failure mode
+            // for a worse and quieter one.
+            post(channel, title: title, body: body ?? spoken,
+                 critical: critical, opens: opens, force: true)
+            return
+        }
+        TTSService.shared.speak(spoken)
     }
 }
 
