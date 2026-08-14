@@ -7,6 +7,7 @@ import EventKit
 import SwiftUI
 import MWDATCore
 import UniformTypeIdentifiers
+import Combine   // BUILD 244: Timer.publish for the live standby log
 
 struct SettingsView: View {
     // BUILD 157 — the advanced-tools switch, read by the Home grid.
@@ -545,6 +546,19 @@ struct SettingsView: View {
                             Image(systemName: "stethoscope")
                                 .foregroundColor(.red)
                             Text("Voice check")
+                                .foregroundColor(AppColors.textPrimary)
+                        }
+                    }
+
+                    // BUILD 245: the same idea for the other failure that
+                    // only happens when nobody can see a console.
+                    NavigationLink {
+                        LiveAICheckView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "waveform.badge.exclamationmark")
+                                .foregroundColor(.orange)
+                            Text("Live AI check")
                                 .foregroundColor(AppColors.textPrimary)
                         }
                     }
@@ -2067,6 +2081,31 @@ struct CostMeterView: View {
 struct VoiceCheckView: View {
     @State private var rows: [(String, String, Bool)] = []
     @State private var tick = 0
+    /// BUILD 244: the arm path's own account of itself.
+    @State private var logLines: [String] = []
+    @State private var copied = false
+    /// A STORED publisher, not one built inside `body`.
+    ///
+    /// `.onReceive(Timer.publish(...).autoconnect())` written inline
+    /// constructs a fresh Autoconnect on every body evaluation, so SwiftUI
+    /// resubscribes and restarts the timer each redraw — and since this
+    /// handler writes `rows` (an array of tuples, not Equatable, so every
+    /// assignment forces another redraw) it can end up never firing at all.
+    /// A diagnostic screen that stops updating while it looks like it is
+    /// updating is worse than no screen.
+    private let logTick = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+
+    /// Every line the ear writes is prefixed with a symbol that says how bad
+    /// it is. Colouring on that alone means the panel never has to parse the
+    /// message — and a log that tries to understand itself is a log that can
+    /// be wrong about itself.
+    private func tint(_ line: String) -> Color {
+        if line.contains("❌") { return .red }
+        if line.contains("⚠️") { return .orange }
+        if line.contains("✅") { return .green }
+        if line.contains("REFUSED") || line.contains("ARM FAILED") { return .orange }
+        return AppColors.textSecondary
+    }
 
     var body: some View {
         List {
@@ -2111,10 +2150,206 @@ struct VoiceCheckView: View {
             } footer: {
                 Text("Hear the tone but not the voice: it's speech output. Hear the voice but not the tone: it's the silent switch. Neither: it's the output route.")
             }
+
+            // ========================================================
+            // BUILD 244 — THE STANDBY LOG.
+            //
+            // The rows above report STATE: armed or not, audio arriving
+            // or not. They have been honest all week and they have not
+            // been enough, because "wake word armed: no" is the symptom
+            // and every build has been a guess at the cause.
+            //
+            // This is the cause. The arm path narrates every decision it
+            // makes — which microphone it chose, what the node's format
+            // came back as, which guard turned it away, what the engine
+            // said when it refused to start — and all of it went to
+            // print(), which on TestFlight goes nowhere at all.
+            //
+            // Newest last, so it reads like what happened.
+            // ========================================================
+            Section {
+                if logLines.isEmpty {
+                    Text("Nothing yet. Tap Standby on the home screen, come back here, and the whole arm attempt will be written out below.")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                } else {
+                    ForEach(Array(logLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 10.5, weight: .regular, design: .monospaced))
+                            .foregroundColor(tint(line))
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 14, bottom: 2, trailing: 10))
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Standby log")
+                    Spacer()
+                    Text("\(ChappyStandbyLog.shared.count) lines")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            } footer: {
+                Text("The last \(ChappyStandbyLog.windowSize) lines the ear wrote. Copy takes the whole buffer, not just what fits on screen — the line that explains it is usually the one that scrolled off.")
+            }
+
+            Section {
+                Button {
+                    UIPasteboard.general.string = ChappyStandbyLog.shared.everything
+                    copied = true
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy the whole log",
+                          systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                }
+                .foregroundColor(copied ? .green : AppColors.textPrimary)
+
+                Button {
+                    ChappyStandbyLog.shared.clear()
+                    logLines = ChappyStandbyLog.shared.recent
+                } label: {
+                    Label("Clear the log", systemImage: "trash")
+                }
+                .foregroundColor(.orange)
+            } footer: {
+                Text("Clear it, tap Standby, then come straight back — that gives one clean arm attempt with nothing else in the way.")
+            }
         }
         .navigationTitle("Voice check")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { rows = ChappyStandby.diagnostics() }
+        .onAppear {
+            rows = ChappyStandby.diagnostics()
+            logLines = ChappyStandbyLog.shared.recent
+        }
+        // The ear keeps writing while this screen is open — arming is
+        // asynchronous and its most interesting lines land a second or two
+        // after the tap. A static snapshot would miss exactly those.
+        .onReceive(logTick) { _ in
+            logLines = ChappyStandbyLog.shared.recent
+            // Every second is right for the log — the arm path writes several
+            // lines a second while it is failing. The diagnostic rows query
+            // the audio session, so they refresh every fourth tick instead.
+            tick += 1
+            if tick % 4 == 0 { rows = ChappyStandby.diagnostics() }
+        }
+    }
+}
+
+// MARK: - Live AI check (BUILD 245)
+//
+// Live AI works with the app open and dies on screen lock. The console
+// that would explain it does not exist on a TestFlight build on a phone in
+// a pocket, and by the time he can look at Xcode the session is long gone.
+//
+// So the log is written to DISK, it survives the app being killed, and it
+// spans launches. Reading it back is this screen.
+//
+// The rows at the top are live state. The panel underneath is the history,
+// and the history is the part that matters — the answer is a SEQUENCE, not
+// a state: locked, then this, then that, then nothing.
+struct LiveAICheckView: View {
+    @State private var logLines: [String] = []
+    @State private var copied = false
+    private let liveTick = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+
+    private func tint(_ line: String) -> Color {
+        if line.contains("❌") || line.contains("⏸️") { return .red }
+        if line.contains("⚠️") || line.contains("🔒") { return .orange }
+        if line.contains("✅") { return .green }
+        if line.contains("────") { return .cyan }
+        if line.contains("🌑") || line.contains("🌒") { return .purple }
+        return AppColors.textSecondary
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Text("Start Live AI, lock the phone, wait about thirty seconds, unlock, then come back here. The sequence below is what actually happened.")
+                    .font(AppTypography.caption)
+                    .foregroundColor(AppColors.textSecondary)
+            } header: {
+                Text("How to catch it")
+            }
+
+            Section {
+                if logLines.isEmpty {
+                    Text("Nothing recorded yet. This fills in as soon as a Live AI session starts.")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                } else {
+                    ForEach(Array(logLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 10.5, weight: .regular, design: .monospaced))
+                            .foregroundColor(tint(line))
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 14, bottom: 2, trailing: 10))
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Live AI log")
+                    Spacer()
+                    Text("\(ChappyLiveLog.shared.count) lines")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            } footer: {
+                Text("Kept on disk, so it survives the app being closed or killed. A line reading “app launched” directly after a background line means iOS terminated Chappy at that point — which is the one cause no other evidence can show.")
+            }
+
+            Section {
+                Button {
+                    UIPasteboard.general.string = ChappyLiveLog.shared.everything
+                    copied = true
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy the whole log",
+                          systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                }
+                .foregroundColor(copied ? .green : AppColors.textPrimary)
+
+                Button {
+                    ChappyLiveLog.shared.clear()
+                    logLines = ChappyLiveLog.shared.recent
+                } label: {
+                    Label("Clear the log", systemImage: "trash")
+                }
+                .foregroundColor(.orange)
+            } footer: {
+                Text("Clear it, then do one clean run: start Live AI, lock, wait, unlock.")
+            }
+
+            Section {
+                row("⏸️ suspended", "iOS stopped running Chappy entirely. Nothing in the app can act while this is happening.")
+                row("🌑 background", "The screen locked or you switched away. The line under it says what Chappy did about it.")
+                row("🔌 socket", "The connection to Google. The line under it says whether the app was on screen or backgrounded when it closed.")
+                row("🎤 mic", "The microphone being let go or taken back.")
+                row("──────", "A launch. Anything above it is a previous run of the app.")
+            } header: {
+                Text("What the symbols mean")
+            }
+        }
+        .navigationTitle("Live AI check")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { logLines = ChappyLiveLog.shared.recent }
+        .onReceive(liveTick) { _ in logLines = ChappyLiveLog.shared.recent }
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(k)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundColor(AppColors.textPrimary)
+            Text(v)
+                .font(AppTypography.caption)
+                .foregroundColor(AppColors.textSecondary)
+        }
     }
 }
 

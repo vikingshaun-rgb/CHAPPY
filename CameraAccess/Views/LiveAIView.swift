@@ -4,6 +4,7 @@
  */
 
 import SwiftUI
+import UIKit   // BUILD 245: UIApplication.applicationState for the Live AI log
 
 struct LiveAIView: View {
     @StateObject private var viewModel: OmniRealtimeViewModel
@@ -121,7 +122,7 @@ struct LiveAIView: View {
         .onAppear {
             // Only start when a device is connected
             guard streamViewModel.hasActiveDevice else {
-                print("⚠️ LiveAIView: Ray-Ban Meta glasses not connected — skipping start")
+                ChappyLiveLog.note("⚠️ [Live] LiveAIView: Ray-Ban Meta glasses not connected — skipping start")
                 return
             }
 
@@ -135,9 +136,9 @@ struct LiveAIView: View {
             Task {
                 if streamViewModel.streamingStatus == .streaming,
                    streamViewModel.hasReceivedFirstFrame {
-                    print("🎥 LiveAIView: stream already live — leaving it alone")
+                    ChappyLiveLog.note("🎬 [Live] LiveAIView: stream already live — leaving it alone")
                 } else {
-                    print("🎥 LiveAIView: Start the video stream")
+                    ChappyLiveLog.note("🎬 [Live] LiveAIView: Start the video stream")
                     await streamViewModel.handleStartStreaming()
                 }
             }
@@ -155,7 +156,18 @@ struct LiveAIView: View {
         }
         .onDisappear {
             // Stop the AI conversation and video stream
-            print("🎥 LiveAIView: Stop the AI conversation and video stream")
+            //
+            // BUILD 245 — RECORDED, BECAUSE IT WOULD BE THE WHOLE ANSWER.
+            //
+            // If SwiftUI calls onDisappear when the screen locks, then Live
+            // AI is not dying, it is being SHUT DOWN — by this line — and
+            // every socket and audio theory is beside the point. Standard
+            // behaviour says a fullScreenCover does not disappear on
+            // backgrounding, but "should not" has cost this project seven
+            // builds in a day, so it gets written down instead of assumed.
+            let st = UIApplication.shared.applicationState
+            ChappyLiveLog.note("🎬 [Live] LiveAIView DISAPPEARED — tearing the session down (app \(st == .active ? "active" : (st == .background ? "BACKGROUND — this would explain everything" : "inactive")))")
+            ChappyLiveLog.shared.flushNow()
             frameTimer?.invalidate()
             frameTimer = nil
             viewModel.disconnect()

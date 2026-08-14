@@ -316,6 +316,8 @@ import UserNotifications   // BUILD 163: the permission truth-check
 import VisionKit          // BUILD 168: Apple's document scanner
 import Vision              // BUILD 168: on-device OCR for scanned pages
 import EventKit
+import UniformTypeIdentifiers   // BUILD 244: UTType.text for the tile drag
+import Combine                  // BUILD 244: Timer.publish for the clock
 
 // MARK: - BUILD 126: SNAP CONFIRMATION
 //
@@ -655,6 +657,43 @@ struct TurboMetaHomeView: View {
     @State private var cachedReminderLine = ""
     @State private var cachedMemoryLine = ""
     @ObservedObject private var openClawService = OpenClawNodeService.shared
+
+    // ================================================================
+    // BUILD 244 — LAYOUT A.
+    //
+    // The old screen led with a 34pt wordmark. He knows what app he
+    // opened. What he does not know at a glance is the time, whether
+    // the ear is armed, and whether anything happened while the phone
+    // was in his pocket — so those three go where the name was.
+    // ================================================================
+    /// The alerts history, opened from the widget at the top right.
+    @State private var showAlerts = false
+    @ObservedObject private var alertHistory = ChappyNotify.History.shared
+    /// Ticks once a minute so the clock is honest without redrawing the
+    /// whole screen at 60fps. The orb animates itself; the clock must not
+    /// be what drives the render loop.
+    @State private var clockNow = Date()
+    /// STATIC. TurboMetaHomeView is re-initialised whenever MainTabView
+    /// re-renders, and an instance-stored publisher would be rebuilt with
+    /// it — a brand new subscription every time, restarting the interval
+    /// and, if the parent redraws faster than 20s, never firing at all.
+    /// One timer for the life of the app is the honest shape of a clock.
+    private static let clockTick = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
+    /// The quick tiles, in his order. Loaded once on appear — reading
+    /// UserDefaults inside a view body would run on every redraw.
+    @State private var tileOrder: [String] = ChappyHomeTiles.order
+    @State private var draggingTile: String?
+    @State private var showTilePicker = false
+    /// Observed so the line UNDER the orb tracks the speaking state too.
+    /// The orb watches TTS itself, so without this the ring would ripple
+    /// while the words beneath it still said "Armed" — which is precisely
+    /// the class of half-wired state this screen is meant to stop.
+    @ObservedObject private var speech = TTSService.shared
+    /// BUILD 244: the weather widget's source. Nothing on the home screen
+    /// ever loaded this — `now` was only ever filled by opening the Weather
+    /// Station or asking out loud — so a widget reading it unobserved would
+    /// have shown "Tap for 7 days" for ever and looked broken on day one.
+    @StateObject private var weather = ChappyWeather.shared
 
     /// POCKET LAW: arm the wake word, but never on top of a module that owns
     /// the microphone. Every one of these covers is a full-screen session; if
@@ -1009,6 +1048,424 @@ struct TurboMetaHomeView: View {
     // VStack. Same views, same order, same modifiers — the screen is
     // byte-for-byte what it was.
     // ================================================================
+
+    // ================================================================
+    // BUILD 244 — LAYOUT A, TOP TO BOTTOM.
+    //
+    // Every block below is its own `some View`. This file has defeated
+    // the type checker twice (192 and 193) and the fix both times was an
+    // opaque return type every few dozen lines — an inference boundary
+    // the solver cannot see through. A redesign is the exact moment that
+    // rule gets broken by accident, so it is written down here.
+    // ================================================================
+
+    /// TIME AND DATE. The first thing on the screen, because it is the
+    /// first thing he looks for and it was the one thing not on it.
+    private var clockHeader: AnyView {
+        AnyView(
+            VStack(spacing: 1) {
+                Text(clockNow, format: .dateTime.hour().minute())
+                    .font(.system(size: 44, weight: .bold, design: .rounded))
+                    .foregroundStyle(
+                        LinearGradient(colors: [theme.textPrimary, theme.accent],
+                                       startPoint: .top, endPoint: .bottom))
+                    .monospacedDigit()
+                Text(clockNow, format: .dateTime.weekday(.wide).day().month(.wide))
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundColor(theme.textSecondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 10)
+        )
+    }
+
+    /// THE MIDDLE ROW: weather on the left, the orb in the centre, alerts
+    /// on the right. Both flanks are real buttons onto real screens — the
+    /// weather station and the notification centre — and both are sized
+    /// like buttons rather than like captions.
+    private var orbRow: AnyView {
+        AnyView(
+            HStack(alignment: .center, spacing: 10) {
+                weatherWidget
+                VStack(spacing: 6) {
+                    ChappyOrbView(theme: theme) { tapOrb() }
+                    Text(orbWords)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(standby.armFailed ? Color(red: 1.0, green: 0.45, blue: 0.45)
+                                                           : theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .frame(height: 30)
+                }
+                .frame(maxWidth: .infinity)
+                alertsWidget
+            }
+        )
+    }
+
+    /// The words under the orb. Computed here rather than read off the
+    /// orb so the row can colour them without the orb having to publish
+    /// its own state upward.
+    private var orbWords: String {
+        if standby.armFailed {
+            // The REASON, not a generic line. Both branches used to say the
+            // same thing, so "You're low on battery" and "I can't get speech
+            // recognition going on this phone" both came out as a shrug —
+            // which is the failure this whole build is about.
+            return standby.armFailureReason.isEmpty
+                ? "The ear won't arm — tap to retry" : standby.armFailureReason
+        }
+        if speech.isSpeaking { return "Talking" }
+        if standby.awake { return "Listening — go on" }
+        if liveAIManager.isRunning { return "Live AI — just talk" }
+        if standby.isListening { return "Armed — say \u{201C}Chappy\u{201D}" }
+        return "Tap to arm the ear"
+    }
+
+    /// Tapping the orb arms the ear — and nothing else, deliberately. If a
+    /// module already holds the microphone the tap must not fight it, so
+    /// it says who has it instead of failing silently, which is the exact
+    /// behaviour that made the ear look broken when it was merely busy.
+    private func tapOrb() {
+        UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.7)
+        if liveAIManager.isRunning {
+            TTSService.shared.speak("Live AI already has the microphone.")
+            return
+        }
+        if continuousVision.isRunning {
+            TTSService.shared.speak("Watch mode has the microphone.")
+            return
+        }
+        standby.toggle()
+    }
+
+    private var weatherWidget: AnyView {
+        AnyView(
+            Button {
+                showWeather = true
+            } label: {
+                VStack(alignment: .leading, spacing: 5) {
+                    Image(systemName: weather.now == nil ? "cloud.sun" : "cloud.sun.fill")
+                        .font(.system(size: 19))
+                        .foregroundColor(Color(red: 1.0, green: 0.78, blue: 0.35))
+                    if let n = weather.now {
+                        Text("\(Int(n.tempC.rounded()))\u{00B0}")
+                            .font(.system(size: 23, weight: .bold, design: .rounded))
+                            .foregroundColor(theme.textPrimary)
+                        Text(ChappyWeather.describe(n.code))
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.textSecondary)
+                            .lineLimit(2)
+                    } else {
+                        Text("Weather")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(theme.textPrimary)
+                        Text("Tap for 7 days")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(11)
+                .frame(width: 92, height: 108, alignment: .topLeading)
+                .background(RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .stroke(Color.white.opacity(0.09), lineWidth: 1))
+            }
+            .buttonStyle(ChappyPressStyle())
+        )
+    }
+
+    /// Hoisted out of the view body — see the note at its use site.
+    private var alertsKeptLine: String {
+        alertHistory.alerts.isEmpty ? "Nothing yet" : "\(alertHistory.alerts.count) kept"
+    }
+
+    private var alertsWidget: AnyView {
+        AnyView(
+            Button {
+                showAlerts = true
+            } label: {
+                VStack(alignment: .leading, spacing: 5) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: alertHistory.unread > 0 ? "bell.badge.fill" : "bell.fill")
+                            .font(.system(size: 19))
+                            .foregroundColor(alertHistory.unread > 0
+                                             ? Color(red: 1.0, green: 0.55, blue: 0.45)
+                                             : theme.textSecondary)
+                    }
+                    if alertHistory.unread > 0 {
+                        Text("\(alertHistory.unread)")
+                            .font(.system(size: 23, weight: .bold, design: .rounded))
+                            .foregroundColor(theme.textPrimary)
+                        Text(alertHistory.unread == 1 ? "new alert" : "new alerts")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.textSecondary)
+                    } else {
+                        Text("Alerts")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(theme.textPrimary)
+                        // verbatim: Text has both a LocalizedStringKey and a
+                        // StringProtocol initialiser, and a ternary of two
+                        // literals that satisfy BOTH is the kind of ambiguity
+                        // that made this file time out twice.
+                        Text(verbatim: alertsKeptLine)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.textSecondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(11)
+                .frame(width: 92, height: 108, alignment: .topLeading)
+                .background(RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .stroke(alertHistory.unread > 0
+                            ? Color(red: 1.0, green: 0.55, blue: 0.45).opacity(0.45)
+                            : Color.white.opacity(0.09), lineWidth: 1))
+            }
+            .buttonStyle(ChappyPressStyle())
+        )
+    }
+
+    /// THE FOUR MODES, SMALLER. Same four actions, same wiring, about
+    /// half the height — they were taking most of the first screenful to
+    /// say four words, and everything below them was paying for it.
+    private var modeStripCompact: AnyView {
+        AnyView(
+            HStack(spacing: 9) {
+                compactMode("Talk", "waveform.circle.fill", theme.accent,
+                            liveAIManager.isRunning) {
+                    if standby.isListening { standby.handOff() }
+                    showLiveAI = true
+                }
+                compactMode("Look", "eye.circle.fill", .purple, false) {
+                    showQuickVision = true
+                }
+                compactMode("Translate", "globe", .teal, false) {
+                    if standby.isListening { standby.handOff() }
+                    showLiveTranslate = true
+                }
+                compactMode("Go", "location.circle.fill", .blue,
+                            navEngine.isNavigating) {
+                    if navEngine.isNavigating {
+                        showNavMap = true
+                    } else {
+                        ChappyStandby.shared.promptForDestination()
+                    }
+                }
+            }
+        )
+    }
+
+    private func compactMode(_ title: String, _ icon: String,
+                             _ accent: Color, _ active: Bool,
+                             _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(accent)
+                Text(title)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 62)
+            .background(RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(active ? accent.opacity(0.22) : Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(active ? accent.opacity(0.7) : Color.white.opacity(0.09),
+                        lineWidth: active ? 1.5 : 1))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+
+    /// THE QUICK TILES, ARRANGEABLE. Press and hold one, drag it where he
+    /// wants it, and the order is written to disk on drop.
+    private var quickTiles: AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("QUICK")
+                        .font(.system(size: 11, weight: .heavy, design: .rounded))
+                        .tracking(1.1)
+                        .foregroundColor(theme.textSecondary)
+                    Spacer()
+                    Text("hold and drag to rearrange")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                    GridItem(.flexible(), spacing: 9),
+                                    GridItem(.flexible(), spacing: 9),
+                                    GridItem(.flexible(), spacing: 9)],
+                          spacing: 9) {
+                    ForEach(tileOrder, id: \.self) { id in
+                        if let spec = ChappyHomeTiles.known[id] {
+                            ChappyQuickTileView(spec: spec,
+                                                active: tileIsActive(id),
+                                                dragging: draggingTile == id,
+                                                action: { runTile(id) },
+                                                onLongPress: longPressTile(id))
+                            .onDrag {
+                                draggingTile = id
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                return NSItemProvider(object: id as NSString)
+                            }
+                            .onDrop(of: [UTType.text],
+                                    delegate: ChappyTileDropDelegate(item: id,
+                                                                     order: $tileOrder,
+                                                                     dragging: $draggingTile))
+                        }
+                    }
+                }
+                // A drag released in the gaps between tiles — or anywhere on
+                // this container that is not a tile — never reaches a tile's
+                // performDrop, so `draggingTile` would stay set and that tile
+                // would sit faded and shrunk until the next drag. This catches
+                // it, and saves the order that the live reordering already
+                // produced.
+                .onDrop(of: [UTType.text], isTargeted: nil) { _ in
+                    draggingTile = nil
+                    ChappyHomeTiles.order = tileOrder
+                    return true
+                }
+            }
+        )
+    }
+
+    /// Hold-to-do-something-else. Only Snap has one: hold it and you get
+    /// the burst — about twenty frames sampled, sharpest kept. It lived on
+    /// the old action grid and would have vanished with it.
+    private func longPressTile(_ id: String) -> (() -> Void)? {
+        guard id == "snap" else { return nil }
+        return {
+            ChappyBurst.shared.fire()
+            journalTick += 1
+        }
+    }
+
+    /// Which tiles light up. Only the ones with a real on/off state —
+    /// a tile that glows for no reason teaches you to ignore the glow.
+    private func tileIsActive(_ id: String) -> Bool {
+        switch id {
+        case "standby": return standby.isListening
+        case "watch": return continuousVision.isRunning
+        case "map": return navEngine.isNavigating
+        default: return false
+        }
+    }
+
+    /// Every tile's action, in one place. These are the SAME calls the old
+    /// action grid made — moved, not rewritten. The grid changed; what the
+    /// buttons do did not, and a redesign that also quietly changes
+    /// behaviour is impossible to review.
+    private func runTile(_ id: String) {
+        switch id {
+        case "snap":
+            ChappyStandby.shared.snapSilently()
+            journalTick += 1
+        case "places":
+            showPlaces = true
+        case "atlas":
+            showAtlas = true
+        case "currency":
+            showCurrency = true
+        case "standby":
+            standby.toggle()
+        case "remember":
+            ChappyStandby.shared.rememberSpotByVoice()
+            journalTick += 1
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        case "dictate":
+            dictateAutoStart = true
+            showDictate = true
+        case "more":
+            // BUILD 244: this toggled openGroup to "more", and there is no
+            // "more" group — tileGrid has travel, day, ask and setup. So the
+            // only visible effect was collapsing whatever was open. One of
+            // the eight default tiles, doing nothing, out of the box.
+            //
+            // It now opens the tile picker, which is what "more" honestly
+            // means here: the actions that did not fit in eight — Video,
+            // Watch, Map, Memory.
+            showTilePicker = true
+        case "video":
+            TTSService.shared.speak("Rolling - about twenty seconds.")
+            ChappyClip.shared.record()
+            journalTick += 1
+        case "watch":
+            if continuousVision.isRunning {
+                continuousVision.stop()
+            } else {
+                if standby.isListening { standby.handOff() }
+                continuousVision.start(streamViewModel: streamViewModel)
+            }
+        case "map":
+            ContextEngine.shared.start()
+            showMapSheet = true
+        case "memory":
+            showMemory = true
+        default:
+            break
+        }
+    }
+
+    /// THE READER, AS A STRIP. It was a full card with a heading, a hint
+    /// line and three buttons, sitting near the bottom where he rarely
+    /// scrolled. Same three verbs, one thin row.
+    private var readerStrip: AnyView {
+        AnyView(
+            HStack(spacing: 8) {
+                Image(systemName: "text.viewfinder")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.cyan)
+                Text("READER")
+                    .font(.system(size: 10.5, weight: .heavy, design: .rounded))
+                    .tracking(0.8)
+                    .foregroundColor(.cyan)
+                Spacer(minLength: 4)
+                readerStripButton("Read") {
+                    TTSService.shared.speak("Reading that now.")
+                    ChappyReader.shared.begin(.read)
+                }
+                readerStripButton("Translate") {
+                    TTSService.shared.speak("Having a look.")
+                    ChappyReader.shared.begin(.translate)
+                }
+                readerStripButton("Scan") {
+                    TTSService.shared.speak("Scanning.")
+                    ChappyReader.shared.begin(.scan)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.05)))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.cyan.opacity(0.22), lineWidth: 1))
+        )
+    }
+
+    private func readerStripButton(_ label: String,
+                                   _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.cyan)
+                .padding(.horizontal, 11)
+                // 34pt: a real target on a strip this thin, where the old
+                // caption-sized text links were about 17.
+                .frame(height: 34)
+                .background(Capsule().fill(Color.cyan.opacity(0.14)))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
 
     /// BUILD 193: The avatar, its listening pulse and the greeting line.
     private var orbHeader: AnyView {
@@ -1413,11 +1870,35 @@ struct TurboMetaHomeView: View {
     }
 
     /// Typed, but routed exactly as if it had been spoken.
+    ///
+    /// BUILD 244 — IT SAID IT DID THIS AND IT DID NOT.
+    ///
+    /// The comment above this function claimed since 209 that the field
+    /// "runs the SAME matcher the voice router uses". It did not. It ran
+    /// the TILE table — a list of screen names — and nothing else. So
+    /// "take me to Brisbane" matched the Go tile, opened navigation, and
+    /// asked him where he wanted to go, having just been told. Every
+    /// sentence with an argument in it lost the argument: the destination,
+    /// the reminder text, the amount, the place name.
+    ///
+    /// It now goes where speech goes — ChappyStandby.submitTyped, into
+    /// finish(), through the real router. The tile table still runs, but
+    /// LAST, inside that router, where a bare word like "atlas" that names
+    /// a screen and nothing else still opens the screen.
+    ///
+    /// The one thing kept from the old path: a bare screen name is still
+    /// handled here first. "places" typed on its own means open Places,
+    /// and sending it to a router that will try to interpret it as a
+    /// sentence is a slower way to the same place.
     private func runAsk() {
         let q = askText.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         askText = ""
-        if let tile = ChappyTiles.match(q) ?? ChappyTiles.leading(q)?.tile {
+        // A bare screen name — the WHOLE sentence is the tile, nothing
+        // left over. `leading` is deliberately not used here: it matches a
+        // tile at the START of a longer sentence, which is exactly the
+        // case that broke ("take me to…" leads with the Go tile).
+        if let tile = ChappyTiles.match(q) {
             if let tool = ChappyRegistry.tool(forScreen: tile.note) {
                 ChappyStandby.shared.startTool(id: tool.id, values: [:])
                 return
@@ -1425,10 +1906,9 @@ struct TurboMetaHomeView: View {
             NotificationCenter.default.post(name: tile.note, object: nil)
             return
         }
-        // Nothing matched — hand it to the search screen rather than
-        // swallowing it. A field that eats what you typed is worse than
-        // one that admits it did not understand.
-        showSearch = true
+        // Everything else is a command. Same path as speech, same
+        // vocabulary, same compound handling, same barge-in.
+        ChappyStandby.shared.submitTyped(q)
     }
 
     private func nowLine(_ icon: String, _ text: String) -> some View {
@@ -1645,7 +2125,11 @@ struct TurboMetaHomeView: View {
     private var tileGrid: AnyView {
         AnyView(
             VStack(spacing: 10) {
-                askField
+                // BUILD 244: askField moved OUT of here and up into Layout A,
+                // above Your Day. Leaving the old one in place would have put
+                // two TextFields bound to the same $askText on one screen —
+                // typing in either would mirror into the other, and onSubmit
+                // would exist twice.
                 nowCard
                 groupHeader("travel", "Travel", "airplane", 6)
                 if openGroup == "travel" { group_travel }
@@ -1673,28 +2157,52 @@ struct TurboMetaHomeView: View {
                     .ignoresSafeArea()
 
                     ScrollView(showsIndicators: false) {
-                        VStack(spacing: 16) {
-                            // ORB HEADER — glows when Chappy is live
-                            orbHeader
+                        VStack(spacing: 14) {
+                            // ============================================
+                            // LAYOUT A (BUILD 244)
+                            //
+                            // Time · chips · weather-orb-alerts · ask ·
+                            // Your Day · the four modes · quick tiles ·
+                            // Reader.
+                            //
+                            // The order is the point. Everything above the
+                            // ask field is a glance — no decision, no
+                            // reading. Everything below it is a thing to
+                            // do, in the order he actually does them. The
+                            // wordmark is gone: he knows what app he
+                            // opened, and it was costing 34 points of the
+                            // first screenful to tell him.
+                            // ============================================
+                            clockHeader
 
-                            // STATUS STRIP
+                            // STATUS STRIP — glasses, camera, Live AI, ear
                             statusStrip
 
-                            // NAVIGATION CARD — appears only while navigating
+                            // WEATHER · ORB · ALERTS
+                            orbRow
+
+                            // NAVIGATION CARD — only while navigating, so
+                            // it costs nothing the rest of the time
                             navCard
 
-                            // THE FOUR MODES
-                            modeStack
+                            // THE ASK FIELD — type anything he could say
+                            askField
 
-                            // QUICK ACTIONS — BUILD 162: a wrapping grid, not a
-                            // cramped single row. Seven actions never fitted
-                            // across one line on a phone; now they breathe, each
-                            // in its own colour, and Ear On lights up when live.
-                            actionGrid
+                            // YOUR DAY — next events, next reminders
+                            todayGlanceCard.chappyScrollFX()
 
-                            // TODAY — journal glance
-                            journalRow
+                            // THE FOUR MODES, at about half their old height
+                            modeStripCompact
 
+                            // QUICK TILES — arrangeable
+                            quickTiles
+
+                            // ViewBuilder takes TEN children and Layout A has
+                            // eleven. Group is free — it is a builder, not a
+                            // container, so it adds no view, no layout pass
+                            // and no spacing of its own; the VStack still
+                            // sees these three exactly where they are.
+                            Group {
                             // BUILD 163 — WHY YOUR NOTIFICATIONS WENT MISSING.
                             //
                             // Every ping, warn time and flight alert in Chappy
@@ -1709,15 +2217,9 @@ struct TurboMetaHomeView: View {
                             // SAY SO, right here, with the button that fixes it.
                             notifBanner
 
-                            // BUILD 140 — THE GLANCE. The day, on the home screen,
-                            // before you've opened anything: next events, next
-                            // reminders, one line of counts. Tap = the full Diary.
-                            todayGlanceCard.chappyScrollFX()
-
-                            // BUILD 144 — THE READER, FINALLY VISIBLE. It shipped
-                            // voice-only in 134 and nobody could find it. Three
-                            // buttons now: look at the thing, tap the verb.
-                            readerCard.chappyScrollFX()
+                            // BUILD 244 — THE READER, AS A THIN STRIP. Same
+                            // three verbs, one row instead of a full card.
+                            readerStrip.chappyScrollFX()
 
                             // BUILD 157 — THE TILE GRID. Nine identical grey rows
                             // became a two-column grid of colour-coded tiles, each
@@ -1729,6 +2231,7 @@ struct TurboMetaHomeView: View {
                             // the "advanced tools" switch in Settings — they were
                             // leftovers from the app this was built on.
                             tileGrid
+                            }
                         }
                         .padding(.horizontal, 18)
                     }
@@ -1776,6 +2279,27 @@ struct TurboMetaHomeView: View {
                 }
                 .fullScreenCover(isPresented: $showUpcoming) {
                     UpcomingView()
+                }
+                // BUILD 244: the alerts widget's destination — every
+                // notification Chappy has posted or spoken, kept.
+                .sheet(isPresented: $showAlerts) { ChappyAlertsCentre() }
+                .sheet(isPresented: $showTilePicker) {
+                    ChappyTilePicker(order: $tileOrder)
+                }
+                // BUILD 244 — MOVED UP, AND IT HAD TO BE.
+                //
+                // This sheet used to hang off the Map button INSIDE the old
+                // actionGrid. That grid is no longer in the hierarchy, so the
+                // presenter went with it: the Map tile would have set
+                // showMapSheet = true and nothing anywhere would have opened.
+                // A modifier attached to a button rather than to the screen is
+                // a presenter with a lifetime nobody is tracking.
+                .sheet(isPresented: $showMapSheet) {
+                    if navEngine.isNavigating {
+                        NavMapSheet(navEngine: navEngine)
+                    } else {
+                        TodayMapSheet()
+                    }
                 }
                 .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
                 .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
@@ -2046,7 +2570,27 @@ struct TurboMetaHomeView: View {
             showLiveAI = false; showQuickVision = false; showLiveTranslate = false
             showMemory = true
         }
+        // BUILD 244: the clock. Twenty seconds is far more often than a
+        // minute display needs, and still nothing next to what the orb's
+        // animations already cost — but it means the minute never sits
+        // visibly stale after coming back from a cover.
+        .onReceive(Self.clockTick) { t in clockNow = t }
         .onAppear {
+            // BUILD 244: his tile arrangement, read once. Reading
+            // UserDefaults from inside a view body would run it on every
+            // redraw, and this screen redraws constantly.
+            tileOrder = ChappyHomeTiles.order
+            clockNow = Date()
+            // BUILD 245: the boundary between one run and the next in the
+            // Live AI log. A launch marker sitting directly under a
+            // "entering background" line means iOS killed the app there —
+            // which no amount of in-app logging could otherwise show.
+            ChappyLiveLog.markLaunch()
+            // BUILD 244: fill the weather widget. Cheap (Open-Meteo, no key)
+            // and only when it is actually empty.
+            if weather.now == nil {
+                Task { await weather.loadHere() }
+            }
             // GPS from app-open (not just Live AI) — journal, Remember and
             // the Map button all need a fix before any session starts
             ContextEngine.shared.start()
@@ -2240,6 +2784,553 @@ struct TurboMetaHomeView: View {
         } message: {
             Text("When you say Chappy emergency, your live location is sent to this WhatsApp number.")
         }
+    }
+}
+
+// ====================================================================
+// MARK: - BUILD 244: THE ORB
+// ====================================================================
+//
+// The avatar has been decorative since 148. It sat at the top of the
+// screen looking alive while the ear underneath it was dead, because the
+// only thing it ever reacted to was Live AI running — and Live AI is the
+// one mode you already know you started.
+//
+// It becomes the control. Tap it and the ear arms. Five states, and the
+// point of the fifth is that FAILED and OFF must never look the same
+// again: a week went into a deaf ear that presented as a grey dot, which
+// reads as "you haven't turned it on yet".
+//
+//   dim          nobody asked for the ear
+//   slow breathe armed, waiting for the name
+//   quick pulse  taking a command right now
+//   ripple       Chappy is talking
+//   red          it was asked, and it could not
+//
+// The states are checked in that order of urgency, not of arrival:
+// speaking beats hearing beats armed, and failure beats all of them.
+struct ChappyOrbView: View {
+
+    @ObservedObject private var standby = ChappyStandby.shared
+    @ObservedObject private var tts = TTSService.shared
+    @ObservedObject private var liveAI = LiveAIManager.shared
+    let theme: ChappyTheme
+    /// Tapping the orb is the whole point, but the home screen owns what a
+    /// tap MEANS (arm the ear, and nothing else if a module holds the mic),
+    /// so the decision stays up there.
+    var onTap: () -> Void
+
+    enum Mode { case failed, speaking, hearing, armed, dim }
+
+    private var mode: Mode {
+        if standby.armFailed { return .failed }
+        if tts.isSpeaking { return .speaking }
+        if standby.awake { return .hearing }
+        if standby.isListening || liveAI.isRunning { return .armed }
+        return .dim
+    }
+
+    @State private var breathe = false
+    @State private var ripple = false
+    @State private var quick = false
+
+    private var ringColour: Color {
+        switch mode {
+        case .failed: return Color(red: 1.0, green: 0.35, blue: 0.35)
+        case .speaking: return theme.accent
+        case .hearing: return Color(red: 0.35, green: 0.95, blue: 0.70)
+        case .armed: return Color(red: 0.35, green: 0.95, blue: 0.70)
+        case .dim: return theme.textSecondary.opacity(0.5)
+        }
+    }
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                // RIPPLE — two rings running outward while Chappy talks. The
+                // slower, wider cousin of the listening pulse, so the two
+                // read differently at a glance from a metre away.
+                if mode == .speaking {
+                    ForEach(0..<2, id: \.self) { i in
+                        Circle()
+                            .stroke(ringColour.opacity(0.45), lineWidth: 2)
+                            .frame(width: 104, height: 104)
+                            .scaleEffect(ripple ? 1.5 : 0.95)
+                            .opacity(ripple ? 0 : 0.75)
+                            .animation(.easeOut(duration: 1.6)
+                                .repeatForever(autoreverses: false)
+                                .delay(Double(i) * 0.8), value: ripple)
+                    }
+                }
+                // QUICK PULSE — tight and fast, because a command is being
+                // taken and the window is short.
+                if mode == .hearing {
+                    ForEach(0..<3, id: \.self) { i in
+                        Circle()
+                            .stroke(ringColour.opacity(0.55), lineWidth: 2)
+                            .frame(width: 100, height: 100)
+                            .scaleEffect(quick ? 1.35 : 1.0)
+                            .opacity(quick ? 0 : 0.8)
+                            .animation(.easeOut(duration: 0.75)
+                                .repeatForever(autoreverses: false)
+                                .delay(Double(i) * 0.25), value: quick)
+                    }
+                }
+
+                ChappyAvatarView(theme: theme, live: liveAI.isRunning)
+                    // DIM is a real state, not an absence of one — the orb
+                    // has to look switched off, or "off" and "broken and
+                    // silent" go on looking identical.
+                    .opacity(mode == .dim ? 0.42 : 1.0)
+                    .saturation(mode == .dim ? 0.25 : 1.0)
+
+                // The state ring. Breathes slowly when armed — a steady,
+                // unhurried heartbeat you can catch out of the corner of an
+                // eye and trust.
+                Circle()
+                    .stroke(ringColour.opacity(mode == .dim ? 0.35 : 0.9), lineWidth: mode == .failed ? 3 : 2)
+                    .frame(width: 104, height: 104)
+                    .scaleEffect(mode == .armed && breathe ? 1.045 : 1.0)
+                    .animation(mode == .armed
+                               ? .easeInOut(duration: 2.6).repeatForever(autoreverses: true)
+                               : .default,
+                               value: breathe)
+
+                // The red state says WHY, not just that. A red ring with no
+                // explanation is the grey dot again in a different colour.
+                if mode == .failed {
+                    Image(systemName: "exclamationmark")
+                        .font(.system(size: 15, weight: .black))
+                        .foregroundColor(ringColour)
+                        .offset(y: 40)
+                }
+            }
+            .frame(width: 116, height: 116)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onAppear { breathe = true; ripple = true; quick = true }
+        .accessibilityLabel("Chappy")
+        .accessibilityValue(stateWords)
+        .accessibilityHint("Double tap to arm the wake word")
+    }
+
+    /// Also used under the orb on screen, so the state is readable and not
+    /// just decodable by someone who remembers what the colours mean.
+    var stateWords: String {
+        switch mode {
+        case .failed: return standby.armFailureReason.isEmpty
+            ? "The ear won't arm — tap to try again" : standby.armFailureReason
+        case .speaking: return "Talking"
+        case .hearing: return "Listening — go on"
+        case .armed: return liveAI.isRunning ? "Live AI — just talk" : "Armed — say \u{201C}Chappy\u{201D}"
+        case .dim: return "Tap to arm the ear"
+        }
+    }
+
+    var stateColour: Color { ringColour }
+}
+
+// ====================================================================
+// MARK: - BUILD 244: THE NOTIFICATION CENTRE
+// ====================================================================
+//
+// Chappy has posted notifications since 163 and kept none of them. Clear
+// the lock screen, or let one land while the phone is in a pocket, and
+// the message is gone with nothing to say it ever existed — for an
+// assistant whose entire job is telling you things while you are not
+// looking at the screen, that is the wrong way round.
+//
+// ChappyNotify.History records every post on a channel he left switched
+// on, including the ones that were SPOKEN rather than shown. This is the
+// screen that reads it back.
+struct ChappyAlertsCentre: View {
+
+    @ObservedObject private var history = ChappyNotify.History.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmClear = false
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if history.alerts.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "bell.slash")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary)
+                        Text("Nothing yet")
+                            .font(.headline)
+                        Text("Arrival pings, spending warnings, overnight imports and anything the home computer finishes will all be kept here \u{2014} including the ones Chappy said out loud.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 34)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach(history.sections()) { section in
+                            Section(section.id) {
+                                ForEach(section.alerts) { a in
+                                    row(a)
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("Alerts")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            history.markAllRead()
+                        } label: {
+                            Label("Mark all read", systemImage: "checkmark.circle")
+                        }
+                        Button(role: .destructive) {
+                            confirmClear = true
+                        } label: {
+                            Label("Clear the history", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+            .confirmationDialog("Clear every alert?", isPresented: $confirmClear, titleVisibility: .visible) {
+                Button("Clear everything", role: .destructive) { history.clearAll() }
+                Button("Keep them", role: .cancel) {}
+            }
+        }
+        // Opening the centre is reading it. Marking read on a delay rather
+        // than instantly leaves the unread dots visible long enough to see
+        // WHICH ones were new, which is the only reason they exist.
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                history.markAllRead()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ a: ChappyNotify.Alert) -> some View {
+        Button {
+            history.markRead(a.id)
+            // A row that came from a screen goes back to that screen. The
+            // notification carried this the whole time and only iOS ever
+            // got to use it.
+            if let o = a.opens {
+                dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    NotificationCenter.default.post(name: Notification.Name(o), object: nil)
+                }
+            }
+        } label: {
+            HStack(alignment: .top, spacing: 11) {
+                Image(systemName: a.icon)
+                    .font(.system(size: 15))
+                    .foregroundColor(a.critical ? .orange : .accentColor)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(a.title)
+                            .font(.subheadline).fontWeight(a.read ? .regular : .semibold)
+                            .foregroundColor(.primary)
+                        if !a.read {
+                            Circle().fill(Color.accentColor).frame(width: 7, height: 7)
+                        }
+                        Spacer(minLength: 0)
+                        Text(Self.clock.string(from: a.at))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    Text(a.body)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(a.channelLabel)
+                        .font(.caption2)
+                        .foregroundColor(.secondary.opacity(0.7))
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .buttonStyle(.plain)
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                history.delete(a.id)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
+    }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"; return f
+    }()
+}
+
+// ====================================================================
+// MARK: - BUILD 244: THE ARRANGEABLE QUICK TILES
+// ====================================================================
+//
+// The old action grid was a fixed row in source order, so changing which
+// four actions sit under his thumb meant a build. Which ones those are
+// changes with what he is doing — Snap and Remember while walking around
+// Ubud, Currency and Places while working out what something costs — and
+// that is not a decision to make once, in Australia, in August.
+//
+// Order lives in UserDefaults as a list of ids. Anything in the seed that
+// is missing from the saved list gets appended, so a build that adds a
+// tile does not have to migrate anything, and an id that no longer exists
+// is dropped on read rather than crashing on lookup.
+enum ChappyHomeTiles {
+
+    static let seeded = ["snap", "places", "atlas", "currency",
+                         "standby", "remember", "dictate", "more"]
+
+    private static let key = "chappy_home_tile_order"
+
+    static var order: [String] {
+        get {
+            // NO SAVED VALUE means a fresh install — hand back the seed.
+            //
+            // The obvious version of this re-appended every seeded id that
+            // was missing, which quietly made the default eight impossible
+            // to REMOVE: taking one out saved the shorter list, and the very
+            // next read put it straight back. A preference that reverts
+            // itself is worse than one you cannot change, because it looks
+            // like it worked.
+            guard let saved = UserDefaults.standard.stringArray(forKey: key) else {
+                return seeded
+            }
+            // Drop ids this build no longer knows; keep his arrangement.
+            return saved.filter { known.keys.contains($0) }
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: key)
+        }
+    }
+
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    struct Spec {
+        let label: String
+        let icon: String
+        let tint: Color
+    }
+
+    /// Every tile the grid can render. Adding one here and to `seeded` is
+    /// the whole job — the grid, the persistence and the drag all key off
+    /// this table.
+    static let known: [String: Spec] = [
+        "snap":     Spec(label: "Snap",     icon: "camera.fill",
+                         tint: Color(red: 0.35, green: 0.85, blue: 1.0)),
+        "places":   Spec(label: "Places",   icon: "mappin.and.ellipse",
+                         tint: Color(red: 0.45, green: 0.85, blue: 0.55)),
+        "atlas":    Spec(label: "Atlas",    icon: "globe.asia.australia.fill",
+                         tint: Color(red: 0.45, green: 0.65, blue: 1.0)),
+        "currency": Spec(label: "Currency", icon: "dollarsign.arrow.circlepath",
+                         tint: Color(red: 1.0, green: 0.78, blue: 0.35)),
+        "standby":  Spec(label: "Standby",  icon: "ear",
+                         tint: Color(red: 0.35, green: 0.95, blue: 0.70)),
+        "remember": Spec(label: "Remember", icon: "mappin.circle.fill",
+                         tint: Color(red: 1.0, green: 0.68, blue: 0.25)),
+        "dictate":  Spec(label: "Dictate",  icon: "mic.fill",
+                         tint: Color(red: 0.98, green: 0.55, blue: 0.35)),
+        "more":     Spec(label: "More",     icon: "square.grid.2x2.fill",
+                         tint: Color(red: 0.75, green: 0.72, blue: 0.85)),
+        "video":    Spec(label: "Video",    icon: "video.fill",
+                         tint: Color(red: 1.0, green: 0.42, blue: 0.55)),
+        "watch":    Spec(label: "Watch",    icon: "eye.fill",
+                         tint: Color(red: 0.85, green: 0.45, blue: 1.0)),
+        "map":      Spec(label: "Map",      icon: "map.fill",
+                         tint: Color(red: 0.45, green: 0.65, blue: 1.0)),
+        "memory":   Spec(label: "Memory",   icon: "brain.head.profile",
+                         tint: Color(red: 0.65, green: 0.75, blue: 1.0)),
+    ]
+}
+
+/// One tile. Sized for a thumb, not for a caption — the whole reason the
+/// old quick actions needed replacing is that they were text links
+/// pretending to be buttons.
+struct ChappyQuickTileView: View {
+    let spec: ChappyHomeTiles.Spec
+    let active: Bool
+    let dragging: Bool
+    let action: () -> Void
+    /// BUILD 244: Snap's hold-for-burst survived the redesign because of
+    /// this. The old action grid attached a LongPressGesture to the Snap
+    /// button; rebuilding the grid without it would have silently deleted
+    /// a feature nobody would have thought to test.
+    var onLongPress: (() -> Void)? = nil
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 7) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(spec.tint.opacity(active ? 0.32 : 0.16))
+                        .frame(width: 44, height: 44)
+                    Image(systemName: spec.icon)
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundColor(spec.tint)
+                }
+                Text(spec.label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            // 78pt tall — comfortably past Apple's 44pt minimum in both
+            // directions, which the old caption-sized links never were.
+            .frame(height: 78)
+            .background(
+                RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .fill(Color.white.opacity(active ? 0.13 : 0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .stroke(active ? spec.tint.opacity(0.65) : Color.white.opacity(0.09),
+                            lineWidth: active ? 1.5 : 1)
+            )
+            .opacity(dragging ? 0.35 : 1)
+            .scaleEffect(dragging ? 0.94 : 1)
+        }
+        .buttonStyle(ChappyPressStyle())
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                guard let onLongPress else { return }
+                UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                onLongPress()
+            }
+        )
+    }
+}
+
+/// BUILD 244 — WHICH TILES ARE ON THE HOME SCREEN.
+///
+/// Drag-to-arrange answers "in what order". This answers "which", and
+/// without it the redesign quietly loses three actions: Video, Watch and
+/// Map were all on the old grid and are not in the seeded eight.
+///
+/// The seeded eight stay the default. This is the way back to the rest.
+struct ChappyTilePicker: View {
+    @Binding var order: [String]
+    @Environment(\.dismiss) private var dismiss
+
+    private var offTiles: [String] {
+        ChappyHomeTiles.known.keys.filter { !order.contains($0) }.sorted()
+    }
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    ForEach(order, id: \.self) { id in
+                        if let s = ChappyHomeTiles.known[id] {
+                            row(id, s, on: true)
+                        }
+                    }
+                } header: {
+                    Text("On the home screen")
+                } footer: {
+                    Text("Drag them into the order you want back on the home screen itself \u{2014} hold a tile and move it.")
+                }
+
+                if !offTiles.isEmpty {
+                    Section("Not shown") {
+                        ForEach(offTiles, id: \.self) { id in
+                            if let s = ChappyHomeTiles.known[id] {
+                                row(id, s, on: false)
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Button(role: .destructive) {
+                        ChappyHomeTiles.reset()
+                        order = ChappyHomeTiles.order
+                    } label: {
+                        Label("Back to the default eight", systemImage: "arrow.uturn.backward")
+                    }
+                }
+            }
+            .navigationTitle("Quick tiles")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func row(_ id: String, _ s: ChappyHomeTiles.Spec, on: Bool) -> some View {
+        Button {
+            if on {
+                order.removeAll { $0 == id }
+            } else {
+                order.append(id)
+            }
+            ChappyHomeTiles.order = order
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: s.icon)
+                    .font(.system(size: 15))
+                    .foregroundColor(s.tint)
+                    .frame(width: 26)
+                Text(s.label)
+                    .foregroundColor(.primary)
+                Spacer()
+                Image(systemName: on ? "minus.circle.fill" : "plus.circle.fill")
+                    .foregroundColor(on ? .red : .green)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// The reorder. Kept as its own DropDelegate rather than an onMove, because
+/// a LazyVGrid has no onMove and wrapping the grid in a List to get one
+/// would cost the layout that made the tiles worth building.
+struct ChappyTileDropDelegate: DropDelegate {
+    let item: String
+    @Binding var order: [String]
+    @Binding var dragging: String?
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging, dragging != item,
+              let from = order.firstIndex(of: dragging),
+              let to = order.firstIndex(of: item) else { return }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            order.move(fromOffsets: IndexSet(integer: from),
+                       toOffset: to > from ? to + 1 : to)
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.5)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+
+    func performDrop(info: DropInfo) -> Bool {
+        ChappyHomeTiles.order = order
+        dragging = nil
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        return true
     }
 }
 
