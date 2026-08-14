@@ -3396,23 +3396,33 @@ final class ChappyStandby: NSObject, ObservableObject {
         // Build 196 moved the ear onto the glasses and this is the bill
         // for it. The trade is still right — the ear has to be where the
         // mouth is — but it needed this guard on the same day.
+        // BUILD 239 — THE SAME WRONG COMPARISON THAT BROKE TRANSLATE.
+        //
+        // This deferred whenever the node and the SESSION disagreed. On
+        // the glasses they always disagree and always will: the node
+        // says 16000 because that IS the Bluetooth HFP microphone, the
+        // session says 48000 because that is the OUTPUT rate. So it
+        // deferred, retried, deferred, and the arm path gave up with
+        // "I couldn't open the microphone" — permanently, on the
+        // glasses, by design.
+        //
+        // installTap's precondition names the NODE's format and nothing
+        // else. The session rate does not appear in it. I removed this
+        // exact comparison from Translate in 236 and did not check
+        // whether the ear carried its own copy. It did. That is why
+        // Translate improved and the wake word did not.
         let session = AVAudioSession.sharedInstance()
-        let hwRate = session.sampleRate
-        if hwRate > 0, abs(hwRate - format.sampleRate) > 1 {
-            print("👂 [Standby] Node says \(format.sampleRate) Hz, session says \(hwRate) Hz — deferring rather than crashing")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, self.isListening else { return }
-                _ = self.startRecognition()
-            }
-            return false
-        }
+        print("👂 [Standby] Node \(format.sampleRate) Hz, session \(session.sampleRate) Hz — installing on the bus format")
 
         guard format.sampleRate > 0, format.channelCount > 0 else {
             print("⚠️ [Standby] Mic format not ready")
             return false
         }
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
+        // BUILD 239: nil = "use the bus's own format". The precondition
+        // becomes true by construction, so the uncatchable exception both
+        // guards existed to dodge cannot occur at all.
+        input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             req.append(buffer)
             // AUDIT P0 (SB-LIVENESS): the only honest proof that audio is
             // actually reaching us. engine.isRunning stays true through most of
