@@ -3372,6 +3372,20 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             return false
         }
+        // BUILD 241 — PREPARE FIRST, OR THE FORMAT IS 0 Hz.
+        //
+        // An AVAudioEngine input node reports 0 Hz until the engine has
+        // been prepared — and over Bluetooth HFP, after a category
+        // change, that is the normal state: the node has not acquired
+        // the hardware yet. The gate below then returns false, the arm
+        // path retries three times and gives up with "I couldn't open
+        // the microphone", which is exactly what Voice check shows:
+        // every prerequisite green, wake word not armed.
+        //
+        // prepare() is free, idempotent, and is the documented way to
+        // make the node acquire a valid format. It was being called
+        // AFTER the tap, at the bottom of this function.
+        engine.prepare()
         let format = input.outputFormat(forBus: 0)
 
         // BUILD 210 — THE LAUNCH CRASH, AND IT IS THE SAME ONE.
@@ -3414,9 +3428,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         let session = AVAudioSession.sharedInstance()
         print("👂 [Standby] Node \(format.sampleRate) Hz, session \(session.sampleRate) Hz — installing on the bus format")
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            print("⚠️ [Standby] Mic format not ready")
-            return false
+        // BUILD 241: this gate is now VESTIGIAL — installTap takes nil,
+        // so `format` is never handed to anything. It is kept as a log
+        // line only. Refusing to arm on the strength of a number nobody
+        // uses is how the ear stayed deaf through five builds of fixes.
+        if format.sampleRate <= 0 || format.channelCount <= 0 {
+            print("⚠️ [Standby] Node still reports \(format.sampleRate) Hz after prepare — installing on the bus format anyway")
         }
         input.removeTap(onBus: 0)
         // BUILD 239: nil = "use the bus's own format". The precondition
