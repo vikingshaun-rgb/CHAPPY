@@ -809,12 +809,30 @@ class LiveTranslateService: NSObject {
                 print("🎙️ [Translate] Current input device: \(inputRoute.portName) (\(inputRoute.portType.rawValue))")
             }
 
+            // BUILD 237 — -10868 IS kAudioUnitErr_FormatNotSupported.
+            //
+            // The engine was built ONCE at startup and reused for the
+            // life of the app, and AVAudioEngine.inputNode CACHES the
+            // hardware format the first time it is touched. Built while
+            // the phone mic was live at 48 kHz, then the Ray-Bans come up
+            // at 16 kHz — and the engine still believes 48 kHz. Starting
+            // it against the real route is a format it cannot support.
+            //
+            // A fresh engine, created AFTER the session is active, reads
+            // the route that actually exists. It is the only way that
+            // cached format is ever refreshed, and an AVAudioEngine is
+            // cheap.
+            audioEngine?.stop()
+            audioEngine?.reset()
+            audioEngine = AVAudioEngine()
+
             guard let engine = audioEngine else {
                 print("❌ [Translate] Audio engine not initialized")
                 return false
             }
 
             let inputNode = engine.inputNode
+            print("🎵 [Translate] Fresh engine — node \(inputNode.outputFormat(forBus: 0).sampleRate) Hz, session \(audioSession.sampleRate) Hz")
             let inputFormat = inputNode.outputFormat(forBus: 0)
 
             // BUILD 64 FIX (THE CRASH): during a route change the input format
