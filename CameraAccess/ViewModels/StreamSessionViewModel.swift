@@ -195,6 +195,19 @@ class StreamSessionViewModel: ObservableObject {
   /// distinguishable.
   private var startedProbe: Bool?
 
+  /// BUILD 219 — what the screen shows instead of black.
+  ///
+  /// A black rectangle is the same answer for six different failures.
+  /// These three numbers separate them: how long we have been waiting,
+  /// whether raw frames are arriving from the glasses at all, and
+  /// whether any of them survived conversion into a picture.
+  ///
+  /// Frames arriving with no picture is a conversion fault. Zero frames
+  /// is a subscription fault. They look identical today and they are not
+  /// the same bug.
+  @Published var waitingSeconds = 0
+  @Published var framesArrived = 0
+
   func startSession() async {
     logger.info("🚀 startSession START")
 
@@ -251,11 +264,32 @@ class StreamSessionViewModel: ObservableObject {
         }
       }
 
-      // Track session state; a stopped session ends the stream UI
+      // Track session state; a stopped session ends the stream UI.
+      //
+      // BUILD 219 — THIS TASK IS NOW THE ONLY READER.
+      //
+      // The wait for .started below used to open a SECOND iterator on
+      // this same stream. With a single-continuation stream, .started is
+      // delivered once — to whichever task is reading — and this one
+      // subscribed first. So the waiter never saw it, timed out, and
+      // everything downstream (addStream, and critically the video frame
+      // subscription) never ran. Session up, audio fine, no frames
+      // possible. That was the black screen, and before 218 it was the
+      // frozen one.
+      //
+      // It also subscribes BEFORE session.start() is called, which
+      // closes the second race: a warm pair of glasses could reach
+      // .started inside the ~100ms it took the old waiter's Task to be
+      // scheduled, and that transition was simply lost.
+      startedProbe = nil
       sessionStateTask = Task { @MainActor [weak self] in
         for await state in session.stateStream() {
           logger.info("📊 Session state: \(String(describing: state))")
+          if state == .started, self?.startedProbe == nil {
+            self?.startedProbe = true
+          }
           if state == .stopped {
+            if self?.startedProbe == nil { self?.startedProbe = false }
             self?.currentVideoFrame = nil
             self?.streamingStatus = .stopped
           }
@@ -276,24 +310,16 @@ class StreamSessionViewModel: ObservableObject {
       // Twenty seconds is the same budget LiveAIManager already uses for
       // the equivalent wait, so this now behaves the same way whichever
       // door the camera is opened through.
-      // Everything here stays on the main actor deliberately: the
-      // session object is not Sendable, so racing it through a task
-      // group would mean shipping it across an isolation boundary. A
-      // probe property and a polled deadline do the same job with none
-      // of that.
-      startedProbe = nil
-      let waiter = Task { @MainActor [weak self] in
-        for await state in session.stateStream() {
-          if state == .started { self?.startedProbe = true; return }
-          if state == .stopped { self?.startedProbe = false; return }
-        }
-        self?.startedProbe = false
-      }
+      // BUILD 219 — watch the probe the monitor fills in. No second
+      // reader, nothing racing, and the subscription is already live.
+      // Everything stays on the main actor because the session object is
+      // not Sendable and must not cross an isolation boundary.
       let deadline = Date().addingTimeInterval(20)
       while startedProbe == nil, Date() < deadline {
+        waitingSeconds = Int(Date().timeIntervalSince(deadline.addingTimeInterval(-20)))
         try? await Task.sleep(nanoseconds: 100_000_000)
       }
-      waiter.cancel()
+      waitingSeconds = 0
 
       guard startedProbe == true else {
         logger.error("❌ Session never reached .started")
@@ -337,6 +363,9 @@ class StreamSessionViewModel: ObservableObject {
       videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] videoFrame in
         // Arrival marker FIRST — the watchdog watches delivery, not conversion
         self?.lastFrameAt = Date()
+        // BUILD 219: counted at ARRIVAL, before the conversion gate, so
+        // "frames are coming but no picture appears" is visible.
+        Task { @MainActor [weak self] in self?.framesArrived += 1 }
         let now = Date()
         guard !Self.frameConversionBusy,
               now.timeIntervalSince(Self.lastConvertAt) > 0.08 else { return }
