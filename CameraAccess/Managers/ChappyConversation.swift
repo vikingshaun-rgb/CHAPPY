@@ -418,8 +418,21 @@ final class ChappyConversation: ObservableObject {
             return ChappyTimers.shared.cancel(matching: args["name"] as? String ?? "")
 
         case "recall":
-            let digest = ChappyDataBridge.recentMemoryDigest()
-            return digest.isEmpty ? "Nothing logged recently." : digest
+            // BUILD 219: the question actually reaches the search now.
+            let query = (args["query"] as? String) ?? ""
+            let days = (args["days"] as? Int) ?? 30
+            let kind = (args["kind"] as? String).flatMap { ChappyMemory.Kind(rawValue: $0) }
+            let meaning = (args["type"] as? String).flatMap { ChappyMemory.Semantic(rawValue: $0) }
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                // No query is a model mistake rather than a real request,
+                // but returning nothing would be unhelpful — fall back to
+                // the old digest so the turn still has something in it.
+                let digest = ChappyDataBridge.recentMemoryDigest()
+                return digest.isEmpty ? "Nothing logged recently." : digest
+            }
+            return await MainActor.run {
+                ChappyMemory.shared.recallFor(query, days: days, kind: kind, meaning: meaning)
+            }
 
         case "get_context":
             return ContextEngine.shared.contextHeader()
@@ -618,9 +631,25 @@ final class ChappyConversation: ObservableObject {
               ["name": p("string", "Which timer. Empty or 'all' cancels everything.")],
               []),
 
+            // BUILD 219 — THE TOOL THAT COULD NOT BE ASKED ANYTHING.
+            //
+            // This declared no parameters and its handler ignored the
+            // question entirely, returning a fixed three-day dump. So the
+            // real query engine underneath — text matching, kind filters,
+            // date ranges, a whole-history disk pass — was never once
+            // reached from a model path. Thirty days of memory the model
+            // could not put a question to is not a memory.
             t("recall",
-              "Search the last few days of what Chappy logged — photos, saved places, notes. Use for 'where was that place', 'what did I do Tuesday', 'that thing I saw'.",
-              [:], []),
+              "Search what Chappy has logged — photos, saved places, notes, conversations, spending. ALWAYS pass a query: the words he used, a place name, a thing. Use for 'where was that place', 'what did I do Tuesday', 'that warung in Sanur', 'what did I spend on food'. Results carry how Chappy knows each one and how sure it is — say so if it matters.",
+              ["query": p("string", "What to look for. The place, the thing, the words he used. Required — an empty query returns everything and helps nobody."),
+               "days": p("integer", "How far back. Default 30."),
+               "kind": p("string", "Optional filter by record shape: place, photo, note, talk, scan, route, ask, spend, day."),
+               // BUILD 222 — the axis that actually matters for most
+               // questions. "What do you know about me" is identity and
+               // preference; it should not wade through three weeks of
+               // photographs to answer.
+               "type": p("string", "Optional filter by MEANING, which is usually the better one: identity (passport, nationality, home), preference (likes, avoids, diet, seat), episodic (what happened), semantic (facts he told you), procedural (how he does things), relational (people), spatial (places), temporal (deadlines and expiries), project (unfinished business), affective (verdicts — loved it, never again), transactional (money, bookings). Durable types search years back, not 30 days.")],
+              ["query"]),
 
             t("get_context",
               "Fresh reading of location, time, weather and motion. The prompt already has a snapshot; only call this if he has clearly moved since.",

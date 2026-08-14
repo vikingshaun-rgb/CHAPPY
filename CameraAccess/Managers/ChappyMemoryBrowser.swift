@@ -46,6 +46,10 @@ import CoreLocation
 
 struct ChappyMemoryBrowser: View {
     @Environment(\.dismiss) private var dismiss
+    /// BUILD 226 — true only when presented as a sheet. This browser is
+    /// the Memory TAB, and a tab has nothing to dismiss to, so it must
+    /// not draw a Done button that can never work.
+    var isModal: Bool = false
     @ObservedObject private var memory = ChappyMemory.shared
 
     @State private var query = ""
@@ -54,6 +58,24 @@ struct ChappyMemoryBrowser: View {
     @State private var deepResults: [ChappyMemory.Entry]?
     @State private var searchingDisk = false
     @State private var selected: ChappyMemory.Entry?
+    /// BUILD 221 — held rather than deleted immediately. A memory is not
+    /// a to-do item; losing one to a stray thumb is not recoverable.
+    @State private var pendingDelete: ChappyMemory.Entry?
+    @State private var editing: ChappyMemory.Entry?
+
+    /// BUILD 227 — HOW THE LIST IS CARVED UP.
+    ///
+    /// By day is a diary and by type is a mind, and both are the right
+    /// answer to different questions. "What did I do Tuesday" wants
+    /// days; "what do you know about me" wants types, and wading
+    /// through three weeks of photographs to find a passport expiry is
+    /// exactly the wall he described.
+    ///
+    /// So it is a switch, not a replacement. Remembered between
+    /// launches, because whichever he prefers he will prefer every time.
+    enum Grouping: String { case day, type }
+    @AppStorage("chappy_memory_grouping") private var groupingRaw = Grouping.day.rawValue
+    private var grouping: Grouping { Grouping(rawValue: groupingRaw) ?? .day }
     @State private var includePulse = false
 
     // MARK: Categories
@@ -135,8 +157,34 @@ struct ChappyMemoryBrowser: View {
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query, prompt: "laksa, Kuta, that temple…")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
+                // BUILD 226 — A BUTTON THAT COULD NEVER WORK.
+                //
+                // This browser is presented as a TAB (MainTabView, tag 1)
+                // and this calls @Environment(\.dismiss). In a tab there
+                // is nothing to dismiss, so the button did precisely
+                // nothing, for ever. It was written for the sheet
+                // presentation described in this file's own header; the
+                // tab came later and nobody removed it.
+                if isModal {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+                // BUILD 227 — day or type. Both are right, for different
+                // questions, so it is a switch rather than a decision I
+                // make on his behalf.
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Picker("Group by", selection: $groupingRaw) {
+                            Label("By day", systemImage: "calendar")
+                                .tag(Grouping.day.rawValue)
+                            Label("By type", systemImage: "square.stack.3d.up")
+                                .tag(Grouping.type.rawValue)
+                        }
+                    } label: {
+                        Image(systemName: grouping == .type
+                              ? "square.stack.3d.up.fill" : "calendar")
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -148,6 +196,21 @@ struct ChappyMemoryBrowser: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) { chips }
             .sheet(item: $selected) { BrowserMemoryCard(entry: $0) }
+            .sheet(item: $editing) { e in
+                BrowserMemoryEditor(entry: e) { ChappyMemory.shared.reload() }
+            }
+            .alert("Delete this memory?",
+                   isPresented: Binding(get: { pendingDelete != nil },
+                                        set: { if !$0 { pendingDelete = nil } })) {
+                Button("Delete", role: .destructive) {
+                    if let e = pendingDelete { ChappyMemory.shared.forget(id: e.id) }
+                    pendingDelete = nil
+                }
+                Button("Keep it", role: .cancel) { pendingDelete = nil }
+            } message: {
+                Text(pendingDelete.map { "\($0.title)\n\nThis removes the entry and its photo. It cannot be undone." }
+                     ?? "")
+            }
         }
     }
 
@@ -189,14 +252,103 @@ struct ChappyMemoryBrowser: View {
 
     // MARK: List
 
+    /// BUILD 227 — one row definition, used by both groupings.
+    ///
+    /// It was inlined inside the day loop, so adding a second grouping
+    /// would have meant a second copy of the swipe actions, the context
+    /// menu and the tap handler — and two copies of an interaction are
+    /// two things that drift apart.
+    @ViewBuilder
+    private func row(_ e: ChappyMemory.Entry) -> some View {
+        BrowserMemoryRow(entry: e).onTapGesture { selected = e }
+            .swipeActions(edge: .trailing) {
+                Button(role: .destructive) { pendingDelete = e } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+            .swipeActions(edge: .leading) {
+                Button { editing = e } label: { Label("Edit", systemImage: "pencil") }
+                    .tint(.orange)
+            }
+            .contextMenu {
+                Button { editing = e } label: {
+                    Label("Correct this", systemImage: "pencil")
+                }
+                Button {
+                    ChappyMemory.shared.setPinned(id: e.id, !e.pinned)
+                } label: {
+                    Label(e.pinned ? "Unpin" : "Keep for good",
+                          systemImage: e.pinned ? "star.slash" : "star")
+                }
+                Divider()
+                Button(role: .destructive) { pendingDelete = e } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+    }
+
     private var listView: some View {
         List {
             if filtered.isEmpty { emptyState }
 
+            if grouping == .type {
+                // BUILD 227 — carved by meaning. Heaviest types first,
+                // so a deadline is never below a fortnight of photos.
+                ForEach(groupedByType, id: \.0) { meaning, items in
+                    Section {
+                        ForEach(items) { e in row(e) }
+                    } header: {
+                        HStack(spacing: 6) {
+                            Image(systemName: meaning.icon)
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(meaning.label)
+                            Spacer()
+                            Text("\(items.count)")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .foregroundStyle(BrowserMemoryRow.tint(meaning))
+                    }
+                }
+            } else {
             ForEach(grouped, id: \.0) { day, items in
                 Section {
                     ForEach(items) { e in
                         BrowserMemoryRow(entry: e).onTapGesture { selected = e }
+                            // BUILD 221 — the answer to "Chappy has this
+                            // wrong" used to be: you can star it. Delete
+                            // and edit both existed, in a screen that is
+                            // not the one wired into this tab.
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    pendingDelete = e
+                                } label: { Label("Delete", systemImage: "trash") }
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button {
+                                    editing = e
+                                } label: { Label("Edit", systemImage: "pencil") }
+                                .tint(.orange)
+                            }
+                            // BUILD 226 — a swipe is not discoverable. He
+                            // asked for a delete button, which means he
+                            // went looking for one and there wasn't one.
+                            // Long press puts the same three actions
+                            // somewhere he can find them.
+                            .contextMenu {
+                                Button { editing = e } label: {
+                                    Label("Correct this", systemImage: "pencil")
+                                }
+                                Button {
+                                    ChappyMemory.shared.setPinned(id: e.id, !e.pinned)
+                                } label: {
+                                    Label(e.pinned ? "Unpin" : "Keep for good",
+                                          systemImage: e.pinned ? "star.slash" : "star")
+                                }
+                                Divider()
+                                Button(role: .destructive) { pendingDelete = e } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                     }
                 } header: {
                     HStack {
@@ -208,6 +360,7 @@ struct ChappyMemoryBrowser: View {
                         }
                     }
                 }
+            }
             }
 
             if deepResults == nil, !query.isEmpty {
@@ -249,6 +402,25 @@ struct ChappyMemoryBrowser: View {
             buckets[key, default: []].append(e)
         }
         return order.map { ($0, buckets[$0] ?? []) }
+    }
+
+    /// BUILD 227 — the same memories, carved by MEANING.
+    ///
+    /// Ordered by the type's own standing weight rather than
+    /// alphabetically or by count, so the things that matter sit at the
+    /// top: what has a date on it, then who he is, then what he prefers,
+    /// and the diary last. That ordering is the same one retrieval uses,
+    /// which means the screen and the reasoning agree about what is
+    /// important — they were two different opinions before.
+    private var groupedByType: [(ChappyMemory.Semantic, [ChappyMemory.Entry])] {
+        var buckets: [ChappyMemory.Semantic: [ChappyMemory.Entry]] = [:]
+        for e in filtered { buckets[e.meaning, default: []].append(e) }
+        return buckets
+            .map { ($0.key, $0.value.sorted { $0.at > $1.at }) }
+            .sorted { a, b in
+                if a.0.baseWeight != b.0.baseWeight { return a.0.baseWeight > b.0.baseWeight }
+                return a.1.count > b.1.count
+            }
     }
 
     private func summaryFor(_ date: Date?) -> String? {
@@ -321,6 +493,24 @@ private struct BrowserMemoryRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.title).font(.callout).lineLimit(2)
                 HStack(spacing: 6) {
+                    // BUILD 226 — WHAT KIND OF THING IS THIS.
+                    //
+                    // Every row looked identical: grey thumbnail, a line
+                    // of text, a time. A photo, a job from the calendar,
+                    // a translated conversation and a saved place are
+                    // four completely different things rendered the same
+                    // way, which is why the list reads as a wall.
+                    //
+                    // Build 222 gave every memory a semantic type. This
+                    // is that type as a coloured tag — what Google
+                    // Photos, Apple's Journal and Samsung's gallery all
+                    // do, for the same reason: colour is read before
+                    // text.
+                    Label(entry.meaning.label, systemImage: entry.meaning.icon)
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(Self.tint(entry.meaning).opacity(0.18), in: Capsule())
+                        .foregroundStyle(Self.tint(entry.meaning))
                     Text(time).font(.caption2).foregroundStyle(.secondary)
                     if let where_ = place {
                         Text("·").font(.caption2).foregroundStyle(.tertiary)
@@ -341,6 +531,25 @@ private struct BrowserMemoryRow: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+    }
+
+    /// One colour per kind of knowing. Warm for things about HIM, cool
+    /// for things about the world, amber for anything with a date on it
+    /// — so a deadline never hides in a row of photographs.
+    static func tint(_ m: ChappyMemory.Semantic) -> Color {
+        switch m {
+        case .identity:      return .pink
+        case .preference:    return .purple
+        case .procedural:    return .indigo
+        case .relational:    return .teal
+        case .temporal:      return .orange
+        case .project:       return .blue
+        case .transactional: return .green
+        case .affective:     return .yellow
+        case .spatial:       return .mint
+        case .semantic:      return .cyan
+        case .episodic:      return .gray
+        }
     }
 
     private var thumb: some View {
@@ -528,5 +737,134 @@ private struct BrowserMemoryCard: View {
             .compactMap { ($0 as? UIWindowScene)?.keyWindow }
             .first?.rootViewController?
             .presentedViewController?.present(av, animated: true)
+    }
+}
+
+
+// =====================================================================
+// BUILD 221 — CORRECTING A MEMORY.
+//
+// Editing was title-only, in a screen that is not the one wired into
+// the Memory tab. So a wrong BODY — the transcript, the note, the part
+// that actually holds the content — could not be fixed at all, and the
+// only correction available anywhere was renaming the label on top of
+// it.
+//
+// A memory you cannot correct is one you eventually stop trusting, and
+// an assistant reasoning from memories its owner has stopped trusting
+// is worse than one with no memory at all.
+//
+// Correcting the title or body SUPERSEDES rather than overwrites, so
+// the earlier version keeps its dates and the change lands in the
+// audit trail. Tags and pinning are plain edits — those are labels on
+// a memory rather than claims about the world.
+// =====================================================================
+
+struct BrowserMemoryEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    let entry: ChappyMemory.Entry
+    var onSave: () -> Void = {}
+
+    @State private var title: String
+    @State private var body_: String
+    @State private var tagText: String
+    @State private var pinned: Bool
+
+    init(entry: ChappyMemory.Entry, onSave: @escaping () -> Void = {}) {
+        self.entry = entry
+        self.onSave = onSave
+        _title = State(initialValue: entry.title)
+        _body_ = State(initialValue: entry.body)
+        _tagText = State(initialValue: entry.tags.joined(separator: ", "))
+        _pinned = State(initialValue: entry.pinned)
+    }
+
+    private var changedClaim: Bool {
+        title != entry.title || body_ != entry.body
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("What it says") {
+                    TextField("Title", text: $title, axis: .vertical)
+                        .lineLimit(1...3)
+                    TextField("Detail", text: $body_, axis: .vertical)
+                        .lineLimit(3...12)
+                }
+
+                Section {
+                    TextField("Comma separated", text: $tagText)
+                    Toggle("Keep this one for good", isOn: $pinned)
+                } header: {
+                    Text("Tags")
+                } footer: {
+                    Text("Pinned memories survive every sweep and every prune.")
+                }
+
+                Section {
+                    // BUILD 222 — what kind of thing Chappy thinks this
+                    // is, which decides how long it stays relevant and
+                    // how highly it ranks when something is asked.
+                    HStack {
+                        Label(entry.meaning.label, systemImage: entry.meaning.icon)
+                            .font(.footnote)
+                        Spacer()
+                        Text(entry.semantic == nil ? "worked out" : "recorded")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text(entry.provenanceLine.prefix(1).uppercased() + entry.provenanceLine.dropFirst())
+                        .font(.footnote)
+                    if !entry.source.isEmpty {
+                        Text("Recorded by: \(entry.source)")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if let sup = entry.supersededAt {
+                        Text("Replaced on \(sup.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
+                } header: {
+                    Text("Where this came from")
+                } footer: {
+                    Text(changedClaim
+                         ? "Changing the words writes a new version. The old one is kept with the date it stopped being true, so nothing is lost."
+                         : "Tags and pinning are labels — changing them doesn't create a new version.")
+                }
+            }
+            .navigationTitle("Correct this")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") { save() }
+                        .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        let m = ChappyMemory.shared
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if changedClaim {
+            // A claim about the world changed — keep the old one.
+            m.supersede(entry.id, with: t, body: body_, origin: .told, confidence: 1.0)
+        }
+
+        let tags = tagText.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { !$0.isEmpty }
+        if tags != entry.tags {
+            for tag in tags where !entry.tags.contains(tag) {
+                m.addTag(id: entry.id, tag)
+            }
+        }
+        if pinned != entry.pinned { m.setPinned(id: entry.id, pinned) }
+
+        onSave()
+        dismiss()
     }
 }

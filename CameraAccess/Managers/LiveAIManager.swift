@@ -1557,12 +1557,22 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// Either answer is worth more than another fix that might work.
     /// Turn the ear back on in Settings, or say nothing and it stays
     /// off — this build is for finding out, not for using.
+    /// BUILD 219 — REMOVED, AND CLEARED OFF DISK.
+    ///
+    /// This was the 213 diagnostic's off switch. Nothing has ever called
+    /// its setter and no Settings screen has bound the key since 214
+    /// removed the toggle — so a phone that received `false` from that
+    /// diagnostic build has had a silently dead wake word ever since,
+    /// with no way back that does not involve deleting the app.
+    ///
+    /// The property stays only long enough to erase the key it guarded.
     static var earArmsItself: Bool {
-        // BUILD 214: back ON by default. 213 proved the ear was never the
-        // problem — the crash report names a stack overflow in SwiftUI's
-        // type machinery, on the main thread, before any audio runs.
-        get { UserDefaults.standard.object(forKey: "chappy_auto_arm") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "chappy_auto_arm") }
+        let d = UserDefaults.standard
+        if d.object(forKey: "chappy_auto_arm") != nil {
+            print("🩹 [Standby] Clearing the orphaned auto-arm flag from a diagnostic build")
+            d.removeObject(forKey: "chappy_auto_arm")
+        }
+        return true
     }
 
     func autoArmIfWanted(reason: String) {
@@ -1650,10 +1660,28 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// A failed arm the USER asked for is spoken. A failed auto-arm is silent —
     /// he never asked, so an unprompted "I need microphone access" from a
     /// pocketed phone is noise, not help.
-    private func announceArmFailure(_ line: String) {
+    /// BUILD 219 — some failures deserve to be heard.
+    ///
+    /// Auto-arm declining because a module is on screen, or because Live
+    /// AI already holds the microphone, is housekeeping and should stay
+    /// quiet. Auto-arm declining because the recogniser is unavailable,
+    /// or a permission is denied, or the microphone would not open, is a
+    /// BREAKAGE — and staying quiet about it is how he ends up spending
+    /// a day believing Chappy has simply become stupid.
+    ///
+    /// Even then it says it once. `lastArmComplaintAt` stops a phone that
+    /// is genuinely broken from announcing it on every launch for a week.
+    private static var lastArmComplaintAt = Date.distantPast
+
+    private func announceArmFailure(_ line: String, breakage: Bool = false) {
         if silentArm {
             silentArm = false
             print("👂 [Standby] Auto-arm declined: \(line)")
+            guard breakage else { return }
+            guard Date().timeIntervalSince(Self.lastArmComplaintAt) > 3600 else { return }
+            Self.lastArmComplaintAt = Date()
+            // Said plainly, once an hour at most, and it names what to do.
+            TTSService.shared.speak(line)
             return
         }
         TTSService.shared.speak(line)
@@ -1737,7 +1765,13 @@ final class ChappyStandby: NSObject, ObservableObject {
         // true — a single low-battery tap deadlocked the wake word permanently.
         guard let recognizer, recognizer.isAvailable else {
             starting = false
-            announceArmFailure("Standby isn't available on this phone right now.")
+            // BUILD 219: breakage, not housekeeping. This is the state
+            // that persists across relaunches — a missing on-device
+            // speech model, or no network with none installed — and it
+            // used to fail silently on every single launch.
+            announceArmFailure(
+                "I can't get speech recognition going on this phone. Check Settings, Chappy, Speech Recognition — and that you have signal.",
+                breakage: true)
             return
         }
         // Battery guard — a local ear sips, but not below 20%.
@@ -2158,6 +2192,9 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// flags — the whole problem with this layer has been code that believed
     /// its own bookkeeping. Shown in Settings → Voice check.
     static func diagnostics() -> [(String, String, Bool)] {
+        // BUILD 225: kick the async read so the row below is populated
+        // by the time he scrolls to it.
+        ChappyNotify.refreshPendingCount()
         let s = AVAudioSession.sharedInstance()
         let st = ChappyStandby.shared
         var out: [(String, String, Bool)] = []
@@ -2191,8 +2228,54 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         let key = !(APIKeyManager.shared.getGoogleAPIKey() ?? "").isEmpty
         out.append(("Voice (Gemini key)", key ? "set" : "missing — falls back to the system voice", true))
+
+        // BUILD 219 — THE FOUR THIS SCREEN COULD NOT SEE.
+        //
+        // Every one of these can leave the wake word dead across
+        // relaunches, and not one of them was reported here. The screen
+        // that exists to answer "why won't it listen" was blind to the
+        // actual answers.
+        let rec = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        let recOK = rec?.isAvailable == true
+        out.append(("Speech recogniser",
+                    recOK ? "available" : "NOT AVAILABLE — this alone stops the ear arming",
+                    recOK))
+
+        let onDevice = rec?.supportsOnDeviceRecognition == true
+        out.append(("Offline speech model",
+                    onDevice ? "installed" : "not installed — nothing to fall back on with no signal",
+                    onDevice))
+
+        out.append(("Standby on at launch",
+                    st.autoArmEnabledPublic ? "yes" : "OFF — Settings, Voice, Standby on at launch",
+                    st.autoArmEnabledPublic))
+
+        // BUILD 225 — WHY NO NOTIFICATIONS.
+        //
+        // Every one of these was invisible while the whole system was
+        // silently dead. A screen that reports "permission granted" and
+        // nothing else cannot tell you that the app decided not to post.
+        let pend = ChappyNotify.pendingCountSnapshot
+        out.append(("Notifications queued with iOS",
+                    pend < 0 ? "checking…" : "\(pend) waiting",
+                    pend != 0))
+        out.append(("Quiet hours",
+                    ChappyReminders.shared.inQuietHours
+                        ? "ON right now — routine alerts are silent until 7am"
+                        : "not active",
+                    true))
+
+        out.append(("Turned off this session",
+                    st.userTurnedOffPublic ? "yes — tap Ear On" : "no",
+                    !st.userTurnedOffPublic))
+
         return out
     }
+
+    /// BUILD 219 — read-only windows so Voice check can report the two
+    /// switches that silently stop the ear arming.
+    var autoArmEnabledPublic: Bool { autoArmEnabled }
+    var userTurnedOffPublic: Bool { userTurnedOff }
 
     /// Read-only view of the input heartbeat, for diagnostics.
     var lastBufferAtPublic: Date { lastBufferAt }
@@ -2264,11 +2347,40 @@ final class ChappyStandby: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self, self.isListening else { return }
                 let now = TTSService.shared.isSpeaking
+
+                // BUILD 219 — the door must open even when nothing was
+                // said. A branch that answers silently, or a render that
+                // failed outright, produces no speaking transition at
+                // all — and the armed window would simply be lost. Six
+                // seconds is longer than any render should take and
+                // short enough that a stale arm never lingers.
+                if !now, let armed = self.followUpArmedAt,
+                   Date().timeIntervalSince(armed) > Self.followUpArmCeiling {
+                    self.openFollowUpAfterSpeaking()
+                }
+
                 defer { self.wasSpeaking = now }
                 guard self.wasSpeaking, !now else { return }
                 // Voice just stopped. Give the speaker's decay a moment, then
                 // throw away everything the recogniser heard during the answer.
                 self.suppressTranscriptBefore = Date().addingTimeInterval(0.3)
+
+                // BUILD 219 — AND THIS IS WHERE THE DOOR OPENS.
+                //
+                // Not when routing returned. Here, the moment the voice
+                // actually stops, which is the moment a person starts
+                // replying. Every assistant worth copying measures its
+                // follow-up window from the end of its own speech —
+                // Google, Alexa and Meta all do, and Chappy did not.
+                self.openFollowUpAfterSpeaking()
+
+                // BUILD 219: and hand off to Google Maps here rather than
+                // the instant the route resolved, so it never cuts the
+                // summary off mid-sentence.
+                if self.pendingMapsHandoff {
+                    self.pendingMapsHandoff = false
+                    NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self, self.isListening, !self.awake, !self.busy else { return }
                     // BUILD 119 — WHY YOU HAVE TO SAY IT TWICE.
@@ -2595,16 +2707,27 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         // Store it immediately with a placeholder — the photo must never be lost
         // waiting on a network call that might not come back.
+        // BUILD 226 — EVERY SNAP WAS BEING STORED TWICE.
+        //
+        // addVisualNote already writes a .photo memory and keeps its id
+        // on the note, precisely so the caller can find it again. The
+        // second remember() call below was writing an identical entry —
+        // same moment, same thumbnail, same caption — so every photo he
+        // has ever taken exists twice in the memory store.
+        //
+        // Not just clutter: it doubles the disk and the thumbnails,
+        // doubles what recall returns, skews every count and every habit
+        // that reads memory, and because the AI caption is written back
+        // to only ONE of the pair, half of them can be left saying
+        // "Photo" while their twin says what it actually was.
+        //
+        // The BUILD 126 comment that used to sit here said photos were
+        // "only ever landing in visual notes". Whether that was true then
+        // or not, addVisualNote writes to the memory store today — so the
+        // fix for that problem is now the cause of this one.
+        //
+        // One write. The note carries the id.
         let note = TripRecorder.shared.addVisualNote(caption: "Photo", thumbnail: thumb)
-
-        // BUILD 126: and into the memory store, which is where you actually go
-        // looking. It was only ever landing in visual notes, so a snapped photo
-        // was invisible to search, to Dreaming and to the AI.
-        let entry = ChappyMemory.shared.remember(.photo,
-                                                 title: "Photo",
-                                                 tags: ["snap"],
-                                                 thumbnail: thumb,
-                                                 source: "snap")
 
         // BUILD 126: and into the camera roll, so it is backed up to iCloud and
         // findable in the app you already use. Add-only permission — Chappy
@@ -2614,7 +2737,10 @@ final class ChappyStandby: NSObject, ObservableObject {
         Task { @MainActor in
             if let caption = await Self.describe(frame) {
                 TripRecorder.shared.updateCaption(id: note.id, to: caption)
-                ChappyMemory.shared.setTitle(id: entry.id, caption)
+                // BUILD 226: the note's own memory id, not a second entry's.
+                if let memID = note.memID {
+                    ChappyMemory.shared.setTitle(id: memID, caption)
+                }
                 // If the card is still on screen, let him read what it is.
                 SnapFeedback.shared.setCaption(caption)
             }
@@ -2856,6 +2982,43 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// While this is in the future, speech routes as a command with no wake
     /// word. Opened after every completed command; see the note in heard().
     private var followUpUntil = Date.distantPast
+
+    /// BUILD 219 — armed when a command finishes routing, spent when the
+    /// speaking actually stops.
+    ///
+    /// The window used to open the instant route() returned, which is
+    /// before Chappy has said a word. A two-second render plus a
+    /// five-second answer left one second of an eight-second window, and
+    /// anything longer expired while he was still being talked at. That
+    /// is the whole reason the name had to be repeated.
+    private var followUpArmedAt: Date?
+
+    /// BUILD 219 — the handoff he asked for.
+    ///
+    /// The Google Maps URL builder has existed for builds. It was wired
+    /// to a BUTTON on the little route card and to the add-a-stop path,
+    /// and nowhere else — so Chappy would find the place, work out the
+    /// route, read the distance aloud, mention that Google Maps could
+    /// drive it, and then wait for him to go hunting for a button. On a
+    /// driving route that is the wrong shape entirely.
+    ///
+    /// Set when a route starts, spent when the summary finishes being
+    /// spoken — opening Maps mid-sentence would cut Chappy off.
+    private var pendingMapsHandoff = false
+
+    /// auto (drive only) · always · ask · never
+    static var mapsHandoffMode: String {
+        UserDefaults.standard.string(forKey: "chappy_maps_handoff") ?? "auto"
+    }
+
+    /// True when the line just spoken was a QUESTION. A question earns a
+    /// longer window and a sound, because Chappy knows an answer is
+    /// coming; a statement earns neither.
+    private var followUpWasAQuestion = false
+
+    /// If speech never starts — a render that failed, a silent branch —
+    /// the window must still open rather than being lost.
+    private static let followUpArmCeiling: TimeInterval = 6
     /// When the current run of follow-ups began. The window resets on every
     /// utterance, so without a ceiling it could stay open all afternoon in a
     /// crowd — and a live routing mic in a market is how someone else's
@@ -2866,6 +3029,49 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// seconds is right for "anything else?" and completely wrong for
     /// "when are you travelling?", which is a question people think about.
     static let flowFollowUpSeconds: TimeInterval = 75
+
+    /// BUILD 219 — open the follow-up window now that the voice has
+    /// stopped, and say so in a way he can perceive.
+    ///
+    /// A question gets the long window and a soft tone, because Chappy
+    /// asked and is waiting. A statement gets the ordinary window and
+    /// silence — the build 144 complaint was a chirp on EVERY utterance,
+    /// and that was fair. Sound should mean something.
+    func openFollowUpAfterSpeaking() {
+        guard let armed = followUpArmedAt else { return }
+        followUpArmedAt = nil
+
+        // A run that has already gone on too long ends here rather than
+        // renewing itself forever.
+        guard Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun else {
+            followUpUntil = .distantPast
+            return
+        }
+
+        let span = followUpWasAQuestion ? Self.flowFollowUpSeconds : Self.followUpSeconds
+        followUpUntil = Date().addingTimeInterval(span)
+        _ = armed
+
+        if followUpWasAQuestion {
+            // Meta's LED, in the only currency these glasses have.
+            ChappyEarcon.shared.askingYou()
+            ChappyHaptics.shared.straightStep()
+        }
+        followUpWasAQuestion = false
+    }
+
+    /// Did the line Chappy just said actually ask him something? A
+    /// question mark is the honest signal; the openers catch the ones
+    /// that were written without one.
+    static func readsAsAQuestion(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !t.isEmpty else { return false }
+        if t.hasSuffix("?") { return true }
+        let openers = ["which ", "what ", "where ", "when ", "how many", "how much",
+                       "would you like", "do you want", "shall i", "should i",
+                       "want me to", "anything else", "how about"]
+        return openers.contains(where: { t.hasPrefix($0) || t.contains(" " + $0) })
+    }
     static let followUpMaxRun: TimeInterval = 45
 
     /// Speech that carries no instruction. Hearing these should HOLD the door
@@ -3355,6 +3561,15 @@ final class ChappyStandby: NSObject, ObservableObject {
 
                     // Filler is not a command — it is a person thinking. Hold
                     // the door and say nothing.
+                    // BUILD 219 — a sentence in progress holds the door.
+                    // Anything still short enough to be the beginning of a
+                    // reply pushes the window out rather than racing it.
+                    if t.split(separator: " ").count <= 2,
+                       Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
+                        followUpUntil = max(followUpUntil,
+                                            Date().addingTimeInterval(Self.followUpSeconds))
+                    }
+
                     if t.count < 3 || Self.fillerWords.contains(t)
                         || Self.fillerWords.contains(where: { t == $0 || t.hasSuffix(" " + $0) }) {
                         if Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
@@ -3631,9 +3846,9 @@ final class ChappyStandby: NSObject, ObservableObject {
             // before the recogniser's own partial-delivery jitter starts
             // clipping words; sentences keep their patience.
             if wordCount <= 2 {
-                debounce = 0.65          // short command — as snappy as it gets
+                debounce = 0.50          // BUILD 219: short command, tightened with the mic fixed
             } else if wordCount <= 4 {
-                debounce = 0.9           // short sentence
+                debounce = 0.70          // BUILD 219: short sentence
             } else {
                 debounce = 1.15          // a real sentence — let him finish it
             }
@@ -3907,8 +4122,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             if Date().timeIntervalSince(self.followUpOpenedAt) > Self.followUpMaxRun {
                 self.followUpOpenedAt = Date()   // fresh run after a real command
             }
-            // Keep the door open — he can carry on without saying the name.
-            self.followUpUntil = Date().addingTimeInterval(8)
+            // BUILD 219 — ARM the door here, open it when the talking
+            // stops. Opening it now would spend most of the window on
+            // Chappy's own voice, which is exactly what it used to do.
+            //
+            // The hardcoded 8 here also disagreed with followUpSeconds
+            // (12) used everywhere else — two numbers for one idea.
+            self.followUpArmedAt = Date()
+            self.followUpWasAQuestion = Self.readsAsAQuestion(TTSService.shared.lastSpokenLine)
             // AUDIT FIX (HIGH — phantom repeats): the recognizer keeps ONE
             // growing transcript for its whole task. Without wiping it, the
             // words "chappy take a photo" stay in the buffer and re-fire the
@@ -4387,6 +4608,38 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         // BUILD 215 — §9's audit, spoken. "What changed?" for any window,
         // written to read like a diary rather than a database dump.
+        // BUILD 224 — HOW HAVE MY GUESSES GONE?
+        //
+        // The other half of §14, and the first thing in this app that
+        // can say it was wrong. Asking also settles anything whose
+        // window has closed, so the numbers are current when he hears
+        // them rather than current as of the last background pass.
+        if c.contains("your guesses") || c.contains("how are your guesses")
+            || c.contains("your predictions") || c.contains("how accurate")
+            || c.contains("were you right") || c.contains("your track record") {
+            ChappyOutcomes.shared.resolveDue()
+            speak(ChappyOutcomes.shared.spokenAccuracy())
+            return
+        }
+
+        // BUILD 224 — "what do you reckon", the ANSWER path.
+        //
+        // Asking is always allowed if the mode permits it. Interrupting
+        // him unprompted is `volunteer()` and has to be earned by a
+        // measured track record — that distinction is the whole reason
+        // this shipped disconnected for four builds.
+        if c.contains("what do you reckon") || c.contains("what do you think i")
+            || c.contains("anything i should") || c.contains("what's likely")
+            || c.contains("whats likely") {
+            ChappyOutcomes.shared.resolveDue()
+            if let guess = ChappyForesight.anticipate() {
+                speak(guess.line)
+            } else {
+                speak("Nothing I'd put money on right now.")
+            }
+            return
+        }
+
         if ["what changed", "what's changed", "whats changed",
             "what have you done today", "what did you do today"].contains(c) {
             speak(ChappyLedger.shared.whatChanged(sinceHours: 24))
@@ -5258,14 +5511,134 @@ final class ChappyStandby: NSObject, ObservableObject {
             } else { speak("No trip planned yet.") }
             return
         }
-        if c.contains("email me the plan") || c.contains("email the trip")
-            || c.contains("email me the trip") || c.contains("send me the itinerary")
-            || c.contains("email the itinerary") {
-            if let t = ChappyTravel.shared.active {
-                _ = ChappyTravel.shared.emailReport(t)
-                speak("Trip's in a draft - one tap sends it.")
-            } else { speak("Nothing to email yet.") }
+        // BUILD 232 — THE CHECKLIST, OUT LOUD.
+        if c.contains("tick off") || c.contains("tick the")
+            || c.hasPrefix("tick ") || c.contains("check off")
+            || c.contains("mark that as done") || c.contains("mark as done") {
+            speak(ChappyFile.shared.tickByPhrase(c, trip: ChappyTravel.shared.active))
             return
+        }
+        if c.contains("add to the checklist") || c.contains("add to my checklist")
+            || c.contains("put on the checklist") {
+            let title = c
+                .replacingOccurrences(of: "add to the checklist", with: "")
+                .replacingOccurrences(of: "add to my checklist", with: "")
+                .replacingOccurrences(of: "put on the checklist", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.count >= 3 else {
+                speak("Add what? Say \"add to the checklist, book the dog kennel\".")
+                return
+            }
+            ChappyFile.shared.addChecklistItem(title)
+            speak("Added — \(title).")
+            return
+        }
+        if c.contains("what's left") || c.contains("whats left")
+            || c.contains("what do i still") || c.contains("still to do")
+            || c.contains("before i fly") || c.contains("the checklist") {
+            speak(ChappyFile.shared.spokenChecklist(ChappyTravel.shared.active))
+            return
+        }
+        // BUILD 230 — are the keys alive?
+        if (c.contains("key") || c.contains("keys"))
+            && (c.contains("working") || c.contains("alive") || c.contains("ok")
+                || c.contains("okay") || c.contains("status") || c.contains("check")) {
+            speak(ChappyKeys.shared.spoken())
+            Task { await ChappyKeys.shared.testAll(force: false) }
+            return
+        }
+
+        // BUILD 231 — EMAIL ANYTHING, NOT JUST THE TRIP PLAN.
+        //
+        // This used to know five phrasings, all of them for the trip
+        // plan, and it always replied "Trip's in a draft - one tap sends
+        // it" whether or not anything was attached and whether or not a
+        // composer could open. Now it says what actually happened, and
+        // it can reach the flight brief, the comparison and the memory
+        // export as well.
+        // AUDIT FINDING — this nearly hijacked reading the inbox.
+        //
+        // The route matches a bare "email", and its last resort is "short
+        // sentence, a trip is open, so he means the trip". "Read my
+        // email" is fifteen characters — so asking Chappy to READ the
+        // inbox would have opened a composer with the trip report
+        // attached. An action he never asked for, fired by a sentence
+        // about something else.
+        //
+        // Reading words disqualify the whole route before anything else
+        // is considered.
+        let readingMail = c.contains("read") || c.contains("any new")
+            || c.contains("unread") || c.contains("check my")
+            || c.contains("check the mail") || c.contains("inbox")
+            || c.contains("who emailed") || c.contains("reply")
+        if !readingMail,
+           c.contains("email") || c.contains("send it to")
+            || c.contains("send that to") || c.contains("mail it") {
+
+            let toPartner = c.contains("partner") || c.contains("my wife")
+                || c.contains("my husband") || c.contains("her") || c.contains("him")
+            let to = toPartner ? ChappyHandoff.partner : ""
+
+            // Which document? Flights and comparison before "trip",
+            // because "email the flight plan" contains both words and
+            // the more specific one has to win.
+            if c.contains("flight") || c.contains("flights") {
+                if let t = ChappyTravel.shared.active {
+                    speak(ChappyHandoff.shared.offerReport(
+                        ChappyTravel.shared.writeFlights(t),
+                        subject: "Flights — \(t.name)",
+                        body: ChappyTravel.shared.spokenItinerary(t),
+                        to: to.isEmpty ? [] : [to]))
+                } else {
+                    speak("No trip planned, so there's no flight report to send yet.")
+                }
+                return
+            }
+            if c.contains("compar") {
+                let trips = ChappyTravel.shared.trips
+                guard trips.count > 1 else {
+                    speak("There's only one trip, so there's nothing to compare it against.")
+                    return
+                }
+                speak(ChappyHandoff.shared.offerReport(
+                    ChappyTravel.shared.writeComparison(trips),
+                    subject: "Trips side by side",
+                    body: "Every trip on file, compared.",
+                    to: to.isEmpty ? [] : [to]))
+                return
+            }
+            if c.contains("memory") || c.contains("memories") || c.contains("diary") {
+                // exportAll writes on a background queue and calls back,
+                // so this one has to speak twice: once to say it started,
+                // once when there is something to attach. Saying nothing
+                // in between is how the app feels broken.
+                speak("Building the export - I'll put it in an email when it's ready.")
+                ChappyMemory.shared.exportAll { url in
+                    Task { @MainActor in
+                        let line = ChappyHandoff.shared.offerReport(
+                            url,
+                            subject: "Chappy — memory export",
+                            body: "Everything Chappy remembers, as a file.",
+                            to: to.isEmpty ? [] : [to])
+                        TTSService.shared.speak(line)
+                    }
+                }
+                return
+            }
+            if c.contains("plan") || c.contains("trip") || c.contains("itinerary")
+                || c.contains("report") {
+                if let t = ChappyTravel.shared.active {
+                    speak(ChappyTravel.shared.emailReport(t, to: to))
+                } else {
+                    speak("Nothing to email yet — there's no trip planned.")
+                }
+                return
+            }
+            // "email" on its own, with a trip open, means the trip.
+            if let t = ChappyTravel.shared.active, c.count < 24 {
+                speak(ChappyTravel.shared.emailReport(t, to: to))
+                return
+            }
         }
         // "add five nights in Ubud" — the one command that builds a trip
         // by voice, so a plan can start on a footpath rather than at a desk.
@@ -6656,6 +7029,18 @@ final class ChappyStandby: NSObject, ObservableObject {
     func armMapsAnswerWindow() {
         expectingMapsAnswerUntil = Date().addingTimeInterval(30)
         if !isListening { silentArm = true; start() }
+
+        // BUILD 219 — hand off without being asked to.
+        //
+        // Driving is the case where it matters: nobody wants to be told a
+        // distance and then go hunting for a button at the lights.
+        // Walking keeps the spoken offer, because Chappy's own
+        // turn-by-turn is usually the better thing on foot.
+        let mode = Self.mapsHandoffMode
+        let driving = NavEngine.shared.lastDriving || NavEngine.shared.lastModeWasScooter
+        if mode == "always" || (mode == "auto" && driving) {
+            pendingMapsHandoff = true
+        }
     }
 
     /// BUILD 133: "get me a coffee on the way and get fuel" → ["cafe",
@@ -7232,7 +7617,10 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     private func speak(_ text: String) {
         ChappyHaptics.shared.straightStep()
-        TTSService.shared.speak(Self.humanise(text))
+        // BUILD 219: speakSmart, not speak. A cached line still plays
+        // whole and instantly; a long unseen one starts on its first
+        // sentence rather than after the whole thing has rendered.
+        TTSService.shared.speakSmart(Self.humanise(text))
     }
 
     /// CONTEXTUAL COACH: four things worth saying RIGHT NOW, rotating so you
@@ -8219,6 +8607,199 @@ final class TripRecorder {
             }
     }
 
+    // =================================================================
+    // BUILD 229 — THE NAME THAT WAS NEVER LEARNED.
+    //
+    // `Spot.placeName` has existed since build 158 carrying the comment
+    // "the real name Apple Maps knows this address by, learned lazily".
+    // It is never written and never read. Nothing lazily learns anything.
+    //
+    // That one dead field is the whole reason his list reads "spot at
+    // 12:28am near Cresthaven Ct — Needs a name, tap to fix": the app
+    // nagging him to do by hand the job it said it would do itself.
+    //
+    // MapKit will name a point of interest within a few metres of a
+    // coordinate. That is how Google Photos labels a picture with the
+    // name of the warung without being told.
+    //
+    // Two things this has to get right or it is worse than nothing:
+    //
+    //   THROTTLING. Apple's POI search refuses a burst. One at a time,
+    //   1.2s apart, twenty per pass. Forty fired at once returns forty
+    //   failures and permanently marks them all as barren.
+    //
+    //   THE DIFFERENCE BETWEEN "NOT TRIED" AND "NOTHING THERE". nil means
+    //   never attempted; empty string means attempted and the coordinate
+    //   genuinely has no named place on it — a layby, a field, his own
+    //   driveway. Without that distinction it re-queries the same barren
+    //   coordinate on every launch for ever.
+    // =================================================================
+
+    private var naming = false
+
+    func autoNameSpots() {
+        guard !naming else { return }
+        let todo = spots.enumerated()
+            .filter { $0.element.placeName == nil && Self.looksUnnamed($0.element.name) }
+            .prefix(20)
+            .map { (index: $0.offset, lat: $0.element.lat, lon: $0.element.lon,
+                    id: $0.element.t) }
+        guard !todo.isEmpty else { return }
+        naming = true
+
+        Task { @MainActor in
+            var found = 0
+            for item in todo {
+                // No coordinate at all: nothing to look up, ever. That
+                // one IS final — it is not a failed lookup, there is
+                // nothing to look up.
+                guard item.lat != 0 || item.lon != 0 else {
+                    Self.mark(recorder: self, at: item.id, name: "")
+                    continue
+                }
+                let result = await Self.lookUp(lat: item.lat, lon: item.lon)
+                // Re-find by timestamp rather than trusting the index —
+                // the list can be edited or deleted from under this.
+                switch result {
+                case .named(let n):
+                    Self.mark(recorder: self, at: item.id, name: n)
+                    found += 1
+                case .nothingThere:
+                    // Looked, and there is genuinely nothing here. Final.
+                    Self.mark(recorder: self, at: item.id, name: "")
+                case .lookupFailed:
+                    // No signal, or Apple throttled us. Leave placeName
+                    // nil so it is tried again — recording this as
+                    // "nothing there" would poison the spot for ever.
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+            }
+            self.naming = false
+            if found > 0 {
+                print("📍 [Trip] Named \(found) place\(found == 1 ? "" : "s")")
+                NotificationCenter.default.post(name: .chappySpotsNamed, object: nil)
+            }
+        }
+    }
+
+    /// Auto-named spots look like "spot at 4:42PM near Cresthaven Ct" or
+    /// "Starred place". Anything he typed himself is left alone.
+    static func looksUnnamed(_ n: String) -> Bool {
+        let l = n.lowercased()
+        return l.hasPrefix("spot at") || l == "starred place" || l.isEmpty
+    }
+
+    private static func mark(recorder: TripRecorder, at stamp: Date, name: String) {
+        guard let i = recorder.spots.firstIndex(where: { $0.t == stamp }) else { return }
+        recorder.spots[i].placeName = name
+        // Only rename the spot itself if he never named it. His words win.
+        if !name.isEmpty, looksUnnamed(recorder.spots[i].name) {
+            recorder.spots[i].name = name
+            if let mid = recorder.spots[i].memID {
+                ChappyMemory.shared.relabel(id: mid, to: name)
+            }
+        }
+        recorder.saveSpots()
+    }
+
+    /// AUDIT FINDING, CAUGHT BEFORE SHIPPING — three outcomes, not two.
+    ///
+    /// This used to return `String?` and the caller wrote an empty string
+    /// for nil. Empty string is FINAL: it means "looked, there is
+    /// genuinely nothing named at this coordinate, stop asking". So a
+    /// pass run with no signal — on a plane, in a dead spot, or simply
+    /// throttled by Apple — would have permanently marked every unnamed
+    /// place as barren, and not one of them would ever be looked up
+    /// again.
+    ///
+    /// That is this project's oldest defect wearing a new hat: a FAILURE
+    /// and an ABSENCE returning the same value. It has already cost the
+    /// greeting, the safe mode, the translate recorder, the black
+    /// screen, the auto-arm and the whole notification system.
+    enum NameResult {
+        case named(String)
+        case nothingThere    // looked, nothing here. Final.
+        case lookupFailed    // could not look. Try again later.
+    }
+
+    /// Convenience for the one caller that only wants a suggestion and
+    /// treats "couldn't look" and "nothing there" the same, because it is
+    /// showing a text field either way.
+    static func namePlace(lat: Double, lon: Double) async -> String? {
+        if case .named(let n) = await lookUp(lat: lat, lon: lon) { return n }
+        return nil
+    }
+
+    /// The nearest named point of interest, within 60 m. Beyond that it
+    /// is not where you were standing, it is the next shop along — and a
+    /// confidently wrong name is worse than no name.
+    static func lookUp(lat: Double, lon: Double) async -> NameResult {
+        let here = CLLocation(latitude: lat, longitude: lon)
+        let region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+            latitudinalMeters: 120, longitudinalMeters: 120)
+
+        // Did EITHER lookup actually manage to run? If neither did, this
+        // is a failure and must not be recorded as an answer.
+        var reached = false
+
+        let req = MKLocalPointsOfInterestRequest(coordinateRegion: region)
+        if let resp = try? await MKLocalSearch(request: req).start() {
+            reached = true
+            let near = resp.mapItems
+                .compactMap { item -> (name: String, metres: Double)? in
+                    guard let n = item.name, !n.isEmpty,
+                          let loc = item.placemark.location else { return nil }
+                    return (n, here.distance(from: loc))
+                }
+                .filter { $0.metres <= 60 }
+                .sorted { $0.metres < $1.metres }
+            if let best = near.first { return .named(best.name) }
+        }
+
+        // Nothing named nearby. Fall back to the street address, which is
+        // still a great deal better than a timestamp — but only if the
+        // geocoder gives a real thoroughfare rather than a plus code.
+        if let marks = try? await CLGeocoder().reverseGeocodeLocation(here),
+           let p = marks.first {
+            reached = true
+            if let poi = p.areasOfInterest?.first, !poi.isEmpty { return .named(poi) }
+            if let street = p.thoroughfare {
+                let numbered = [p.subThoroughfare, street]
+                    .compactMap { $0 }.joined(separator: " ")
+                if !numbered.isEmpty { return .named(numbered) }
+            }
+        }
+        return reached ? .nothingThere : .lookupFailed
+    }
+
+    /// BUILD 229 — add a place from the list, at a coordinate you choose.
+    /// Until now a spot could only be born from the Home screen's Remember
+    /// button or by voice, so "add this one while I'm looking at the list"
+    /// was not a thing the app could do.
+    @discardableResult
+    func addSpot(named rawName: String, lat: Double, lon: Double,
+                 category: String, note: String) -> Spot {
+        let snap = ContextEngine.shared.snapshot
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var spot = Spot(name: name.isEmpty ? "New place" : name, t: Date(),
+                        lat: lat, lon: lon,
+                        street: snap.street, city: snap.city, country: snap.country)
+        spot.category = category
+        spot.note = note.isEmpty ? nil : note
+        let mem = ChappyMemory.shared.rememberAt(.place, title: spot.name,
+                                                 lat: lat, lon: lon,
+                                                 street: spot.street, city: spot.city,
+                                                 country: spot.country,
+                                                 tags: ["spot", "added"],
+                                                 source: "places")
+        spot.memID = mem.id
+        spots.append(spot)
+        saveSpots()
+        return spot
+    }
+
     private func saveSpots() {
         let snapshot = spots
         let url = spotsURL
@@ -8853,6 +9434,23 @@ final class ChappyMemory: ObservableObject {
             case .appointment: return "calendar"
             }
         }
+
+        /// BUILD 219 — never lose a memory to an unrecognised category.
+        ///
+        /// Synthesised Codable throws on an unknown raw value, and
+        /// readDay drops whatever throws — silently. So the day a later
+        /// build adds a new kind, every entry of that kind becomes
+        /// invisible to THIS build, and if this build then rewrites the
+        /// day file those entries are gone for good.
+        ///
+        /// Unknown categories now land in .note, which is the honest
+        /// place for "something was recorded here and I do not know what
+        /// to call it". The text survives, which is the part that
+        /// matters.
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Kind(rawValue: raw) ?? .note
+        }
     }
 
     // MARK: The entry
@@ -8860,6 +9458,204 @@ final class ChappyMemory: ObservableObject {
     // Every field except id/at/kind/title is optional on purpose: a memory
     // written with no GPS fix is still a memory, and refusing to store it
     // because the sky was cloudy is how you end up with gaps.
+    /// BUILD 222 — WHAT A MEMORY MEANS, as opposed to what shape it is.
+    ///
+    /// `Kind` is the FORM of the record: a photo, a scan, a note, a
+    /// route. This is the MEANING: identity, a preference, a deadline, a
+    /// verdict. They are orthogonal — a photo of a passport page is a
+    /// photo carrying identity — and collapsing them into one field
+    /// loses information in both directions.
+    ///
+    /// Optional on the entry, so nothing that has ever been written
+    /// needs to change and every old line still decodes. Anything
+    /// unclassified is classified on the fly by the same local rules
+    /// used at write time.
+    ///
+    /// The point of typing is DURABILITY. An identity fact is true until
+    /// he says otherwise. An episodic one was true about a moment and
+    /// decays as evidence about now. A deadline stops mattering the day
+    /// after it passes. Today all three age identically, which is how a
+    /// three-week-old lunch can outrank a passport expiry in a search
+    /// for the word "expiry".
+    enum Semantic: String, Codable, CaseIterable, Identifiable {
+        /// Who he is. Passport, nationality, home city, name, the things
+        /// that do not change without an announcement.
+        case identity
+        /// What he likes and avoids. Diet, seat, budget band, the aisle.
+        case preference
+        /// What happened, at a time and a place. The diary.
+        case episodic
+        /// A fact about the world he told Chappy — not about himself.
+        case semantic
+        /// How he does things. Routines, sequences, the way he packs.
+        case procedural
+        /// People, and why they matter to him.
+        case relational
+        /// Places, and his relationship to them — base, frequent,
+        /// historical, passing through.
+        case spatial
+        /// Deadlines and expiries. The dates that actually bite.
+        case temporal
+        /// Ongoing objectives and unfinished business.
+        case project
+        /// Verdicts. Loved it, never again, worth the money.
+        case affective
+        /// Money, bookings, references, what was paid.
+        case transactional
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .identity:      return "About you"
+            case .preference:    return "Preferences"
+            case .episodic:      return "What happened"
+            case .semantic:      return "Facts"
+            case .procedural:    return "How you do things"
+            case .relational:    return "People"
+            case .spatial:       return "Places"
+            case .temporal:      return "Dates that matter"
+            case .project:       return "Ongoing"
+            case .affective:     return "Verdicts"
+            case .transactional: return "Money"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .identity:      return "person.text.rectangle"
+            case .preference:    return "heart.text.square"
+            case .episodic:      return "clock.arrow.circlepath"
+            case .semantic:      return "text.book.closed"
+            case .procedural:    return "list.number"
+            case .relational:    return "person.2"
+            case .spatial:       return "mappin.and.ellipse"
+            case .temporal:      return "calendar.badge.exclamationmark"
+            case .project:       return "flag"
+            case .affective:     return "star.leadinghalf.filled"
+            case .transactional: return "creditcard"
+            }
+        }
+
+        /// HOW LONG THIS STAYS TRUE, in days, as evidence about NOW.
+        ///
+        /// Not an expiry — nothing is deleted for being old. This is the
+        /// weight retrieval gives it. A preference from a year ago is
+        /// still probably true; a location from a year ago tells you
+        /// nothing about where he is standing.
+        var durabilityDays: Double {
+            switch self {
+            case .identity:      return 3650   // a decade; it changes by announcement
+            case .preference:    return 730
+            case .procedural:    return 730
+            case .relational:    return 1095
+            case .semantic:      return 1095
+            case .affective:     return 540    // tastes move, slowly
+            case .project:       return 180
+            case .transactional: return 365
+            case .spatial:       return 120
+            case .temporal:      return 90     // a deadline is about its own date
+            case .episodic:      return 45
+            }
+        }
+
+        /// How much weight a memory of this type carries before age is
+        /// considered. Stable truths outrank the diary when a question
+        /// could be answered from either.
+        var baseWeight: Double {
+            switch self {
+            case .identity:      return 1.00
+            case .temporal:      return 0.95
+            case .preference:    return 0.90
+            case .procedural:    return 0.85
+            case .project:       return 0.80
+            case .relational:    return 0.75
+            case .semantic:      return 0.70
+            case .affective:     return 0.65
+            case .transactional: return 0.60
+            case .spatial:       return 0.55
+            case .episodic:      return 0.50
+            }
+        }
+
+        /// BUILD 222 — the same forward-compatibility the Kind enum got,
+        /// and the reason to write it down: I fixed exactly this hazard
+        /// on Kind one build ago and then reintroduced it here by adding
+        /// two new enums to a persisted model without thinking about the
+        /// next build's decoder.
+        ///
+        /// Synthesised Codable throws on an unknown raw value, and
+        /// readDay drops whatever throws — silently. So the day a later
+        /// build adds a twelfth type, every entry carrying it becomes
+        /// invisible to THIS build, and if this build rewrites that day
+        /// file they are gone.
+        ///
+        /// Unknown types fall to .episodic, which is the honest default:
+        /// something happened and I do not know what to call it.
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Semantic(rawValue: raw) ?? .episodic
+        }
+    }
+
+    /// BUILD 219 — WHERE A MEMORY CAME FROM.
+    ///
+    /// A closed set on purpose. `source` is free text and drifted to
+    /// twenty-two different values across the codebase, which is fine
+    /// for "which module wrote this" and useless for "should I trust
+    /// it". These six are the only ways Chappy can come to know
+    /// anything, and they rank naturally: told beats heard beats seen
+    /// beats inferred.
+    enum Origin: String, Codable, CaseIterable {
+        /// He said it, in as many words.
+        case told
+        /// Overheard or transcribed — a conversation, a dictation.
+        case heard
+        /// The camera saw it — a photo, a scan, a read.
+        case seen
+        /// A model concluded it from something else. NOT the same as
+        /// told, and the whole reason this enum exists.
+        case inferred
+        /// Computed from data Chappy already had — a distance, a total,
+        /// a pattern in the trail.
+        case derived
+        /// Came from outside — the calendar, a booking, a file.
+        case imported
+
+        var spoken: String {
+            switch self {
+            case .told:     return "you told me"
+            case .heard:    return "I heard it"
+            case .seen:     return "I saw it"
+            case .inferred: return "I worked it out"
+            case .derived:  return "I calculated it"
+            case .imported: return "it came from your calendar or a booking"
+            }
+        }
+
+        /// The confidence a fact of this kind starts life with.
+        var defaultConfidence: Double {
+            switch self {
+            case .told:     return 1.0
+            case .imported: return 0.95
+            case .seen:     return 0.85
+            case .heard:    return 0.8
+            case .derived:  return 0.75
+            case .inferred: return 0.6
+            }
+        }
+
+        /// BUILD 222 — same reasoning as Semantic above. An unknown
+        /// origin must not cost him the memory it was attached to.
+        /// Falls to .inferred, which is the CAUTIOUS default: if Chappy
+        /// cannot tell how it knows something, it should not claim the
+        /// user said it.
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Origin(rawValue: raw) ?? .inferred
+        }
+    }
+
     struct Entry: Codable, Identifiable, Equatable {
         var id: UUID = UUID()
         /// WHEN. Always set. Encoded as ISO-8601 so the raw file is readable.
@@ -8889,6 +9685,86 @@ final class ChappyMemory: ObservableObject {
         var expires: Date?
         /// Which part of Chappy wrote this. Useful when a module misbehaves.
         var source: String = ""
+
+        // ===== BUILD 219 — PROVENANCE, CONFIDENCE, VERSIONING =====
+        //
+        // Every field below is Optional, without exception. This model
+        // has to decode every line ever written to disk, including the
+        // thousands that pre-date these three ideas entirely. A
+        // non-Optional addition here would not fail loudly; it would
+        // silently drop his history on the next read.
+
+        /// HOW Chappy came to believe this. `source` says which module
+        /// wrote the line; this says what kind of knowing it is.
+        ///
+        /// The distinction that matters most is told versus inferred. A
+        /// fact he stated and a fact a model guessed used to be
+        /// identical on disk, and an assistant that cannot tell those
+        /// apart will eventually recite a guess back to him as though
+        /// he had said it.
+        var origin: Origin?
+
+        /// HOW SURE. 1.0 for something he said in as many words, lower
+        /// for anything derived or inferred. Recall can be asked to
+        /// stay quiet below a threshold rather than volunteering
+        /// half-beliefs.
+        var confidence: Double?
+
+        /// TEMPORAL VERSIONING. When a fact changes, the old line is not
+        /// overwritten — it is stamped here and left in place, and the
+        /// replacement points back at it.
+        ///
+        /// So "he lives in the Kuta villa" does not vanish when he
+        /// moves; it becomes something that was true until a date, which
+        /// is what a memory is supposed to be.
+        var supersededAt: Date?
+        /// The entry that replaced this one.
+        var supersededBy: UUID?
+        /// The entry this one replaced.
+        var supersedes: UUID?
+
+        // ===== BUILD 222 — WHAT IT MEANS =====
+
+        /// The semantic type, when it was known at write time. Optional
+        /// on purpose: every line written before build 222 has none, and
+        /// `meaning` classifies those on the fly rather than requiring a
+        /// migration that could lose them.
+        var semantic: Semantic?
+
+        /// The type, classified if it was never stored. This is what
+        /// everything should read — `semantic` is the stored value and
+        /// may legitimately be nil for the rest of the file's life.
+        var meaning: Semantic {
+            semantic ?? ChappyMemory.classify(kind: kind, title: title,
+                                              body: body, tags: tags)
+        }
+
+        /// How much this memory is worth as evidence about NOW.
+        ///
+        /// Type weight, decayed over that type's own durability. A
+        /// preference from last year still counts for most of its
+        /// weight; a location from last year counts for almost none.
+        /// Pinned memories never decay — that is what pinning means.
+        var weightNow: Double {
+            let m = meaning
+            guard !pinned else { return m.baseWeight }
+            let ageDays = Date().timeIntervalSince(at) / 86_400
+            let ratio = max(0, 1 - (ageDays / m.durabilityDays))
+            // Never all the way to zero — an old memory is weak evidence,
+            // not an absence of evidence.
+            return m.baseWeight * (0.25 + 0.75 * ratio) * (confidence ?? 1.0)
+        }
+
+        /// True while this is the current version of whatever it says.
+        var isCurrent: Bool { supersededAt == nil }
+
+        /// Said the way a person would, for the audit trail and for
+        /// anything that has to explain itself out loud.
+        var provenanceLine: String {
+            let o = origin ?? .told
+            guard let c = confidence, c < 0.95 else { return o.spoken }
+            return "\(o.spoken), \(Int(c * 100))% sure"
+        }
         // ===== REMINDER FIELDS (PHASE 5.5) =====
         // All optional, so every memory written before reminders existed still
         // decodes, and a memory becomes a reminder by gaining a trigger rather
@@ -9022,7 +9898,13 @@ final class ChappyMemory: ObservableObject {
 
     private init() {
         loadSummaries()
-        loadHotDays()
+loadHotDays()
+        // BUILD 221: once a day, drop day files older than the keep
+        // window. Runs after the hot window is loaded so a prune can
+        // never race a read of the same file.
+pruneOldDays()
+        // BUILD 226: and clear the duplicates the double write left behind.
+        sweepDuplicates()
     }
 
     // MARK: - Writing
@@ -9041,12 +9923,37 @@ final class ChappyMemory: ObservableObject {
                   expiresInDays: Int? = nil,
                   source: String = "",
                   at when: Date = Date(),
-                  assetID: String? = nil) -> Entry {
+                  assetID: String? = nil,
+                  // BUILD 219 — defaulted so that not one of the ~90
+                  // existing call sites needs touching, and every one of
+                  // them still gets a sensible stamp.
+                  origin: Origin = .told,
+                  confidence: Double? = nil,
+                  // BUILD 222 — supply it when the caller knows, and the
+                  // classifier fills it in when it doesn't. Defaulted, so
+                  // not one of the existing call sites needs touching.
+                  semantic: Semantic? = nil) -> Entry {
+
+        // BUILD 219 — THE SAFETY FILTER THIS STORE NEVER HAD.
+        //
+        // The Keeper refuses credentials, card numbers and medical terms
+        // before they reach the sixty-fact profile. This store — the one
+        // that model-extracted facts are written into, and the one whose
+        // digest is uploaded on every proactive brief — refused nothing.
+        // Same rule, both doors.
+        guard Self.safeToStore(title), Self.safeToStore(body) else {
+            print("🧠 [Memory] refused a memory on the blocklist")
+            return Entry(at: when, kind: kind, title: "")
+        }
 
         let snap = ContextEngine.shared.snapshot
         var e = Entry(at: when, kind: kind,
                       title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                       body: body)
+        e.origin = origin
+        e.confidence = confidence ?? origin.defaultConfidence
+        e.semantic = semantic ?? Self.classify(kind: kind, title: title,
+                                               body: body, tags: tags)
         e.lat = snap.latitude
         e.lon = snap.longitude
         e.street = snap.street
@@ -9271,6 +10178,136 @@ final class ChappyMemory: ObservableObject {
         }
     }
 
+    /// BUILD 226 — REMOVE THE DUPLICATES ALREADY ON HIS PHONE.
+    ///
+    /// Fixing the double write stops new ones. It does nothing about the
+    /// months of doubled photos already in the store, and telling him to
+    /// delete them by hand — two at a time, in a list where they look
+    /// identical — is not a fix.
+    ///
+    /// A duplicate here is exact and unambiguous: the same kind, the
+    /// same title, and a timestamp within two seconds. Nothing else in
+    /// this app can produce that, because a real second photo two
+    /// seconds later would have its own caption.
+    ///
+    /// The KEEPER is the one with a photo on disk, then the older one —
+    /// so a captioned twin never loses to an uncaptioned one. Runs once,
+    /// behind a flag, like the pulse sweep before it.
+    func sweepDuplicates() {
+        let flag = "chappy_dupe_sweep_226"
+        guard !UserDefaults.standard.bool(forKey: flag) else { return }
+        UserDefaults.standard.set(true, forKey: flag)
+
+        io.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            guard let files = try? fm.contentsOfDirectory(at: self.root,
+                                                          includingPropertiesForKeys: nil)
+            else { return }
+            var removed = 0
+            var removedIDs: [UUID] = []
+
+            for url in files where url.pathExtension == "jsonl" {
+                let entries = self.readDay(url)
+                guard entries.count > 1 else { continue }
+                var keep: [Entry] = []
+                for e in entries.sorted(by: { $0.at < $1.at }) {
+                    if let twinIdx = keep.firstIndex(where: { k in
+                        k.kind == e.kind
+                            && k.title == e.title
+                            && abs(k.at.timeIntervalSince(e.at)) <= 2
+                    }) {
+                        // Same thing, twice. Keep whichever has the photo.
+                        let existing = keep[twinIdx]
+                        let loser: Entry
+                        if e.hasPhoto && !existing.hasPhoto {
+                            keep[twinIdx] = e
+                            loser = existing
+                        } else {
+                            loser = e
+                        }
+                        // Never drop something he deliberately kept.
+                        if loser.pinned { keep.append(loser); continue }
+                        removedIDs.append(loser.id)
+                        removed += 1
+                        continue
+                    }
+                    keep.append(e)
+                }
+                if keep.count != entries.count {
+                    self.rewrite(day: url, entries: keep.sorted { $0.at < $1.at })
+                }
+            }
+
+            guard removed > 0 else { return }
+            print("🧹 [Memory] Removed \(removed) duplicate entries")
+            for id in removedIDs {
+                try? fm.removeItem(at: self.thumbURL(id))
+            }
+            DispatchQueue.main.async {
+                for id in removedIDs { self.setRecent(remove: id) }
+            }
+        }
+    }
+
+    /// BUILD 221 — AGE-BASED PRUNING, WHICH DID NOT EXIST.
+    ///
+    /// `expires` is nil by default, so nothing in the episodic log ever
+    /// aged out on its own. The only bulk cleanup was a one-shot
+    /// migration behind a UserDefaults flag, and the trail's own pruner
+    /// is a deliberate no-op. The log grew forever.
+    ///
+    /// Not urgent at his volume today. Very much a thing you notice in
+    /// month six of a trip, on a phone, with photos attached to it.
+    ///
+    /// Pinned entries are immune, as they are to every other sweep —
+    /// that is what pinning has always meant here. Default is two years,
+    /// which is long enough that this is a safety valve rather than a
+    /// policy, and it is settable.
+    static var keepDays: Int {
+        let v = UserDefaults.standard.integer(forKey: "chappy_memory_keep_days")
+        return v > 0 ? v : 730
+    }
+
+    /// Runs at most once a day. Deletes whole day FILES rather than
+    /// rewriting them, which is the reason the log is split by day.
+    func pruneOldDays() {
+        let key = "chappy_memory_prune_at"
+        let last = UserDefaults.standard.object(forKey: key) as? Date
+        if let last, Date().timeIntervalSince(last) < 86_400 { return }
+        UserDefaults.standard.set(Date(), forKey: key)
+
+        let cutoff = Calendar.current.date(byAdding: .day,
+                                           value: -Self.keepDays, to: Date()) ?? Date.distantPast
+        io.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            guard let files = try? fm.contentsOfDirectory(at: self.root,
+                                                          includingPropertiesForKeys: nil)
+            else { return }
+            var dropped = 0
+            for url in files where url.pathExtension == "jsonl" {
+                // Files are named "day-yyyy-MM-dd.jsonl".
+                let name = url.deletingPathExtension().lastPathComponent
+                guard name.hasPrefix("day-") else { continue }
+                let stamp = String(name.dropFirst(4))
+                guard let day = Self.dayKeyFormatter.date(from: stamp),
+                      day < cutoff else { continue }
+                // A day holding anything pinned is kept whole. Splitting
+                // it to save a few kilobytes is not worth the risk of
+                // losing something he deliberately kept.
+                let entries = self.readDay(url)
+                if entries.contains(where: { $0.pinned }) { continue }
+                for e in entries where e.hasPhoto {
+                    try? fm.removeItem(at: self.thumbURL(e.id))
+                }
+                try? fm.removeItem(at: url)
+                dropped += 1
+            }
+            if dropped > 0 { print("🧹 [Memory] Pruned \(dropped) day files older than \(Self.keepDays) days") }
+        }
+    }
+
     /// Delete a whole day. One file, one deletion — this is the reason the
     /// log is split by day in the first place.
     func forgetDay(_ d: Date) {
@@ -9351,6 +10388,105 @@ final class ChappyMemory: ObservableObject {
     /// Force a reload (after a migration, or a restore from backup).
     func reload() { loadHotDays(); loadSummaries() }
 
+    /// BUILD 222 — WHAT KIND OF THING IS THIS?
+    ///
+    /// Local, offline, deterministic, and cheap enough to run on every
+    /// read of an unclassified entry. No model call: a classifier that
+    /// needs the network is one that fails on a plane, and the whole
+    /// point of typing is to make retrieval better when Chappy is
+    /// offline in a market.
+    ///
+    /// Ordered most-specific first. A line matching several patterns
+    /// takes the earliest, because "my passport expires in March" is a
+    /// deadline before it is an identity fact — the date is the part
+    /// that bites.
+    static func classify(kind: Kind, title: String,
+                         body: String = "", tags: [String] = []) -> Semantic {
+        let t = (title + " " + body + " " + tags.joined(separator: " ")).lowercased()
+
+        func any(_ words: [String]) -> Bool { words.contains(where: { t.contains($0) }) }
+
+        // Deadlines first — a date that bites outranks whatever it is about.
+        if any(["expires", "expiry", "expire", "renew", "deadline", "due by",
+                "valid until", "runs out", "last day"]) { return .temporal }
+
+        // Money and bookings.
+        if kind == .spend { return .transactional }
+        if any(["paid", "cost me", "booking ref", "confirmation number",
+                "receipt", "invoice", "refund", "deposit"]) { return .transactional }
+
+        // Identity — the things that change by announcement.
+        if any(["my passport", "my licence", "my license", "my nationality",
+                "i'm australian", "im australian", "my full name",
+                "date of birth", "my home is", "i live in", "i'm from",
+                "shoe size", "my size"]) { return .identity }
+
+        // A verdict about something.
+        // BUILD 222 — widened after testing the RULES rather than the
+        // phrases I imagined. "best i've" only matches when those two
+        // words are adjacent, and nobody says it that way: the real
+        // sentence is "best fish soup I'VE HAD all week". The verdict
+        // marker is the experience clause, not the superlative.
+        if any(["i've had", "ive had", "i have had", "best i", "best thing",
+                "never again", "worth it", "not worth", "loved", "hated",
+                "disappointing", "overrated", "so good", "belting",
+                "would go back", "wouldn't go back", "wouldnt go back",
+                "favourite", "favorite", "worst"]) { return .affective }
+
+        // Preferences — standing likes and avoidances.
+        if any(["i prefer", "i like", "i don't like", "i dont like",
+                "i avoid", "allergic", "i always", "i never",
+                "aisle", "window seat", "vegetarian", "no pork",
+                "i can't eat", "i cant eat"]) { return .preference }
+
+        // How he does things.
+        if any(["first i", "then i", "the way i", "my routine",
+                "how i pack", "before i fly", "every time i", "i usually"])
+        { return .procedural }
+
+        // People.
+        if any(["my wife", "my husband", "my partner", "my mum", "my mother",
+                "my dad", "my father", "my brother", "my sister", "my friend",
+                "my mate", "his name is", "her name is", "we met"])
+        { return .relational }
+
+        // Something unfinished.
+        if any(["still need to", "need to sort", "waiting on", "haven't yet",
+                "havent yet", "to do", "chase up", "follow up", "in progress"])
+        { return .project }
+
+        // Places he has a relationship with.
+        if kind == .place { return .spatial }
+        if kind == .route { return .spatial }
+        if any(["stayed at", "we stay", "our place in", "home base"]) { return .spatial }
+
+        // A fact about the world, told rather than experienced.
+        if kind == .scan || kind == .ask { return .semantic }
+
+        // Everything else happened at a moment: photos, videos, talks,
+        // days, notes and reminders are the diary.
+        return .episodic
+    }
+
+    /// BUILD 219 — the same blocklist the Keeper has always applied,
+    /// now guarding the episodic store too.
+    ///
+    /// This matters more here than it does there. The Keeper's profile
+    /// is written from a curated extraction; this store takes whatever
+    /// any module hands it, including a model's reading of a document,
+    /// and its digest is what gets uploaded when Chappy composes a
+    /// brief. An unfiltered store that also leaves the device is the
+    /// wrong shape.
+    static func safeToStore(_ text: String) -> Bool {
+        guard !text.isEmpty else { return true }
+        let s = text.lowercased()
+        let banned = ["password", "passcode", "api key", "api_key", "sk-ant", "aiza",
+                      "credit card", "card number", "cvv", "bank account", "bsb",
+                      "passport number", "licence number", "license number",
+                      "medicare number", "tax file", "diagnos", "prescription for"]
+        return !banned.contains(where: { s.contains($0) })
+    }
+
     /// Drop anything past its expiry that is not pinned. Verbatim conversation
     /// transcripts are the reason this exists.
     @discardableResult
@@ -9389,6 +10525,11 @@ final class ChappyMemory: ObservableObject {
     struct Query {
         var text: String = ""
         var kinds: Set<Kind> = []
+        /// BUILD 222 — filter by what a memory MEANS rather than what
+        /// shape it is. "What do you know about me" is a question about
+        /// identity and preference; it should not have to wade through
+        /// three weeks of photographs to answer.
+        var meanings: Set<Semantic> = []
         var from: Date?
         var to: Date?
         var pinnedOnly = false
@@ -9403,6 +10544,131 @@ final class ChappyMemory: ObservableObject {
 
     /// Instant, offline, over the hot window.
     func search(_ q: Query) -> [Entry] { Self.match(recent, q) }
+
+    /// BUILD 219 — WHAT THE REASONING LAYER SHOULD HAVE HAD ALL ALONG.
+    ///
+    /// The model's `recall` tool took no parameters and returned a fixed
+    /// three-day dump, so the query engine below it was never once used
+    /// from a model path. Ask about a warung in Sanur and Chappy got
+    /// three days of everything, none of it Sanur, and answered from
+    /// nothing.
+    ///
+    /// This is the bridge: a question in, the memories that actually
+    /// match it out, each one carrying when, where, how Chappy knows it
+    /// and how sure it is — because a model handed bare text will state
+    /// a guess with the same confidence as a fact, and now it does not
+    /// have to.
+    ///
+    /// Superseded entries are excluded unless asked for. A fact that has
+    /// since changed coming back as though it were still true is worse
+    /// than not remembering it at all.
+    func recallFor(_ question: String,
+                   days: Int = 30,
+                   kind: Kind? = nil,
+                   meaning: Semantic? = nil,
+                   minConfidence: Double = 0.0,
+                   includeSuperseded: Bool = false,
+                   limit: Int = 12) -> String {
+
+        var q = Query()
+        q.text = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let k = kind { q.kinds = [k] }
+        if let m = meaning { q.meanings = [m] }
+        // BUILD 222 — a question about identity, preferences or how he
+        // does things is not a question about the last 30 days. Those
+        // types are durable by definition, so the window opens out
+        // rather than quietly excluding the very facts being asked for.
+        if let m = meaning, m.durabilityDays > 365 {
+            q.from = Calendar.current.date(byAdding: .day, value: -3650, to: Date())
+        }
+        q.from = Calendar.current.date(byAdding: .day, value: -max(1, days), to: Date())
+
+        var hits = search(q)
+            .filter { includeSuperseded || $0.isCurrent }
+            .filter { ($0.confidence ?? 1.0) >= minConfidence }
+
+        // Nothing in the hot window. Say so precisely rather than
+        // implying the whole history is empty — the disk pass is
+        // asynchronous and cannot be awaited from here.
+        guard !hits.isEmpty else {
+            return q.text.isEmpty
+                ? "Nothing logged in the last \(days) days."
+                : "Nothing in the last \(days) days about \(q.text). It may be further back — ask me to search everything."
+        }
+
+        hits.sort { $0.at > $1.at }
+        let df = DateFormatter()
+        df.dateFormat = "EEE d MMM, HH:mm"
+
+        var lines: [String] = []
+        for e in hits.prefix(limit) {
+            var line = "\(df.string(from: e.at)) — \(e.title)"
+            if !e.body.isEmpty, e.body != e.title {
+                line += ". \(e.body.prefix(200))"
+            }
+            if let p = e.place, !p.isEmpty { line += " [at \(p)]" }
+            else if let c = e.city, !c.isEmpty { line += " [in \(c)]" }
+            // The part that stops a guess being repeated as a fact,
+            // and — new in 222 — what kind of thing it is, so the model
+            // can tell a standing preference from a one-off.
+            line += " (\(e.meaning.rawValue); \(e.provenanceLine))"
+            lines.append(line)
+        }
+        if hits.count > limit {
+            lines.append("…and \(hits.count - limit) more.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// BUILD 219 — TEMPORAL VERSIONING, THE WRITE SIDE.
+    ///
+    /// Every mutation used to overwrite in place: read the day file,
+    /// change the value, rewrite. The previous value was simply gone.
+    /// "He moved out of the Kuta villa" destroyed the fact that he had
+    /// ever lived there, which is the opposite of what a memory does.
+    ///
+    /// Superseding keeps both. The old entry is stamped with the moment
+    /// it stopped being true and points forward; the new one points
+    /// back. Recall hides superseded entries by default, so nothing
+    /// stale is volunteered — but "what did I have before" is now a
+    /// question with an answer.
+    @discardableResult
+    func supersede(_ oldID: UUID,
+                   with title: String,
+                   body: String = "",
+                   origin: Origin = .told,
+                   confidence: Double? = nil) -> Entry? {
+        guard let old = recent.first(where: { $0.id == oldID }) else { return nil }
+
+        var fresh = remember(old.kind,
+                             title: title,
+                             body: body.isEmpty ? old.body : body,
+                             tags: old.tags,
+                             source: old.source,
+                             origin: origin,
+                             confidence: confidence)
+        // An empty title means the blocklist refused it. Do not stamp the
+        // old entry as superseded by something that was never stored —
+        // that would erase a fact and put nothing in its place.
+        guard !fresh.title.isEmpty else { return nil }
+
+        let stampedAt = Date()
+        // Both directions, through the one persistence path that exists.
+        mutate(id: fresh.id) { $0.supersedes = oldID }
+        mutate(id: oldID) { e in
+            e.supersededAt = stampedAt
+            e.supersededBy = fresh.id
+        }
+        fresh.supersedes = oldID
+
+        // The correction feedback loop, which had a Kind case declared
+        // and no writer anywhere in the app.
+        ChappyLedger.shared.record(.corrected, subject: old.title,
+                                   detail: "now: \(title)")
+        return fresh
+    }
+
+    /// The whole history. Calls back on the main thread.
 
     /// The whole history. Calls back on the main thread.
     func searchEverything(_ q: Query, completion: @escaping ([Entry]) -> Void) {
@@ -9430,6 +10696,7 @@ final class ChappyMemory: ObservableObject {
 
         return entries.filter { e in
             if !q.kinds.isEmpty && !q.kinds.contains(e.kind) { return false }
+            if !q.meanings.isEmpty && !q.meanings.contains(e.meaning) { return false }
             if q.pinnedOnly && !e.pinned { return false }
             if q.photosOnly && !e.hasPhoto { return false }
             if let f = q.from, e.at < f { return false }
@@ -9441,6 +10708,23 @@ final class ChappyMemory: ObservableObject {
         }
         .sorted {
             if $0.pinned != $1.pinned { return $0.pinned }
+            // BUILD 222 — WEIGHT, THEN RECENCY.
+            //
+            // Ranking by recency alone is right for a diary and wrong
+            // for a mind. "What size shoe do I take" and "what did I
+            // have for lunch on Tuesday" are not the same question and
+            // must not be answered from the same end of the pile.
+            //
+            // Weight is the type's standing importance decayed over that
+            // type's own durability — so a preference from last year
+            // still outranks a photograph from last week, and a location
+            // from last year outranks nothing.
+            //
+            // Recency still breaks ties, and within one type it is
+            // effectively the whole ordering, which is what makes the
+            // diary still read like a diary.
+            let a = $0.weightNow, b = $1.weightNow
+            if abs(a - b) > 0.08 { return a > b }
             return $0.at > $1.at
         }
     }
@@ -10713,7 +11997,14 @@ final class ChappyReminders: NSObject, ObservableObject {
         let info = UNNotificationCategory(identifier: "CHAPPY_INFO",
                                           actions: [], intentIdentifiers: [], options: [])
         let center = UNUserNotificationCenter.current()
-        center.setNotificationCategories([cat, info])
+        // BUILD 225: CHAPPY_BRIEF is stamped on every proactive brief and
+        // was never registered, so those notifications arrived with no
+        // actions on them. Delivery was unaffected — the buttons simply
+        // did not exist.
+        let brief = UNNotificationCategory(identifier: "CHAPPY_BRIEF",
+                                           actions: [], intentIdentifiers: [],
+                                           options: [])
+        center.setNotificationCategories([cat, info, brief])
         center.delegate = self
     }
 
@@ -11021,6 +12312,23 @@ final class ChappyReminders: NSObject, ObservableObject {
             trigger = UNTimeIntervalNotificationTrigger(
                 timeInterval: max(1, fire.timeIntervalSinceNow), repeats: false)
         }
+        // BUILD 225 — AN OVERDUE REMINDER USED TO VANISH.
+        //
+        // The branch above only builds a trigger when the fire time is
+        // in the FUTURE. Anything already due fell through to the guard
+        // below and returned silently — and because rescheduleAll()
+        // wipes the queue on every launch, an overdue reminder was
+        // removed from iOS and never put back. It existed in the app,
+        // it just never rang again.
+        //
+        // Five seconds, so it arrives as a notification he can act on
+        // rather than being quietly forgotten.
+        if trigger == nil, e.floatingTime == nil, e.placeTrigger == nil,
+           let fire = e.effectiveFire, fire <= Date(), e.doneAt == nil {
+            trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
+            content.title = "Overdue — " + content.title
+        }
+
         // A place-only reminder has no clock; ContextEngine fires it instead.
         guard let t = trigger else { return }
 
@@ -11037,7 +12345,19 @@ final class ChappyReminders: NSObject, ObservableObject {
 
     /// Re-arm everything after a restore, a reinstall, or a timezone change.
     func rescheduleAll() {
-        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        // BUILD 225 — THIS USED TO DELETE EVERY PENDING NOTIFICATION IN
+        // THE APP, not just its own.
+        //
+        // removeAllPendingNotificationRequests() is app-wide, and this
+        // runs 2.5 seconds after every launch. Timers restored at launch
+        // and every pending list ping were wiped a moment after being
+        // armed, by a function that only ever re-adds reminders.
+        //
+        // Now it removes exactly what it owns — the reminder identifiers
+        // — and leaves everyone else's alone.
+        let mine = open.map { $0.id.uuidString }
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: mine)
         for e in open { schedule(e) }
         print("🔔 [Reminders] \(open.count) reminders re-armed")
     }
@@ -11061,6 +12381,10 @@ final class ChappyReminders: NSObject, ObservableObject {
         // his jobs are REMOTE, so he never moves, so a movement-driven check
         // would never fire for exactly the events that matter most.
         ChappyCalendar.shared.checkHeadsUp()
+        // BUILD 225: and hand the lead times to iOS, which is awake at
+        // half past seven whether Chappy is or not. Self-throttled to
+        // once every thirty minutes.
+        ChappyCalendar.shared.scheduleUpcoming()
         guard !TTSService.shared.isSpeaking else { return }
         let ready = due().filter {
             $0.deliveredAt == nil && Self.categoryPings(Self.category(of: $0))
@@ -11587,15 +12911,42 @@ enum ChappyNotify {
         var key: String { "chappy_notify_" + rawValue }
     }
 
-    /// True when speaking would NOT have reached him — which is the only time
-    /// a banner earns its place.
+    /// BUILD 225 — THE FUNCTION THAT ATE EVERY NOTIFICATION.
+    ///
+    /// This used to also return false whenever the ear was armed with
+    /// background audio allowed. Both of those are permanently true on
+    /// his phone — the audio mode is declared in Info.plist and the ear
+    /// deliberately stays alive in the background — so it returned false
+    /// for ever, and `post` below bailed before creating a single
+    /// notification request. Seventeen call sites, including every
+    /// calendar path. Not suppressed by iOS. Never created.
+    ///
+    /// The reasoning was "Chappy can speak, so a banner is noise". It
+    /// assumes SPEAKING EQUALS REACHING HIM, and it does not: the phone
+    /// is in a pocket, the glasses are on the table, the volume is down,
+    /// he is on a call, he is asleep, another app holds the audio
+    /// session. A spoken line nobody hears is not a delivered message —
+    /// and unlike a banner it leaves no trace he can come back to.
+    ///
+    /// What survives is the one case that was always right: if the app
+    /// is ACTIVE he is looking at the screen, and a banner over the top
+    /// of what he is already reading is genuinely noise.
     @MainActor
     static func voiceCouldNotReach() -> Bool {
-        // In the foreground he is looking at the screen; a banner is noise.
-        if UIApplication.shared.applicationState == .active { return false }
-        // Armed in a pocket with background audio: Chappy can speak, so it does.
-        if ChappyStandby.shared.isListening && ChappyStandby.backgroundAudioAllowed { return false }
-        return true
+        UIApplication.shared.applicationState != .active
+    }
+
+    /// BUILD 225 — how many notifications iOS is actually holding.
+    ///
+    /// Refreshed asynchronously and read synchronously by Voice check,
+    /// because a diagnostic screen that has to await something will
+    /// show a blank row and teach him nothing. -1 means "not asked yet".
+    nonisolated(unsafe) static var pendingCountSnapshot = -1
+
+    static func refreshPendingCount() {
+        UNUserNotificationCenter.current().getPendingNotificationRequests { reqs in
+            pendingCountSnapshot = reqs.count
+        }
     }
 
     @MainActor
@@ -11614,6 +12965,10 @@ enum ChappyNotify {
         c.body = body
         c.threadIdentifier = "chappy-" + channel.rawValue
         c.categoryIdentifier = "CHAPPY_INFO"
+        // BUILD 225: quiet hours are for routine chatter. Something
+        // marked critical is a job, a flight, a leave-by — it keeps its
+        // sound at three in the morning, because the whole reason it is
+        // marked critical is that missing it costs him something.
         if critical {
             c.interruptionLevel = .timeSensitive
             c.sound = .default
@@ -11626,7 +12981,14 @@ enum ChappyNotify {
         if let o = opens { c.userInfo = ["chappyOpens": o.rawValue] }
 
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
-        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        // BUILD 225: the error was discarded here, on the busiest path in
+        // the whole notification system. A refusal from iOS looked
+        // exactly like a delivery.
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err {
+                print("⚠️ [Notify] REFUSED \(channel.rawValue): \(err.localizedDescription)")
+            }
+        }
         print("🔔 [Notify] \(channel.rawValue): \(title) — \(body)")
     }
 
@@ -12221,6 +13583,106 @@ final class ChappyCalendar: ObservableObject {
     private var headsUpDone: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: "chappy_cal_headsup") ?? []) }
         set { UserDefaults.standard.set(Array(newValue.suffix(80)), forKey: "chappy_cal_headsup") }
+    }
+
+    /// BUILD 225 — SCHEDULE THE JOBS, DON'T POLL FOR THEM.
+    ///
+    /// `checkHeadsUp` below is a POLLER. It runs on a thirty-second
+    /// in-app tick, works out whether an event is inside its lead window
+    /// RIGHT NOW, and speaks. There is no UNCalendarNotificationTrigger
+    /// anywhere in this file.
+    ///
+    /// A phone spends its life suspended. So an eight o'clock job with a
+    /// thirty-minute lead needed Chappy to be awake and running at
+    /// 07:30, which it almost never is — and the one feature he asked
+    /// for by name produced nothing at all.
+    ///
+    /// This hands the lead times to iOS, which is awake at 07:30 whether
+    /// Chappy is or not. Same lead rules, same important-event double
+    /// warning, same behaviour filter — but the delivery is the system's
+    /// job now, and the poller becomes the belt-and-braces rather than
+    /// the whole mechanism.
+    ///
+    /// Identifiers are the event's own fingerprint plus the lead, so
+    /// rescheduling replaces rather than duplicates, and only calendar
+    /// notifications are ever removed.
+    private var lastScheduleAt = Date.distantPast
+
+    func scheduleUpcoming(force: Bool = false) {
+        guard authorised else { return }
+        // Rebuilding 32 requests on a 30-second tick would be absurd.
+        // Half an hour is far tighter than any lead time in use and
+        // still catches an event added minutes ago.
+        if !force, Date().timeIntervalSince(lastScheduleAt) < 1800 { return }
+        lastScheduleAt = Date()
+        let centre = UNUserNotificationCenter.current()
+
+        centre.getPendingNotificationRequests { pending in
+            let oldIDs = pending.map(\.identifier).filter { $0.hasPrefix("chappy-cal-") }
+            if !oldIDs.isEmpty {
+                centre.removePendingNotificationRequests(withIdentifiers: oldIDs)
+            }
+
+            Task { @MainActor in
+                var made = 0
+                for e in self.upcoming(days: 14) {
+                    guard let start = e.startDate, !e.isAllDay,
+                          self.effectiveBehaviour(for: e) == .ping else { continue }
+
+                    let important = self.level(for: e) == .important
+                    let fp = Self.fingerprint(e)
+                    let custom = self.eventLeads[fp].map(Double.init)
+                    let leads: [Double] = important
+                        ? [1440, custom ?? 60]
+                        : [custom ?? Double(e.calendar.map { self.leadMinutes(for: $0) } ?? 30)]
+
+                    for lead in leads {
+                        let fireAt = start.addingTimeInterval(-lead * 60)
+                        // Nothing in the past, and nothing so far out that
+                        // it will be rescheduled a dozen times before it
+                        // matters. iOS caps an app at 64 pending anyway.
+                        guard fireAt > Date().addingTimeInterval(60) else { continue }
+
+                        let c = UNMutableNotificationContent()
+                        c.title = (important ? "⚑ " : "") + (e.title ?? "Coming up")
+                        let df = DateFormatter(); df.dateFormat = "h:mm a"
+                        var body = df.string(from: start)
+                        body += " · " + Self.leadLabel(Int(lead))
+                        if let l = e.location, !l.isEmpty {
+                            body += " · " + (l.split(separator: ",").first.map(String.init) ?? l)
+                        }
+                        c.body = body
+                        c.threadIdentifier = "chappy-calendar"
+                        c.categoryIdentifier = "CHAPPY_INFO"
+                        // A job is time-sensitive by definition: it keeps
+                        // its sound inside quiet hours, because the whole
+                        // point is that missing it costs him money.
+                        c.interruptionLevel = important ? .timeSensitive : .active
+                        c.sound = .default
+                        c.userInfo = ["chappyOpens": Notification.Name.chappyOpenUpcoming.rawValue]
+
+                        let parts = Calendar.current.dateComponents(
+                            [.year, .month, .day, .hour, .minute], from: fireAt)
+                        let req = UNNotificationRequest(
+                            identifier: "chappy-cal-\(fp)#\(Int(lead))",
+                            content: c,
+                            trigger: UNCalendarNotificationTrigger(dateMatching: parts, repeats: false))
+                        centre.add(req) { err in
+                            if let err {
+                                print("⚠️ [Calendar] Could not schedule: \(err.localizedDescription)")
+                            }
+                        }
+                        made += 1
+                        // iOS keeps only the 64 soonest pending requests and
+                        // silently drops the rest. Leave room for reminders
+                        // and timers rather than filling the queue with
+                        // fortnight-away calendar entries.
+                        if made >= 32 { return }
+                    }
+                }
+                print("🔔 [Calendar] Scheduled \(made) heads-up notifications")
+            }
+        }
     }
 
     func checkHeadsUp() {
@@ -15964,6 +17426,10 @@ extension Notification.Name {
     /// deleted, a live month fetched. The Flights screen redraws its
     /// graph and calendar off this rather than polling.
     static let chappyFaresChanged = Notification.Name("chappyFaresChanged")
+    /// BUILD 229: the naming pass finished and found something, so the
+    /// Places list should redraw. Posted only when a name was actually
+    /// learned — a pass that found nothing is not news.
+    static let chappySpotsNamed = Notification.Name("chappySpotsNamed")
     /// BUILD 202 — a tool started from outside the app: Siri, Spotlight,
     /// Shortcuts, the Action button. userInfo carries the tool id and any
     /// values the shortcut supplied.
@@ -18392,14 +19858,37 @@ extension ChappyTravel {
         }
     }
 
-    /// Hand the trip to the mail app. One tap sends — iOS never lets an
-    /// app send mail on its own, and it never will.
+    /// BUILD 231 — THIS USED TO SEND THE REPORT AS PLAIN TEXT.
+    ///
+    /// It called ChappyMail.compose, which builds a mailto: URL, and a
+    /// mailto URL cannot carry an attachment. So the HTML report — the
+    /// map, the cost tables, the deal grading, the booking links, the
+    /// trust stamps — was written to disk and then not sent. What went
+    /// out was the text fallback, and whoever received it had no way to
+    /// know the good version existed.
+    ///
+    /// Now: Apple's own composer, with the report attached. Still one
+    /// human tap to send, because iOS never lets an app send mail on its
+    /// own and never will.
     @discardableResult
-    func emailReport(_ trip: Trip, to: String = "") -> Bool {
-        ChappyMail.compose(to: to,
-                           subject: "\(trip.name) — \(trip.dateLine)",
-                           body: reportText(trip),
-                           preferOutlook: ChappyMail.hasOutlook)
+    func emailReport(_ trip: Trip, to: String = "") -> String {
+        let url = writeReport(trip)
+        return ChappyHandoff.shared.offerReport(
+            url,
+            subject: "\(trip.name) — \(trip.dateLine)",
+            body: reportText(trip),
+            to: to.isEmpty ? [] : [to])
+    }
+
+    /// The version with the map drawn into it. Slower, because the map
+    /// has to render, so the caller decides which one it wants.
+    func emailReportWithMap(_ trip: Trip, to: String = "") async -> String {
+        let url = await writeReportWithMap(trip) ?? writeReport(trip)
+        return ChappyHandoff.shared.offerReport(
+            url,
+            subject: "\(trip.name) — \(trip.dateLine)",
+            body: reportText(trip),
+            to: to.isEmpty ? [] : [to])
     }
 }
 
@@ -19100,21 +20589,656 @@ final class ChappyVisa: ObservableObject {
         return Self.auPassport[c]
     }
 
-    /// Official sources. Smartraveller is the Australian government's own
-    /// advice and is the correct thing to point an Australian at; the
-    /// second link is the country's own immigration service, because
-    /// Smartraveller summarises and immigration decides.
-    static func smartravellerURL(_ country: String) -> URL? {
-        let slug = country.lowercased()
-            .replacingOccurrences(of: " ", with: "-")
-            .replacingOccurrences(of: "'", with: "")
-        return URL(string: "https://www.smartraveller.gov.au/destinations/\(slug)")
+    // =================================================================
+    // BUILD 229 — THE OFFICIAL LINKS. HAND-VERIFIED, ONE AT A TIME.
+    //
+    // What this replaces: a button labelled "Official source" that
+    // opened a GOOGLE SEARCH. Search results for visa applications are
+    // dominated by paid lookalikes — e-visa-indonesia.com,
+    // evisa-imigrasi-go.id (a .id domain crafted to read as the
+    // restricted .go.id namespace), evisagov.vn, evisa-moip-gov.com
+    // titled "Myanmar eVisa (Official Government)". They charge several
+    // times the government fee and take a passport scan to do it.
+    //
+    // A button that says "Official source" and lands one tap from those
+    // is worse than no button, because the label is a promise the code
+    // does not keep.
+    //
+    // THE RULE FOR THIS TABLE: a URL goes in only if it was verified.
+    // Where it was not, the entry is absent and the screen says so. Tonga
+    // has no citizen-facing immigration site I could confirm, so Tonga
+    // has no link — that is the correct outcome, not a gap to be filled
+    // with a guess.
+    //
+    // The .embassy.gov.au pattern does NOT hold and must not be
+    // generated: Commonwealth posts are highcommission.gov.au, Brunei's
+    // host is bruneidarussalam, Hong Kong nests under China, and Taiwan
+    // has no .gov.au presence at all because Australia has no formal
+    // relations there.
+    //
+    // Reviewed August 2026. These drift. The screen carries the date.
+    struct Official {
+        /// The country's own immigration or e-visa portal.
+        let immigration: String
+        /// The Australian embassy, high commission or consulate there.
+        let embassy: String
+        /// Smartraveller groups its destinations by region, and the URL
+        /// carries it. Without this every Smartraveller link 404s.
+        let region: String
+        /// Only where Smartraveller's own slug differs from the plain
+        /// lowercase-hyphenated name.
+        var slug: String? = nil
+        /// Shown under the links when the source needs a caveat.
+        var caveat: String = ""
     }
 
+    static let official: [String: Official] = [
+        // ---- South-East Asia
+        "Indonesia":   Official(immigration: "https://evisa.imigrasi.go.id/",
+                                embassy: "https://indonesia.embassy.gov.au/", region: "asia"),
+        "Thailand":    Official(immigration: "https://www.thaievisa.go.th/",
+                                embassy: "https://thailand.embassy.gov.au/", region: "asia"),
+        "Vietnam":     Official(immigration: "https://evisa.gov.vn/",
+                                embassy: "https://vietnam.embassy.gov.au/", region: "asia",
+                                caveat: "Vietnam moved its e-visa portal in late 2024. Older guides still point at the previous address."),
+        "Malaysia":    Official(immigration: "https://malaysiavisa.imi.gov.my/",
+                                embassy: "https://malaysia.highcommission.gov.au/", region: "asia",
+                                caveat: "Malaysian Immigration publishes a notice naming this as the only official eVISA site."),
+        "Singapore":   Official(immigration: "https://www.ica.gov.sg/",
+                                embassy: "https://singapore.highcommission.gov.au/", region: "asia"),
+        "Philippines": Official(immigration: "https://immigration.gov.ph/",
+                                embassy: "https://philippines.embassy.gov.au/", region: "asia",
+                                caveat: "The eTravel arrival form is FREE. Any site charging for it is not the government."),
+        "Cambodia":    Official(immigration: "https://www.evisa.gov.kh/",
+                                embassy: "https://cambodia.embassy.gov.au/", region: "asia"),
+        "Laos":        Official(immigration: "https://laoevisa.gov.la/",
+                                embassy: "https://laos.embassy.gov.au/", region: "asia"),
+        "Myanmar":     Official(immigration: "https://evisa.moip.gov.mm/",
+                                embassy: "https://myanmar.embassy.gov.au/", region: "asia"),
+        "Brunei":      Official(immigration: "https://www.immigration.gov.bn/en/",
+                                embassy: "https://bruneidarussalam.highcommission.gov.au/",
+                                region: "asia", slug: "brunei-darussalam"),
+        "Timor-Leste": Official(immigration: "https://www.migracao.gov.tl/",
+                                embassy: "https://timorleste.embassy.gov.au/", region: "asia"),
+        // ---- The rest of Asia
+        "Japan":       Official(immigration: "https://www.evisa.mofa.go.jp/",
+                                embassy: "https://japan.embassy.gov.au/", region: "asia"),
+        "South Korea": Official(immigration: "https://www.k-eta.go.kr/",
+                                embassy: "https://southkorea.embassy.gov.au/", region: "asia",
+                                slug: "south-korea-republic-korea"),
+        "Taiwan":      Official(immigration: "https://visawebapp.boca.gov.tw/BOCA_MRVWeb",
+                                embassy: "https://www.australia.org.tw/", region: "asia",
+                                caveat: "Australia has no formal relations with Taiwan, so the post is the Australian Office, Taipei — not a .gov.au address."),
+        "Hong Kong":   Official(immigration: "https://www.immd.gov.hk/",
+                                embassy: "https://hongkong.china.embassy.gov.au/", region: "asia"),
+        "China":       Official(immigration: "https://cova.mfa.gov.cn/",
+                                embassy: "https://china.embassy.gov.au/", region: "asia"),
+        "India":       Official(immigration: "https://indianvisaonline.gov.in/evisa/",
+                                embassy: "https://india.highcommission.gov.au/", region: "asia"),
+        "Sri Lanka":   Official(immigration: "https://www.eta.gov.lk/",
+                                embassy: "https://srilanka.highcommission.gov.au/", region: "asia",
+                                caveat: "Sri Lanka's ETA was briefly run by a private consortium. Guides still pointing at a commercial portal are out of date."),
+        "Nepal":       Official(immigration: "https://www.immigration.gov.np/",
+                                embassy: "https://nepal.embassy.gov.au/", region: "asia"),
+        "Maldives":    Official(immigration: "https://imuga.immigration.gov.mv/",
+                                embassy: "https://maldives.highcommission.gov.au/", region: "asia"),
+        "United Arab Emirates":
+                       Official(immigration: "https://icp.gov.ae/en/",
+                                embassy: "https://uae.embassy.gov.au/", region: "middle-east"),
+        // ---- Pacific and home region
+        "New Zealand": Official(immigration: "https://nzeta.immigration.govt.nz/",
+                                embassy: "https://newzealand.embassy.gov.au/", region: "pacific"),
+        "Fiji":        Official(immigration: "https://www.immigration.gov.fj/",
+                                embassy: "https://fiji.embassy.gov.au/", region: "pacific"),
+        "Vanuatu":     Official(immigration: "https://immigration.gov.vu/",
+                                embassy: "https://vanuatu.embassy.gov.au/", region: "pacific"),
+        "Papua New Guinea":
+                       Official(immigration: "https://ica.gov.pg/",
+                                embassy: "https://png.embassy.gov.au/", region: "pacific"),
+        "Samoa":       Official(immigration: "https://mpmc.gov.ws/divisions/immigration/",
+                                embassy: "https://samoa.embassy.gov.au/", region: "pacific"),
+        // Tonga: no citizen-facing immigration site could be verified.
+        // The embassy link stands alone rather than inventing one.
+        "Tonga":       Official(immigration: "",
+                                embassy: "https://tonga.embassy.gov.au/", region: "pacific",
+                                caveat: "Tonga has no standalone immigration website I could verify — the High Commission is the reliable contact."),
+        "Cook Islands":
+                       Official(immigration: "https://mfai.gov.ck/immigration",
+                                embassy: "https://cookislands.highcommission.gov.au/", region: "pacific"),
+        "New Caledonia":
+                       Official(immigration: "https://france-visas.gouv.fr/",
+                                embassy: "https://noumea.consulate.gov.au/", region: "pacific",
+                                caveat: "New Caledonia is French territory, so the visa system is France's."),
+        // ---- Further afield
+        "United Kingdom":
+                       Official(immigration: "https://www.gov.uk/eta",
+                                embassy: "https://uk.embassy.gov.au/", region: "europe"),
+        "Ireland":     Official(immigration: "https://www.irishimmigration.ie/",
+                                embassy: "https://ireland.embassy.gov.au/", region: "europe"),
+        "United States":
+                       Official(immigration: "https://esta.cbp.dhs.gov/",
+                                embassy: "https://usa.embassy.gov.au/", region: "americas",
+                                slug: "united-states-america",
+                                caveat: "ESTA has more paid imitators than any other system on this list. The only official address is esta.cbp.dhs.gov."),
+        "Canada":      Official(immigration: "https://www.canada.ca/en/immigration-refugees-citizenship/services/visit-canada/eta.html",
+                                embassy: "https://canada.embassy.gov.au/", region: "americas"),
+        "Turkey":      Official(immigration: "https://www.evisa.gov.tr/",
+                                embassy: "https://turkey.embassy.gov.au/", region: "europe",
+                                slug: "turkiye"),
+        "Morocco":     Official(immigration: "https://www.acces-maroc.ma/",
+                                embassy: "https://morocco.embassy.gov.au/", region: "africa"),
+        "Egypt":       Official(immigration: "https://www.visa2egypt.gov.eg/",
+                                embassy: "https://egypt.embassy.gov.au/", region: "africa"),
+        "South Africa":
+                       Official(immigration: "https://www.dha.gov.za/",
+                                embassy: "https://southafrica.embassy.gov.au/", region: "africa"),
+        "Kenya":       Official(immigration: "https://www.etakenya.go.ke/",
+                                embassy: "https://kenya.highcommission.gov.au/", region: "africa"),
+        "Tanzania":    Official(immigration: "https://visa.immigration.go.tz/",
+                                embassy: "https://kenya.highcommission.gov.au/nair/Tanzania.html",
+                                region: "africa",
+                                caveat: "Australia has no resident mission in Tanzania — it is covered from Nairobi."),
+        "Brazil":      Official(immigration: "https://brazil.vfsevisa.com/",
+                                embassy: "https://brazil.embassy.gov.au/", region: "americas",
+                                caveat: "Australians need a visa for Brazil again since 2025. The official portal is run by VFS on the government's behalf, so it is NOT a .gov.br address — that is expected here, and only here."),
+        "Argentina":   Official(immigration: "https://www.argentina.gob.ar/migraciones",
+                                embassy: "https://argentina.embassy.gov.au/", region: "americas"),
+        "Chile":       Official(immigration: "https://serviciomigraciones.cl/en/home/",
+                                embassy: "https://chile.embassy.gov.au/", region: "americas"),
+        "Peru":        Official(immigration: "https://www.gob.pe/migraciones",
+                                embassy: "https://peru.embassy.gov.au/", region: "americas"),
+        "Mexico":      Official(immigration: "https://www.inm.gob.mx/",
+                                embassy: "https://mexico.embassy.gov.au/", region: "americas"),
+        // ---- Europe. Schengen is one allowance and Australians are
+        // visa-free within it, so there is no application portal to
+        // point at. The region is here purely so Smartraveller resolves.
+        "France":      Official(immigration: "", embassy: "", region: "europe"),
+        "Germany":     Official(immigration: "", embassy: "", region: "europe"),
+        "Italy":       Official(immigration: "", embassy: "", region: "europe"),
+        "Spain":       Official(immigration: "", embassy: "", region: "europe"),
+        "Portugal":    Official(immigration: "", embassy: "", region: "europe"),
+        "Netherlands": Official(immigration: "", embassy: "", region: "europe"),
+        "Greece":      Official(immigration: "", embassy: "", region: "europe"),
+        "Switzerland": Official(immigration: "", embassy: "", region: "europe"),
+        "Croatia":     Official(immigration: "", embassy: "", region: "europe"),
+    ]
+
+    /// When this table was last checked, shown on the screen. An
+    /// unstamped official link ages into a wrong one silently.
+    static let officialReviewed = "August 2026"
+
+    /// BUILD 229 — THIS USED TO 404 FOR EVERY COUNTRY.
+    ///
+    /// It built /destinations/<country>. The real shape carries a REGION:
+    /// /destinations/asia/indonesia. So every Smartraveller button in the
+    /// app, on every card, since build 178, opened a not-found page.
+    ///
+    /// Four slugs also differ from the plain name and would still 404
+    /// with the region right — the United States has no "of", South Korea
+    /// carries its formal name, Turkey is Türkiye and files under EUROPE
+    /// rather than the Middle East, and Brunei is Brunei Darussalam.
+    ///
+    /// No entry in the table means no deep link. The destinations index
+    /// is a real page and a wrong deep link is not.
+    static func smartravellerURL(_ country: String) -> URL? {
+        guard let o = official[country] else {
+            return URL(string: "https://www.smartraveller.gov.au/destinations")
+        }
+        let slug = o.slug ?? country.lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "'", with: "")
+        return URL(string: "https://www.smartraveller.gov.au/destinations/\(o.region)/\(slug)")
+    }
+
+    /// The country's own immigration service — the only body that
+    /// actually decides anything. nil when it could not be verified,
+    /// which the screen then says out loud.
+    static func immigrationURL(_ country: String) -> URL? {
+        guard let u = official[country]?.immigration, !u.isEmpty else { return nil }
+        return URL(string: u)
+    }
+
+    /// The Australian mission there. Not generated from a pattern —
+    /// see the note on the table.
+    static func embassyURL(_ country: String) -> URL? {
+        guard let u = official[country]?.embassy, !u.isEmpty else { return nil }
+        return URL(string: u)
+    }
+
+    static func caveat(_ country: String) -> String {
+        official[country]?.caveat ?? ""
+    }
+
+    /// The LAST resort, and labelled as one on screen. Kept only for
+    /// countries with no verified entry, and never called "official" —
+    /// the whole reason this build exists is that a search result and an
+    /// official source are not the same thing.
     static func officialSearchURL(_ country: String) -> URL? {
-        let q = "\(country) official immigration visa requirements Australian passport"
+        let q = "\(country) government immigration department visa requirements"
             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        return URL(string: "https://www.google.com/search?q=\(q)")
+        return URL(string: "https://duckduckgo.com/?q=\(q)")
+    }
+
+    /// Everything the picker offers, sorted, with the ones he actually
+    /// flies between first. A list of sixty countries where Indonesia is
+    /// somewhere in the middle is a list he has to search every time.
+    static var pickerCountries: [String] {
+        let near = ["Indonesia", "Thailand", "Vietnam", "Malaysia", "Singapore",
+                    "Philippines", "Cambodia", "Laos", "Japan", "New Zealand"]
+        let rest = (Set(auPassport.keys).union(otherKnownCountries))
+            .subtracting(near).sorted()
+        return near + rest
+    }
+}
+
+// =====================================================================
+// BUILD 230 — IS THIS KEY ACTUALLY ALIVE?
+//
+// Until now: no indicator anywhere, for any key. Settings said "Saved",
+// which means the string reached the Keychain. Not that it is valid, not
+// that the account has credit, not that it hasn't been revoked, not that
+// Google hasn't scoped it to the wrong API.
+//
+// So a dead key and a working key looked identical until a report came
+// back thin — which is the same defect that cost the greeting, the safe
+// mode, the black screen and the entire notification system. Silence and
+// failure must never look the same.
+//
+// Every check here is a REAL NETWORK CALL. Not "does the string start
+// with AIza", which is what most apps mean by validating a key and which
+// passes a revoked key every single time.
+// =====================================================================
+
+@MainActor
+final class ChappyKeys: ObservableObject {
+
+    static let shared = ChappyKeys()
+    private init() { load() }
+
+    enum Slot: String, CaseIterable, Identifiable, Codable {
+        case claude, gemini, maps, aviation, tripadvisor, fares, mail
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .claude:      return "Claude"
+            case .gemini:      return "Gemini"
+            case .maps:        return "Google Maps"
+            case .aviation:    return "AviationStack"
+            case .tripadvisor: return "Tripadvisor"
+            case .fares:       return "Travelpayouts"
+            case .mail:        return "iCloud mail"
+            }
+        }
+
+        /// What actually stops working when this one dies. The point of
+        /// the screen is not the dot, it is knowing what the dot costs.
+        var unlocks: String {
+            switch self {
+            case .claude:
+                return "The research brain. Every trip plan, every price reading, every visa check, every deal hunt and every report. Nothing else in the travel side works without it."
+            case .gemini:
+                return "The voice — Live AI, the wake word, spoken answers and the camera descriptions."
+            case .maps:
+                return "Place names, ratings, geocoding and navigation. Falls back to Apple Maps, which is worse in Asia."
+            case .aviation:
+                return "Live flight status on the day — gate, delay, actual departure. Nothing else uses it."
+            case .tripadvisor:
+                return "Ratings and review counts in the saved and emailed report. Without it the report loses its denominators."
+            case .fares:
+                return "The Fares tab's day grid and month calendar. Without it that tab shows only prices you logged yourself."
+            case .mail:
+                return "Reading your inbox aloud and replying by voice."
+            }
+        }
+
+        var baked: Bool {
+            switch self {
+            case .claude, .gemini, .maps, .aviation: return true
+            case .tripadvisor, .fares, .mail:        return false
+            }
+        }
+
+        /// Free-tier cost of running the check itself.
+        var testCosts: String {
+            switch self {
+            case .aviation: return "Costs one flight check out of your 100 a month, so this one is tested at most once a day."
+            default:        return ""
+            }
+        }
+    }
+
+    enum State: String, Codable {
+        case unknown     // never tested
+        case live        // authenticated, just now
+        case failed      // the provider said no, and said why
+        case missing     // no key in the slot at all
+
+        var dot: String {
+            switch self {
+            case .live:    return "circle.fill"
+            case .failed:  return "exclamationmark.circle.fill"
+            case .missing: return "circle.dashed"
+            case .unknown: return "circle"
+            }
+        }
+    }
+
+    struct Status: Codable {
+        var state: State = .unknown
+        var at: Date?
+        var detail: String = ""
+    }
+
+    // Renamed from `status` in the same build it was written:
+    // a stored property and a method with the same name on one type is
+    // an overload Swift usually resolves and occasionally does not.
+    @Published private(set) var statuses: [String: Status] = [:]
+    @Published private(set) var testing: Set<String> = []
+
+    func status(_ s: Slot) -> Status { statuses[s.rawValue] ?? Status() }
+    func isTesting(_ s: Slot) -> Bool { testing.contains(s.rawValue) }
+
+    /// Everything green? Used by the home screen's status square.
+    var allGood: Bool {
+        Slot.allCases.filter(\.baked).allSatisfy { status($0).state == .live }
+    }
+    var problems: [Slot] {
+        Slot.allCases.filter { status($0).state == .failed }
+    }
+
+    // MARK: what's in each slot
+
+    func value(_ s: Slot) -> String? {
+        switch s {
+        case .claude:      return APIKeyManager.shared.getAPIKey(for: .anthropic)
+        case .gemini:      return APIKeyManager.shared.getGoogleAPIKey()
+        case .maps:        return APIKeyManager.shared.getMapsAPIKey()
+        case .aviation:    return APIKeyManager.shared.getAviationStackKey()
+        case .tripadvisor:
+            let k = UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? ""
+            return k.isEmpty ? nil : k
+        case .fares:
+            let k = UserDefaults.standard.string(forKey: "chappy_tp_token") ?? ""
+            return k.isEmpty ? nil : k
+        case .mail:
+            return ChappyMail.shared.isConfigured ? "configured" : nil
+        }
+    }
+
+    /// Enough of the key to recognise it, and not enough to use it.
+    func masked(_ s: Slot) -> String {
+        guard let v = value(s), v.count > 8 else { return "not set" }
+        if s == .mail { return ChappyMail.shared.address }
+        return String(v.prefix(6)) + "…" + String(v.suffix(4)) + "  (\(v.count) chars)"
+    }
+
+    // MARK: the tests
+
+    func testAll(force: Bool = false) async {
+        for s in Slot.allCases {
+            await test(s, force: force)
+        }
+    }
+
+    func test(_ slot: Slot, force: Bool = false) async {
+        guard !testing.contains(slot.rawValue) else { return }
+
+        guard let key = value(slot) else {
+            write(slot, Status(state: .missing, at: Date(),
+                               detail: slot.baked
+                                ? "Nothing in the slot — which shouldn't happen for a built-in key."
+                                : "Not set. \(slot.unlocks)"))
+            return
+        }
+
+        // AviationStack: one test IS one of the hundred. Once a day.
+        if slot == .aviation, !force {
+            let last = status(slot).at
+            if let last, Date().timeIntervalSince(last) < 86_400,
+               status(slot).state != .unknown { return }
+        }
+
+        testing.insert(slot.rawValue)
+        defer { testing.remove(slot.rawValue) }
+
+        let result = await Self.probe(slot, key: key)
+        write(slot, Status(state: result.ok ? .live : .failed,
+                           at: Date(), detail: result.detail))
+    }
+
+    private func write(_ slot: Slot, _ st: Status) {
+        statuses[slot.rawValue] = st
+        save()
+    }
+
+    // MARK: the probes — each one a real call to the real provider
+
+    private nonisolated static func probe(_ slot: Slot, key: String) async -> (ok: Bool, detail: String) {
+        switch slot {
+
+        case .claude:
+            // /v1/models is a genuine auth check and spends no tokens.
+            var r = URLRequest(url: URL(string: "https://api.anthropic.com/v1/models?limit=1")!)
+            r.setValue(key, forHTTPHeaderField: "x-api-key")
+            r.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            return await http(r, name: "Claude")
+
+        case .gemini:
+            let u = URL(string: "https://generativelanguage.googleapis.com/v1beta/models?key=\(key)&pageSize=1")!
+            return await http(URLRequest(url: u), name: "Gemini")
+
+        case .maps:
+            // A wrongly-scoped Google key returns HTTP 200 with
+            // REQUEST_DENIED in the body. Checking the status code alone
+            // — which is what a naive check does — would call that a
+            // pass, and it is the single most likely way this key fails.
+            let u = URL(string: "https://maps.googleapis.com/maps/api/geocode/json?latlng=-8.6500,115.2167&key=\(key)")!
+            do {
+                let (d, _) = try await URLSession.shared.data(from: u)
+                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+                let st = (j?["status"] as? String) ?? "?"
+                if st == "OK" || st == "ZERO_RESULTS" {
+                    return (true, "Geocoding answered.")
+                }
+                let msg = (j?["error_message"] as? String) ?? st
+                return (false, "Google said \(st). \(msg)")
+            } catch {
+                return (false, error.localizedDescription)
+            }
+
+        case .aviation:
+            let u = URL(string: "https://api.aviationstack.com/v1/flights?access_key=\(key)&limit=1")!
+            do {
+                let (d, _) = try await URLSession.shared.data(from: u)
+                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+                if let err = j?["error"] as? [String: Any] {
+                    let msg = (err["message"] as? String)
+                        ?? (err["info"] as? String) ?? "refused"
+                    return (false, msg)
+                }
+                if j?["data"] != nil {
+                    // It answered, so it cost one. Count it honestly.
+                    await MainActor.run { ChappyFlightBudget.shared.record(1) }
+                    return (true, "Answered. That check used one of your 100.")
+                }
+                return (false, "Unrecognised answer from AviationStack.")
+            } catch {
+                return (false, error.localizedDescription)
+            }
+
+        case .tripadvisor:
+            let u = URL(string: "https://api.content.tripadvisor.com/api/v1/location/search?key=\(key)&searchQuery=Ubud")!
+            var r = URLRequest(url: u)
+            r.setValue("application/json", forHTTPHeaderField: "accept")
+            return await http(r, name: "Tripadvisor")
+
+        case .fares:
+            let u = URL(string: "https://api.travelpayouts.com/v1/prices/cheap?origin=BNE&destination=DPS&token=\(key)")!
+            do {
+                let (d, resp) = try await URLSession.shared.data(from: u)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+                if code == 401 || code == 403 {
+                    return (false, "Travelpayouts rejected the token.")
+                }
+                if let success = j?["success"] as? Bool, success == false {
+                    return (false, (j?["error"] as? String) ?? "Refused.")
+                }
+                return code == 200
+                    ? (true, "Fare data answered.")
+                    : (false, "HTTP \(code).")
+            } catch {
+                return (false, error.localizedDescription)
+            }
+
+        case .mail:
+            // A real IMAP login, through the same client that reads the
+            // inbox — so a pass here means the inbox will actually open.
+            let out = await ChappyMail.shared.check()
+            let err = await ChappyMail.shared.lastError
+            if let err, !err.isEmpty { return (false, err) }
+            return (true, out.hasPrefix("Couldn't") ? out : "Signed in to the mailbox.")
+        }
+    }
+
+    /// Shared HTTP check. 401 and 403 are the key being wrong; anything
+    /// else that fails is worth saying out loud rather than reporting as
+    /// a bad key, because "no signal" is not "revoked".
+    private nonisolated static func http(_ r: URLRequest, name: String) async -> (Bool, String) {
+        do {
+            let (d, resp) = try await URLSession.shared.data(for: r)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            switch code {
+            case 200...299:
+                return (true, "\(name) authenticated.")
+            case 401, 403:
+                var why = "rejected the key"
+                if let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                   let e = j["error"] as? [String: Any],
+                   let m = e["message"] as? String { why = m }
+                return (false, "\(name) \(why).")
+            case 429:
+                return (false, "\(name) rate limited — the key is valid, you're just over the quota right now.")
+            default:
+                return (false, "\(name) answered HTTP \(code).")
+            }
+        } catch {
+            return (false, "Couldn't reach \(name): \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: keeping the answer
+
+    private let store = "chappy_key_status_v1"
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(statuses) {
+            UserDefaults.standard.set(d, forKey: store)
+        }
+    }
+    private func load() {
+        guard let d = UserDefaults.standard.data(forKey: store),
+              let v = try? JSONDecoder().decode([String: Status].self, from: d) else { return }
+        statuses = v
+    }
+
+    /// Spoken — "Chappy, are your keys working?"
+    func spoken() -> String {
+        let bad = problems
+        let missing = Slot.allCases.filter { status($0).state == .missing && !$0.baked }
+        if bad.isEmpty && missing.isEmpty {
+            let tested = Slot.allCases.filter { status($0).state == .live }.count
+            return tested == 0
+                ? "I haven't checked the keys yet. Open Settings, API keys, and they'll all test themselves."
+                : "All \(tested) keys answered. Nothing to worry about."
+        }
+        var out: [String] = []
+        if !bad.isEmpty {
+            out.append("\(bad.map(\.label).joined(separator: " and ")) "
+                + (bad.count == 1 ? "is not working" : "are not working") + ".")
+            if let first = bad.first { out.append(status(first).detail) }
+        }
+        if !missing.isEmpty {
+            out.append("Still to set up: \(missing.map(\.label).joined(separator: ", ")).")
+        }
+        return out.joined(separator: " ")
+    }
+}
+
+// =====================================================================
+// BUILD 231 — THE EMAIL HANDOFF.
+//
+// What this replaces: a mailto: URL. A mailto URL cannot carry an
+// attachment — there is no parameter for it and there never has been —
+// so `emailReport` has been sending the PLAIN TEXT fallback of a report
+// whose whole value is the map, the tables, the grading and the links.
+// All of it built, written to disk, and then not sent. The person
+// receiving it had no way to know a better version existed.
+//
+// The composer is a view and the voice path is in a manager with no view
+// context, so the payload comes through here and the root tab view
+// presents it. Which means saying "email the report" and tapping Email
+// go down exactly the same path — the only way this app is allowed to
+// add anything.
+// =====================================================================
+
+@MainActor
+final class ChappyHandoff: ObservableObject {
+
+    static let shared = ChappyHandoff()
+    private init() {}
+
+    struct Payload: Identifiable {
+        let id = UUID()
+        var to: [String] = []
+        var subject: String
+        /// Plain-text body. The pretty version is the attachment — this
+        /// is what shows in the preview pane and on a watch.
+        var body: String
+        /// The report itself. nil is allowed, and means text only.
+        var attachment: URL?
+        var mime: String = "text/html"
+    }
+
+    @Published var pending: Payload?
+
+    /// Where reports go when you don't say. Set once in Settings so the
+    /// voice route doesn't have to make you spell an address at a phone.
+    static var partner: String {
+        get { UserDefaults.standard.string(forKey: "chappy_partner_email") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_partner_email") }
+    }
+
+    static var partnerName: String {
+        get { UserDefaults.standard.string(forKey: "chappy_partner_name") ?? "your partner" }
+        set { UserDefaults.standard.set(newValue, forKey: "chappy_partner_name") }
+    }
+
+    /// Put a composer on screen. Returns the sentence to speak, because
+    /// every voice path in this app has to say what it did.
+    @discardableResult
+    func offer(subject: String, body: String, attachment: URL?,
+               to: [String] = [], mime: String = "text/html") -> String {
+        let addr = to.isEmpty && !Self.partner.isEmpty ? [Self.partner] : to
+        pending = Payload(to: addr, subject: subject, body: body,
+                          attachment: attachment, mime: mime)
+        if attachment == nil {
+            return "Email's on screen — one tap sends it."
+        }
+        return addr.isEmpty
+            ? "Report's attached and the email is on screen. Add who it's going to and hit send."
+            : "Report's attached, addressed to \(Self.partnerName). One tap sends it."
+    }
+
+    /// Nothing to attach is a real answer, not an error to swallow.
+    @discardableResult
+    func offerReport(_ url: URL?, subject: String, body: String,
+                     to: [String] = []) -> String {
+        guard let url, FileManager.default.fileExists(atPath: url.path) else {
+            return "I couldn't build that report, so there's nothing to attach yet."
+        }
+        return offer(subject: subject, body: body, attachment: url, to: to)
     }
 }
 
@@ -19929,6 +22053,18 @@ enum ChappyAudio {
 
         case .speaking:
             mode = .default
+            // BUILD 219 — THE LINE THAT MADE CHAPPY DEAF.
+            //
+            // .allowBluetooth was missing here and present in .listening,
+            // so the first answer released the Ray-Ban HFP link and the
+            // input fell back to the phone. backToListening() below only
+            // repairs a mismatched CATEGORY or MODE — both of which still
+            // matched — so nothing ever put it back. Every command after
+            // the first was heard through a pocket.
+            //
+            // Build 196 wrote the right sentence about this option and
+            // then only fixed one of the two places that needed it.
+            opts.insert(.allowBluetooth)
             if p == "never" { opts.insert(.mixWithOthers) } else { opts.insert(.duckOthers) }
 
         case .conversation:
@@ -19946,7 +22082,20 @@ enum ChappyAudio {
             // link is the slowest route change there is; it must count as
             // upheaval from the instant we ask for it.
             let changing = s.category != .playAndRecord || s.categoryOptions != opts || s.mode != mode
-            if changing { ChappyStandby.lastAudioUpheavalAt = Date() }
+
+            // BUILD 219 — not every change is upheaval.
+            //
+            // lastAudioUpheavalAt makes the tap installer wait 800ms for
+            // the route to settle. That is right when the route really
+            // moves — gaining or losing the Bluetooth input, or changing
+            // category or mode. It is wrong for a duck: ducking other
+            // audio does not move the microphone anywhere, and stamping
+            // it made the ear deaf for most of a second after every
+            // single answer.
+            let routeMoves = s.category != .playAndRecord
+                || s.mode != mode
+                || s.categoryOptions.contains(.allowBluetooth) != opts.contains(.allowBluetooth)
+            if routeMoves { ChappyStandby.lastAudioUpheavalAt = Date() }
             try s.setCategory(.playAndRecord, mode: mode, options: opts)
             try s.setActive(true)
             return true
@@ -27076,6 +29225,153 @@ final class ChappyFile: ObservableObject {
         }
     }
 
+    // =================================================================
+    // BUILD 232 — THE TICK.
+    //
+    // `done` below is DERIVED: true when Chappy can see a matching
+    // booking or document, false otherwise. That works for the flight
+    // and the insurance and nothing else. The eSIM, the money, the
+    // forecast, re-checking the refundables — Chappy cannot see any of
+    // those, so they could never be ticked by anybody and sat there
+    // unticked for ever. A checklist with permanently-unticked items is
+    // a checklist you stop reading, which makes the whole thing worse
+    // than not having one.
+    //
+    // A manual tick, OR'd with the derived one. Ticking something and
+    // then booking it must not un-tick it, so it is an OR and never a
+    // replacement.
+    // =================================================================
+
+    private static let tickKey = "chappy_checklist_ticked"
+
+    var ticked: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: Self.tickKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: Self.tickKey) }
+    }
+
+    func isTicked(_ id: String) -> Bool { ticked.contains(id) }
+
+    func setTicked(_ id: String, _ on: Bool) {
+        var t = ticked
+        if on { t.insert(id) } else { t.remove(id) }
+        ticked = t
+        objectWillChange.send()
+    }
+
+    /// Your own items. No generated list covers everything, and the ones
+    /// that pretend to are the ones nobody finishes.
+    struct Extra: Codable, Identifiable {
+        var id = UUID()
+        var title: String
+        var detail: String = ""
+        var daysOut: Int = 30
+        var addedAt: Date = Date()
+    }
+
+    private static let extrasKey = "chappy_checklist_extras"
+
+    var extras: [Extra] {
+        get {
+            guard let d = UserDefaults.standard.data(forKey: Self.extrasKey),
+                  let v = try? JSONDecoder().decode([Extra].self, from: d) else { return [] }
+            return v
+        }
+        set {
+            if let d = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(d, forKey: Self.extrasKey)
+            }
+            objectWillChange.send()
+        }
+    }
+
+    @discardableResult
+    func addChecklistItem(_ title: String, detail: String = "", daysOut: Int = 30) -> Extra {
+        let e = Extra(title: title, detail: detail, daysOut: daysOut)
+        extras.append(e)
+        return e
+    }
+
+    func removeChecklistItem(_ id: UUID) {
+        extras.removeAll { $0.id == id }
+        setTicked("extra-\(id.uuidString)", false)
+    }
+
+    /// "tick off the visa" — match on the words, not on an id he will
+    /// never see. Returns what to SAY, because a silent tick from a
+    /// voice command is indistinguishable from not hearing him.
+    func tickByPhrase(_ raw: String, trip: ChappyTravel.Trip?) -> String {
+        let q = raw.lowercased()
+            .replacingOccurrences(of: "tick off", with: "")
+            .replacingOccurrences(of: "tick", with: "")
+            .replacingOccurrences(of: "check off", with: "")
+            .replacingOccurrences(of: "mark", with: "")
+            .replacingOccurrences(of: "as done", with: "")
+            .replacingOccurrences(of: "done", with: "")
+            .replacingOccurrences(of: "the ", with: " ")
+            .replacingOccurrences(of: "my ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 3 else {
+            return "Tick off what? Say something like \"tick off the insurance\"."
+        }
+
+        var candidates: [(id: String, title: String)] = []
+        if let trip { candidates = timeline(trip).map { ($0.id, $0.title) } }
+        candidates += extras.map { ("extra-\($0.id.uuidString)", $0.title) }
+        guard !candidates.isEmpty else {
+            return "There's no checklist yet — it builds itself once there's a trip planned."
+        }
+
+        // Whole-word overlap, most words in common wins. Bare `contains`
+        // is what made country matching resolve Australia to the United
+        // States, and it would do the same kind of thing here.
+        let words = q.split(separator: " ").map(String.init).filter { $0.count > 2 }
+        func score(_ title: String) -> Int {
+            let t = " " + title.lowercased() + " "
+            return words.reduce(0) { $0 + (t.contains(" \($1)") ? 1 : 0) }
+        }
+        let best = candidates.map { ($0, score($0.title)) }
+            .max { $0.1 < $1.1 }
+        guard let best, best.1 > 0 else {
+            return "I couldn't find \"\(q)\" on the checklist. Say \"what's left\" and I'll read it out."
+        }
+        setTicked(best.0.id, true)
+        let left = trip.map { remaining($0) } ?? 0
+        return left == 0
+            ? "\(best.0.title) — ticked. That's everything on the list."
+            : "\(best.0.title) — ticked. \(left) left."
+    }
+
+    func remaining(_ trip: ChappyTravel.Trip) -> Int {
+        timeline(trip).filter { !$0.done }.count + extras.filter {
+            !isTicked("extra-\($0.id.uuidString)")
+        }.count
+    }
+
+    /// "What's left before I fly?"
+    func spokenChecklist(_ trip: ChappyTravel.Trip?) -> String {
+        guard let trip else {
+            return "There's no trip planned, so there's no list yet."
+        }
+        let items = timeline(trip).filter { !$0.done }
+        let mine = extras.filter { !isTicked("extra-\($0.id.uuidString)") }
+        guard !items.isEmpty || !mine.isEmpty else {
+            return "Nothing left — the whole list is ticked."
+        }
+        let urgent = items.filter(\.urgent)
+        var out: [String] = []
+        out.append("\(items.count + mine.count) still to do.")
+        if !urgent.isEmpty {
+            out.append("Overdue or close to it: "
+                + urgent.prefix(3).map(\.title).joined(separator: ", ") + ".")
+        }
+        let rest = items.filter { !$0.urgent }.prefix(4).map(\.title)
+            + mine.prefix(2).map(\.title)
+        if !rest.isEmpty {
+            out.append("Then: " + rest.joined(separator: ", ") + ".")
+        }
+        return out.joined(separator: " ")
+    }
+
     // MARK: the timeline
 
     struct TimelineItem: Identifiable {
@@ -27099,9 +29395,15 @@ final class ChappyFile: ObservableObject {
         var items: [TimelineItem] = []
 
         func add(_ bucket: String, _ by: Int, _ title: String, _ detail: String, _ done: Bool) {
+            // BUILD 232: derived OR manual. An item Chappy can see is
+            // done stays done whatever the tick says, and an item it
+            // cannot see can now be ticked by hand or by voice — which
+            // before this was true of nothing at all.
+            let ticked = self.isTicked("\(bucket)-\(title)")
+            let really = done || ticked
             items.append(TimelineItem(bucket: bucket, daysOut: by, title: title,
-                                      detail: detail, done: done,
-                                      urgent: !done && out <= by))
+                                      detail: detail, done: really,
+                                      urgent: !really && out <= by))
         }
 
         // ---------------------------------------------------------- 90
@@ -27185,7 +29487,38 @@ final class ChappyFile: ObservableObject {
             "Booked or agreed, with a price. The airport taxi rank is where every trip loses its first argument.",
             false)
 
+        // ------------------------------------------------ BUILD 232
+        // Your own items, in the bucket they belong to. Appended after
+        // the generated ones and then re-sorted, so "book the dog
+        // kennel" sits with the other 60-day jobs rather than at the
+        // bottom where nobody looks.
+        for e in extras {
+            let id = "extra-\(e.id.uuidString)"
+            let done = isTicked(id)
+            items.append(TimelineItem(bucket: Self.bucketName(e.daysOut),
+                                      daysOut: e.daysOut,
+                                      title: e.title,
+                                      detail: e.detail.isEmpty ? "Yours." : e.detail,
+                                      done: done,
+                                      urgent: !done && out <= e.daysOut))
+        }
+        // Furthest-out first, which is the order they have to happen in.
+        items.sort { $0.daysOut > $1.daysOut }
+
         return items
+    }
+
+    /// Which heading a day-count belongs under. Kept here so a custom
+    /// item lands in the same buckets the generated ones use rather than
+    /// inventing a sixth heading.
+    static func bucketName(_ days: Int) -> String {
+        switch days {
+        case 90...:  return "90 days out"
+        case 60..<90: return "60 days out"
+        case 30..<60: return "30 days out"
+        case 7..<30:  return "7 days out"
+        default:      return "The day before"
+        }
     }
 }
 
@@ -27199,25 +29532,105 @@ extension ChappyTravel {
         guard !items.isEmpty else { return "" }
         let E = Self.e
 
+        // BUILD 232 — A CHECKLIST YOU CAN TICK, NOT A LIST YOU READ.
+        //
+        // This used to print ○ and ✓ as text. Now it's real checkboxes
+        // with the app's current state already applied, a progress bar,
+        // and a link on the items that have somewhere to go.
+        //
+        // Ticking in an EMAILED copy saves to that browser and nowhere
+        // else — a document cannot write back to a phone, and pretending
+        // otherwise would be the worst kind of lie this app could tell.
+        // So the document says so, in the document.
+        let done = items.filter(\.done).count
+        let pct = items.isEmpty ? 0 : Int(Double(done) / Double(items.count) * 100)
+
         var h = "<div class=\"card\"><h2>What to do, and when"
         h += Self.stampHTML(ChappyStamp(.record, source: "your plan", confidence: 88))
         h += "</h2>"
         h += "<p class=\"s2\">Built from this trip rather than from a generic checklist — the visa line only "
         h += "appears because this trip needs one, and the driving-permit line only because there's a scooter "
-        h += "in it. Ticked items are things Chappy can already see are done.</p>"
+        h += "in it.</p>"
+        h += "<p class=\"s2\" id=\"ckcount\">\(done) of \(items.count) done</p>"
+        h += "<div style=\"height:8px;border-radius:6px;background:rgba(255,255,255,.09);overflow:hidden;margin:2px 0 14px\">"
+        h += "<i id=\"ckbar\" style=\"display:block;height:100%;width:\(pct)%;background:linear-gradient(90deg,#4caf50,#4dd0a7);transition:width .3s\"></i></div>"
+        h += "<ul class=\"ck\" id=\"ck\" style=\"list-style:none;margin:0;padding:0\">"
 
         var bucket = ""
+        var n = 0
         for item in items {
             if item.bucket != bucket {
                 bucket = item.bucket
-                h += "<p class=\"daysep\">\(E(bucket))</p>"
+                h += "</ul><p class=\"daysep\">\(E(bucket))</p><ul class=\"ck\" style=\"list-style:none;margin:0;padding:0\">"
             }
-            let cls = item.done ? "tl done" : (item.urgent ? "tl urgent" : "tl")
-            h += "<div class=\"\(cls)\"><span class=\"tick\">\(item.done ? "✓" : "○")</span><div>"
-            h += "<b>\(E(item.title))</b><span class=\"d\">\(E(item.detail))</span></div></div>"
+            n += 1
+            let cid = "ck\(n)"
+            let checked = item.done ? " checked" : ""
+            h += "<li style=\"display:flex;gap:11px;align-items:flex-start;padding:10px 2px;border-bottom:1px solid rgba(255,255,255,.07)\">"
+            h += "<input type=\"checkbox\" id=\"\(cid)\"\(checked) "
+            h += "style=\"flex:0 0 auto;width:22px;height:22px;margin-top:2px;accent-color:#4caf50;cursor:pointer\">"
+            h += "<label for=\"\(cid)\" style=\"flex:1;min-width:0;cursor:pointer\">"
+            h += "<b>\(E(item.title))</b>"
+            if item.urgent && !item.done {
+                h += " <span style=\"color:#ffb300;font-size:11px;font-weight:800\">DUE</span>"
+            }
+            h += "<span class=\"d\">\(E(item.detail))</span>"
+            if let link = Self.checklistLink(item.title) {
+                h += "<div style=\"margin-top:5px\"><a href=\"\(link.1)\" "
+                h += "style=\"display:inline-block;padding:4px 10px;border-radius:14px;"
+                h += "background:rgba(79,195,247,.14);color:#4fc3f7;font-size:12px;"
+                h += "font-weight:600;text-decoration:none\">\(E(link.0))</a></div>"
+            }
+            h += "</label></li>"
         }
+        h += "</ul>"
+        h += "<p class=\"s2\" style=\"margin-top:12px\">Ticking here saves to whichever browser you opened this in, "
+        h += "and nowhere else — a document can't write back to a phone. The live list is in Chappy: tick it there, "
+        h += "or say <i>\"tick off the insurance\"</i>, and the next report you generate prints already ticked.</p>"
         h += "</div>"
+
+        // Ticks survive a reload, which is the whole point of ticking.
+        h += "<script>(function(){"
+        h += "var b=[].slice.call(document.querySelectorAll('#ck input,ul.ck input'));"
+        h += "var bar=document.getElementById('ckbar'),c=document.getElementById('ckcount');"
+        h += "var K='chappy_report_ticks_\(trip.id.uuidString)';"
+        h += "try{var v=JSON.parse(localStorage.getItem(K)||'null');"
+        h += "if(v){b.forEach(function(x){x.checked=v.indexOf(x.id)>=0})}}catch(e){}"
+        h += "function p(){var d=b.filter(function(x){return x.checked}).length;"
+        h += "if(bar)bar.style.width=(b.length?d/b.length*100:0)+'%';"
+        h += "if(c)c.textContent=d+' of '+b.length+' done';"
+        h += "try{localStorage.setItem(K,JSON.stringify(b.filter(function(x){return x.checked})"
+        h += ".map(function(x){return x.id})))}catch(e){}}"
+        h += "b.forEach(function(x){x.addEventListener('change',p)});p();})();</script>"
         return h
+    }
+
+    /// A checklist item that has somewhere to go gets a link. Only where
+    /// the destination is certain — a wrong link on a visa line is how
+    /// somebody ends up on a scam portal, which is exactly what build
+    /// 229 spent its time removing.
+    static func checklistLink(_ title: String) -> (String, String)? {
+        let t = title.lowercased()
+        if t.hasPrefix("visa") {
+            // Point at the real immigration service for the first
+            // country named in the title, or nothing at all.
+            for c in ChappyVisa.official.keys where t.contains(c.lowercased()) {
+                if let u = ChappyVisa.immigrationURL(c) {
+                    return ("Apply — \(c) immigration", u.absoluteString)
+                }
+            }
+            return ("Smartraveller", "https://www.smartraveller.gov.au/destinations")
+        }
+        if t.contains("passport") {
+            return ("Passport office", "https://www.passports.gov.au/")
+        }
+        if t.contains("driving permit") {
+            return ("What an IDP is", "https://www.smartraveller.gov.au/before-you-go/transport/driving")
+        }
+        if t.contains("check in") {
+            return ("Your flights", "https://www.skyscanner.com.au/")
+        }
+        return nil
     }
 
     /// What's booked, what it cost, and the cancellation deadlines —
@@ -27475,6 +29888,22 @@ final class ChappyWatch: ObservableObject {
         /// them against the route rather than burying them in reminders.
         var hits: [Hit] = []
 
+        // BUILD 229 — what this watch is actually watching.
+        //
+        // Until now the only record of the departure month was inside
+        // the human-readable label ("BNE → DPS, September 2026"), which
+        // meant `searchLink` had nothing to date a booking URL from and
+        // fell back to the day the last price was taken. Every deal link
+        // therefore searched for TODAY.
+        //
+        // All three Optional, without exception. A non-Optional field
+        // added to a persisted Codable throws in the synthesised
+        // init(from:) for every record saved before it existed, and this
+        // project has lost data to that twice.
+        var departs: Date?
+        var party: Int?
+        var oneWay: Bool?
+
         var due: Bool {
             guard let last = lastChecked else { return true }
             let days = Calendar.current.dateComponents([.day], from: last, to: Date()).day ?? 0
@@ -27582,6 +30011,43 @@ final class ChappyWatch: ObservableObject {
         watches[i].active.toggle(); save()
     }
 
+    /// BUILD 229 — WATCH A ROUTE WITHOUT PLANNING A TRIP FIRST.
+    ///
+    /// The only way to create a route watch used to be `watchRoutes(of:)`,
+    /// which reads its routes off a planned trip. So the Flights screen
+    /// with no trip had no path to the watcher at all.
+    ///
+    /// That is the wrong way round. Watching a route is what you do
+    /// BEFORE you commit to dates — it is how you find out what the route
+    /// costs so you can pick the dates. Google Flights puts Track Prices
+    /// on the search screen; Hopper's whole product is the watch button.
+    ///
+    /// `tripID` stays nil, which the model already allowed for, so a
+    /// standalone watch survives a trip being planned or deleted later.
+    @discardableResult
+    func watchRoute(from a: ChappyPorts.Airport, to b: ChappyPorts.Airport,
+                    month: Date, oneWay: Bool, party: Int) -> Watch {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        f.locale = Locale(identifier: "en_US_POSIX")
+
+        var w = Watch()
+        w.kind = .route
+        w.tripID = nil
+        w.currency = ChappyFX.shared.home
+        w.departs = month
+        w.party = max(1, party)
+        w.oneWay = oneWay
+        w.label = "\(a.iata) → \(b.iata), \(f.string(from: month))"
+
+        let shape = oneWay ? "one-way" : "return"
+        w.query = "\(shape) economy airfare \(a.city) (\(a.iata)) to "
+            + "\(b.city) (\(b.iata)) departing \(f.string(from: month)) "
+            + "for \(w.party ?? 1) adult\((w.party ?? 1) == 1 ? "" : "s"). "
+            + "Give the ONE-WAY price if that is what was asked for — do not halve a return."
+        add(w)
+        return w
+    }
+
     /// Watch the routes of a trip automatically. Every flown segment,
     /// once — this is the whole reason the airport atlas exists.
     func watchRoutes(of trip: ChappyTravel.Trip) {
@@ -27598,6 +30064,11 @@ final class ChappyWatch: ObservableObject {
             // And it matters more than a word: one-way is rarely half a
             // return — roughly half on the Asian low-cost carriers, and
             // seventy to ninety per cent of a return on full-service.
+            // BUILD 229: carry the real departure date, so searchLink
+            // stops dating booking URLs from the day a price was taken.
+            w.departs = hop.when
+            w.party = trip.party
+            w.oneWay = trip.oneWay
             let shape = trip.oneWay == true ? "one-way" : "return"
             w.query = "\(shape) economy airfare \(hop.from.city) (\(hop.from.iata)) to "
                 + "\(hop.to.city) (\(hop.to.iata)) departing \(f.string(from: hop.when)) "
@@ -27608,6 +30079,38 @@ final class ChappyWatch: ObservableObject {
     }
 
     // MARK: the run
+
+    /// BUILD 229 — ONE WATCH, RIGHT NOW.
+    ///
+    /// `run()` below is a background sweep: everything due, a second and
+    /// a half between calls, and it refuses to start if it is already
+    /// going. Right for a background job, useless for the moment he taps
+    /// "Watch this route" and is sitting there waiting to see a number.
+    ///
+    /// No notification, deliberately — he is holding the phone and
+    /// looking at the row. A banner about something already on screen is
+    /// exactly the noise this app has too much of.
+    func checkOne(_ id: UUID) async {
+        guard let start = watches.firstIndex(where: { $0.id == id }) else { return }
+        let w = watches[start]
+        guard w.kind == .route || w.kind == .stay else { return }
+
+        let p = await priceReading(for: w)
+
+        // Re-find AFTER the await. Nothing runs during it — this is all
+        // MainActor — but it is a suspension point, and "Stop watching"
+        // is one tap away. An index taken before can point into an array
+        // that has since got shorter. This exact mistake was a live
+        // crash in `run()`.
+        guard let i = watches.firstIndex(where: { $0.id == id }) else { return }
+        if let p {
+            watches[i].points.append(p)
+            if watches[i].points.count > 104 { watches[i].points.removeFirst() }
+            watches[i].lastMessage = watches[i].adviceLine
+        }
+        watches[i].lastChecked = Date()
+        save()
+    }
 
     /// One pass over everything due. Deliberately sequential and
     /// deliberately slow — this is a background job, not a screen, and
@@ -27778,12 +30281,22 @@ final class ChappyWatch: ObservableObject {
         guard parts.count == 2, parts[0].count == 3, parts[1].count == 3 else {
             return "https://www.skyscanner.com.au/"
         }
-        let when = w.points.last?.at ?? w.createdAt
+        // BUILD 229 — TWO BUGS, BOTH IN THESE FIVE LINES.
+        //
+        // `points.last?.at` is the day the PRICE WAS TAKEN, not the day
+        // he wants to fly. Every "Book it" link in the app has been
+        // opening a search for today. The watch carries its own
+        // departure month now, so the link points where it claims to.
+        //
+        // And `adults=2` was hardcoded. He travels alone.
+        let when = w.departs ?? w.points.last?.at ?? w.createdAt
         let f = DateFormatter(); f.dateFormat = "yyMMdd"
         f.locale = Locale(identifier: "en_US_POSIX")
+        let heads = max(1, w.party ?? 1)
+        let rtn = (w.oneWay ?? false) ? 0 : 1
         return "https://www.skyscanner.com.au/transport/flights/"
             + parts[0].lowercased() + "/" + parts[1].lowercased() + "/"
-            + f.string(from: when) + "/?adults=2&cabinclass=economy&rtn=0"
+            + f.string(from: when) + "/?adults=\(heads)&cabinclass=economy&rtn=\(rtn)"
     }
 
     /// Every live hit across every watch, newest first — what the
@@ -31133,9 +33646,19 @@ final class ChappyLastResult {
 final class ChappyRouterLog {
 
     static let shared = ChappyRouterLog()
-    private init() {}
+    private init() { load() }
 
-    struct Entry {
+    /// BUILD 221 — Codable, because this record was worth keeping and
+    /// wasn't kept.
+    ///
+    /// Every field here is the answer to "why did Chappy do that": what
+    /// it heard, which tier claimed the sentence, which tool ran, how
+    /// confident it was, what came of it, and how long it really took.
+    /// All of it lived in RAM behind a 100-entry cap and died on every
+    /// app exit — so the one question it exists to answer could only be
+    /// asked before you closed the app, which is never when you want to
+    /// ask it.
+    struct Entry: Codable {
         let at: Date
         let heard: String
         let tier: String         // pocket | tiles | flow | intent | plan | ask
@@ -31146,13 +33669,63 @@ final class ChappyRouterLog {
     }
 
     private(set) var entries: [Entry] = []
-    private static let cap = 100
+    /// BUILD 221: 100 in memory was a display cap. On disk it can afford
+    /// to be a real history without being a burden — a few hundred
+    /// kilobytes for weeks of decisions.
+    private static let cap = 600
+
+    private static let file = "chappy_routerlog.json"
+
+    private var url: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            .first?.appendingPathComponent(Self.file)
+    }
+
+    /// Written on a background queue and coalesced — the router logs on
+    /// every routed sentence and must never wait on a disk write.
+    private let io = DispatchQueue(label: "chappy.routerlog.io", qos: .utility)
+    private var saveWork: DispatchWorkItem?
+
+    private func load() {
+        guard let url, let d = try? Data(contentsOf: url),
+              let rows = try? JSONDecoder().decode([Entry].self, from: d)
+        else { return }
+        entries = rows.suffix(Self.cap)
+    }
+
+    private func scheduleSave() {
+        saveWork?.cancel()
+        let snapshot = entries
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let url = self.url,
+                  let d = try? JSONEncoder().encode(snapshot) else { return }
+            try? d.write(to: url, options: .atomic)
+        }
+        saveWork = work
+        io.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    /// Everything Chappy decided, newest first, as plain readable lines.
+    /// This is the export for "why did it do that" — and the first thing
+    /// worth reading when a route goes somewhere strange.
+    func readableHistory(limit: Int = 200) -> String {
+        let f = DateFormatter(); f.dateFormat = "d MMM HH:mm:ss"
+        return entries.suffix(limit).reversed().map { e in
+            let c = e.confidence.map { String(format: " %.2f", $0) } ?? ""
+            let t = e.tool.map { " → \($0)" } ?? ""
+            return "\(f.string(from: e.at))  [\(e.tier)\(c)]  \"\(e.heard)\"\(t)  \(e.outcome)  \(e.ms)ms"
+        }.joined(separator: "\n")
+    }
 
     func add(heard: String, tier: String, tool: String? = nil,
              confidence: Double? = nil, outcome: String, ms: Int) {
         entries.append(Entry(at: Date(), heard: heard, tier: tier, tool: tool,
                              confidence: confidence, outcome: outcome, ms: ms))
         if entries.count > Self.cap { entries.removeFirst(entries.count - Self.cap) }
+        // BUILD 221: coalesced two seconds out, so a run of commands
+        // costs one write rather than one per sentence, and the router
+        // never waits on the disk.
+        scheduleSave()
         let c = confidence.map { String(format: " %.2f", $0) } ?? ""
         print("🧭 [Route] \(ms)ms \(tier)\(c) \(tool ?? "-") — \(outcome)")
     }
@@ -31597,6 +34170,84 @@ enum ChappySelfTest {
         check("date refuses 'sometime soon'", ChappySlots.parse("sometime soon", as: .date), nil)
 
         // ---- airports, including the ones with no airport ----------
+        // ---- BUILD 224: the outcome loop --------------------------
+        //
+        // The property that matters is the GATE, not the arithmetic: a
+        // cold predictor must not be allowed to interrupt him. That is
+        // the Google Now failure, and it is the one thing here that
+        // cannot be allowed to regress quietly.
+        let cold = ChappyOutcomes.Score(sort: .place, resolved: 0, hits: 0)
+        check("outcomes: a cold predictor is not trusted",
+              cold.trusted ? "yes" : "no", "no")
+        let thin = ChappyOutcomes.Score(sort: .place, resolved: 4, hits: 4)
+        check("outcomes: perfect but thin is still not trusted",
+              thin.trusted ? "yes" : "no", "no")
+        let good = ChappyOutcomes.Score(sort: .place, resolved: 8, hits: 6)
+        check("outcomes: 6 of 8 earns the right to speak",
+              good.trusted ? "yes" : "no", "yes")
+        let bad = ChappyOutcomes.Score(sort: .place, resolved: 12, hits: 3)
+        check("outcomes: 3 of 12 is disgraced",
+              bad.disgraced ? "yes" : "no", "yes")
+        check("outcomes: disgraced is never trusted",
+              bad.trusted ? "yes" : "no", "no")
+        check("outcomes: a settled score needs six",
+              ChappyOutcomes.Score(sort: .place, resolved: 6, hits: 4).settled ? "yes" : "no", "yes")
+        check("outcomes: every sort explains itself",
+              ChappyOutcomes.Sort.allCases.allSatisfy { !$0.spoken.isEmpty } ? "yes" : "no", "yes")
+        check("outcomes: off means silent",
+              ChappyForesight.mode == .off ? (ChappyForesight.anticipate() == nil ? "silent" : "spoke")
+                                           : "silent", "silent")
+
+        // ---- BUILD 222: the semantic classifier -------------------
+        //
+        // Tested by walking the RULES rather than by trying phrases I
+        // expect to work — the same discipline that caught a tool with
+        // no trigger words in 199. Each of these is a rule boundary, and
+        // the ordering ones matter most: a date that bites has to
+        // outrank whatever it is a date about.
+        func meaning(_ title: String, _ kind: ChappyMemory.Kind = .note) -> String {
+            ChappyMemory.classify(kind: kind, title: title).rawValue
+        }
+        check("meaning: passport expiry is a deadline, not identity",
+              meaning("my passport expires in March"), "temporal")
+        check("meaning: passport alone is identity",
+              meaning("my passport is Australian"), "identity")
+        check("meaning: a spend is transactional",
+              meaning("lunch", .spend), "transactional")
+        check("meaning: a saved place is spatial",
+              meaning("that warung", .place), "spatial")
+        check("meaning: a verdict is affective",
+              meaning("best fish soup I've had all week"), "affective")
+        check("meaning: a standing avoidance is a preference",
+              meaning("I avoid red meat"), "preference")
+        check("meaning: a routine is procedural",
+              meaning("the way I pack is shoes first"), "procedural")
+        check("meaning: unfinished business is a project",
+              meaning("still need to sort the onward ticket"), "project")
+        check("meaning: a photo is the diary",
+              meaning("sunset over the rice fields", .photo), "episodic")
+        // The original phrase here was "the menu says no pork", which
+        // returns .preference — because "no pork" is a dietary marker and
+        // that rule fires before the kind check. That is arguably the
+        // right answer and definitely the wrong TEST: it was asserting
+        // the kind fallback while feeding it a phrase that never reaches
+        // it. Caught by running the rules rather than reading them.
+        check("meaning: a scan with no personal marker is a world fact",
+              meaning("opening hours nine to five", .scan), "semantic")
+        check("meaning: a dietary marker beats the kind fallback",
+              meaning("the menu says no pork", .scan), "preference")
+        check("meaning: every type has a label and an icon",
+              ChappyMemory.Semantic.allCases
+                .allSatisfy { !$0.label.isEmpty && !$0.icon.isEmpty } ? "yes" : "no", "yes")
+        check("meaning: identity outlasts episodic",
+              ChappyMemory.Semantic.identity.durabilityDays
+                > ChappyMemory.Semantic.episodic.durabilityDays ? "yes" : "no", "yes")
+        check("meaning: identity outweighs episodic",
+              ChappyMemory.Semantic.identity.baseWeight
+                > ChappyMemory.Semantic.episodic.baseWeight ? "yes" : "no", "yes")
+        check("meaning: eleven types, no more no less",
+              String(ChappyMemory.Semantic.allCases.count), "11")
+
         // ---- BUILD 217: the flight desk ---------------------------
         //
         // Added because 199 shipped a `navigate` tool with no trigger
@@ -31918,6 +34569,20 @@ enum ChappyPatterns {
         return out
     }
 
+    /// BUILD 224 — visits inside a window, for the outcome loop.
+    ///
+    /// Reads the trail's files directly rather than calling ChappyTrail,
+    /// which is @MainActor. That is the same reason the DiskVisit mirror
+    /// above exists, and the note there applies equally here: the
+    /// resolver runs from a background pass and must not hop isolation
+    /// to answer "did he actually turn up".
+    static func visitsBetween(_ from: Date, _ to: Date) -> [(lat: Double, lon: Double, arrive: Date)] {
+        let span = max(1, Int(to.timeIntervalSince(from) / 86_400) + 2)
+        return loadVisits(days: span)
+            .filter { $0.arrive >= from && $0.arrive <= to }
+            .map { (lat: $0.lat, lon: $0.lon, arrive: $0.arrive) }
+    }
+
     // ---------------------------------------------------------------- build
     /// Recomputed on demand and cached for ten minutes. Ninety days of
     /// visits is a few thousand records; this is milliseconds, but it is
@@ -32160,6 +34825,240 @@ final class ChappyLedger {
 // never afterwards. Google Now is the warning: predicting well and
 // explaining nothing is how a good feature becomes a creepy one.
 //
+// =====================================================================
+// MARK: - THE OUTCOME LOOP (Build 224)
+// =====================================================================
+//
+// The half of §14 that has never existed.
+//
+// `ChappyLedger` has declared `.predicted` and `.outcome` for builds and
+// written neither, so nothing Chappy ever guessed was scored against
+// what actually happened. An assistant that predicts and never measures
+// cannot improve, and — worse — cannot know when to shut up.
+//
+// This is deliberately small and deliberately evidence-based. A place
+// prediction resolves by asking the trail whether he actually turned up.
+// No model call, nothing uploaded, works on a plane.
+//
+// The rule that matters most is the one about earning it: a KIND of
+// prediction stays silent until it has been right often enough, over
+// enough occasions, to deserve interrupting him. Google Now predicted
+// eagerly from cold and died of it.
+//
+final class ChappyOutcomes: ObservableObject {
+
+    static let shared = ChappyOutcomes()
+
+    /// What sort of guess this was. Accuracy is tracked per kind, so a
+    /// good place predictor is not silenced by a bad timing one.
+    enum Sort: String, Codable, CaseIterable {
+        case place        // "you're often at X about now"
+        case timing       // "you usually leave about now"
+        case need         // "you normally want Y after X"
+        case deadline     // "this is about to matter"
+
+        var spoken: String {
+            switch self {
+            case .place:    return "where you'd be"
+            case .timing:   return "when you'd move"
+            case .need:     return "what you'd want"
+            case .deadline: return "what was coming up"
+            }
+        }
+    }
+
+    struct Prediction: Codable, Identifiable {
+        var id = UUID()
+        var at = Date()
+        var sort: Sort
+        /// What was predicted, in the words it would be said in.
+        var claim: String
+        /// The evidence, stated alongside — never separated from it.
+        var because: String
+        var confidence: Double
+        /// A key the resolver can check against reality. For a place
+        /// prediction this is the habit key.
+        var subject: String
+        /// Where, for a place prediction. Optional so the model stays
+        /// decodable if a later build predicts something without a
+        /// coordinate. Resolution goes by DISTANCE rather than by key
+        /// string, because a habit key is the cluster's coordinate and a
+        /// visit's own coordinate will never match it exactly.
+        var lat: Double?
+        var lon: Double?
+        /// When we will know. Nothing resolves early.
+        var resolveAfter: Date
+        /// nil until scored.
+        var hit: Bool?
+        var resolvedAt: Date?
+        /// True once it has actually been said out loud, so a silent
+        /// prediction is not scored as if it had been offered.
+        var spoken: Bool = false
+
+        var isOpen: Bool { hit == nil }
+    }
+
+    @Published private(set) var predictions: [Prediction] = []
+
+    private let key = "chappy_predictions_v1"
+    private static let cap = 300
+
+    private init() { load() }
+
+    private func load() {
+        guard let d = UserDefaults.standard.data(forKey: key),
+              let rows = try? JSONDecoder().decode([Prediction].self, from: d)
+        else { return }
+        predictions = rows
+    }
+
+    private func save() {
+        var rows = predictions
+        if rows.count > Self.cap { rows.removeFirst(rows.count - Self.cap) }
+        predictions = rows
+        guard let d = try? JSONEncoder().encode(rows) else { return }
+        UserDefaults.standard.set(d, forKey: key)
+    }
+
+    // ------------------------------------------------------- recording
+
+    /// Record a guess at the moment it is made, whether or
+    /// not it is ever said out loud. A prediction Chappy kept to itself
+    /// still tells us whether it WOULD have been right, which is how a
+    /// cold kind earns its way up to speaking.
+    @discardableResult
+    func predict(_ sort: Sort, claim: String, because: String,
+                 confidence: Double, subject: String,
+                 lat: Double? = nil, lon: Double? = nil,
+                 resolvesInHours: Double = 3) -> Prediction {
+        let p = Prediction(sort: sort, claim: claim, because: because,
+                           confidence: confidence, subject: subject,
+                           lat: lat, lon: lon,
+                           resolveAfter: Date().addingTimeInterval(resolvesInHours * 3600))
+        predictions.append(p)
+        save()
+        ChappyLedger.shared.record(.predicted, subject: subject,
+                                   detail: claim, confidence: confidence)
+        return p
+    }
+
+    func markSpoken(_ id: UUID) {
+        guard let i = predictions.firstIndex(where: { $0.id == id }) else { return }
+        predictions[i].spoken = true
+        save()
+    }
+
+    // ------------------------------------------------------- resolving
+
+    /// Score everything whose window has closed, against what the trail
+    /// actually recorded. Cheap, offline, and safe to call often — it
+    /// only touches predictions that are both open and due.
+    func resolveDue() {
+        let now = Date()
+        var changed = false
+        for i in predictions.indices where predictions[i].isOpen {
+            let p = predictions[i]
+            guard p.resolveAfter <= now else { continue }
+            let hit = Self.happened(p)
+            predictions[i].hit = hit
+            predictions[i].resolvedAt = now
+            changed = true
+            ChappyLedger.shared.record(.outcome, subject: p.subject,
+                                       detail: hit ? "happened: \(p.claim)"
+                                                   : "didn't happen: \(p.claim)",
+                                       confidence: p.confidence)
+        }
+        if changed { save() }
+    }
+
+    /// Did it actually happen? Evidence only — the trail's own record of
+    /// where he went, which is on the phone and never uploaded.
+    ///
+    /// Deliberately conservative: an unresolvable prediction counts as a
+    /// MISS rather than being quietly dropped. A scoring system that
+    /// discards the cases it cannot judge will flatter itself forever.
+    private static func happened(_ p: Prediction) -> Bool {
+        switch p.sort {
+        case .place, .timing:
+            guard let plat = p.lat, let plon = p.lon else { return false }
+            // Read the trail from DISK, not through ChappyTrail — that
+            // class is @MainActor and this runs from a background pass.
+            // 250 metres is the same radius the pattern engine clusters
+            // at, so "he turned up" means the same thing in both places.
+            let window = ChappyPatterns.visitsBetween(
+                p.at.addingTimeInterval(-1800), p.resolveAfter)
+            return window.contains { Self.metres(plat, plon, $0.lat, $0.lon) < 250 }
+        case .need, .deadline:
+            // Resolved by him acting on it — the ledger already records
+            // acceptance against the same subject.
+            let r = ChappyLedger.shared.record(of: p.subject)
+            return r.accepted > 0
+        }
+    }
+
+    /// Haversine, in metres. Local copy rather than a dependency: this
+    /// runs while resolving and must never reach for anything that could
+    /// be unavailable.
+    private static func metres(_ aLat: Double, _ aLon: Double,
+                               _ bLat: Double, _ bLon: Double) -> Double {
+        let r = 6_371_000.0
+        let dLat = (bLat - aLat) * .pi / 180
+        let dLon = (bLon - aLon) * .pi / 180
+        let a = sin(dLat / 2) * sin(dLat / 2)
+            + cos(aLat * .pi / 180) * cos(bLat * .pi / 180) * sin(dLon / 2) * sin(dLon / 2)
+        return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+    }
+
+    // -------------------------------------------------------- scoring
+
+    struct Score {
+        let sort: Sort
+        let resolved: Int
+        let hits: Int
+        var rate: Double { resolved == 0 ? 0 : Double(hits) / Double(resolved) }
+        /// Enough evidence to act on at all.
+        var settled: Bool { resolved >= 6 }
+        /// Good enough to interrupt him.
+        var trusted: Bool { settled && rate >= 0.55 }
+        /// Bad enough to stop.
+        var disgraced: Bool { resolved >= 10 && rate < 0.40 }
+
+        var spoken: String {
+            guard resolved > 0 else { return "no track record yet" }
+            return "\(hits) right out of \(resolved)"
+        }
+    }
+
+    func score(_ sort: Sort) -> Score {
+        let mine = predictions.filter { $0.sort == sort && !$0.isOpen }
+        return Score(sort: sort, resolved: mine.count,
+                     hits: mine.filter { $0.hit == true }.count)
+    }
+
+    /// THE GATE. May this kind of prediction interrupt him?
+    ///
+    /// Three ways to fail, and all three are silence rather than a
+    /// downgraded guess: not enough evidence, not accurate enough, or
+    /// demonstrably bad. Nothing in this app un-learns except this.
+    func mayVolunteer(_ sort: Sort) -> Bool {
+        let s = score(sort)
+        if s.disgraced { return false }
+        return s.trusted
+    }
+
+    /// The honest report — what Chappy has guessed and how it went.
+    func spokenAccuracy() -> String {
+        let parts = Sort.allCases.map { sort -> String in
+            let s = score(sort)
+            if s.resolved == 0 { return "\(sort.spoken): nothing scored yet" }
+            let verdict = s.disgraced ? " — so I've stopped saying it"
+                        : (s.trusted ? "" : " — not enough to speak up on yet")
+            return "\(sort.spoken): \(s.spoken)\(verdict)"
+        }
+        return "Here's how my guesses have gone. " + parts.joined(separator: ". ") + "."
+    }
+}
+
 enum ChappyForesight {
 
     enum Mode: String, CaseIterable {
@@ -32188,14 +35087,54 @@ enum ChappyForesight {
 
     /// What is likely, and how sure — never stated as fact. Returns nil
     /// far more often than not, which is the point.
+    /// Unchanged for every existing caller: this is the ANSWER path,
+    /// used when he has asked. Interrupting him is `volunteer()` below
+    /// and has to be earned.
     static func anticipate() -> (line: String, confidence: Double)? {
+        anticipateInner(volunteering: false)
+    }
+
+    /// BUILD 224 — the same guess, now recorded and gated.
+    ///
+    /// `volunteering` is the difference between answering a question and
+    /// interrupting him. Answering is always allowed if the mode permits
+    /// it; interrupting has to be earned by a measured track record.
+    static func anticipateInner(volunteering: Bool) -> (line: String, confidence: Double)? {
         guard mode == .suggestive || mode == .proactive else { return nil }
+        if volunteering, mode != .proactive { return nil }
+
         let likely = ChappyPatterns.usualAboutNow()
         guard let top = likely.first, top.strength == .habit else { return nil }
         let c = top.confidence
         guard c >= 0.55 else { return nil }
+
         // §2 and §10: the reason travels with the prediction, and the
         // wording never claims he said it.
-        return ("You're often at \(top.name) about now — \(top.visits) times so far. Want it?", c)
+        let because = "\(top.visits) times so far"
+        let line = "You're often at \(top.name) about now — \(because). Want it?"
+
+        // Recorded whether or not it is said. A prediction Chappy keeps
+        // to itself still tells us whether it WOULD have been right,
+        // which is how a cold kind earns its way up to speaking.
+        let p = ChappyOutcomes.shared.predict(
+            .place, claim: "at \(top.name)", because: because,
+            confidence: c,
+            subject: top.key,
+            lat: top.lat, lon: top.lon,
+            resolvesInHours: 3)
+
+        // THE GATE. Interrupting him requires a track record; answering
+        // a direct question does not.
+        if volunteering, !ChappyOutcomes.shared.mayVolunteer(.place) { return nil }
+
+        ChappyOutcomes.shared.markSpoken(p.id)
+        return (line, c)
+    }
+
+    /// What Chappy would say unprompted, if it has earned the right.
+    /// Returns nil far more often than not, which is the point.
+    static func volunteer() -> (line: String, confidence: Double)? {
+        ChappyOutcomes.shared.resolveDue()
+        return anticipateInner(volunteering: true)
     }
 }
