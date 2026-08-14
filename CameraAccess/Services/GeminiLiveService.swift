@@ -10,6 +10,208 @@ import Foundation
 import UIKit
 import AVFoundation
 
+// ====================================================================
+// MARK: - BUILD 245: THE LIVE AI LOG
+// ====================================================================
+//
+// Live AI works with the app open and dies on screen lock. Same shape of
+// problem as the deaf ear — a failure that only happens when nobody can
+// see a console — and it gets the same treatment: write down what
+// actually happens, then read it back.
+//
+// ONE THING MAKES THIS DIFFERENT FROM THE STANDBY LOG, AND IT IS THE
+// WHOLE DESIGN.
+//
+// The standby log lives in RAM, because the ear fails while he is
+// holding the phone and can open Voice check five seconds later. This
+// one has to survive the app being KILLED. If iOS terminates Chappy
+// while the screen is locked — which is one of the candidate causes —
+// then an in-memory log dies with the process and the build is wasted.
+//
+// So every line goes to disk. Coalesced on a background queue during
+// normal running, and FLUSHED SYNCHRONOUSLY on the way into the
+// background, which is the exact moment the interesting lines are
+// written and the exact moment we might not come back.
+//
+// It also survives across launches on purpose. The launch marker is
+// what turns "the log stops" into evidence: if the last line before a
+// launch marker is "entering background" and nothing follows it, the
+// process was killed rather than any socket having closed.
+final class ChappyLiveLog {
+
+    static let shared = ChappyLiveLog()
+    private init() { load() }
+
+    /// Bigger than the standby log's 300 — this one spans lock, unlock and
+    /// possibly a relaunch, and the answer may be several minutes back.
+    private static let cap = 500
+    /// What the panel shows without scrolling.
+    static let windowSize = 60
+
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    private static let launchedAt = Date()
+    private static let clock: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
+
+    private static let file = "chappy_livelog.txt"
+    private var url: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            .first?.appendingPathComponent(Self.file)
+    }
+
+    private let io = DispatchQueue(label: "chappy.livelog.io", qos: .utility)
+    private var saveWork: DispatchWorkItem?
+
+    private func load() {
+        guard let url, let s = try? String(contentsOf: url, encoding: .utf8) else { return }
+        // Array(...) — suffix() returns an ArraySlice and there is no
+        // implicit conversion to [String].
+        lines = Array(s.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init).suffix(Self.cap))
+    }
+
+    /// WALL CLOCK, not seconds-since-launch.
+    ///
+    /// The standby log uses a relative stamp because it reads one arm
+    /// attempt end to end. This log has to be lined up against something
+    /// that happened in the real world — "I locked it at about twenty
+    /// past" — and possibly across a relaunch, where a relative stamp
+    /// resets to zero and quietly lies about the order of events.
+    static func note(_ s: String) {
+        print(s)
+        let stamped = "\(clock.string(from: Date()))  \(s)"
+        let log = shared
+        log.lock.lock()
+        log.lines.append(stamped)
+        if log.lines.count > cap { log.lines.removeFirst(log.lines.count - cap) }
+        log.lock.unlock()
+        log.scheduleSave()
+    }
+
+    /// Called from the home screen on appear. Draws the line between one
+    /// run and the next — the single most informative mark in the file,
+    /// because a launch marker directly after a "background" line with
+    /// nothing in between IS the answer.
+    ///
+    /// ONCE PER PROCESS, and the guard is the whole point.
+    ///
+    /// The call site is the home screen's `.onAppear`, and that is not a
+    /// once-per-launch event: the home screen is a TAB ROOT, so every
+    /// return from the Settings tab fires it, and so does dismissing the
+    /// Live AI cover. Without this guard the log would print
+    ///
+    ///     🌑 Mic stood down. If the next line is a launch marker, iOS killed us here.
+    ///     ──────── app launched ────────
+    ///
+    /// after an ordinary lock, unlock and close — which is exactly the test
+    /// he is being asked to run, and exactly the conclusion this file tells
+    /// him to draw. The most load-bearing line in the build would have been
+    /// a false positive on its own instructions.
+    private static var didMarkLaunch = false
+    static func markLaunch() {
+        guard !didMarkLaunch else { return }
+        didMarkLaunch = true
+        note("──────── app launched ────────")
+    }
+
+    /// `saveWork` is behind the lock like everything else here.
+    ///
+    /// note() is genuinely called from three threads in this build — the
+    /// main thread, the URLSession delegate queue (the socket close and
+    /// receive-failure lines both log from there), and the audio tap thread.
+    /// Two of them reassigning a strong reference at once is a double
+    /// release, and the moment it would happen is a socket dying while audio
+    /// is flowing: precisely the event being instrumented. A crash in the
+    /// logger would be a spectacular way to lose the evidence.
+    private func scheduleSave() {
+        lock.lock()
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.writeOut() }
+        saveWork = work
+        lock.unlock()
+        io.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    private func writeOut() {
+        lock.lock(); let snapshot = lines; lock.unlock()
+        guard let url else { return }
+        try? snapshot.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// SYNCHRONOUS. Called on the way into the background, where a
+    /// debounced write on a utility queue may simply never get to run —
+    /// iOS suspends the process, the queue stops, and the lines that
+    /// explain everything are still sitting in RAM when we are killed.
+    func flushNow() {
+        lock.lock(); saveWork?.cancel(); saveWork = nil; lock.unlock()
+        writeOut()
+    }
+
+    var recent: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(lines.suffix(Self.windowSize))
+    }
+
+    var everything: String {
+        lock.lock(); defer { lock.unlock() }
+        guard !lines.isEmpty else { return "(nothing recorded yet)" }
+        return lines.joined(separator: "\n")
+    }
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return lines.count
+    }
+
+    func clear() {
+        lock.lock(); lines.removeAll(); lock.unlock()
+        writeOut()
+        Self.note("🧹 [Live] Log cleared by hand")
+    }
+
+    // MARK: The state snapshot
+    //
+    // Printed at every lifecycle edge. The point of taking all of it at
+    // once is that the CAUSE is nearly always a disagreement between two
+    // of these — the socket says open while the engine says stopped, or
+    // the session claims to be active while the route has moved to the
+    // phone. Reading them one at a time, a build apart, is how a week
+    // goes by.
+    /// NOT @MainActor. AVAudioSession is safe to read from anywhere, and
+    /// this is called from notification observers that run ON the main
+    /// queue but are not statically main-actor-isolated — annotating it
+    /// would make every one of those call sites fail to compile.
+    static func audioState() -> String {
+        let s = AVAudioSession.sharedInstance()
+        let inp = s.currentRoute.inputs.first?.portName ?? "none"
+        let out = s.currentRoute.outputs.first?.portName ?? "none"
+        return "in:\(inp) out:\(out) cat:\(s.category.rawValue) mode:\(s.mode.rawValue) other:\(s.isOtherAudioPlaying)"
+    }
+
+    /// How long iOS says we may keep running. `.greatestFiniteMagnitude`
+    /// means "you have a background mode and no deadline" — anything else
+    /// is a countdown to suspension, and seeing a real number here is by
+    /// itself the answer to why a session dies.
+    /// UIApplication IS main-actor-isolated, so this reads it through
+    /// `assumeIsolated` rather than being annotated @MainActor. Every call
+    /// site is a main-queue notification observer or a @MainActor task —
+    /// provably on the main thread, but not statically isolated, which is
+    /// exactly the gap assumeIsolated exists to close. A synchronous read
+    /// matters here: the alternative is hopping onto a Task that iOS may
+    /// never get around to running before it suspends us, which would lose
+    /// the line at precisely the moment it is worth having.
+    static func backgroundBudget() -> String {
+        MainActor.assumeIsolated {
+            let t = UIApplication.shared.backgroundTimeRemaining
+            if t >= .greatestFiniteMagnitude { return "unlimited (background mode active)" }
+            return String(format: "%.0fs remaining", t)
+        }
+    }
+}
+
 // MARK: - Gemini Live Service
 
 class GeminiLiveService: NSObject {
@@ -170,6 +372,69 @@ class GeminiLiveService: NSObject {
     private var wantsRecording = false
     private var wasRecordingBeforeBackground = false
     private var lifecycleTokens: [NSObjectProtocol] = []
+
+    // MARK: - BUILD 245: session watch
+
+    /// One word for the socket, for the log lines. `URLSessionTask.State`
+    /// prints as an integer, which is one more thing to look up at the exact
+    /// moment you are trying to read quickly.
+    var socketStateWord: String {
+        guard let ws = webSocket else { return "none" }
+        switch ws.state {
+        case .running: return "running"
+        case .suspended: return "SUSPENDED"
+        case .canceling: return "cancelling"
+        case .completed: return "COMPLETED"
+        @unknown default: return "unknown"
+        }
+    }
+
+    /// THE SUSPENSION DETECTOR — the highest-value line in this build.
+    ///
+    /// Every other signal here is something we are told. This is the one
+    /// thing that can only be inferred: whether iOS quietly stopped running
+    /// the process at all.
+    ///
+    /// A repeating timer cannot fire while a process is suspended. So a
+    /// heartbeat that notices its own tick was late by more than a couple of
+    /// seconds is direct evidence of suspension, with the duration attached
+    /// — and it distinguishes the three candidate causes from each other,
+    /// which nothing in the app has ever been able to do:
+    ///
+    ///   gap, then everything works        -> iOS suspended us, we resumed
+    ///   gap, then socket COMPLETED        -> the suspension killed the socket
+    ///   no gap, socket closes anyway      -> the network dropped it; nothing
+    ///                                        to do with backgrounding at all
+    ///   gap, then a launch marker         -> we were terminated, not suspended
+    private var heartbeat: Timer?
+    private var lastBeatAt = Date()
+
+    private func startHeartbeat() {
+        heartbeat?.invalidate()
+        lastBeatAt = Date()
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = Date()
+            let gap = now.timeIntervalSince(self.lastBeatAt)
+            self.lastBeatAt = now
+            guard gap > 3.0 else { return }
+            ChappyLiveLog.note(String(format: "⏸️ [Live] PROCESS WAS SUSPENDED for %.0fs — no code ran in that window", gap))
+            Task { @MainActor in
+                ChappyLiveLog.note("⏸️ [Live]   on waking: socket:\(self.socketStateWord) recording:\(self.isRecording) configured:\(self.isSessionConfigured)")
+                ChappyLiveLog.note("⏸️ [Live]   audio: \(ChappyLiveLog.audioState())")
+            }
+        }
+        // .common, or the timer stops dead the moment he touches a scroll
+        // view — which would look exactly like a suspension and send the
+        // next build chasing a gap that never happened.
+        RunLoop.main.add(t, forMode: .common)
+        heartbeat = t
+    }
+
+    private func stopHeartbeat() {
+        heartbeat?.invalidate()
+        heartbeat = nil
+    }
     private var restartAttempt = 0
     private static let restartDelays: [TimeInterval] = [0.4, 1.0, 2.5]
     /// Deferrals while waiting for the mic format to settle. Bounded so a
@@ -193,12 +458,31 @@ class GeminiLiveService: NSObject {
     /// a stale instance would fight the live one for the input hardware — and
     /// two engines tapping the same input is a crash, not a glitch.
     deinit {
+        // BUILD 245: the heartbeat is retained by the run loop, not by this
+        // object — its closure holds self weakly — so without this it keeps
+        // ticking after the service is gone. Harmless in itself, but a
+        // second session would then have two, and the suspension detector
+        // would report every gap twice. A diagnostic that double-counts is
+        // worse than none, because it looks like corroboration.
+        // A Timer must be invalidated on the thread that scheduled it, and
+        // deinit runs wherever the last reference happens to be dropped. If
+        // that is not main, invalidate() is a silent no-op and the timer
+        // keeps ticking — so a second session would have two heartbeats and
+        // the suspension detector would report every gap twice. A diagnostic
+        // that double-counts is worse than none, because it reads as
+        // corroboration.
+        if let t = heartbeat {
+            heartbeat = nil
+            if Thread.isMainThread { t.invalidate() }
+            else { DispatchQueue.main.async { t.invalidate() } }
+        }
+        ChappyLiveLog.shared.flushNow()
         let nc = NotificationCenter.default
         for token in lifecycleTokens { nc.removeObserver(token) }
         if let token = engineWatchdogToken { nc.removeObserver(token) }
         audioEngine?.inputNode.removeTap(onBus: 0)
         if let engine = audioEngine, engine.isRunning { engine.stop() }
-        print("🧹 [Gemini] Service torn down cleanly")
+        ChappyLiveLog.note("🧹 [Gemini] Service torn down cleanly")
     }
 
     // MARK: - Audio Engine Setup
@@ -251,7 +535,7 @@ class GeminiLiveService: NSObject {
             switch type {
             case .began:
                 guard self.wantsRecording else { return }
-                print("🎤 [Gemini] Interrupted — letting the mic go, will reclaim it")
+                ChappyLiveLog.note("🎤 [Gemini] Interrupted — letting the mic go, will reclaim it")
                 self.teardownCapture()
             case .ended:
                 guard self.wantsRecording, !self.isRecording else { return }
@@ -269,23 +553,87 @@ class GeminiLiveService: NSObject {
         // us and the session handed elsewhere. Let go cleanly on the way out
         // and take it back on the way in, rather than pretending nothing
         // happened and leaving a dead tap behind.
+        // BUILD 245 — THE LOCK, INSTRUMENTED.
+        //
+        // "Live AI dies on screen lock" has to become a sequence of facts
+        // before it can become a fix. Everything below is recorded at the
+        // edge, and the log is flushed to disk SYNCHRONOUSLY, because the
+        // whole question is whether we survive what happens next.
+        //
+        // Note what is deliberately NOT here: a change of behaviour. The
+        // teardown below is the same teardown as build 244. There is an
+        // asymmetry with the wake word — Standby checks
+        // `backgroundAudioAllowed` and stays live in the background, this
+        // handler has never checked anything and always lets the mic go,
+        // and Info.plist does declare `audio` — but that is a HYPOTHESIS,
+        // and hypotheses are what the last seven builds were made of. The
+        // log will say whether it is the answer.
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.isUserSessionActive else { return }
+                ChappyLiveLog.note("🌒 [Live] WILL RESIGN ACTIVE — socket:\(self.socketStateWord) recording:\(self.isRecording) configured:\(self.isSessionConfigured)")
+                ChappyLiveLog.note("🌒 [Live]   audio: \(ChappyLiveLog.audioState())")
+                ChappyLiveLog.shared.flushNow()
+            })
+
         lifecycleTokens.append(nc.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil, queue: .main) { [weak self] _ in
-                guard let self, self.isRecording else { return }
-                print("🎤 [Gemini] Backgrounded — standing the mic down cleanly")
+                guard let self else { return }
+                if self.isUserSessionActive {
+                    ChappyLiveLog.note("🌑 [Live] DID ENTER BACKGROUND — socket:\(self.socketStateWord) recording:\(self.isRecording) wantsMic:\(self.wantsRecording)")
+                    ChappyLiveLog.note("🌑 [Live]   background budget: \(ChappyLiveLog.backgroundBudget())")
+                    ChappyLiveLog.note("🌑 [Live]   audio: \(ChappyLiveLog.audioState())")
+                    ChappyLiveLog.note("🌑 [Live]   playback engine running: \(self.playbackEngine?.isRunning == true)")
+                }
+                guard self.isRecording else {
+                    if self.isUserSessionActive {
+                        ChappyLiveLog.note("🌑 [Live] Mic was already down — nothing to stand down")
+                        ChappyLiveLog.shared.flushNow()
+                    }
+                    return
+                }
+                ChappyLiveLog.note("🎤 [Gemini] Backgrounded — standing the mic down cleanly (this handler does NOT check the audio background mode; Standby's equivalent does)")
                 self.wasRecordingBeforeBackground = true
                 self.teardownCapture()
+                ChappyLiveLog.note("🌑 [Live] Mic stood down. If the next line is a launch marker, iOS killed us here.")
+                // Synchronous, and last. Everything above must be on disk
+                // before iOS is free to suspend the process.
+                ChappyLiveLog.shared.flushNow()
             })
 
         lifecycleTokens.append(nc.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
             object: nil, queue: .main) { [weak self] _ in
-                guard let self, self.wasRecordingBeforeBackground else { return }
+                guard let self else { return }
+                if self.isUserSessionActive {
+                    ChappyLiveLog.note("🌅 [Live] WILL ENTER FOREGROUND — socket:\(self.socketStateWord) recording:\(self.isRecording) wasRecording:\(self.wasRecordingBeforeBackground)")
+                    ChappyLiveLog.note("🌅 [Live]   audio: \(ChappyLiveLog.audioState())")
+                }
+                guard self.wasRecordingBeforeBackground else { return }
                 self.wasRecordingBeforeBackground = false
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                     self?.reclaimMic(why: "returned to foreground")
                 }
+            })
+
+        // PROTECTED DATA. With a passcode set, iOS can pull the file system
+        // out from under a backgrounded app — and a service that cannot read
+        // its own key or write its own log looks exactly like a service whose
+        // socket died. Never checked before; free to check now.
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.isUserSessionActive else { return }
+                ChappyLiveLog.note("🔒 [Live] PROTECTED DATA GOING AWAY (device locking with a passcode)")
+                ChappyLiveLog.shared.flushNow()
+            })
+        lifecycleTokens.append(nc.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.isUserSessionActive else { return }
+                ChappyLiveLog.note("🔓 [Live] Protected data available again")
             })
 
         // Belt and braces: didBecomeActive fires on unlock even when
@@ -298,7 +646,7 @@ class GeminiLiveService: NSObject {
                 self.reclaimMic(why: "became active")
             })
 
-        print("🛟 [Gemini] Audio lifelines installed (interruption + route + lifecycle)")
+        ChappyLiveLog.note("🛟 [Gemini] Audio lifelines installed (interruption + route + lifecycle)")
     }
 
     /// BUILD 125: release capture without touching INTENT. Safe to call from
@@ -321,14 +669,14 @@ class GeminiLiveService: NSObject {
     /// disarmed the old watchdog permanently.
     private func reclaimMic(why: String) {
         guard wantsRecording, isSessionConfigured, !isRecording else { return }
-        print("🎤 [Gemini] Reclaiming the mic (\(why)), attempt \(restartAttempt + 1)")
+        ChappyLiveLog.note("🎤 [Gemini] Reclaiming the mic (\(why)), attempt \(restartAttempt + 1)")
         startRecording()
         guard !isRecording else { restartAttempt = 0; return }
 
         let attempt = restartAttempt
         guard attempt < Self.restartDelays.count else {
             restartAttempt = 0
-            print("❌ [Gemini] Could not reclaim the mic after \(Self.restartDelays.count) tries")
+            ChappyLiveLog.note("❌ [Gemini] Could not reclaim the mic after \(Self.restartDelays.count) tries")
             onError?("Chappy can't hear you — close and reopen the chat.")
             return
         }
@@ -339,7 +687,7 @@ class GeminiLiveService: NSObject {
     }
 
     private func revivePlaybackEngine() {
-        print("🔄 [Gemini] Playback engine dead (interruption/route change) — reviving")
+        ChappyLiveLog.note("🔄 [Gemini] Playback engine dead (interruption/route change) — reviving")
         playerNode?.stop()
         playbackEngine?.stop()
         isPlaybackEngineRunning = false
@@ -354,14 +702,14 @@ class GeminiLiveService: NSObject {
 
         guard let playbackEngine = playbackEngine,
               let playerNode = playerNode else {
-            print("❌ [Gemini] Failed to initialize the playback engine")
+            ChappyLiveLog.note("❌ [Gemini] Failed to initialize the playback engine")
             return
         }
 
         playbackEngine.attach(playerNode)
         playbackEngine.connect(playerNode, to: playbackEngine.mainMixerNode, format: playbackAudioFormat)
         playbackEngine.prepare()
-        print("✅ [Gemini] Playback engine initialized")
+        ChappyLiveLog.note("✅ [Gemini] Playback engine initialized")
     }
 
     private func configureAudioSession() {
@@ -374,7 +722,7 @@ class GeminiLiveService: NSObject {
             try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
             try audioSession.setActive(true, options: [.notifyOthersOnDeactivation])
         } catch {
-            print("⚠️ [Gemini] Audio session Configuration failed: \(error)")
+            ChappyLiveLog.note("⚠️ [Gemini] Audio session Configuration failed: \(error)")
         }
     }
 
@@ -385,9 +733,9 @@ class GeminiLiveService: NSObject {
             configureAudioSession()
             try playbackEngine.start()
             isPlaybackEngineRunning = true
-            print("▶️ [Gemini] Playback engine started")
+            ChappyLiveLog.note("▶️ [Gemini] Playback engine started")
         } catch {
-            print("❌ [Gemini] Playback engine failed to start: \(error)")
+            ChappyLiveLog.note("❌ [Gemini] Playback engine failed to start: \(error)")
         }
     }
 
@@ -398,7 +746,7 @@ class GeminiLiveService: NSObject {
         playerNode?.reset()
         playbackEngine.stop()
         isPlaybackEngineRunning = false
-        print("⏹️ [Gemini] Playback engine stopped and queue cleared")
+        ChappyLiveLog.note("⏹️ [Gemini] Playback engine stopped and queue cleared")
     }
 
     // MARK: - WebSocket Connection
@@ -416,10 +764,10 @@ class GeminiLiveService: NSObject {
         let urlString = baseURL
 
         let keyPreview = apiKey.count > 10 ? "\(apiKey.prefix(6))…\(apiKey.suffix(4))" : "TOO-SHORT(\(apiKey.count))"
-        print("🔌 [Gemini] Preparing WebSocket connection — model: \(model), key: \(keyPreview)")
+        ChappyLiveLog.note("🔌 [Gemini] Preparing WebSocket connection — model: \(model), key: \(keyPreview)")
 
         guard let url = URL(string: urlString) else {
-            print("❌ [Gemini] Invalid URL")
+            ChappyLiveLog.note("❌ [Gemini] Invalid URL")
             onError?("Invalid URL")
             return
         }
@@ -437,7 +785,12 @@ class GeminiLiveService: NSObject {
         webSocket = urlSession?.webSocketTask(with: request)
         webSocket?.resume()
 
-        print("🔌 [Gemini] WebSocket Task started")
+        ChappyLiveLog.note("🔌 [Gemini] WebSocket Task started")
+        startHeartbeat()
+        Task { @MainActor in
+            ChappyLiveLog.note("🔌 [Live] Session opening — audio: \(ChappyLiveLog.audioState())")
+            ChappyLiveLog.note("🔌 [Live]   background budget: \(ChappyLiveLog.backgroundBudget())")
+        }
         receiveMessage()
     }
 
@@ -449,7 +802,9 @@ class GeminiLiveService: NSObject {
             ChappyAudio.conversationActive = false
             ChappyAudio.releaseAfterSpeech()
         }
-        print("🔌 [Gemini] Disconnect the WebSocket")
+        ChappyLiveLog.note("🔌 [Gemini] Disconnect the WebSocket — DELIBERATE (the user or a cap ended it)")
+        stopHeartbeat()
+        ChappyLiveLog.shared.flushNow()
         if GeminiLiveService.activeInstance === self { GeminiLiveService.activeInstance = nil }
         // AUDIT FIX (LA-C2 / LA-H10): drop the brakes and the interlock flag
         // together — a stale "live" flag would lock Continuous Vision out for
@@ -622,7 +977,7 @@ class GeminiLiveService: NSObject {
         ]
 
         sendJSON(setupMessage)
-        print("⚙️ [Gemini] Send session configuration")
+        ChappyLiveLog.note("⚙️ [Gemini] Send session configuration")
     }
 
     // MARK: - Audio Recording
@@ -636,7 +991,7 @@ class GeminiLiveService: NSObject {
         guard !isRecording else { return }
 
         do {
-            print("🎤 [Gemini] Start recording")
+            ChappyLiveLog.note("🎤 [Gemini] Start recording")
 
             let audioSession = AVAudioSession.sharedInstance()
             switch audioSession.recordPermission {
@@ -674,7 +1029,7 @@ class GeminiLiveService: NSObject {
             configureAudioSession()
 
             guard let engine = audioEngine else {
-                print("❌ [Gemini] Audio engine not initialized")
+                ChappyLiveLog.note("❌ [Gemini] Audio engine not initialized")
                 return
             }
 
@@ -726,16 +1081,16 @@ class GeminiLiveService: NSObject {
             guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
                   !settling, !disagrees else {
                 if disagrees {
-                    print("⚠️ [Gemini] Node says \(inputFormat.sampleRate) Hz, session says \(hwRate) Hz — deferring rather than crashing")
+                    ChappyLiveLog.note("⚠️ [Gemini] Node says \(inputFormat.sampleRate) Hz, session says \(hwRate) Hz — deferring rather than crashing")
                 }
                 formatDeferrals += 1
                 guard formatDeferrals <= Self.maxFormatDeferrals else {
                     formatDeferrals = 0
-                    print("❌ [Gemini] Input format never settled — giving up rather than looping")
+                    ChappyLiveLog.note("❌ [Gemini] Input format never settled — giving up rather than looping")
                     onError?("Chappy can't get to the microphone. Close the chat and open it again.")
                     return
                 }
-                print("⚠️ [Gemini] Input \(settling ? "route settling" : "format not ready (\(inputFormat.sampleRate) Hz)") — deferring \(formatDeferrals)/\(Self.maxFormatDeferrals)")
+                ChappyLiveLog.note("⚠️ [Gemini] Input \(settling ? "route settling" : "format not ready (\(inputFormat.sampleRate) Hz)") — deferring \(formatDeferrals)/\(Self.maxFormatDeferrals)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self, self.wantsRecording, !self.isRecording else { return }
                     self.startRecording()
@@ -743,7 +1098,7 @@ class GeminiLiveService: NSObject {
                 return
             }
             formatDeferrals = 0
-            print("🎵 [Gemini] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
+            ChappyLiveLog.note("🎵 [Gemini] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
 
             if let recordTargetFormat {
                 recordConverter = AVAudioConverter(from: inputFormat, to: recordTargetFormat)
@@ -761,7 +1116,7 @@ class GeminiLiveService: NSObject {
             isRecording = true
             restartAttempt = 0
             installRecordEngineWatchdog()
-            print("✅ [Gemini] Recording started")
+            ChappyLiveLog.note("✅ [Gemini] Recording started")
 
         } catch {
             // BUILD 125: leave nothing behind. The tap installed a few lines
@@ -769,7 +1124,7 @@ class GeminiLiveService: NSObject {
             // thing that turns the NEXT attempt into a crash.
             audioEngine?.inputNode.removeTap(onBus: 0)
             isRecording = false
-            print("❌ [Gemini] Failed to start recording: \(error.localizedDescription)")
+            ChappyLiveLog.note("❌ [Gemini] Failed to start recording: \(error.localizedDescription)")
             // Not surfaced to the wearer: reclaimMic retries with backoff and
             // only speaks up once it has genuinely given up.
         }
@@ -793,7 +1148,7 @@ class GeminiLiveService: NSObject {
             // could never fire again for the life of the object. It disarmed
             // itself at exactly the moment it was needed most.
             guard let self, self.wantsRecording, self.isSessionConfigured else { return }
-            print("🔧 [Gemini] Audio engine reconfigured — rebuilding the mic tap")
+            ChappyLiveLog.note("🔧 [Gemini] Audio engine reconfigured — rebuilding the mic tap")
             self.teardownCapture()
             // Backoff rather than a single 0.3 s shot: a route change during a
             // lock or a call needs longer than that before iOS will hand the
@@ -815,7 +1170,7 @@ class GeminiLiveService: NSObject {
         restartAttempt = 0
         guard isRecording else { return }
 
-        print("🛑 [Gemini] Stop recording")
+        ChappyLiveLog.note("🛑 [Gemini] Stop recording")
         teardownCapture()
         hasAudioBeenSent = false
     }
@@ -843,7 +1198,7 @@ class GeminiLiveService: NSObject {
                     if now.timeIntervalSince(lastLoudAt) > 0.8 && !speechFrameFired {
                         speechFrameFired = true
                         endFrameFired = false
-                        print("🎤⚡ [Gemini] Local speech detected — instant frame")
+                        ChappyLiveLog.note("🎤⚡ [Gemini] Local speech detected — instant frame")
                         DispatchQueue.main.async { self.onSpeechStarted?() }
                     }
                     lastLoudAt = now
@@ -856,7 +1211,7 @@ class GeminiLiveService: NSObject {
                     let quiet = now.timeIntervalSince(lastLoudAt)
                     if quiet > 0.35 && quiet < 1.5 {
                         endFrameFired = true
-                        print("🎤🏁 [Gemini] Speech ended — live-shot frame")
+                        ChappyLiveLog.note("🎤🏁 [Gemini] Speech ended — live-shot frame")
                         DispatchQueue.main.async { self.onSpeechStarted?() }
                     }
                 }
@@ -905,7 +1260,7 @@ class GeminiLiveService: NSObject {
 
         if !hasAudioBeenSent {
             hasAudioBeenSent = true
-            print("✅ [Gemini] First audio sent")
+            ChappyLiveLog.note("✅ [Gemini] First audio sent")
             DispatchQueue.main.async { [weak self] in
                 self?.onFirstAudioSent?()
             }
@@ -933,7 +1288,7 @@ class GeminiLiveService: NSObject {
 
     @MainActor
     private func runTool(name: String, args: [String: Any]) async -> String {
-        print("🔧 [Gemini] Tool: \(name) args: \(args)")
+        ChappyLiveLog.note("🔧 [Gemini] Tool: \(name) args: \(args)")
         switch name {
         case "navigate_to":
             // AUDIT FIX (NAV-MODE): the model narrates the mode in its own
@@ -952,7 +1307,7 @@ class GeminiLiveService: NSObject {
                 ? saidDrive
                 : (mode.contains("driv") || mode.contains("car") || mode.contains("taxi"))
             let dest = args["destination"] as? String ?? ""
-            print("🧭 [Gemini] navigate_to '\(dest)' mode='\(mode)' spokenSaidDrive=\(saidDrive) → driving=\(driving)")
+            ChappyLiveLog.note("🧭 [Gemini] navigate_to '\(dest)' mode='\(mode)' spokenSaidDrive=\(saidDrive) → driving=\(driving)")
             let summary = await NavEngine.shared.navigate(to: dest, driving: driving)
             // Ground the narration: tell the model, in the tool result, which
             // mode it actually got, so it can't invent the other one.
@@ -1239,7 +1594,7 @@ class GeminiLiveService: NSObject {
                 }
                 if dest2.count > 1 {
                     journalCommandFired = true
-                    print("🧭 [Gemini] Nav bridge fallback → '\(dest2)' driving=\(wantsDrive)")
+                    ChappyLiveLog.note("🧭 [Gemini] Nav bridge fallback → '\(dest2)' driving=\(wantsDrive)")
                     Task { @MainActor in
                         let reply = await NavEngine.shared.navigate(to: dest2, driving: wantsDrive)
                         self.sendAppReply("Navigation: \(reply) Tell the user this briefly.")
@@ -1283,7 +1638,7 @@ class GeminiLiveService: NSObject {
         if dest.lowercased().hasPrefix("the ") { dest = String(dest.dropFirst(4)) }
         guard dest.count > 1 else { return }
         journalCommandFired = true
-        print("🧭 [Gemini] Nav bridge v2 → '\(dest)'")
+        ChappyLiveLog.note("🧭 [Gemini] Nav bridge v2 → '\(dest)'")
         if dest.lowercased() == "home" {
             Task { @MainActor in
                 let reply = await NavEngine.shared.getHome()
@@ -1362,14 +1717,14 @@ class GeminiLiveService: NSObject {
     private func sendJSON(_ json: [String: Any]) {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: json),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            print("❌ [Gemini] Failed to serialize JSON")
+            ChappyLiveLog.note("❌ [Gemini] Failed to serialize JSON")
             return
         }
 
         let message = URLSessionWebSocketTask.Message.string(jsonString)
         webSocket?.send(message) { [weak self] error in
             if let error = error {
-                print("❌ [Gemini] Send failed: \(error.localizedDescription)")
+                ChappyLiveLog.note("❌ [Gemini] Send failed: \(error.localizedDescription)")
                 self?.onError?("Send error: \(error.localizedDescription)")
             }
         }
@@ -1471,7 +1826,7 @@ class GeminiLiveService: NSObject {
         // bandwidth.
         let prepared = resizedForLive(image, maxDimension: 512)
         guard var imageData = prepared.jpegData(compressionQuality: 0.8) else {
-            print("❌ [Gemini] Failed to compress image")
+            ChappyLiveLog.note("❌ [Gemini] Failed to compress image")
             return
         }
         // Safety net: if still heavy, recompress rather than drop. This
@@ -1481,7 +1836,7 @@ class GeminiLiveService: NSObject {
             imageData = smaller
         }
         guard imageData.count <= 500 * 1024 else {
-            print("⚠️ [Gemini] Frame too large even after recompress - skipping")
+            ChappyLiveLog.note("⚠️ [Gemini] Frame too large even after recompress - skipping")
             return
         }
 
@@ -1489,7 +1844,7 @@ class GeminiLiveService: NSObject {
 
         imageSendCount += 1
         if imageSendCount == 1 || imageSendCount % 10 == 0 {
-            print("📸 [Gemini] Sent frame #\(imageSendCount): \(imageData.count) bytes")
+            ChappyLiveLog.note("📸 [Gemini] Sent frame #\(imageSendCount): \(imageData.count) bytes")
         }
 
         let message: [String: Any] = [
@@ -1500,7 +1855,7 @@ class GeminiLiveService: NSObject {
 
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            print("❌ [Gemini] Failed to serialize frame")
+            ChappyLiveLog.note("❌ [Gemini] Failed to serialize frame")
             return
         }
 
@@ -1508,7 +1863,7 @@ class GeminiLiveService: NSObject {
         webSocket?.send(.string(jsonString)) { [weak self] error in
             self?.isFrameSendInFlight = false
             if let error = error {
-                print("❌ [Gemini] Frame send failed: \(error.localizedDescription)")
+                ChappyLiveLog.note("❌ [Gemini] Frame send failed: \(error.localizedDescription)")
             }
         }
     }
@@ -1521,7 +1876,7 @@ class GeminiLiveService: NSObject {
 
         let prepared = resizedForLive(image, maxDimension: 1600)
         guard var imageData = prepared.jpegData(compressionQuality: 0.9) else {
-            print("❌ [Gemini] Failed to compress high-res frame")
+            ChappyLiveLog.note("❌ [Gemini] Failed to compress high-res frame")
             return
         }
         if imageData.count > 800 * 1024,
@@ -1529,11 +1884,11 @@ class GeminiLiveService: NSObject {
             imageData = smaller
         }
         guard imageData.count <= 1200 * 1024 else {
-            print("⚠️ [Gemini] High-res frame too large - skipping")
+            ChappyLiveLog.note("⚠️ [Gemini] High-res frame too large - skipping")
             return
         }
 
-        print("📖 [Gemini] Sending HIGH-RES frame: \(imageData.count) bytes")
+        ChappyLiveLog.note("📖 [Gemini] Sending HIGH-RES frame: \(imageData.count) bytes")
 
         let message: [String: Any] = [
             "realtime_input": [
@@ -1554,7 +1909,16 @@ class GeminiLiveService: NSObject {
 
             case .failure(let error):
                 let nsError = error as NSError
-                print("❌ [Gemini] Failed to receive message: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
+                ChappyLiveLog.note("❌ [Gemini] Failed to receive message: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]")
+                // 53 is "software caused connection abort" — what iOS does to
+                // your sockets when it suspends you. 57 is "socket is not
+                // connected", -999 is our own cancel. Naming them here saves
+                // looking three of them up while reading a screenshot.
+                Task { @MainActor in
+                    let st = UIApplication.shared.applicationState
+                    ChappyLiveLog.note("❌ [Live]   receive failed while the app was \(st == .active ? "ACTIVE" : (st == .background ? "BACKGROUND" : "INACTIVE"))")
+                    ChappyLiveLog.shared.flushNow()
+                }
                 // AUDIT FIX (LA-H2): 57/-999 are our own teardown; anything
                 // else is a live socket dying mid-conversation — recover, don't
                 // just report and go quiet forever.
@@ -1589,7 +1953,7 @@ class GeminiLiveService: NSObject {
 
             // Handle setup complete
             if json["setupComplete"] != nil {
-                print("✅ [Gemini] Session configured")
+                ChappyLiveLog.note("✅ [Gemini] Session configured")
                 self.isSessionConfigured = true
                 self.onConnected?()
                 Task { @MainActor in ChappyHaptics.shared.connected() }
@@ -1605,7 +1969,7 @@ class GeminiLiveService: NSObject {
                             "turn_complete": true
                         ]
                     ])
-                    print("🎯 [Gemini] Carried over standby question: \(pending)")
+                    ChappyLiveLog.note("🎯 [Gemini] Carried over standby question: \(pending)")
                 }
                 // COST METER: bank elapsed minutes across renewals
                 if let started = self.liveSessionStartAt {
@@ -1663,7 +2027,7 @@ class GeminiLiveService: NSObject {
             // goAway: session clock expiring — reconnect gracefully NOW,
             // resuming the same session via the stored handle.
             if json["goAway"] != nil {
-                print("⏳ [Gemini] goAway received — renewing session")
+                ChappyLiveLog.note("⏳ [Gemini] goAway received — renewing session")
                 self.renewSession()
                 return
             }
@@ -1683,7 +2047,7 @@ class GeminiLiveService: NSObject {
             // Handle errors
             if let error = json["error"] as? [String: Any] {
                 let message = error["message"] as? String ?? "Unknown error"
-                print("❌ [Gemini] Server error: \(message)")
+                ChappyLiveLog.note("❌ [Gemini] Server error: \(message)")
                 self.onError?(message)
                 return
             }
@@ -1698,7 +2062,7 @@ class GeminiLiveService: NSObject {
             for part in parts {
                 // Handle text response
                 if let text = part["text"] as? String {
-                    print("💬 [Gemini] AIReply: \(text)")
+                    ChappyLiveLog.note("💬 [Gemini] AIReply: \(text)")
                     onTranscriptDelta?(text)
                 }
 
@@ -1717,7 +2081,7 @@ class GeminiLiveService: NSObject {
 
         // Check if turn is complete
         if let turnComplete = content["turnComplete"] as? Bool, turnComplete {
-            print("✅ [Gemini] AIReply complete")
+            ChappyLiveLog.note("✅ [Gemini] AIReply complete")
             lastInteractionAt = Date() // ECO DRIP: conversation = full rate
             finishAudioPlayback()
             onTranscriptDone?("")
@@ -1728,13 +2092,13 @@ class GeminiLiveService: NSObject {
             if !currentModelLine.isEmpty {
                 if audioChunksThisTurn == 0 {
                     consecutiveSilentTurns += 1
-                    print("🔇 [Gemini] Turn had TEXT but no AUDIO (\(consecutiveSilentTurns) in a row) — reviving")
+                    ChappyLiveLog.note("🔇 [Gemini] Turn had TEXT but no AUDIO (\(consecutiveSilentTurns) in a row) — reviving")
                     Task { @MainActor in ChappyHaptics.shared.voiceRevived() }
                     stopPlaybackEngine()
                     setupPlaybackEngine()
                     if consecutiveSilentTurns >= 2 {
                         consecutiveSilentTurns = 0
-                        print("🔇 [Gemini] Voice watchdog: renewing session to restore audio")
+                        ChappyLiveLog.note("🔇 [Gemini] Voice watchdog: renewing session to restore audio")
                         renewSession()
                     }
                 } else {
@@ -1760,7 +2124,7 @@ class GeminiLiveService: NSObject {
 
         // Check for interrupted flag
         if let interrupted = content["interrupted"] as? Bool, interrupted {
-            print("⚠️ [Gemini] Reply interrupted")
+            ChappyLiveLog.note("⚠️ [Gemini] Reply interrupted")
             stopPlaybackEngine()
             setupPlaybackEngine()
         }
@@ -1768,7 +2132,7 @@ class GeminiLiveService: NSObject {
         // Handle input transcription (user speech)
         if let inputTranscription = content["inputTranscription"] as? [String: Any],
            let text = inputTranscription["text"] as? String {
-            print("👤 [Gemini] User said: \(text)")
+            ChappyLiveLog.note("👤 [Gemini] User said: \(text)")
             currentUserLine += text
             // INSTANT EYES: the moment the user starts talking, fire a fresh
             // frame immediately (no waiting for the next 0.5s tick) so the
@@ -1784,7 +2148,7 @@ class GeminiLiveService: NSObject {
             let lower = text.lowercased()
             if lower.contains("read th") || lower.contains("read it")
                 || lower.contains("read me")                 || lower.contains("what do these") {
-                print("📖 [Gemini] Read request detected — requesting high-res frame")
+                ChappyLiveLog.note("📖 [Gemini] Read request detected — requesting high-res frame")
                 onReadRequest?()
             }
 
@@ -1910,7 +2274,7 @@ class GeminiLiveService: NSObject {
         // Handle output transcription (AI speech text)
         if let outputTranscription = content["outputTranscription"] as? [String: Any],
            let text = outputTranscription["text"] as? String {
-            print("💬 [Gemini] AIText: \(text)")
+            ChappyLiveLog.note("💬 [Gemini] AIText: \(text)")
             currentModelLine += text
             onTranscriptDelta?(text)
         }
@@ -1930,7 +2294,7 @@ class GeminiLiveService: NSObject {
                 setupPlaybackEngine()
                 startPlaybackEngine()
                 playerNode?.play()
-                print("🔄 [Gemini] Re-initialize the playback engine")
+                ChappyLiveLog.note("🔄 [Gemini] Re-initialize the playback engine")
             }
         }
 
@@ -2032,7 +2396,7 @@ extension GeminiLiveService {
 
 extension GeminiLiveService: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        print("✅ [Gemini] WebSocket Connection established")
+        ChappyLiveLog.note("✅ [Gemini] WebSocket Connection established")
         DispatchQueue.main.async {
             self.configureSession()
         }
@@ -2040,12 +2404,24 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason given"
-        print("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        ChappyLiveLog.note("🔌 [Gemini] WebSocket Disconnected, closeCode: \(closeCode.rawValue), reason: \(reasonString)")
+        // BUILD 245: WHERE the app was when the socket died is the whole
+        // question. A close while backgrounded and a close while on screen
+        // are different faults with different fixes, and this line has never
+        // existed, so every close for months has been indistinguishable.
+        Task { @MainActor in
+            let st = UIApplication.shared.applicationState
+            let word = st == .active ? "ACTIVE (on screen)"
+                     : (st == .background ? "BACKGROUND (locked or switched away)" : "INACTIVE (locking, or a banner is up)")
+            ChappyLiveLog.note("🔌 [Live]   socket closed while the app was \(word)")
+            ChappyLiveLog.note("🔌 [Live]   audio: \(ChappyLiveLog.audioState())")
+            ChappyLiveLog.shared.flushNow()
+        }
         // Session-duration abort (1008 after a missed goAway): reconnect
         // silently instead of showing an error — the renewed session resumes
         // where it left off via the resumption handle.
         if closeCode.rawValue == 1008 && reasonString.lowercased().contains("goaway") {
-            print("⏳ [Gemini] Session-duration abort — auto-renewing")
+            ChappyLiveLog.note("⏳ [Gemini] Session-duration abort — auto-renewing")
             DispatchQueue.main.async { self.renewSession() }
             return
         }
@@ -2070,7 +2446,7 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
         }
         recoveryAttempts += 1
         let delay = Double(recoveryAttempts) * 1.5
-        print("🔁 [Gemini] Recovery \(recoveryAttempts)/3 in \(delay)s — \(why)")
+        ChappyLiveLog.note("🔁 [Gemini] Recovery \(recoveryAttempts)/3 in \(delay)s — \(why)")
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isUserSessionActive, !self.isSessionConfigured else { return }
             self.renewSession()
@@ -2092,7 +2468,7 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
             self.isRenewingSession = false
-            print("🔁 [Gemini] Reconnecting (resume handle: \(self.resumptionHandle != nil ? "yes" : "none"))")
+            ChappyLiveLog.note("🔁 [Gemini] Reconnecting (resume handle: \(self.resumptionHandle != nil ? "yes" : "none"))")
             self.connect()
         }
     }
@@ -2113,7 +2489,7 @@ extension GeminiLiveService: URLSessionWebSocketDelegate {
         }
         guard !details.isEmpty else { return }
         let message = "Connection failed: " + details.joined(separator: " — ")
-        print("❌ [Gemini] \(message)")
+        ChappyLiveLog.note("❌ [Gemini] \(message)")
         reportSocketError(message)
     }
 }

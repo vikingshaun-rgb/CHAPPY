@@ -9,6 +9,7 @@ import AVFoundation
 import NaturalLanguage
 import CryptoKit
 import Security   // BUILD 175: errSecInteractionNotAllowed
+import UIKit      // BUILD 244: UIImpactFeedbackGenerator for the speech taps
 
 /// BUILD 125 — ONE VOICE.
 ///
@@ -423,12 +424,69 @@ class TTSService: NSObject, ObservableObject {
     // would be a second way to deadlock.
     private func setSpeaking(_ value: Bool, since: Date?) {
         if Thread.isMainThread {
+            let changed = isSpeaking != value
             isSpeaking = value
             speakingSince = since
+            if changed { Self.speechHaptic(value) }
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.isSpeaking = value
-                self?.speakingSince = since
+                guard let self else { return }
+                let changed = self.isSpeaking != value
+                self.isSpeaking = value
+                self.speakingSince = since
+                if changed { Self.speechHaptic(value) }
+            }
+        }
+    }
+
+    /// BUILD 244 — THE TAP THAT SAYS HE'S TALKING.
+    ///
+    /// With the glasses on and the phone pocketed there is no way to tell
+    /// "Chappy is answering" from "Chappy heard nothing" until the first
+    /// word arrives — and the first word can be twenty seconds behind the
+    /// question when the network voice is cold. A soft tap at the start and
+    /// a softer one at the end closes that gap without a screen.
+    ///
+    /// UIImpactFeedbackGenerator, deliberately, not CoreHaptics: this fires
+    /// from arbitrary call sites at arbitrary times, and CHHapticEngine has
+    /// to be started, kept alive, and restarted after every audio-session
+    /// interruption — which in this app is constantly. An engine that must
+    /// survive the audio session is the wrong dependency for the one signal
+    /// whose job is to work when the audio path is misbehaving.
+    ///
+    /// Both generators are kept alive rather than made per call: a freshly
+    /// allocated generator has to warm the Taptic Engine before its first
+    /// impact, so a throwaway one is reliably late for exactly the event it
+    /// is timing.
+    ///
+    /// UIFeedbackGenerator and everything on it is @MainActor in the SDK,
+    /// and TTSService is a plain class whose setSpeaking is deliberately NOT
+    /// MainActor-isolated (see the deadlock note above). So the generators
+    /// are built and fired inside `Task { @MainActor in }` — which is
+    /// exactly the shape ChappyHaptics already uses in LiveAIManager, and
+    /// the only shape in this project proven to compile. Reaching for
+    /// nonisolated(unsafe) here would be silencing a thread-safety warning
+    /// on a file whose worst outage came from doing precisely that.
+    @MainActor private static var startHaptic: UIImpactFeedbackGenerator?
+    @MainActor private static var endHaptic: UIImpactFeedbackGenerator?
+
+    private static func speechHaptic(_ starting: Bool) {
+        guard UserDefaults.standard.object(forKey: "chappy_speech_haptics") == nil
+                || UserDefaults.standard.bool(forKey: "chappy_speech_haptics") else { return }
+        Task { @MainActor in
+            // Kept alive rather than made per call: a freshly allocated
+            // generator has to warm the Taptic Engine before its first
+            // impact, so a throwaway one is reliably late for exactly the
+            // event it is timing.
+            if startHaptic == nil { startHaptic = UIImpactFeedbackGenerator(style: .soft) }
+            if endHaptic == nil { endHaptic = UIImpactFeedbackGenerator(style: .rigid) }
+            if starting {
+                startHaptic?.prepare()
+                startHaptic?.impactOccurred(intensity: 0.55)
+                // Warm the other one now, so the end tap is on time.
+                endHaptic?.prepare()
+            } else {
+                endHaptic?.impactOccurred(intensity: 0.35)
             }
         }
     }
