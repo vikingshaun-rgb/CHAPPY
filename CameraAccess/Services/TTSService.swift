@@ -591,7 +591,19 @@ class TTSService: NSObject, ObservableObject {
                 print("⚠️ [TTS] Playback engine refused (attempt \(attempt + 1)): \(error.localizedDescription)")
                 // Give the session a moment to settle, then rebuild the graph
                 // outright rather than restarting an engine iOS has invalidated.
-                Thread.sleep(forTimeInterval: 0.12)
+                //
+                // BUILD 219: this was Thread.sleep, which blocks whatever
+                // thread it is called on — routinely the main one, in the
+                // middle of answering him. usleep on a retry path is no
+                // better in principle but this one is bounded and rare;
+                // the real fix is that the retry now happens far less
+                // often, because the engine is no longer torn down after
+                // every single line.
+                if Thread.isMainThread {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+                } else {
+                    Thread.sleep(forTimeInterval: 0.12)
+                }
                 configureAudioSession()
                 playbackEngine = nil
                 playerNode = nil
@@ -622,6 +634,24 @@ class TTSService: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    /// BUILD 219 — tear the engine down only once he has actually
+    /// stopped being spoken to.
+    ///
+    /// Four seconds is longer than the gap between sentences in an
+    /// answer and shorter than any pause in a conversation, so a run of
+    /// lines keeps one engine and a finished answer still releases it.
+    private var engineIdleWork: DispatchWorkItem?
+
+    private func scheduleEngineIdle() {
+        engineIdleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isSpeaking else { return }
+            self.stopPlaybackEngine()
+        }
+        engineIdleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
     }
 
     private func stopPlaybackEngine() {
@@ -847,6 +877,39 @@ class TTSService: NSObject, ObservableObject {
     //
     //   Short lines (one sentence, under ~140 characters) go straight
     //   down the normal path — chunking them would only add overhead.
+
+    /// BUILD 219 — the entry point every spoken reply should use.
+    ///
+    /// Picks between the two existing paths on the one criterion that
+    /// matters: is this exact line already on disk?
+    ///
+    ///   * Cached — play it whole. This is the fast path and chunking it
+    ///     would wreck it, because the pieces are not cached.
+    ///   * Not cached, and long enough to have a second sentence — chunk
+    ///     it. The first sentence starts while the rest are still being
+    ///     rendered, which is the difference between a 1.5 second wait
+    ///     and a 0.4 second one.
+    ///   * Short — one render. Splitting "Saved." helps nobody.
+    ///
+    /// The 80-character floor exists so a two-clause acknowledgement is
+    /// not split into two network calls to save nothing.
+    func speakSmart(_ text: String, languageCode: String? = nil) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let wantsSystemVoice =
+            (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
+
+        if !wantsSystemVoice, VoiceCache.shared.has(text: trimmed, voice: voiceName) {
+            speak(trimmed, languageCode: languageCode)
+            return
+        }
+        if trimmed.count >= 80, Self.sentenceChunks(trimmed).count > 1 {
+            speakLong(trimmed, languageCode: languageCode)
+            return
+        }
+        speak(trimmed, languageCode: languageCode)
+    }
 
     func speakLong(_ text: String, languageCode: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1290,7 +1353,19 @@ class TTSService: NSObject, ObservableObject {
             print("🔊 [TTS] Stale utterance finished — leaving the current one alone")
             return
         }
-        stopPlaybackEngine()
+        // BUILD 219 — IDLE, DON'T DEMOLISH.
+        //
+        // The engine was stopped after every single line and rebuilt for
+        // the next one, which costs 20-120ms of silence at the front of
+        // every reply and occasionally trips the retry path above. A
+        // conversation is a run of lines, not a series of unrelated
+        // events; the graph should still be standing when the next one
+        // arrives.
+        //
+        // It is still torn down when the voice genuinely stops — see the
+        // idle sweep below — so nothing is left holding the route open
+        // indefinitely.
+        scheduleEngineIdle()
     }
 
     private func createPCMBuffer(from data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {

@@ -781,7 +781,12 @@ class LiveTranslateService: NSObject {
                 print("🎙️ [Translate] Bluetooth mic, mode: \(mode == .default ? "media (loud)" : "voice")")
             }
             try audioSession.setActive(true)
-            applyOutputRoute()
+            // BUILD 219: applyOutputRoute() used to sit here, one
+            // statement before the input format is read. Overriding the
+            // output port perturbs the route, and the format was then
+            // sampled while it was still moving. It now runs after the
+            // engine is started, where it can no longer poison the
+            // number the tap depends on.
 
             if let inputRoute = audioSession.currentRoute.inputs.first {
                 print("🎙️ [Translate] Current input device: \(inputRoute.portName) (\(inputRoute.portType.rawValue))")
@@ -801,8 +806,34 @@ class LiveTranslateService: NSObject {
             // format.sampleRate == hwFormat.sampleRate" — an ObjC exception
             // that goes straight through Swift's error handling and kills the
             // app. Refuse, and let the caller try again.
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                print("⚠️ [Translate] Input format not ready (\(inputFormat.sampleRate) Hz) — deferring")
+            // BUILD 219 — THE OTHER HALF OF THE CRASH.
+            //
+            // The 0 Hz case above was caught in build 64. The case that
+            // has been killing the app is different and worse, because
+            // both numbers look valid: the input node still reports the
+            // OLD rate (48000) while the session has already moved to
+            // the Bluetooth rate (16000, sometimes 8000). installTap
+            // compares them and aborts the process.
+            //
+            // GeminiLiveService has had this exact guard since build 208
+            // and it was never brought back here, even though the 0 Hz
+            // guard above was borrowed in the other direction.
+            let hwRate = audioSession.sampleRate
+            let disagrees = hwRate > 0 && abs(hwRate - inputFormat.sampleRate) > 1
+
+            // And the same settling window every other audio path here
+            // respects. Claiming the Ray-Ban link is the slowest route
+            // change there is; reading a format while it is still moving
+            // is how you get two valid numbers that disagree.
+            let settling = Date().timeIntervalSince(ChappyStandby.lastAudioUpheavalAt) < 0.7
+
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
+                  !disagrees, !settling else {
+                let why = disagrees
+                    ? "node says \(inputFormat.sampleRate) Hz, session says \(hwRate) Hz"
+                    : (settling ? "route still settling"
+                                : "format not ready (\(inputFormat.sampleRate) Hz)")
+                print("⚠️ [Translate] Not installing the tap — \(why). Deferring.")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self, self.isUserSessionActive, !self.isRecording else { return }
                     self.startRecording(usePhoneMic: usePhoneMic)
@@ -819,6 +850,9 @@ class LiveTranslateService: NSObject {
 
             engine.prepare()
             try engine.start()
+
+            // BUILD 219: moved down from before the format read.
+            applyOutputRoute()
 
             isRecording = true
             // Keep the audio thread's copy of "is Chappy talking" fresh without
