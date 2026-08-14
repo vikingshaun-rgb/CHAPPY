@@ -1261,9 +1261,13 @@ final class ChappyStandbyLog {
     /// 300 is about ten minutes of a badly misbehaving ear, and roughly
     /// four arm attempts with all their retries. Enough to hold the whole
     /// story of a failure that started before he thought to look.
-    private static let cap = 300
-    /// What the panel shows without scrolling. He asked for ~30.
-    static let windowSize = 40
+    /// BUILD 247: 300 -> 500. The log now carries every transcript and every
+    /// debounce decision, so a minute of talking is a lot more lines than a
+    /// minute of arming was — and a buffer that overflows has thrown away the
+    /// beginning of the conversation, which is where the answer usually is.
+    private static let cap = 500
+    /// What the panel shows without scrolling.
+    static let windowSize = 60
 
     private let lock = NSLock()
     private var lines: [String] = []
@@ -1330,8 +1334,55 @@ final class ChappyStandby: NSObject, ObservableObject {
     @Published private(set) var armFailureReason = ""
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-    private var request: SFSpeechAudioBufferRecognitionRequest?
+    /// The main-actor view of the current request. Everything on the main
+    /// thread reads and writes this one; the didSet keeps the audio thread's
+    /// copy in step.
+    private var request: SFSpeechAudioBufferRecognitionRequest? {
+        didSet { publishLiveRequest(request) }
+    }
     private var task: SFSpeechRecognitionTask?
+
+    // MARK: BUILD 247 — the audio thread's view of the request
+    //
+    // The tap closure runs on a REAL-TIME AUDIO THREAD, and it now has to
+    // reach the CURRENT request rather than one captured when the tap was
+    // installed — that capture is what forced a tap rebuild after every
+    // command, and the log measured it at 1.1 seconds of deafness each time.
+    //
+    // But reading `request` straight from that thread would be an
+    // unsynchronised load of a strong class reference while the main thread
+    // stores over it. The audio thread can retain an object whose refcount
+    // has already reached zero: a crash on the render thread, random, and
+    // impossible to reproduce on demand. Trading a deaf ear for that is a
+    // bad trade.
+    //
+    // So the audio thread gets its own reference behind a lock. The lock is
+    // held for a pointer copy and nothing else — no allocation, no I/O, no
+    // waiting on the main thread — which is what makes it acceptable to take
+    // on a real-time thread at all.
+    private let reqLock = NSLock()
+    nonisolated(unsafe) private var liveRequest: SFSpeechAudioBufferRecognitionRequest?
+
+    nonisolated private func publishLiveRequest(_ r: SFSpeechAudioBufferRecognitionRequest?) {
+        reqLock.lock(); liveRequest = r; reqLock.unlock()
+    }
+
+    /// Called from the tap. Copies the reference out under the lock, then
+    /// appends outside it.
+    nonisolated private func appendLive(_ buffer: AVAudioPCMBuffer) {
+        reqLock.lock(); let r = liveRequest; reqLock.unlock()
+        r?.append(buffer)
+    }
+
+    /// BUILD 247: a value token instead of the captured-box identity check.
+    /// `var thisTask` captured and mutated inside its own completion handler
+    /// is a retain cycle — box holds task, task holds handler, handler holds
+    /// box — and 247 raises the swap rate from once per 50s renewal to once
+    /// per command. An Int compared by value leaks nothing.
+    private var taskGen = 0
+    /// BUILD 247: fast-restart backoff state for swapRequest().
+    private var lastSwapAt = Date.distantPast
+    private var swapsWithoutResult = 0
     /// AUDIT P0 (SB-RESET): this was a `let`, so it could never be replaced.
     /// Apple's contract for a media-services reset is that every AVAudioEngine
     /// and node in the process is invalid and must be DISPOSED OF and recreated
@@ -1445,7 +1496,16 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     /// Bumped when the server recogniser errors. Two strikes and this session
     /// stays on-device — no retry storm, no silent deafness on a bad line.
-    static var serverHearingFailures = 0
+    /// BUILD 247: `nonisolated(unsafe)`, matching `lastAudioUpheavalAt` above.
+    /// It is read and written from the recognition callback, which is not
+    /// main-actor isolated — the same pattern this file already uses for the
+    /// upheaval stamp.
+    nonisolated(unsafe) static var serverHearingFailures = 0
+
+    /// BUILD 247: change-gate and rate-limit for the transcript log.
+    private static var lastLoggedHeard = ""
+    private static var lastHeardLogAt = Date.distantPast
+    private static var lastDebounceNote = ""
 
     private static let wakeWords = [
         "chappy", "chappie", "chapy", "chappy's", "chappi", "chapi",
@@ -2033,12 +2093,35 @@ final class ChappyStandby: NSObject, ObservableObject {
         // two auto-arms 0.27s apart, both proceeding, because the
         // failure path had already cleared the flag.
         // ============================================================
+        armWhenSettled()
+    }
+
+    /// BUILD 247 — WAIT UNTIL IT IS ACTUALLY SETTLED, NOT JUST ONCE.
+    ///
+    /// 246 waited out the upheaval it caused, and that was right — but it
+    /// waited exactly once. His log shows why that is not enough:
+    ///
+    ///   0.25s  Our own input change is 0.00s old — waiting 0.80s
+    ///   1.06s  Audio still settling (0.237s since the last upheaval)
+    ///   1.06s  Arming failed (attempt 1)
+    ///
+    /// The route-change NOTIFICATION from our own setPreferredInput lands
+    /// asynchronously — about 0.8s later — and re-stamps while we are already
+    /// waiting. So the wait expired into a fresh stamp, that counted as a
+    /// failed arm, and the ladder burned two of its three attempts before
+    /// succeeding at 5.40s. It armed, but it took six seconds and spent two
+    /// lives doing it.
+    ///
+    /// Re-checking is the fix. A re-stamp means wait again, not fail — that
+    /// is what "settled" means. Bounded at five looks so a genuinely unstable
+    /// route still reaches the real failure path rather than waiting forever.
+    private func armWhenSettled(tries: Int = 0) {
         let upheavalAge = Date().timeIntervalSince(Self.lastAudioUpheavalAt)
         let mustSettle = 0.8 - upheavalAge
-        if mustSettle > 0 {
+        if mustSettle > 0, tries < 5 {
             ChappyStandbyLog.note(String(
-                format: "👂 [Standby] Our own input change is %.2fs old — waiting %.2fs for it to settle, then arming",
-                upheavalAge, mustSettle))
+                format: "👂 [Standby] Upheaval is %.2fs old — waiting %.2fs for it to settle%@",
+                upheavalAge, mustSettle, tries == 0 ? ", then arming" : " (re-stamped, wait \(tries + 1))"))
             DispatchQueue.main.asyncAfter(deadline: .now() + mustSettle) { [weak self] in
                 guard let self else { return }
                 // BUILD 246 — `starting` IS THE CANCEL TOKEN, AND THIS GUARD
@@ -2077,9 +2160,18 @@ final class ChappyStandby: NSObject, ObservableObject {
                     self.starting = false
                     return
                 }
-                self.completeArming()
+                // Round again. If our own route-change notification re-stamped
+                // while we waited, this sees it and waits the remainder
+                // instead of walking into the gate and burning an attempt.
+                self.armWhenSettled(tries: tries + 1)
             }
             return
+        }
+        // Only when it is genuinely still moving. `tries >= 5` on its own also
+        // fires on the normal success case, and a log that says "still
+        // unsettled" about a settled route is worse than no log at all.
+        if tries >= 5, mustSettle > 0 {
+            ChappyStandbyLog.note("👂 [Standby] Route still unsettled after five waits — arming anyway and letting the ladder handle it")
         }
         completeArming()
     }
@@ -3005,6 +3097,22 @@ final class ChappyStandby: NSObject, ObservableObject {
         Self.saveToCameraRoll(frame)
 
         Task { @MainActor in
+            // BUILD 248 — WHY EVERY PIN SAYS "PHOTO".
+            //
+            // The placeholder is written first on purpose, so a picture is
+            // never lost waiting on a network call, and the AI caption is
+            // meant to replace it a second or two later. When describe()
+            // returns nil — no key, no signal, a 4xx, a safety refusal — this
+            // block simply did nothing. Silently. So the entry keeps the
+            // placeholder for ever, and since EVERY photo keeps the same
+            // placeholder, the map becomes a wall of identical "Photo" pins
+            // with no way to tell which is which and no clue why.
+            //
+            // Two changes, neither of them a guess at the cause:
+            //   1. the failure is recorded, so the next log says which it was
+            //   2. the fallback is the PLACE, which Chappy already knows
+            //      without asking anyone — "Photo · Jalan Raya Ubud" is a pin
+            //      you can find again; "Photo" is not.
             if let caption = await Self.describe(frame) {
                 TripRecorder.shared.updateCaption(id: note.id, to: caption)
                 // BUILD 226: the note's own memory id, not a second entry's.
@@ -3013,6 +3121,17 @@ final class ChappyStandby: NSObject, ObservableObject {
                 }
                 // If the card is still on screen, let him read what it is.
                 SnapFeedback.shared.setCaption(caption)
+            } else {
+                let snap = ContextEngine.shared.snapshot
+                let place = snap.street ?? snap.city ?? snap.country
+                let f = DateFormatter(); f.dateFormat = "h:mm a"
+                let fallback = place.map { "Photo · \($0)" }
+                    ?? "Photo · \(f.string(from: Date()))"
+                ChappyStandbyLog.note("📸 [Snap] No AI caption came back — filed as \u{201C}\(fallback)\u{201D}")
+                TripRecorder.shared.updateCaption(id: note.id, to: fallback)
+                if let memID = note.memID {
+                    ChappyMemory.shared.setTitle(id: memID, fallback)
+                }
             }
         }
     }
@@ -3035,11 +3154,27 @@ final class ChappyStandby: NSObject, ObservableObject {
     }
 
     /// One line, cheap and quiet. Never spoken unless he asks for it.
+    ///
+    /// BUILD 248 — SIX FAILURES THAT ALL LOOKED THE SAME.
+    ///
+    /// This was one guard covering the key, the JPEG, the URL, the network
+    /// call, the status code and four levels of JSON unwrapping — every one
+    /// of them returning nil, indistinguishably, with nothing written down.
+    /// So "every pin says Photo" had six possible causes and no way to tell
+    /// them apart. Each one now names itself.
     static func describe(_ image: UIImage) async -> String? {
-        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let jpeg = image.jpegData(compressionQuality: 0.5),
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
-        else { return nil }
+        guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty else {
+            ChappyStandbyLog.note("📸 [Snap] No caption — the Google API key is missing")
+            return nil
+        }
+        guard let jpeg = image.jpegData(compressionQuality: 0.5) else {
+            ChappyStandbyLog.note("📸 [Snap] No caption — the frame would not encode as JPEG")
+            return nil
+        }
+        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)") else {
+            ChappyStandbyLog.note("📸 [Snap] No caption — bad URL")
+            return nil
+        }
         let body: [String: Any] = [
             "contents": [["role": "user", "parts": [
                 ["text": "Describe this photo in ONE short line, under 12 words, as a note-to-self for finding it again later. No preamble. Example: 'handwritten warung sign, opening hours in Indonesian'."],
@@ -3052,13 +3187,39 @@ final class ChappyStandby: NSObject, ObservableObject {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 15
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await URLSession.shared.data(for: req)
+        } catch {
+            ChappyStandbyLog.note("📸 [Snap] No caption — the call failed: \(error.localizedDescription)")
+            return nil
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard code == 200 else {
+            // The body carries Google's actual complaint — a bad key, a
+            // disabled API, a quota. Worth the first 200 characters.
+            let msg = String(data: data.prefix(200), encoding: .utf8) ?? ""
+            ChappyStandbyLog.note("📸 [Snap] No caption — HTTP \(code): \(msg)")
+            return nil
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let c = json["candidates"] as? [[String: Any]],
-              let content = c.first?["content"] as? [String: Any],
+              let first = c.first else {
+            ChappyStandbyLog.note("📸 [Snap] No caption — 200 but no candidates (usually a safety block)")
+            return nil
+        }
+        guard let content = first["content"] as? [String: Any],
               let parts = content["parts"] as? [[String: Any]],
-              let t = parts.first?["text"] as? String else { return nil }
+              let t = parts.first?["text"] as? String else {
+            // The finish reason is the tell. MAX_TOKENS here means the model
+            // spent the whole budget before writing any text, which is what a
+            // thinking model does when maxOutputTokens is set too low — and
+            // it would fail this way on every single photo, for ever.
+            let why = first["finishReason"] as? String ?? "unknown"
+            ChappyStandbyLog.note("📸 [Snap] No caption — 200, candidate present, no text. finishReason: \(why)")
+            return nil
+        }
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -3721,7 +3882,24 @@ final class ChappyStandby: NSObject, ObservableObject {
         // becomes true by construction, so the uncatchable exception both
         // guards existed to dodge cannot occur at all.
         input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
-            req.append(buffer)
+            // BUILD 247 — APPEND TO THE CURRENT REQUEST, NOT A CAPTURED ONE.
+            //
+            // This used to capture `req`, which bound the tap to one
+            // recognition request for its whole life. So renewing the
+            // recogniser after every command meant tearing the TAP down and
+            // building it again — and the log measured what that costs:
+            //
+            //   13.85s  Recogniser running — tap installed, waiting for audio
+            //   14.95s  ✅ AUDIO IS ARRIVING — first buffer
+            //
+            // 1.1 seconds deaf, after EVERY command, four times in that log.
+            // Mid-sentence, that is the back half of what he was saying gone,
+            // which is exactly what "it keeps cutting me off" is.
+            //
+            // Goes through appendLive(), which takes the lock — see the note
+            // on liveRequest. Reading `request` directly from here would be a
+            // strong-reference race against the main thread.
+            self?.appendLive(buffer)
             // AUDIT P0 (SB-LIVENESS): the only honest proof that audio is
             // actually reaching us. engine.isRunning stays true through most of
             // the ways this ear dies; buffers stopping is what "deaf" looks like.
@@ -3775,45 +3953,43 @@ final class ChappyStandby: NSObject, ObservableObject {
         // third — an unbounded ping-pong of orphaned recognizers all calling
         // heard(), i.e. duplicate commands. Each callback now proves it is
         // still the current task before doing anything.
-        var thisTask: SFSpeechRecognitionTask?
-        thisTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        // BUILD 247: the same generation token swapRequest uses, so both
+        // paths invalidate the same way — and so this one stops leaking a
+        // task per call. `var thisTask` captured and mutated inside its own
+        // handler is a retain cycle: the box holds the task, the task holds
+        // the handler, the handler holds the box.
+        taskGen &+= 1
+        let gen = taskGen
+        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             if let result {
                 // A result proves the path works; forgive earlier blips.
                 if !useOnDevice { Self.serverHearingFailures = 0 }
                 let text = result.bestTranscription.formattedString.lowercased()
                 Task { @MainActor in
-                    guard let self, self.task === thisTask else { return }
+                    guard let self, self.taskGen == gen else { return }
+                    self.swapsWithoutResult = 0
                     self.heard(text)
                 }
             }
             if error != nil || (result?.isFinal ?? false) {
-                // BUILD 244: a recogniser that dies on every task looks
-                // exactly like a microphone that hears nothing, and the two
-                // have never been told apart on this screen. 1101 is the
-                // local speech service failing to start, 203 is the server
-                // giving up, 216 is the task being cancelled normally.
-                if let error {
-                    let ns = error as NSError
-                    ChappyStandbyLog.note("⚠️ [Standby] Recogniser ended — \(ns.domain) \(ns.code): \(error.localizedDescription)")
-                }
-                if error != nil && !useOnDevice {
-                    Self.serverHearingFailures += 1
-                    if Self.serverHearingFailures == 2 {
-                        ChappyStandbyLog.note("👂 [Standby] Server hearing failed twice — on-device for the rest of this session")
-                    }
-                }
+                // BUILD 247: one shared place, and it no longer counts our own
+                // cancellations as the server failing.
+                if let error { Self.noteRecogniserEnd(error, onDevice: useOnDevice) }
                 Task { @MainActor in
-                    guard let self, self.task === thisTask else { return }
+                    guard let self, self.taskGen == gen else { return }
                     self.task = nil
                     // AUDIT FIX: restarting the EAR while a command routes is
                     // harmless (re-entry is blocked in finish()); the old
                     // !busy guard left the ear dead for up to 50 seconds.
                     guard self.isListening else { return }
-                    _ = self.startRecognition()
+                    // BUILD 247: swapRequest, not startRecognition. The tap and
+                    // the engine are fine — only the transcript is stale — and
+                    // rebuilding the tap here was costing 1.1s of deafness on a
+                    // path that runs after every command.
+                    self.swapRequest()
                 }
             }
         }
-        task = thisTask
         ChappyStandbyLog.note("👂 [Standby] Recogniser running (\(useOnDevice ? "on-device" : "server")) — tap installed, waiting for audio")
         return true
     }
@@ -3830,6 +4006,28 @@ final class ChappyStandby: NSObject, ObservableObject {
         // acknowledgement and an interruption.
         lastHeardAt = Date()
         lastHeard = text
+
+        // BUILD 247 — WHAT IT ACTUALLY HEARD.
+        //
+        // Every log so far has recorded what was ROUTED, never what was
+        // HEARD. So a sentence that was misheard, clipped, swallowed as
+        // self-talk or lost in the deaf window left no trace at all — and
+        // "it cut me off" could not be told apart from "it never heard me".
+        //
+        // Rate-limited and change-gated on purpose: the recogniser delivers
+        // partials several times a second, and a log that floods is a log
+        // that has thrown away the line you needed by the time you open it.
+        // 1.2s, not 0.35s. heard() fires on every partial whether or not the
+        // wake word landed, so a room with talking in it produced ~170 lines
+        // a minute — which meant a 500-line buffer held about three minutes
+        // and the 60-line panel showed twenty seconds. The arming story this
+        // buffer exists for would have been evicted before he could open it.
+        if text != Self.lastLoggedHeard,
+           Date().timeIntervalSince(Self.lastHeardLogAt) > 1.2 {
+            Self.lastLoggedHeard = text
+            Self.lastHeardLogAt = Date()
+            ChappyStandbyLog.note("🗣️ [Standby] Heard: \u{201C}\(text)\u{201D}")
+        }
 
         // BARGE-IN LAW — with the self-interruption guard.
         // Naive "any speech stops the voice" is a trap: the mic hears CHAPPY
@@ -4219,6 +4417,20 @@ final class ChappyStandby: NSObject, ObservableObject {
                 debounce = 1.15          // a real sentence — let him finish it
             }
         }
+        // BUILD 247: WHICH window was chosen, and for what tail. When a
+        // sentence fires early, this is the line that says whether the tail
+        // was judged finished, unfinished, extendable or just short — and
+        // therefore which of the four rules needs changing. Guessing at that
+        // from the outcome alone is how "translate" ended up firing without
+        // "into Indonesian" for several builds.
+        //
+        // Change-gated: this sits on the per-partial path and would otherwise
+        // add three to five lines a second, flooding out the very lines it is
+        // meant to sit next to.
+        if Self.lastDebounceNote != "\(debounce)|\(cleanTail)" {
+            Self.lastDebounceNote = "\(debounce)|\(cleanTail)"
+            ChappyStandbyLog.note(String(format: "⏳ [Standby] Waiting %.2fs for the rest of \u{201C}%@\u{201D}", debounce, cleanTail))
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + debounce, execute: work)
     }
 
@@ -4537,11 +4749,141 @@ final class ChappyStandby: NSObject, ObservableObject {
     }
 
     /// Discard the accumulated transcript and listen fresh.
+    ///
+    /// BUILD 247 — WITHOUT TOUCHING THE MICROPHONE.
+    ///
+    /// This used to call startRecognition(), which removes and reinstalls the
+    /// input tap and restarts the engine. Measured cost from his log: 1.1
+    /// seconds with no audio reaching anything, after every single command.
+    /// Say "Chappy translate this into Indonesian" and the ear fires on
+    /// "translate", goes deaf for a second, and the rest of the sentence
+    /// lands in the hole — then turns up later as its own nonsense command
+    /// ("indonesia"). One sentence, two wrong actions, and it looks like
+    /// Chappy is interrupting and babbling.
+    ///
+    /// The tap does not need to move. The only thing that has to be fresh is
+    /// the RECOGNITION REQUEST — the recogniser keeps one growing transcript
+    /// per task, and that is the thing that has to be thrown away so old
+    /// words cannot re-fire. So swap the request and the task; leave the
+    /// engine and the tap exactly where they are.
     private func resetRecognition() {
         guard isListening else { return }
-        task?.cancel(); task = nil
-        request?.endAudio(); request = nil
-        _ = startRecognition()
+        swapRequest()
+    }
+
+    /// Build a fresh request and task against the EXISTING tap. Nothing here
+    /// touches the audio engine, the session, or the input node — so there is
+    /// no settling, no format negotiation, and no deaf window.
+    private func swapRequest() {
+        guard let recognizer else { return }
+        // BUILD 247 — THROTTLE. Without this, a task that fails immediately
+        // restarts itself immediately, forever, at main-queue speed. The old
+        // path was accidentally throttled by the tap rebuild and the 0.7s
+        // upheaval gate it had to clear; this path has neither, so it needs a
+        // real one. Reachable: once the session has demoted to on-device, a
+        // missing or broken local model errors instantly every time.
+        let sinceLastSwap = Date().timeIntervalSince(lastSwapAt)
+        if sinceLastSwap < 0.4, swapsWithoutResult >= 2 {
+            ChappyStandbyLog.note(String(format: "🔁 [Standby] Recogniser restarting too fast (%.2fs, %d with no result) — backing off 0.6s", sinceLastSwap, swapsWithoutResult))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, self.isListening else { return }
+                self.swapRequest()
+            }
+            return
+        }
+        lastSwapAt = Date()
+        swapsWithoutResult += 1
+
+        // Order matters, and this order is deliberate.
+        //
+        // The tap is STILL RUNNING throughout this function — that is the
+        // whole point of it. So the window between ending the old request and
+        // publishing the new one is a window in which live buffers are being
+        // appended to a request that has had endAudio() called on it, which
+        // the API says must not happen and which silently drops audio.
+        //
+        // Building the new request takes a UserDefaults read, a spots query
+        // and three array builds — long enough, at 46ms a buffer, to matter.
+        // So: detach the task, build everything, PUBLISH, and only then end
+        // the old request. The tap is never pointed at a dead request.
+        let old = task
+        let oldReq = request
+        task = nil
+        old?.cancel()
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        let forcedOffline = UserDefaults.standard.bool(forKey: "chappy_hearing_offline_only")
+        let useOnDevice = recognizer.supportsOnDeviceRecognition
+            && (forcedOffline || Self.serverHearingFailures >= 2)
+        req.requiresOnDeviceRecognition = useOnDevice
+        req.taskHint = .search
+        var hints = Self.wakePhraseHints
+        hints += Self.wakeWords
+        hints += TripRecorder.shared.spots.suffix(40).map { $0.name }
+        hints += Self.brandHints
+        req.contextualStrings = Array(hints.prefix(100))
+        // Published BEFORE the old one is ended, so the tap — still running,
+        // still delivering buffers — always has a live request to append to.
+        // This is the line that closes the 1.1s hole.
+        request = req
+        oldReq?.endAudio()
+
+        taskGen &+= 1
+        let gen = taskGen
+        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            if let result {
+                if !useOnDevice { Self.serverHearingFailures = 0 }
+                let text = result.bestTranscription.formattedString.lowercased()
+                Task { @MainActor in
+                    guard let self, self.taskGen == gen else { return }
+                    // A result proves this swap produced something, so the
+                    // fast-restart backoff resets.
+                    self.swapsWithoutResult = 0
+                    self.heard(text)
+                }
+            }
+            if error != nil || (result?.isFinal ?? false) {
+                if let error { Self.noteRecogniserEnd(error, onDevice: useOnDevice) }
+                Task { @MainActor in
+                    guard let self, self.taskGen == gen else { return }
+                    self.task = nil
+                    guard self.isListening else { return }
+                    self.swapRequest()
+                }
+            }
+        }
+        ChappyStandbyLog.note("🔁 [Standby] Fresh transcript (\(useOnDevice ? "on-device" : "server")) — tap left running, no deaf window")
+    }
+
+    /// BUILD 247 — OUR OWN CANCELLATION IS NOT A HEARING FAILURE.
+    ///
+    /// From his log:
+    ///
+    ///   ⚠️ Recogniser ended — kLSRErrorDomain 301: Recognition request was canceled
+    ///   ⚠️ Recogniser ended — kLSRErrorDomain 301: Recognition request was canceled
+    ///   👂 Server hearing failed twice — on-device for the rest of this session
+    ///
+    /// 301 is what iOS reports when WE cancel — which happens after every
+    /// single command, by design. Counting those as the server failing meant
+    /// Chappy demoted itself to on-device recognition during normal use, and
+    /// on-device is the model that is measurably worse at proper nouns. So
+    /// the harder he tried to be understood, the worse it heard him — and
+    /// "Indonesian" is exactly the class of word it then gets wrong.
+    ///
+    /// Build 104 added the fallback for a genuinely bad line. This restores
+    /// that meaning: only a real failure counts.
+    nonisolated static func noteRecogniserEnd(_ error: Error, onDevice: Bool) {
+        let ns = error as NSError
+        // 301 kLSR / 216 / -999 are all "we cancelled it". 1110 is "no speech
+        // detected", which is a normal outcome of a quiet room, not a fault.
+        let ours = ns.code == 301 || ns.code == 216 || ns.code == -999 || ns.code == 1110
+        ChappyStandbyLog.note("⚠️ [Standby] Recogniser ended — \(ns.domain) \(ns.code): \(error.localizedDescription)\(ours ? " (expected, not counted)" : "")")
+        guard !ours, !onDevice else { return }
+        serverHearingFailures += 1
+        if serverHearingFailures == 2 {
+            ChappyStandbyLog.note("👂 [Standby] Server hearing failed twice — on-device for the rest of this session")
+        }
     }
 
     // =================================================================
@@ -12425,7 +12767,32 @@ final class ChappyReminders: NSObject, ObservableObject {
                                            actions: [], intentIdentifiers: [],
                                            options: [])
         center.setNotificationCategories([cat, info, brief])
-        center.delegate = self
+        // BUILD 248 — THE DELEGATE COLLISION.
+        //
+        // `center.delegate = self` used to be here, and iOS allows exactly
+        // ONE UNUserNotificationCenter delegate per app. ChappyProactive
+        // claims it at launch (TurboMetaApp -> registerBackgroundTask), and
+        // build 132 deliberately made that one the ROUTER: it forwards
+        // reminder notifications here and shows a banner for everything else.
+        //
+        // This line then stole it back — because registerCategories() runs
+        // from requestPermission(), which the home screen calls on appear,
+        // seconds AFTER launch. Last writer wins, so the router was replaced
+        // by this class on every single run.
+        //
+        // What that cost, both ways round:
+        //   • ChappyProactive's own handling never ran — tapping a check-in
+        //     brief or a shopping-list notification no longer opened a
+        //     conversation carrying it, which is the entire point of them.
+        //   • Worse, this class's didReceive falls through to
+        //     `post(.chappyOpenReminders)` for anything without a reminder
+        //     id — so tapping ANY other Chappy notification (an arrival, an
+        //     import, a spend warning, a research answer) opened the
+        //     Reminders screen instead of the thing it was about.
+        //
+        // The router already forwards everything this class needs. It does
+        // not need to be the delegate, and it must not be.
+        ChappyStandbyLog.note("🔔 [Reminders] Categories registered (delegate left with the router)")
     }
 
     /// QUIET HOURS. A reminder that buzzes at 3am is one you turn off
@@ -15248,19 +15615,51 @@ final class ChappyTrail: NSObject, ObservableObject {
 
     fileprivate func handle(visit: CLVisit) {
         rollIfNeeded()
-        let arrive = visit.arrivalDate == .distantPast ? Date() : visit.arrivalDate
         let coord = visit.coordinate
         if visit.departureDate == .distantFuture {
             // Arrival. Skip if an open visit already covers this spot.
             if todayVisits.contains(where: { $0.depart == nil && close($0, to: coord) }) { return }
+            // Here, `distantPast` genuinely does mean "now": iOS is telling us
+            // about an arrival it has just detected.
+            let arrive = visit.arrivalDate == .distantPast ? Date() : visit.arrivalDate
             var v = Visit(arrive: arrive, depart: nil,
                           lat: coord.latitude, lon: coord.longitude, name: nil)
             todayVisits.append(v)
             saveToday()
             geocode(&v)
         } else {
-            // Departure. Close the matching open visit, or file the whole stay.
+            // ============================================================
+            // BUILD 248 — WHY STOP DURATIONS WERE WRONG.
+            //
+            // `arrive` used to be computed ONCE, above, for both branches:
+            //
+            //     let arrive = visit.arrivalDate == .distantPast ? Date() : ...
+            //
+            // On an arrival that is right. On a DEPARTURE it is badly wrong.
+            // CLVisit reports `.distantPast` for an arrival it never observed
+            // — which is the normal case whenever the app was not running
+            // when he got there, i.e. most stops. Substituting `Date()` then
+            // means "arrived NOW", and the departure is also now, so a
+            // three-hour stay at a warung was recorded as a stop of roughly
+            // zero minutes.
+            //
+            // That is the bug, and it flattered every long stay into nothing
+            // while leaving the short ones looking fine — which is exactly
+            // why it read as "durations are wrong" rather than "durations are
+            // missing".
+            //
+            // When iOS does not know when he arrived, neither do we, and
+            // inventing a number is worse than showing a moment. Using the
+            // departure for both makes the stop a point in time and its
+            // duration honestly zero, instead of a fabricated span.
+            // ============================================================
+            let arrive = visit.arrivalDate == .distantPast
+                ? visit.departureDate
+                : visit.arrivalDate
+            // Close the matching open visit, or file the whole stay.
             if let i = todayVisits.firstIndex(where: { $0.depart == nil && close($0, to: coord) }) {
+                // This is the good path — we saw the arrival ourselves, so the
+                // span is real. Nothing here needs the guess above.
                 todayVisits[i].depart = visit.departureDate
             } else {
                 var v = Visit(arrive: arrive, depart: visit.departureDate,
