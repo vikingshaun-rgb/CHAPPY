@@ -50,6 +50,21 @@ class StreamSessionViewModel: ObservableObject {
     // ALL of them flow through streamingStatus.
     didSet {
       UIApplication.shared.isIdleTimerDisabled = (streamingStatus != .stopped)
+      // BUILD 245: every start, stall and stop of the glasses stream, into
+      // the Live AI log.
+      //
+      // The comment above already says iOS stalls the frame pipeline when
+      // the display sleeps — audio survives, video freezes — and that is a
+      // large part of what "Live AI dies on lock" could mean. But it has
+      // never been RECORDED, so there has been no way to tell a frozen
+      // video pipeline from a dead socket from a suspended process. All
+      // three feel identical from the outside: Chappy stops answering.
+      //
+      // Every start/stop path in this file flows through this property, so
+      // one line here covers all of them.
+      guard streamingStatus != oldValue else { return }
+      let st = UIApplication.shared.applicationState
+      ChappyLiveLog.note("📹 [Stream] \(oldValue) → \(streamingStatus) (app \(st == .active ? "active" : (st == .background ? "BACKGROUND" : "inactive")))")
     }
   }
   @Published var showError: Bool = false
