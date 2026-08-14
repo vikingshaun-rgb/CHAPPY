@@ -172,6 +172,20 @@ class LiveTranslateService: NSObject {
     /// never fire after a deliberate disconnect.
     private var isUserSessionActive = false
 
+    /// BUILD 233 — HOW MANY TIMES THE TAP HAS DEFERRED.
+    ///
+    /// Build 220 added a format guard with a 0.5s retry and NO BOUND, so
+    /// a route that never settles — which is the normal state of an HFP
+    /// Bluetooth mic reporting 16 kHz against a 48 kHz node — retried
+    /// twice a second for ever, on the main thread, restarting the audio
+    /// engine every pass. It froze Translate, dragged the whole app,
+    /// tore down the wake-word tap on every cycle and eventually took
+    /// the process with it.
+    ///
+    /// Bounded now, and it gives up out loud.
+    private var tapDeferrals = 0
+    private static let maxTapDeferrals = 8
+
     // Reconnect bookkeeping: recording may only resume AFTER setupComplete,
     // never straight after connect() — audio sent before setup kills the socket.
     private var shouldResumeRecordingAfterSetup = false
@@ -505,6 +519,9 @@ class LiveTranslateService: NSObject {
         // BUILD 56: a deliberate close must never trigger the recovery logic.
         isUserSessionActive = false
         recoveryAttempts = 0
+        // BUILD 233: and the deferral count, so one bad route doesn't
+        // poison the next session with a counter that starts at seven.
+        tapDeferrals = 0
         resumptionHandle = nil
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
@@ -833,13 +850,49 @@ class LiveTranslateService: NSObject {
                     ? "node says \(inputFormat.sampleRate) Hz, session says \(hwRate) Hz"
                     : (settling ? "route still settling"
                                 : "format not ready (\(inputFormat.sampleRate) Hz)")
-                print("⚠️ [Translate] Not installing the tap — \(why). Deferring.")
+
+                // BUILD 233 — THE BOUND THAT WAS MISSING.
+                tapDeferrals += 1
+                guard tapDeferrals <= Self.maxTapDeferrals else {
+                    print("🛑 [Translate] Gave up after \(Self.maxTapDeferrals) attempts — \(why)")
+                    tapDeferrals = 0
+
+                    // The Bluetooth route will not settle. The phone mic
+                    // does not have the HFP rate problem, so try it once
+                    // rather than calling the whole feature dead.
+                    if !usePhoneMic {
+                        print("🎤 [Translate] Falling back to the phone microphone")
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.isUserSessionActive else { return }
+                            self.onError?("The glasses microphone wouldn't settle, so I've switched to the phone mic. Speak into the phone.")
+                            TTSService.shared.speak("The glasses mic wouldn't settle. I've switched to the phone microphone.")
+                            _ = self.startRecording(usePhoneMic: true)
+                        }
+                        return false
+                    }
+
+                    // Phone mic too. Now it is genuinely broken, and
+                    // saying nothing is what made every one of these
+                    // faults take a week to find.
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.onError?("I can't get a clean microphone signal — \(why). Close Translate, then reopen it.")
+                        TTSService.shared.speak("I can't get a clean microphone signal. Close translate and open it again.")
+                        self.isRecording = false
+                    }
+                    return false
+                }
+
+                print("⚠️ [Translate] Not installing the tap — \(why). Deferring (\(tapDeferrals)/\(Self.maxTapDeferrals)).")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self, self.isUserSessionActive, !self.isRecording else { return }
-                    self.startRecording(usePhoneMic: usePhoneMic)
+                    _ = self.startRecording(usePhoneMic: usePhoneMic)
                 }
                 return false
             }
+
+            // Got a clean format. Any earlier deferrals are history.
+            tapDeferrals = 0
 
             print("🎵 [Translate] Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
             print("🎵 [Translate] Target format: \(targetSampleRate) Hz (will auto-resample)")
