@@ -44,6 +44,17 @@ struct LiveAIView: View {
                 // so Chappy could see things he could not — which makes
                 // its answers baffling. Letterboxed shows him exactly
                 // what it is looking at, at the size it actually is.
+                // BUILD 219 — a black screen is not an answer.
+                //
+                // Six different failures all produced the same black
+                // rectangle, and 218's error message went to a property
+                // this view never reads: it displays `viewModel`'s error,
+                // and the camera's errors live on `streamViewModel`. So
+                // the explanation was written and thrown away. Mine.
+                if !streamViewModel.hasReceivedFirstFrame {
+                    cameraStatusView
+                }
+
                 if let videoFrame = streamViewModel.currentVideoFrame,
                    streamViewModel.hasReceivedFirstFrame {
                     GeometryReader { geometry in
@@ -274,6 +285,53 @@ struct LiveAIView: View {
     }
 
     // MARK: - Device Not Connected View
+
+    /// BUILD 219 — what is actually going on with the camera.
+    ///
+    /// Three states, three different bugs, told apart without a console:
+    ///   * an error, shown with a retry rather than swallowed;
+    ///   * waking, with the seconds counting — a counter that reaches 20
+    ///     and stops is the handshake timing out;
+    ///   * connected but no picture, with the frame count — frames
+    ///     arriving and no picture means conversion is failing, zero
+    ///     frames means nothing ever subscribed.
+    private var cameraStatusView: some View {
+        VStack(spacing: 14) {
+            if streamViewModel.showError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 30)).foregroundColor(.orange)
+                Text(streamViewModel.errorMessage)
+                    .font(.subheadline).foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 34)
+                Button {
+                    Task { await streamViewModel.handleStartStreaming() }
+                } label: {
+                    Text("Try again")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .padding(.horizontal, 22).padding(.vertical, 9)
+                        .background(Capsule().fill(Color.white.opacity(0.16)))
+                        .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+            } else if streamViewModel.streamingStatus == .streaming {
+                ProgressView().tint(.white)
+                Text("Connected — waiting for the first picture")
+                    .font(.subheadline).foregroundColor(.white.opacity(0.85))
+                Text("\(streamViewModel.framesArrived) frames in")
+                    .font(.caption2).foregroundColor(.white.opacity(0.45))
+            } else {
+                ProgressView().tint(.white)
+                Text("Waking the glasses…")
+                    .font(.subheadline).foregroundColor(.white.opacity(0.85))
+                if streamViewModel.waitingSeconds > 3 {
+                    Text("\(streamViewModel.waitingSeconds)s")
+                        .font(.caption2).foregroundColor(.white.opacity(0.45))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
     private var deviceNotConnectedView: some View {
         VStack(spacing: AppSpacing.xl) {

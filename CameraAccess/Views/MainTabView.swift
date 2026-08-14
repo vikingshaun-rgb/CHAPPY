@@ -17,6 +17,13 @@ struct MainTabView: View {
     }
 
     var body: some View {
+        // BUILD 231: one line, and every module in the app can put a
+        // real email on screen with the report attached — including the
+        // ones raised by voice from a manager that has no view context.
+        tabs.chappyMailHost()
+    }
+
+    private var tabs: some View {
         TabView(selection: $selectedTab) {
             // Home - Feature entry
             TurboMetaHomeView(streamViewModel: streamViewModel, wearablesViewModel: wearablesViewModel, apiKey: apiKey)

@@ -690,8 +690,27 @@ struct SettingsView: View {
                     }
                 }
 
-                // BUILD 150 — FLIGHTS (Amadeus keys, addable any time).
+                // BUILD 230 — API KEYS, WITH A LIGHT ON EACH.
                 Section {
+                    NavigationLink {
+                        ChappyKeysView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "key.horizontal.fill")
+                                .foregroundColor(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("API keys")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyKeysView.summaryLine)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                            Spacer()
+                            Circle()
+                                .fill(ChappyKeysView.summaryColour)
+                                .frame(width: 9, height: 9)
+                        }
+                    }
                     NavigationLink {
                         FlightKeysView()
                     } label: {
@@ -699,18 +718,47 @@ struct SettingsView: View {
                             Image(systemName: "airplane.circle.fill")
                                 .foregroundColor(.cyan)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Flights")
+                                Text("Fare data")
                                     .foregroundColor(AppColors.textPrimary)
-                                Text(ChappyFlights.shared.isConfigured
-                                     ? "Connected — say \u{201C}watch flights to Bali in September\u{201D}"
-                                     : "Add the free Amadeus keys to unlock deal watching")
+                                Text(ChappyFareSource.isConfigured
+                                     ? "On — the Fares tab has a live day grid"
+                                     : "Add the free Travelpayouts token")
                                     .font(AppTypography.caption)
                                     .foregroundColor(AppColors.textSecondary)
                             }
                         }
                     }
                 } footer: {
-                    Text("Free developer account at developers.amadeus.com — create an app, copy the API Key and API Secret here. Watched routes are checked up to 3 times a day.")
+                    Text("Every key the app uses, each one tested against the real provider rather than just checked for the right shape. Green means it authenticated; red carries the reason.")
+                        .font(AppTypography.caption)
+                }
+
+                // BUILD 231 — WHO REPORTS GO TO.
+                //
+                // Stored once so "email my partner the Bali report" has
+                // somewhere to send to. Without this the voice route can
+                // only open an empty composer and hope you type an
+                // address one-handed at an airport.
+                Section {
+                    NavigationLink {
+                        ChappyPartnerView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .foregroundColor(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Who reports go to")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyHandoff.partner.isEmpty
+                                     ? "Not set — say an address or type one"
+                                     : ChappyHandoff.partner)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Say \u{201C}email my partner the report\u{201D} and it goes here, attached, with one tap left to send. Nothing is ever sent without you tapping send — iOS does not allow an app to send mail on its own, and it never will.")
                         .font(AppTypography.caption)
                 }
 
@@ -1187,9 +1235,19 @@ struct APIKeySettingsView: View {
         NavigationView {
             Form {
                 Section {
-                    SecureField("settings.apikey.placeholder".localized, text: $apiKey)
+                    // BUILD 227: same disease as the travel keys — a
+                    // SecureField in a Form is claimed by AutoFill, which
+                    // eats the placeholder and the keystrokes. These have
+                    // not been reported as broken, but they are the same
+                    // shape of field holding the same shape of secret,
+                    // and re-entering a Gemini key on a rented Mac in
+                    // Indonesia is not the moment to discover it.
+                    TextField("settings.apikey.placeholder".localized, text: $apiKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textContentType(.none)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .keyboardType(.asciiCapable)
                 } header: {
                     Text("\(displayTitle) API Key")
                 } footer: {
@@ -1739,9 +1797,19 @@ struct GoogleAPIKeySettingsView: View {
         NavigationView {
             Form {
                 Section {
-                    SecureField("settings.apikey.placeholder".localized, text: $apiKey)
+                    // BUILD 227: same disease as the travel keys — a
+                    // SecureField in a Form is claimed by AutoFill, which
+                    // eats the placeholder and the keystrokes. These have
+                    // not been reported as broken, but they are the same
+                    // shape of field holding the same shape of secret,
+                    // and re-entering a Gemini key on a rented Mac in
+                    // Indonesia is not the moment to discover it.
+                    TextField("settings.apikey.placeholder".localized, text: $apiKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textContentType(.none)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .keyboardType(.asciiCapable)
                 } header: {
                     Text("Google Gemini API Key")
                 } footer: {
@@ -2359,6 +2427,347 @@ struct MailSetupView: View {
 
 
 // BUILD 150 — FLIGHT KEYS. Two fields, Keychain-stored, addable whenever.
+// =====================================================================
+// BUILD 227 — THE KEY FIELD.
+//
+// Every API key in this app was a SecureField, and every one of them was
+// unsaveable for the same reason: iOS reads a SecureField in a Form as a
+// new-password field, hands it to AutoFill, and AutoFill eats both the
+// placeholder and the keystrokes. Save then wrote the empty binding over
+// a key that had been pasted correctly.
+//
+// Four things this does that the old field did not:
+//
+//   1. textContentType(.none) — the line that actually stops AutoFill
+//      claiming it. Without this nothing else here matters.
+//   2. A Paste button. He is copying a long random string out of a
+//      browser on another device; typing it is not a real option, and a
+//      masked field makes a bad paste invisible.
+//   3. Show/hide, defaulting to SHOWN, because the entire point of
+//      looking at a key you just pasted is to see that it arrived whole.
+//   4. A character count. A key that pasted short is obvious at a glance
+//      instead of failing silently at the first call.
+// =====================================================================
+
+struct ChappyKeyField: View {
+    let title: String
+    @Binding var text: String
+    var onSave: () -> Void
+
+    @State private var hidden = false
+
+    private var masked: String {
+        guard hidden, !text.isEmpty else { return text }
+        return String(repeating: "•", count: min(text.count, 40))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if hidden {
+                    Text(masked.isEmpty ? title : masked)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(text.isEmpty ? .secondary : .primary)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    TextField(title, text: $text, axis: .vertical)
+                        .font(.system(.footnote, design: .monospaced))
+                        .lineLimit(1...3)
+                        // THE IMPORTANT LINE. Everything else here is
+                        // comfort; this is what stops iOS deciding the
+                        // field is a password and taking it over.
+                        .textContentType(.none)
+                        .autocorrectionDisabled(true)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.asciiCapable)
+                        .submitLabel(.done)
+                }
+
+                // BUILD 228: a 17pt glyph. Legal target now.
+                Button { hidden.toggle() } label: {
+                    Image(systemName: hidden ? "eye.slash" : "eye")
+                        .font(.body)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+            }
+
+            HStack(spacing: 14) {
+                Button {
+                    if let p = UIPasteboard.general.string {
+                        text = p.trimmingCharacters(in: .whitespacesAndNewlines)
+                        hidden = false
+                    }
+                } label: {
+                    Label("Paste", systemImage: "doc.on.clipboard")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Button("Save") { onSave() }
+                    .font(.subheadline.weight(.semibold))
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+
+                if !text.isEmpty {
+                    Button { text = "" } label: {
+                        Label("Clear", systemImage: "xmark.circle")
+                            .font(.subheadline)
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if !text.isEmpty {
+                    Text("\(text.count) characters")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+// =====================================================================
+// BUILD 230 — THE KEYS SCREEN.
+//
+// The dot is the smallest part of this. The useful part is the sentence
+// under each row saying WHAT STOPS WORKING when that key dies — "Gemini
+// is red" means nothing, "the voice is down" means everything.
+//
+// Tests run when the screen opens and the answers are cached, so opening
+// it tells you the truth without pressing anything. AviationStack is the
+// exception and says so on the row: testing it spends one of your
+// hundred a month, so it runs at most once a day.
+// =====================================================================
+
+// BUILD 231 — where reports go.
+struct ChappyPartnerView: View {
+    @State private var email = ChappyHandoff.partner
+    @State private var name = ChappyHandoff.partnerName
+    @State private var saved = false
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("name@example.com", text: $email)
+                    .textContentType(.emailAddress)
+                    .keyboardType(.emailAddress)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+            } header: {
+                Text("Email address")
+            } footer: {
+                Text("Every report Chappy builds can go here — the trip plan with the map, the flight brief, the comparison, the memory export.")
+            }
+
+            Section {
+                TextField("your partner", text: $name)
+            } header: {
+                Text("What to call them")
+            } footer: {
+                Text("Only used in what Chappy says back — \u{201C}addressed to Sam, one tap sends it\u{201D}.")
+            }
+
+            Section {
+                Button {
+                    ChappyHandoff.partner = email.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ChappyHandoff.partnerName = n.isEmpty ? "your partner" : n
+                    saved = true
+                } label: {
+                    Text("Save").fontWeight(.semibold).frame(minHeight: 44)
+                }
+                if saved {
+                    Text("Saved.").font(.footnote).foregroundColor(.secondary)
+                }
+            }
+        }
+        .navigationTitle("Who reports go to")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct ChappyKeysView: View {
+
+    @ObservedObject private var keys = ChappyKeys.shared
+    @State private var tripKey = UserDefaults.standard.string(forKey: "chappy_tripadvisor_key") ?? ""
+    @State private var fareKey = UserDefaults.standard.string(forKey: "chappy_tp_token") ?? ""
+
+    /// For the Settings row, so the state is visible before you open it.
+    static var summaryLine: String {
+        let k = ChappyKeys.shared
+        let bad = k.problems
+        if !bad.isEmpty {
+            return "\(bad.count) not working — \(bad.map(\.label).joined(separator: ", "))"
+        }
+        let live = ChappyKeys.Slot.allCases.filter { k.status($0).state == .live }.count
+        if live == 0 { return "Not checked yet — open to test them" }
+        let missing = ChappyKeys.Slot.allCases
+            .filter { k.status($0).state == .missing && !$0.baked }
+        return missing.isEmpty
+            ? "All \(live) answering"
+            : "\(live) answering · \(missing.count) still to set up"
+    }
+
+    static var summaryColour: Color {
+        let k = ChappyKeys.shared
+        if !k.problems.isEmpty { return .red }
+        if ChappyKeys.Slot.allCases.contains(where: { k.status($0).state == .unknown }) {
+            return .orange
+        }
+        return .green
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Each of these is tested by actually calling the provider — not by checking the key looks right, which is what most apps mean by validating a key and which passes a revoked one every time.")
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+
+            ForEach(ChappyKeys.Slot.allCases) { slot in
+                Section {
+                    row(slot)
+                    if slot == .tripadvisor {
+                        ChappyKeyField(title: "Paste the Tripadvisor key", text: $tripKey) {
+                            let k = tripKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            tripKey = k
+                            UserDefaults.standard.set(k, forKey: "chappy_tripadvisor_key")
+                            Task { await keys.test(.tripadvisor, force: true) }
+                        }
+                    }
+                    if slot == .fares {
+                        ChappyKeyField(title: "Paste the Travelpayouts token", text: $fareKey) {
+                            let k = fareKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            fareKey = k
+                            UserDefaults.standard.set(k, forKey: "chappy_tp_token")
+                            ChappyFareSource.shared.forget()
+                            Task { await keys.test(.fares, force: true) }
+                        }
+                    }
+                } header: {
+                    Text(slot.label)
+                }
+            }
+
+            Section {
+                Button {
+                    Task { await keys.testAll(force: false) }
+                } label: {
+                    Label("Test them all again", systemImage: "arrow.clockwise")
+                        .frame(minHeight: 44)
+                }
+            } footer: {
+                Text("Green means the key authenticated at the time shown. It cannot tell you how much credit is left or when a key expires — no provider exposes that on a key check, and claiming otherwise would be a guess dressed up as a status light.")
+            }
+        }
+        .navigationTitle("API keys")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            Task { await keys.testAll(force: false) }
+        }
+    }
+
+    @ViewBuilder private func row(_ slot: ChappyKeys.Slot) -> some View {
+        let st = keys.status(slot)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 9) {
+                if keys.isTesting(slot) {
+                    ProgressView().scaleEffect(0.7).frame(width: 14)
+                } else {
+                    Image(systemName: st.state.dot)
+                        .font(.system(size: 13))
+                        .foregroundColor(colour(st.state))
+                        .frame(width: 14)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(headline(slot, st))
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(colour(st.state))
+                    Text(keys.masked(slot))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await keys.test(slot, force: true) }
+                } label: {
+                    Text("Test")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(keys.isTesting(slot))
+            }
+
+            if !st.detail.isEmpty {
+                Text(st.detail)
+                    .font(.caption)
+                    .foregroundColor(st.state == .failed ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text(slot.unlocks)
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !slot.testCosts.isEmpty {
+                Label(slot.testCosts, systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if slot.baked {
+                Text("Built into the app — you don't need to enter this one.")
+                    .font(.caption2).foregroundColor(.secondary.opacity(0.8))
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    private func headline(_ slot: ChappyKeys.Slot, _ st: ChappyKeys.Status) -> String {
+        switch st.state {
+        case .live:
+            guard let at = st.at else { return "Working" }
+            return "Working — checked \(Self.ago(at))"
+        case .failed:  return "Not working"
+        case .missing: return slot.baked ? "Missing from the build" : "Not set up"
+        case .unknown: return "Not checked yet"
+        }
+    }
+
+    private func colour(_ s: ChappyKeys.State) -> Color {
+        switch s {
+        case .live:    return .green
+        case .failed:  return .red
+        case .missing: return .orange
+        case .unknown: return .secondary
+        }
+    }
+
+    private static func ago(_ d: Date) -> String {
+        let m = Int(Date().timeIntervalSince(d) / 60)
+        if m < 2 { return "just now" }
+        if m < 60 { return "\(m) min ago" }
+        let h = m / 60
+        if h < 24 { return "\(h)h ago" }
+        return "\(h / 24)d ago"
+    }
+}
+
 struct FlightKeysView: View {
     @State private var apiKey = ""
     @State private var apiSecret = ""
@@ -2377,14 +2786,14 @@ struct FlightKeysView: View {
             // grid; without it the graph still runs on the fares you log
             // yourself, which is the half that is unarguably real.
             Section {
-                SecureField("Paste the token", text: $fareKey)
-                Button("Save") {
-                    let k = fareKey.trimmingCharacters(in: .whitespaces)
+                ChappyKeyField(title: "Paste the Travelpayouts token", text: $fareKey) {
+                    let k = fareKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    fareKey = k
                     UserDefaults.standard.set(k, forKey: ChappyFareSource.tokenKey)
                     ChappyFareSource.shared.forget()
                     fareStatus = k.isEmpty
                         ? "Cleared. The graph runs on your own journal now."
-                        : "Saved. Open Flights, Fares tab — the day grid fills in."
+                        : "Saved \(k.count) characters. Open Flights, Fares tab — the day grid fills in."
                 }
                 if !fareStatus.isEmpty {
                     Text(fareStatus).font(.footnote).foregroundColor(.secondary)
@@ -2404,17 +2813,21 @@ struct FlightKeysView: View {
                 Text("Sign up free at travelpayouts.com, open the API section and copy the token. It is self-serve — no partner approval, no card. What it gives you is the cheapest fare somebody's search actually RETURNED for each day of a month, with the date it was seen. That is not a live quote and it does not book anything, and Chappy says so every time it shows you one. WITHOUT it, everything still works: the graph draws the fares you log yourself and the verdict on whether a price is any good comes from your own record, which is the only source that cannot be switched off.")
             }
 
-            Section("Amadeus API key") {
-                SecureField("API Key", text: $apiKey)
-            }
-            Section("Amadeus API secret") {
-                SecureField("API Secret", text: $apiSecret)
-            }
+            // BUILD 230 — THE AMADEUS FIELDS ARE GONE.
+            //
+            // Amadeus paused self-service registrations in March 2026 and
+            // decommissioned the developer portal outright on 17 July
+            // 2026. There is no signup form left to fill in. A settings
+            // field you cannot possibly complete wastes your time twice:
+            // once trying, and once wondering whether you should.
+            //
+            // The flight day always ran on AviationStack, which is baked
+            // in and now has a light on it in API keys.
             Section {
                 Button("Save") {
                     let k = apiKey.trimmingCharacters(in: .whitespaces)
                     let sec = apiSecret.trimmingCharacters(in: .whitespaces)
-                    guard !k.isEmpty, !sec.isEmpty else { status = "Both fields, then Save."; return }
+                    guard !k.isEmpty, !sec.isEmpty else { status = ""; return }
                     _ = APIKeyManager.shared.saveAmadeusKey(k)
                     _ = APIKeyManager.shared.saveAmadeusSecret(sec)
                     apiKey = ""; apiSecret = ""
@@ -2554,6 +2967,31 @@ struct TravelKeysView: View {
                 Text("Passport expiry, who you fly with, who's coming. Chappy plans for this person rather than a generic Australian — and it checks the six-month passport rule on every trip, which is what actually stops people at the check-in desk.")
             }
 
+            // BUILD 221 — THE SWITCH THIS FEATURE NEVER HAD.
+            //
+            // Proximity recall — walk past somewhere and Chappy quietly
+            // says what happened there — is the best thing in the whole
+            // location layer, and it shipped OFF with no control
+            // anywhere. The only way to turn it on was to say a phrase
+            // nobody would ever guess. A feature with no discoverable
+            // switch is a feature nobody has.
+            Section {
+                Toggle("Remind me where I am", isOn: Binding(
+                    get: { ChappyRelevance.shared.isEnabled },
+                    set: { ChappyRelevance.shared.isEnabled = $0 }
+                ))
+                if ChappyRelevance.shared.isEnabled {
+                    Text(ChappyRelevance.shared.lastRemark.isEmpty
+                         ? "Nothing said yet today."
+                         : "Last: \(ChappyRelevance.shared.lastRemark)")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Place memories")
+            } footer: {
+                Text("When you come back to somewhere you've been, Chappy mentions what happened there — quietly, at most three times a day, never within 45 minutes of the last one, and never between 10pm and 7am. Memories older than four months are archaeology and stay quiet. All of it is worked out on the phone; nothing about where you are is uploaded to say it.")
+            }
+
             Section {
                 Picker("Everything is priced in", selection: Binding(
                     get: { fx.home },
@@ -2570,13 +3008,13 @@ struct TravelKeysView: View {
             }
 
             Section {
-                SecureField("Paste the key", text: $key)
-                Button("Save") {
-                    let k = key.trimmingCharacters(in: .whitespaces)
+                ChappyKeyField(title: "Paste the Tripadvisor key", text: $key) {
+                    let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    key = k
                     UserDefaults.standard.set(k, forKey: "chappy_tripadvisor_key")
                     status = k.isEmpty
                         ? "Cleared. Places now come from Apple Maps."
-                        : "Saved. Open a leg and tap Eat & see."
+                        : "Saved \(k.count) characters. Open a leg and tap Eat & see."
                 }
                 if !status.isEmpty {
                     Text(status).font(.footnote).foregroundColor(.secondary)
@@ -2589,9 +3027,9 @@ struct TravelKeysView: View {
 
             // BUILD 183 — THE SECOND OPINION.
             Section {
-                SecureField("Google Maps API key", text: $gkey)
-                Button("Save") {
-                    let k = gkey.trimmingCharacters(in: .whitespaces)
+                ChappyKeyField(title: "Google Maps API key", text: $gkey) {
+                    let k = gkey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    gkey = k
                     if k.isEmpty {
                         _ = APIKeyManager.shared.deleteMapsAPIKey()
                         // AUDIT: seedDefaultKeys() puts the built-in key back
