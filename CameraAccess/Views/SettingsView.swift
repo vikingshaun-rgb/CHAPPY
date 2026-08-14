@@ -733,6 +733,25 @@ struct SettingsView: View {
                         .font(AppTypography.caption)
                 }
 
+                // BUILD 234 — HOW MUCH IT SAYS WITHOUT BEING ASKED.
+                Section {
+                    Picker("Speaks up", selection: Binding(
+                        get: { ChappyNotify.unprompted },
+                        set: { ChappyNotify.unprompted = $0 })) {
+                        ForEach(ChappyNotify.Unprompted.allCases) { u in
+                            Text(u.label).tag(u)
+                        }
+                    }
+                    Text(ChappyNotify.unprompted.detail)
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                } header: {
+                    Text("Talking to you")
+                } footer: {
+                    Text("Anything Chappy is not allowed to say out loud arrives as a notification instead — it is never thrown away. You can also just say \u{201C}Chappy, be quiet\u{201D}.")
+                        .font(AppTypography.caption)
+                }
+
                 // BUILD 231 — WHO REPORTS GO TO.
                 //
                 // Stored once so "email my partner the Bali report" has
