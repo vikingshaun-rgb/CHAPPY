@@ -187,7 +187,12 @@ final class ChappyPulse: ObservableObject {
         d.removeObject(forKey: Key.boost)
         let prior = Tier(rawValue: d.string(forKey: Key.priorTier) ?? "off") ?? .off
         setTier(prior, speak: false)
-        TTSService.shared.speak("Back to \(prior == .off ? "not recording" : prior.label.lowercased()).")
+        // BUILD 254: waits for a gap. mustBeHeard TRUE, on reflection —
+        // setTier() above has already CHANGED what Chappy is recording, so
+        // dropping the line leaves the tier silently reverted with nothing
+        // said. A state change he did not ask for has to be announced; only
+        // information can be dropped.
+        ChappyStandby.speakWhenClear("Back to \(prior == .off ? "not recording" : prior.label.lowercased()).")
     }
 
     /// Call once at launch.
@@ -225,7 +230,9 @@ final class ChappyPulse: ObservableObject {
         if level >= 0, level < batteryFloor, UIDevice.current.batteryState != .charging {
             print("📸 [Pulse] battery \(Int(level * 100))% — standing down")
             setTier(.off, speak: false)
-            TTSService.shared.speak("Battery's low — I've stopped ambient memory.")
+            // BUILD 254: worth hearing, so it waits rather than drops — but
+            // it no longer lands on top of whatever he is saying.
+            ChappyStandby.speakWhenClear("Battery's low — I've stopped ambient memory.")
             return
         }
 

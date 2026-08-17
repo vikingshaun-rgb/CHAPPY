@@ -1422,10 +1422,6 @@ final class ChappyStandby: NSObject, ObservableObject {
     private var routeTask: Task<Void, Never>?
     private var starting = false
     private var wasListeningBeforeHandoff = false
-    private var pendingAmbiguous: String?
-    /// AUDIT P1 (SB-STICKY): the either/or question expires. Without this it
-    /// latched forever and hijacked the next unrelated command.
-    private var ambiguousAskedAt = Date.distantPast
     /// AUDIT FIX (SB-H1): interruption/route resilience state.
     private var resilienceInstalled = false
     private var interruptedWhileListening = false
@@ -1506,6 +1502,28 @@ final class ChappyStandby: NSObject, ObservableObject {
     private static var lastLoggedHeard = ""
     private static var lastHeardLogAt = Date.distantPast
     private static var lastDebounceNote = ""
+
+    // MARK: BUILD 253 — no sentence leaves without a trace
+    //
+    // `routeStartedAt` is the clock everything else is measured against:
+    // the moment a finished command entered the router. The backstop
+    // compares ChappyRouterLog's last recorded DECISION against this
+    // stamp — nothing else; an earlier version also read TTS's last
+    // spoken line and review took that apart, see closeTheBooks. So an
+    // instrumented tier keeps its own record, and an uninstrumented one —
+    // nav, briefs, timers, lists, the screen openers — at least leaves a
+    // line saying the record has a gap where it should be.
+    nonisolated(unsafe) static var routeStartedAt = Date.distantPast
+    /// Bumped on every finish(). A cancelled route's tail compares its own
+    /// copy against this and writes nothing if he has moved on.
+    nonisolated(unsafe) static var routeToken = 0
+
+    /// Milliseconds from the command being finalised to now. This is the
+    /// number he means by "delay" — it starts when he stopped talking,
+    /// not when some internal stage happened to begin.
+    static var msSinceRouteStart: Int {
+        max(0, Int(Date().timeIntervalSince(routeStartedAt) * 1000))
+    }
 
     private static let wakeWords = [
         "chappy", "chappie", "chapy", "chappy's", "chappi", "chapi",
@@ -3338,11 +3356,25 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             closeAllPrompts()
             ChappyStandbyLog.note("👂 [Standby] Changed his mind mid-prompt → '\(cleaned)'")
+            // BUILD 253: this is a SECOND route entry point, and it never
+            // stamped. Without these four lines the timing statics still
+            // held the previous sentence — or, at cold start, distantPast —
+            // so the log would have reported this command as having taken
+            // about two thousand years. A diagnostic that prints a number
+            // that absurd gets ignored, and then it is worse than nothing.
+            Self.routeToken &+= 1
+            let token = Self.routeToken
+            Self.routeStartedAt = Date()
             busy = true
             routeTask?.cancel()
             routeTask = Task { @MainActor in
                 await self.route(cleaned)
+                // Same token guard as the main route tail — see the note
+                // there. Returning without clearing is safe because the
+                // holder of the newer token owns `busy` and clears it.
+                guard !Task.isCancelled, token == Self.routeToken else { return }
                 self.busy = false
+                Self.closeTheBooks(on: cleaned, token: token)
                 self.followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
                 self.resetRecognition()
             }
@@ -3471,6 +3503,14 @@ final class ChappyStandby: NSObject, ObservableObject {
     func openFollowUpAfterSpeaking() {
         guard let armed = followUpArmedAt else { return }
         followUpArmedAt = nil
+        // BUILD 254: an outstanding confirmation IS a question, whatever it
+        // sounds like. ChappyGate's destructive line — "That will delete it
+        // and I can't undo it. Say yes to go ahead." — has no question mark
+        // and matches none of readsAsAQuestion's openers, so it opened the
+        // twelve-second door instead of the seventy-five-second one. His
+        // "yes" thirty seconds later was never routed at all, and the
+        // forty-five-second pending window below it was never reached.
+        if pendingPlanTool != nil { followUpWasAQuestion = true }
 
         // A run that has already gone on too long ends here rather than
         // renewing itself forever.
@@ -3771,7 +3811,9 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         request = req
 
-        let input = engine.inputNode
+        // BUILD 252: `var`, because a stale node format is now cured by
+        // replacing the engine below — and the new engine has a new node.
+        var input = engine.inputNode
         // BUILD 142 — THE CRASH IN THE .IPS, KILLED AT THE SOURCE.
         //
         // installTap throws an UNCATCHABLE exception when the hardware format
@@ -3815,7 +3857,55 @@ final class ChappyStandby: NSObject, ObservableObject {
         // make the node acquire a valid format. It was being called
         // AFTER the tap, at the bottom of this function.
         engine.prepare()
-        let format = input.outputFormat(forBus: 0)
+        var format = input.outputFormat(forBus: 0)
+
+        // ============================================================
+        // BUILD 252 — THE STALE NODE FORMAT, AND THE PROOF.
+        //
+        // His log contains the failure AND its own recovery, eight
+        // seconds apart, which is what makes this certain rather than
+        // another theory:
+        //
+        //   5590.01  Node 48000.0 Hz, session 16000.0 Hz — installing
+        //   5590.21  Engine started
+        //   5592.23  ❌ TAP INSTALLED BUT SILENT — no audio in 2s
+        //   5598.62  Engine replaced          <- the liveness sweep
+        //   5598.67  Node 16000.0 Hz, session 16000.0 Hz — installing
+        //   5598.81  ✅ AUDIO IS ARRIVING
+        //
+        // Same route, same session, same code path. The ONLY difference
+        // is that the second attempt ran on a FRESH AVAudioEngine, so
+        // the input node re-acquired the hardware and reported 16 kHz
+        // instead of a stale 48. A tap installed on a node whose cached
+        // format disagrees with the live session installs fine, starts
+        // fine, and never delivers a single buffer.
+        //
+        // Build 239 removed a sample-rate comparison here, correctly:
+        // it DEFERRED on mismatch, which meant on the glasses it never
+        // armed at all. But the number it was reading was real. The
+        // answer was never to wait for the node to change its mind —
+        // it cannot, the format is cached at first touch. The answer is
+        // to throw the engine away, which is exactly what the sweep does
+        // six seconds later, successfully, every time.
+        //
+        // So: replace it here, BEFORE the tap, and save the six seconds
+        // of deafness the sweep currently costs. Bounded to one attempt
+        // per call — if a fresh engine still disagrees, that is a real
+        // route problem and the tap-silent watchdog will say so.
+        // ============================================================
+        let sessionRate = AVAudioSession.sharedInstance().sampleRate
+        if format.sampleRate > 0, sessionRate > 0,
+           abs(format.sampleRate - sessionRate) > 1 {
+            ChappyStandbyLog.note(String(format: "🔧 [Standby] Node %.0f Hz but session %.0f Hz — the node's format is stale, replacing the engine before the tap", format.sampleRate, sessionRate))
+            engine.stop()
+            engine.inputNode.removeTap(onBus: 0)
+            engine = AVAudioEngine()
+            reinstallConfigChangeObserver()
+            input = engine.inputNode
+            engine.prepare()
+            format = input.outputFormat(forBus: 0)
+            ChappyStandbyLog.note(String(format: "🔧 [Standby] Fresh engine reports %.0f Hz against a %.0f Hz session", format.sampleRate, AVAudioSession.sharedInstance().sampleRate))
+        }
 
         // BUILD 210 — THE LAUNCH CRASH, AND IT IS THE SAME ONE.
         //
@@ -3912,6 +4002,38 @@ final class ChappyStandby: NSObject, ObservableObject {
         let installedAt = Date()
         lastBufferAt = installedAt
         if !engine.isRunning {
+            // ========================================================
+            // BUILD 252 — MAKE THE SESSION ACTIVE BEFORE STARTING.
+            //
+            // From his log, four times in eight seconds at cold launch
+            // on the built-in mic:
+            //
+            //   ⚠️ ENGINE WOULD NOT START — com.apple.coreaudio.avfaudio
+            //      2003329396
+            //
+            // 2003329396 is 0x77686174, which spells 'what' — CoreAudio's
+            // catch-all for "you asked for something that makes no sense
+            // in the state I am in". The overwhelmingly common cause is
+            // starting an engine against an audio session that is not
+            // active: ChappyAudio.apply() sets the CATEGORY, and a
+            // category is not an activation.
+            //
+            // It has been invisible until now because it only bites at
+            // cold launch, where another app or the system may still hold
+            // the session for a moment — and by the time he opened Voice
+            // check it had usually recovered on the glasses, which take a
+            // different path.
+            //
+            // Activating is cheap, idempotent, and the error is worth
+            // having on its own: if THIS is what fails, the log now says
+            // so instead of blaming the engine.
+            // ========================================================
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                let ns = error as NSError
+                ChappyStandbyLog.note("⚠️ [Standby] Audio session would not activate — \(ns.domain) \(ns.code): \(error.localizedDescription)")
+            }
             engine.prepare()
             do { try engine.start() } catch {
                 // BUILD 244: the OSStatus matters. -10868 is
@@ -4048,14 +4170,101 @@ final class ChappyStandby: NSObject, ObservableObject {
             reallySpeaking = false
         }
         if reallySpeaking {
-            let killWords = ["chappy stop", "stop chappy", "shut up", "shush",
-                             "be quiet", "quiet", "enough", "stop talking", "that's enough"]
-            if killWords.contains(where: { text.hasSuffix($0) || text.contains($0) }) {
+            // ============================================================
+            // BUILD 254 — WHOLE WORDS. AND WHY BARE "STOP" IS NOT HERE.
+            //
+            // I tried twice to make a bare "stop" work in this branch and
+            // review killed both. The second attempt was the instructive
+            // one, because it could never have fired at all.
+            //
+            // `text` here is not what he just said. It is the recogniser's
+            // CUMULATIVE transcript for the whole task — and the AUDIT P0
+            // (SB-SELFTALK) note in this same file records that the mic tap
+            // stays live while Chappy speaks with no echo cancellation, so
+            // that transcript reliably contains CHAPPY'S OWN SENTENCE too.
+            // By the time he says "stop" over a weather answer, `text` reads
+            // "it's twenty eight degrees and humid stop". An equality test
+            // can never match it, and a hasSuffix test — my first attempt —
+            // matches "chappy navigate to the bus stop" instead, silencing
+            // Chappy and binning the command.
+            //
+            // There is no test on a contaminated cumulative string that can
+            // tell those two apart. Doing it properly means diffing the
+            // transcript against what Chappy has spoken, which is a real
+            // piece of work and not a line in a build about barge-in.
+            //
+            // So bare "stop" still does nothing mid-answer, and that is
+            // recorded here rather than claimed fixed.
+            //
+            // BARE "QUIET" AND BARE "ENOUGH" ARE ALSO GONE, and that IS a
+            // change from 253. Same reason, the other way round: matched
+            // anywhere in a transcript that contains Chappy's own voice,
+            // they fire on Chappy's own lines. "Fair enough." "Not enough
+            // readings yet." "I couldn't get enough text off that." Each
+            // silenced the sentence it was part of. And two real commands
+            // were swallowed here and never reached their handlers:
+            // "quiet mode", and "is five hundred thousand rupiah enough
+            // for dinner" — the second being the exact shape this file's
+            // own AUDIT P0 note further down exists to protect.
+            //
+            // Whole-word matching does not help either of them: in "quiet
+            // mode" and "is that enough", the word IS a whole word.
+            //
+            // What is left is the set that is far LESS likely to appear in
+            // Chappy's own speech or inside another command: shut up,
+            // shush, be quiet, stop talking, that's enough / thats enough,
+            // chappy stop and stop chappy.
+            // Not impossible — a model answer could say "that's enough for
+            // two" — but these are two- and three-word phrases rather than
+            // single common words, which is the whole difference. Each
+            // still matches anywhere in a contaminated transcript, which is
+            // what makes them work mid-answer at all.
+            // ============================================================
+            let killPhrases = ["chappy stop", "stop chappy", "shut up", "shush",
+                               "be quiet", "stop talking",
+                               "that's enough", "thats enough"]
+            let padded = " " + text + " "
+            let killed = killPhrases.contains { padded.contains(" " + $0 + " ") }
+            if killed {
                 TTSService.shared.stop()
                 ChappyHaptics.shared.straightStep()
                 awake = false; command = ""
                 routeWork?.cancel()
-                ChappyStandbyLog.note("🤫 [Standby] Killed mid-sentence by voice")
+                // ========================================================
+                // BUILD 254 — AND CLEAR THE WORK, NOT JUST THE VOICE.
+                //
+                // This stopped the audio and left `busy` true and the route
+                // task running. Two consequences, both of which he has hit:
+                //
+                //  1. The next command got "One thing at a time - still on
+                //     the last." The barge-in guard in finish() is written
+                //     to catch exactly that case, but it only fires while
+                //     TTS is STILL speaking — which this branch has just
+                //     made false. The two guards defeated each other.
+                //  2. The route task kept running. That is NOT fixed —
+                //     see the long note on speak(): cancellation never
+                //     reaches route()'s non-throwing awaits, so a zombie
+                //     answer can still arrive and speak. Clearing busy
+                //     makes it land on a live new command instead of on
+                //     silence, which is worse in one way and better in
+                //     another; the honest fix is cancellation inside
+                //     NavEngine and friends, and it is not in this build.
+                //
+                // Bumping the token also retires the pending gap-check from
+                // 253, which is right: he cancelled it, so there is nothing
+                // for the log to say.
+                // ========================================================
+                busy = false
+                routeTask?.cancel()
+                Self.routeToken &+= 1
+                // And flush the ear, as the interrupt branch in finish()
+                // does. Without it the cumulative transcript still holds
+                // "shut up", and once busy is clear the next command can
+                // run — so the stale phrase re-kills its answer on the
+                // first partial. Harmless in 253 only because busy stayed
+                // true and nothing could follow.
+                resetRecognition()
+                ChappyStandbyLog.note("🤫 [Standby] Killed mid-sentence by voice — audio, route, busy and transcript all cleared")
                 return
             }
             // BUILD 133 — BARGE-IN, NOT JUST A MUTE BUTTON.
@@ -4374,14 +4583,36 @@ final class ChappyStandby: NSObject, ObservableObject {
             // BUILD 202: an exact screen name. Nothing it could grow into
             // changes the answer, so stop waiting for silence.
             debounce = 0.05
-        } else if Self.extendableCommands.contains(cleanTail) {
+        } else if Self.wantsALongWindow(cleanTail) {
             // BUILD 90: 0.40s was too tight for "translate … to Indonesian".
             // The tail arrives as a separate recogniser partial and any natural
             // pause expired the window, firing bare "translate" and losing the
             // language. Words that commonly take a tail get longer.
             // BUILD 135: widened again — the recogniser delivers partials in
             // bursts, and a burst gap mid-sentence was firing half a thought.
-            debounce = ["translate", "navigate", "go", "map to"].contains(cleanTail) ? 0.9 : 0.6
+            //
+            // BUILD 254 — THE ARGUMENT-TAKERS, INCLUDING THE SYNONYMS.
+            //
+            // A bare "weather" now waits 0.9s instead of 0.05s. That is the
+            // trade this build makes everywhere: nine tenths of a second of
+            // patience against losing "in Ubud tomorrow" entirely. BUILD
+            // 144's own spec was "wait till I finish speaking — 1 to 2
+            // seconds of silence — THEN respond".
+            //
+            // THIS BRANCH SITS ABOVE extendableCommands ON PURPOSE, and it
+            // took two goes to get there. My first cut put the test INSIDE
+            // that branch, where it could only ever see words already in
+            // that set — the canonical spellings I had just listed by hand.
+            // Every synonym (visas, eat, dinner, diary, fly, currency,
+            // navigation, weather station) sailed past to the generic
+            // word-count branch at 0.50s. My second cut put it below, which
+            // let extendableCommands claim translate and navigate first and
+            // hand them 0.6s. It has to be first, and it is.
+            debounce = 0.9
+        } else if Self.extendableCommands.contains(cleanTail) {
+            // Everything else that commonly takes a tail, but where the
+            // tail is shorter or rarer: snap, watch, remember, take me to.
+            debounce = 0.6
         } else {
             // BUILD 118 — FASTER ONCE HE HAS ACTUALLY FINISHED.
             //
@@ -4509,6 +4740,17 @@ final class ChappyStandby: NSObject, ObservableObject {
                 ChappyStandbyLog.note("‼️ [Standby] terminal '\(a)' is a prefix of '\(b)' — would fire early")
             }
         }
+        // BUILD 254 — A CHECK I WROTE AND THEN DELETED, AND WHY.
+        //
+        // I added a loop here flagging any extendable word that is also an
+        // exact tile name. Review pointed out it would print a ‼️ line for
+        // every one of them forever — because being in both sets is now
+        // the NORMAL state, and isFinishedName declining them is the fix,
+        // not the fault. A permanent red warning describing correct
+        // behaviour trains you to ignore the warnings that matter.
+        //
+        // There is nothing left to check: the invariant is enforced by
+        // construction one screen down, in isFinishedName's first guard.
     }
 
     /// Known commands that MAY take a tail. A short grace, then fire.
@@ -4539,9 +4781,161 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// still be growing into "travel desk to Bali".
     static func isFinishedName(_ tail: String) -> Bool {
         guard !tail.isEmpty, tail.split(separator: " ").count <= 2 else { return false }
+        // ============================================================
+        // BUILD 254 — THE 50-MILLISECOND BUG. THIS ONE LINE IS THE FIX.
+        //
+        // A word can be an exact screen name AND a word that normally
+        // takes a tail. "translate" is both, and so are navigate, route,
+        // directions, weather, reminder, search, convert, flights, food
+        // and memory — every one of which had to be ADDED to
+        // extendableCommands for this guard to reach it. See the note in
+        // that set: the first cut of this fix caught only "translate".
+        //
+        // This function is tested BEFORE the extendable branch, and it
+        // returns a 0.05-second window. So for every one of those words
+        // the 0.9-second window that BUILD 90 and BUILD 135 each wrote
+        // specifically to stop "translate" firing without its language
+        // has been unreachable ever since BUILD 202 inserted this test
+        // above it. Two separate fixes, both correct, both dead.
+        //
+        // What he lived with: "chappy, translate this into indonesian"
+        // fires on the bare word "translate" after fifty milliseconds,
+        // opens Translate, wipes the transcript, and the rest of his
+        // sentence arrives a beat later as a second command reading
+        // "indonesia". That is his log, line for line.
+        //
+        // There is a validator for a neighbouring class of collision —
+        // validateCommandSets() guards terminalCommands against
+        // neverInstant and against prefix clashes. I added a check for
+        // THIS pair to it and then deleted it again: see the note there.
+        // Being in both sets is now the normal state, so the check would
+        // have printed a permanent false alarm. The invariant is enforced
+        // by construction, here, instead.
+        // ============================================================
+        guard !extendableCommands.contains(tail) else { return false }
         guard let t = ChappyTiles.match(tail) else { return false }
-        return t.words.contains(tail)
+        guard t.words.contains(tail) else { return false }
+        // ============================================================
+        // BUILD 254, SECOND CUT — DECLINE BY TILE, NOT BY WORD.
+        //
+        // My first cut listed the words. Review then listed the forty-odd
+        // it had missed, because ChappyTiles.all is a SYNONYM table and
+        // this function fires on any exact word in it. Fixing "flights"
+        // left "fly", "airfare" and "my flights" firing at fifty
+        // milliseconds. Fixing "food" left "eat", "dinner", "lunch",
+        // "restaurant" and "hungry". Fixing "memory" left "diary",
+        // "journal" and "memories".
+        //
+        // Listing words was always going to lose that race — a synonym
+        // added to a tile next year would quietly reopen it. So the test
+        // is on the TILE. If the screen is one you normally name WITH an
+        // argument, none of its spellings gets the instant window, today
+        // or ever.
+        // ============================================================
+        guard let canonical = t.words.first,
+              !Self.tilesThatTakeAnArgument.contains(canonical) else { return false }
+        return true
     }
+
+    /// Screens usually asked for WITH an argument. "Weather" is nearly
+    /// always "weather in X" or "weather tomorrow"; "flights" is "flights
+    /// to Y". Keyed on each tile's canonical (FIRST) spelling, so one
+    /// entry covers every synonym in that tile — a non-canonical entry is
+    /// not an error, it is silently inert, which is worse.
+    ///
+    /// Keying on the tile pulls about seventy words from 0.05s to 0.9s,
+    /// synonyms included — calendar, agenda, notes, diary, journal,
+    /// memories, spots, money, rates, lunch, dinner. A good few of those
+    /// are said bare fairly often, and they now pay nine tenths of a
+    /// second for a screen they wanted straight away. That is the
+    /// deliberate trade, and it is a real cost: nine tenths of a second on
+    /// a bare command against losing the argument on one that had it.
+    static let tilesThatTakeAnArgument: Set<String> = [
+        "travel desk", "flights", "visas", "weather", "currency",
+        "navigate", "food", "search", "reminders", "memory",
+        "places", "translate",
+        // "upcoming" and "dictate", NOT "calendar" and "notes". Review
+        // caught both: this set is keyed on each tile's FIRST spelling,
+        // and those two tiles are headed "upcoming" and "dictate". A
+        // non-canonical entry here is not an error, it is simply inert —
+        // which is the worst kind, because it reads as covered.
+        "upcoming", "dictate",
+    ]
+
+    /// BUILD 254 — every way he might say "stop", enumerated up front so
+    /// the test at the top of finish() can be plain equality. 636 strings —
+    /// 5x12x5 for the ambiguous single words plus 7x12x4 for the phrases,
+    /// which get no " please" trailer — built once, and worth it for a
+    /// matcher that cannot misfire.
+    static let interruptPhrases: Set<String> = {
+        // The ambiguous single words. They take every lead-in and every
+        // trailer, because on their own they are unmistakable.
+        let short = ["stop", "stop it", "quiet", "enough", "cancel"]
+        // The phrases. Same lead-ins, but NO " please" trailer — review
+        // caught that " please" in the shared list made "shut up please"
+        // an interrupt, which is exactly what the deliberate exclusion of
+        // "please " as a LEAD-IN was there to prevent. Both spellings have
+        // to be out, or the BUILD 234 handler that turns unprompted speech
+        // off is unreachable by voice.
+        let phrases = ["shut up", "shush", "be quiet", "stop talking",
+                       "that's enough", "thats enough", "never mind"]
+        let leadIns = ["", "ok ", "okay ", "no ", "just ", "alright ",
+                       "right ", "yeah ", "hey ", "oi ", "wait ", "chappy "]
+        var out = Set<String>()
+        for b in short {
+            for l in leadIns {
+                for t in ["", " now", " please", " mate", " chappy"] { out.insert(l + b + t) }
+            }
+        }
+        for b in phrases {
+            for l in leadIns {
+                for t in ["", " now", " mate", " chappy"] { out.insert(l + b + t) }
+            }
+        }
+        return out
+    }()
+
+    /// BUILD 254, SECOND CUT — the long window by TILE as well as by word.
+    ///
+    /// needsItsTail names the canonical spellings. Review pointed out that
+    /// left every SYNONYM on the generic word-count branch at 0.50s —
+    /// "visas", "eat", "dinner", "diary", "fly", "currency", "navigation",
+    /// "weather station". Ten times better than the 0.05s they had, and
+    /// still not the window they need. Asking the tile catches all of them
+    /// with one condition, exactly as isFinishedName does.
+    static func wantsALongWindow(_ tail: String) -> Bool {
+        if needsItsTail.contains(tail) { return true }
+        guard let t = ChappyTiles.match(tail), t.words.contains(tail),
+              let canonical = t.words.first else { return false }
+        return tilesThatTakeAnArgument.contains(canonical)
+    }
+
+    /// The words that get the 0.9s window by NAME rather than by tile.
+    ///
+    /// A static, because the first cut built this Set literal fresh on
+    /// every recogniser partial, several times a second, while every
+    /// sibling collection in this file is a static let.
+    ///
+    /// Worth being straight about: every entry here ALSO resolves through
+    /// the tile branch of wantsALongWindow, so deleting this set would
+    /// change no debounce anywhere today. It is kept as the belt to the
+    /// tile test's braces — a word can be renamed out of a tile, and this
+    /// list is the thing that would still catch it.
+    ///
+    /// Once the branch moved above extendableCommands this list is
+    /// consulted for EVERY tail, not only extendable ones, so the earlier
+    /// note about "go" and "map to" being untestable here no longer
+    /// applies. They stay out because neither can reach a tile anyway:
+    /// ChappyTiles.filler strips "go" and "to", so normalise("go") is
+    /// empty and normalise("map to") is just "map", and match() returns
+    /// nil for both. (An
+    /// earlier draft of this note said "neither takes an argument", which
+    /// is plainly false of "go to Ubud".)
+    static let needsItsTail: Set<String> = [
+        "translate", "navigate", "route", "directions", "weather",
+        "forecast", "reminder", "reminders", "search", "convert",
+        "flights", "flight", "food", "memory",
+    ]
 
     static let extendableCommands: Set<String> = [
         "translate", "snap", "photo", "take a photo", "take a picture",
@@ -4559,6 +4953,42 @@ final class ChappyStandby: NSObject, ObservableObject {
         // is exactly what they need, so the tail can arrive.
         "stop", "cancel", "quiet", "battery", "where am i",
         "emergency", "sos", "help", "help me", "open maps", "enough",
+        // ============================================================
+        // BUILD 254 — THE WORDS THE FIRST CUT OF THIS FIX MISSED.
+        //
+        // My first attempt guarded isFinishedName with this set and the
+        // comment claimed it covered translate, navigate, reminder,
+        // weather, search, convert, flights, food, memory and route.
+        // Review checked: it covered exactly ONE of them. This list held
+        // "navigate to" and "route to" — the PREFIXED forms — and not one
+        // of the bare words. So nine of the ten kept their fifty-
+        // millisecond window and kept losing their argument, while a
+        // comment above them said they were fixed.
+        //
+        // Adding them here is half the fix. The other half is in
+        // isFinishedName, which now declines by TILE, so the forty-odd
+        // SYNONYMS this list still doesn't name — fly, eat, dinner, diary,
+        // visa, currency — are covered too. Listing words was always going
+        // to lose that race.
+        //
+        // Third time this build cycle a change of mine was contradicted by
+        // code a few lines away. Written down rather than quietly fixed.
+        //
+        // Membership of this set means one thing: the word commonly
+        // takes a tail, so waiting is worth more than answering fast.
+        // Every one of these is a tile name AND a word with an argument.
+        "navigate", "route", "directions", "weather", "forecast",
+        "reminder", "reminders", "search", "convert",
+        "flights", "flight", "food", "memory",
+        // NOT "remind me" and NOT "translate to". Review caught both:
+        // they were already getting the THREE-SECOND hesitation window —
+        // "remind me" from openerFragments, "translate to" from ending in
+        // a dangling "to" — and putting them here would have SHORTENED
+        // them, because looksUnfinished's first line is an early-out for
+        // anything in this set. "Hey chappy, remind me to call the
+        // landlord about the—" is the sentence in this build's own change
+        // note, and my fix would have made it worse.
+        // ============================================================
     ]
 
     private func finish(_ raw: String) {
@@ -4570,11 +5000,55 @@ final class ChappyStandby: NSObject, ObservableObject {
         // command that could never do its job. He'd get a failure tone and
         // "Still working on the last one" while Chappy kept talking over him.
         // Interrupts jump the queue and kill the work that's blocking them.
-        let interrupts = ["stop", "shut up", "shush", "quiet", "enough",
-                          "be quiet", "stop talking", "that's enough",
-                          "thats enough", "never mind", "cancel"]
+        // ============================================================
+        // BUILD 254 — EQUALITY ONLY, AGAINST AN ENUMERATED SET.
+        //
+        // This was an exact-match test, so "stop it", "ok stop", "no stop"
+        // and "stop now" all missed it and fell through to the full router
+        // — where "stop" on its own is a place name.
+        //
+        // I tried a prefix test (makes "stop navigation" an interrupt: it
+        // would kill the route task and then NOT stop the navigation) and
+        // then a suffix test (makes "navigate to the bus stop", "what's the
+        // next stop", "is that enough" and "keep it quiet" interrupts, each
+        // thrown away with only a haptic to show for it). Both were wrong,
+        // and both were caught by review rather than by him.
+        //
+        // So no fuzzy matching at all. The set is enumerated up front —
+        // every base phrase, with the little words people actually put
+        // either side of it — and the test is plain equality. It cannot
+        // have a false positive by construction, and it now covers the
+        // phrasings the exact-match version missed.
+        //
+        // "please" is deliberately NOT a lead-in: "please shut up" is how
+        // the BUILD 234 handler further down is reached, the one that turns
+        // unprompted speech off for good. Making it an interrupt here would
+        // put that setting out of reach by voice.
+        // ============================================================
         let cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
-        if interrupts.contains(cleaned) {
+        let isInterrupt = Self.interruptPhrases.contains(cleaned)
+        if isInterrupt {
+            // BUILD 253 — TWO HOLES HERE, BOTH FOUND BY REVIEW.
+            //
+            // 1. "Stop" left no router-log entry, ever. It is the command
+            //    most likely to be the subject of a complaint, and it was
+            //    the one command the record could not show.
+            // 2. This path cancels routeTask but returned BEFORE the
+            //    token bump, so the killed sentence's pending verdict
+            //    still fired eight seconds later and reported on work he
+            //    had explicitly cancelled.
+            //
+            // Bumping the token here retires that verdict silently, which
+            // is right: he cancelled it, so there is nothing to say.
+            // Note: no routeStartedAt restamp. There is nothing to time —
+            // this path returns without routing — and writing a stamp
+            // nothing reads is the write-only-state habit this build is
+            // supposed to be getting rid of. ms is a genuine 0.
+            Self.routeToken &+= 1
+            ChappyRouterLog.shared.add(
+                heard: cleaned, tier: "flow", tool: "interrupt",
+                confidence: nil, outcome: "Interrupt — killed whatever was in flight",
+                ms: 0)
             TTSService.shared.stop()
             routeTask?.cancel()
             // An interrupt cancels the QUESTION too. Cutting Chappy off
@@ -4615,6 +5089,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             // dropped" and "never heard at all" are indistinguishable — so he
             // repeats himself into a void. Say something.
             ChappyStandbyLog.note("👂 [Standby] Busy — dropped: \(raw)")
+            // BUILD 253: logged. A dropped command is a sentence he said
+            // that did nothing, which is the exact complaint this screen
+            // exists to answer — and it was the one such case that left
+            // no trace anywhere but the ear's own log.
+            ChappyRouterLog.shared.add(
+                heard: raw, tier: "untagged", tool: nil, confidence: nil,
+                outcome: "Dropped — Chappy was still working on the one before it.",
+                ms: 0, routeDecision: false)
             ChappyHaptics.shared.straightStep()
             TTSService.shared.speak("One thing at a time - still on the last.")
             // AUDIT P1 (SB-AWAKE): `awake` was left TRUE here. The next sentence
@@ -4676,6 +5158,46 @@ final class ChappyStandby: NSObject, ObservableObject {
         emptyPromptAt = nil
         emptyPromptWork?.cancel(); emptyPromptWork = nil
         ChappyStandbyLog.note("👂➡️ [Standby] Command: \(cmd)")
+        // ============================================================
+        // BUILD 253 — TIME IT, AND LOG IT WHATEVER HAPPENS.
+        //
+        // Two holes this closes.
+        //
+        // FIRST, the router log had blind spots exactly where the
+        // problems are. ChappyRouterLog.add() was called from about ten
+        // places — flights, places, reminders, tiles, intent — and from
+        // NOWHERE else. Navigation did not log. The web search did not
+        // log. The conversation model did not log. Nothing that fell
+        // through logged. So a sentence that went the wrong way, or went
+        // nowhere, left no entry at all, and "What Chappy did" was
+        // quietly a partial record while looking like a complete one.
+        //
+        // 253 instruments the model paths and the fall-through directly,
+        // and puts a backstop behind everything else that leaves a line
+        // saying the record has a gap. What it does NOT do is promise one
+        // entry per sentence: a plan still writes one per step, and the
+        // two known limits below can drop a line rather than misfile it.
+        // The promise is narrower and true — no sentence is invisible.
+        //
+        // SECOND, nothing measured the DELAY. The log could tell you what
+        // was heard and what ran, never how long he waited. These stamps
+        // make the two questions he actually asks — "why was that slow"
+        // and "why did it do that" — answerable from one screen.
+        // ============================================================
+        //
+        // THIRD, AND THIS ONE BIT IN REVIEW: the stamps are global, and
+        // routeTask is cancelled and replaced the moment he barges in with
+        // a second sentence. A cancelled task's tail still runs, so the
+        // OLD sentence's verdict would wake up holding the NEW sentence's
+        // stamps — fabricating a phantom "unmatched" entry against a
+        // sentence that was routing perfectly well. A logging bug that
+        // invents mis-routes is worse than no logging at all.
+        //
+        // Hence the token. Each finish() takes a number; a verdict whose
+        // number has moved on says nothing.
+        Self.routeToken &+= 1
+        let token = Self.routeToken
+        Self.routeStartedAt = Date()
         busy = true
         routeTask?.cancel()
         routeTask = Task { @MainActor in
@@ -4692,10 +5214,51 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if i > 0 {
                     // Let the first action finish speaking before the next.
                     try? await Task.sleep(nanoseconds: 400_000_000)
+                    // Restamp, so the deliberate 400 ms pause is not billed
+                    // to the second command as if it were latency.
+                    //
+                    // This return does NOT clear `busy`, and must not.
+                    // Reaching it means either the token moved on — in
+                    // which case a newer route owns `busy` and clearing it
+                    // would let two route the same moment — or the task
+                    // was cancelled by stop() or the interrupt, both of
+                    // which clear `busy` themselves. A stuck `busy` made
+                    // the ear permanently deaf once; so would an unstuck
+                    // one at the wrong moment.
+                    guard !Task.isCancelled, token == Self.routeToken else { return }
+                    Self.routeStartedAt = Date()
                 }
                 await route(part)
+                // BUILD 253 — a verdict PER PART, not per sentence. With
+                // one check at the end, "remember this spot and take me
+                // home" left no trace at all if the first half worked and
+                // the second half died — and half a compound going
+                // missing is precisely what the backstop exists to catch.
+                //
+                // KNOWN LIMIT, stated rather than hidden: verdicts are
+                // judged against one shared "last decision" clock, so on a
+                // COMPOUND a later part's entry can make an earlier part
+                // look accounted for. Single commands — everything he
+                // actually says most of the day — are exact. Fixing the
+                // compound case properly needs a per-part identity on
+                // every one of the router's log calls, which is a bigger
+                // change than this build should carry.
+                Self.closeTheBooks(on: part, token: token)
             }
             if parts.count > 1 { ChappyStandbyLog.note("👂 [Standby] Ran \(parts.count) commands in one sentence") }
+            // BUILD 254 — DON'T CLEAR A BUSY FLAG THAT ISN'T YOURS.
+            //
+            // 254 made the kill-word branch clear `busy` so a fresh command
+            // could start straight after an interrupt. That is right, and it
+            // exposed this: the cancelled task's tail still runs, and it
+            // clears `busy` and calls resetRecognition() with no idea that a
+            // NEWER command now owns both. It would wipe the new sentence's
+            // transcript mid-flight.
+            //
+            // Safe to return without clearing, because whoever moved the
+            // token already owns `busy` and will clear it themselves — the
+            // kill branch, the interrupt, barge-in and stop() all do.
+            guard !Task.isCancelled, token == Self.routeToken else { return }
             self.busy = false
             if Date().timeIntervalSince(self.followUpOpenedAt) > Self.followUpMaxRun {
                 self.followUpOpenedAt = Date()   // fresh run after a real command
@@ -4739,10 +5302,23 @@ final class ChappyStandby: NSObject, ObservableObject {
         // The wake word is implied by the act of typing — strip it if he
         // typed it anyway, so "chappy what's the time" isn't routed as a
         // bare wake word with a tail nobody reads.
-        var cleaned = q
-        let lower = q.lowercased()
-        for w in Self.wakeWords where lower.hasPrefix(w + " ") {
-            cleaned = String(q.dropFirst(w.count + 1))
+        // BUILD 253 — LOWERCASE IT, AS THE EAR DOES.
+        //
+        // Found while auditing the router log's blind spots, and it is a
+        // straight bug in 244's own ask field. The recogniser lowercases
+        // its transcript at source, so every one of the router's several
+        // hundred tests is written against lowercase — hasPrefix("what"),
+        // contains("take me to"), all of it. Typed text went in with its
+        // capitals intact, so "What's the weather" matched nothing that
+        // "what's the weather" matches.
+        //
+        // Which means the ask field, added specifically so he could get a
+        // command through when the ear was deaf, quietly failed on any
+        // sentence he typed with a capital letter — and iOS capitalises
+        // the first letter for you by default.
+        var cleaned = q.lowercased()
+        for w in Self.wakeWords where cleaned.hasPrefix(w + " ") {
+            cleaned = String(cleaned.dropFirst(w.count + 1))
             break
         }
         finish(cleaned)
@@ -4940,7 +5516,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                     line = "\(r.carrier): \(r.sports) Checked \(ChappyBags.vintage)."
                 }
                 ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                           outcome: "baggage for \(r.carrier)", ms: 1)
+                                           outcome: "baggage for \(r.carrier)", ms: ChappyStandby.msSinceRouteStart)
                 return line
             }
             // No airline named — give him the rule that is true everywhere
@@ -4970,7 +5546,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                     origin: oo, dest: dd, month: ChappyFlightsPrefs.thisMonth)
             }
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                       outcome: "carriers \(oo)-\(dd)", ms: 1)
+                                       outcome: "carriers \(oo)-\(dd)", ms: ChappyStandby.msSinceRouteStart)
             NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
             return ChappyRoutes.spoken(oo, dd, quotes: quotes)
         }
@@ -5019,7 +5595,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 source: "flights")
 
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                       outcome: "logged \(Int(v)) \(oo)-\(dd)", ms: 1)
+                                       outcome: "logged \(Int(v)) \(oo)-\(dd)", ms: ChappyStandby.msSinceRouteStart)
             return line
         }
 
@@ -5049,7 +5625,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             var line = verdict.spoken
             if let t = ChappyFareJournal.trend(origin: oo, dest: dd) { line += " " + t }
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                       outcome: "judged \(Int(v))", ms: 1)
+                                       outcome: "judged \(Int(v))", ms: ChappyStandby.msSinceRouteStart)
             return line
         }
 
@@ -5080,7 +5656,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             line += "It's a fare somebody's search returned, \(best.ageNote), not a live quote."
             NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                       outcome: "cheapest day \(oo)-\(dd)", ms: 1)
+                                       outcome: "cheapest day \(oo)-\(dd)", ms: ChappyStandby.msSinceRouteStart)
             return line
         }
 
@@ -5090,7 +5666,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                           "what's my flight situation", "whats my flight situation"]
         if briefWords.contains(where: { c.contains($0) }) {
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
-                                       outcome: "spoke the brief", ms: 1)
+                                       outcome: "spoke the brief", ms: ChappyStandby.msSinceRouteStart)
             NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
             return await spokenFlightBrief()
         }
@@ -5184,6 +5760,26 @@ final class ChappyStandby: NSObject, ObservableObject {
         // BUILD 129: everything new lives behind one entry point. If the
         // hook doesn't recognise a command it returns false and the router
         // below runs exactly as it always has.
+        // BUILD 254 — THE CONFIRMATION EXPIRES BEFORE ANYTHING ELSE RUNS.
+        //
+        // An ignored "shall I?" used to leave pendingPlanTool set for good,
+        // and openFollowUpAfterSpeaking now reads that flag to choose
+        // between a twelve-second door and a seventy-five-second one — so
+        // one unanswered question put the microphone into question-mode
+        // permanently.
+        //
+        // My first cut put this just above the branch that consumes it,
+        // which is BELOW the hook. Any command the hook handles returns at
+        // the next line and never reaches it, so a run of hook-handled
+        // commands kept the stale flag alive indefinitely. It has to be
+        // the first thing route() does, and it is.
+        if pendingPlanTool != nil,
+           Date().timeIntervalSince(pendingPlanAskedAt) >= Self.followUpMaxRun {
+            ChappyStandbyLog.note("⌛ [Standby] Confirmation went unanswered — dropping it")
+            pendingPlanTool = nil; pendingPlanValues = [:]
+            pendingPlanRival = nil
+            pendingPlanAskedAt = .distantPast
+        }
         if await ChappyRouterHook.intercept(c) { return }
 
         // BUILD 197 — A LIVE FLOW OWNS THE NEXT SENTENCE.
@@ -5199,8 +5795,27 @@ final class ChappyStandby: NSObject, ObservableObject {
         // and lets the router have it. Being in a conversation must never
         // trap you in one.
         // BUILD 198 — the answer to "did you mean visas?"
+        // BUILD 254 — TIED TO THE MICROPHONE, NOT TO A NUMBER.
+        //
+        // This was a hardcoded 30 seconds while the ear could still be
+        // open. His "yes" arrived at 35, matched nothing, fell the whole
+        // length of the ladder, and the reminder he had just confirmed was
+        // never created.
+        //
+        // My first cut changed the 30 to 45. My second added the mic's own
+        // ceiling as a second condition, and review showed that made it
+        // WORSE: followUpOpenedAt is stamped at launch and then only when a
+        // run is already 45s stale, so at the moment a confirm question is
+        // asked it is typically 20-45 seconds old. The effective window
+        // became min(45, 45 - that age) — routinely under thirty, and in
+        // the worst case one second.
+        //
+        // The real fault was never the number. It was that asking him a
+        // question did not restart the clock the microphone runs on. So
+        // that is what is fixed, at all three places the question is asked;
+        // here the window is simply 45, which the mic can now always match.
         if let pending = pendingPlanTool,
-           Date().timeIntervalSince(pendingPlanAskedAt) < 30 {
+           Date().timeIntervalSince(pendingPlanAskedAt) < Self.followUpMaxRun {
             let vals = pendingPlanValues
             let rival = pendingPlanRival
             pendingPlanTool = nil; pendingPlanValues = [:]
@@ -5274,7 +5889,7 @@ final class ChappyStandby: NSObject, ObservableObject {
            let picked = ChappyLastResult.shared.referenced(c) {
             ChappyFlow.shared.cancel()
             ChappyRouterLog.shared.add(heard: c, tier: "reference", tool: "places",
-                                       outcome: "resolved to \(picked.title)", ms: 1)
+                                       outcome: "resolved to \(picked.title)", ms: ChappyStandby.msSinceRouteStart)
             if ChappyLastResult.want(c) == .describe {
                 // Everything in `why` is a fact — a rating, a review count,
                 // a distance, an opening state. Reading it back is an
@@ -5333,7 +5948,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
             speak("Done — six in the evening on \(f.string(from: when)), the day before \(next.route).")
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "reminders",
-                                       outcome: "day-before-flying reminder", ms: 1)
+                                       outcome: "day-before-flying reminder", ms: ChappyStandby.msSinceRouteStart)
             return
         }
 
@@ -5462,6 +6077,8 @@ final class ChappyStandby: NSObject, ObservableObject {
                     pendingPlanTool = tool.id
                     pendingPlanValues = values
                     pendingPlanAskedAt = Date()
+                    // BUILD 254: asking restarts the mic's run clock.
+                    followUpOpenedAt = Date()
                     speak(ask)
                     followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
                     return
@@ -7486,7 +8103,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyEarcon.shared.done()
             NotificationCenter.default.post(name: lead.tile.note, object: nil)
             ChappyRouterLog.shared.add(heard: c, tier: "tiles", tool: tool.id,
-                                       outcome: "named the screen and the details", ms: 1)
+                                       outcome: "named the screen and the details", ms: ChappyStandby.msSinceRouteStart)
             ChappyLedger.shared.record(.ran, subject: tool.id, detail: c)
             let opening = ChappyFlow.shared.start(tool, from: c)
             if !opening.isEmpty { speak(opening) }
@@ -7519,19 +8136,48 @@ final class ChappyStandby: NSObject, ObservableObject {
         // The planner picks up whatever it declines.
         ChappyEarcon.shared.tap()
         ChappyEarcon.shared.startThinking()
-        let planStarted = Date()
         async let plannedTask = ChappyOrchestrator.plan(c)
         let intent = await ChappyIntent.classify(c)
         let planned = await plannedTask
-        let planMs = Int(Date().timeIntervalSince(planStarted) * 1000)
+        // BUILD 253: `planMs` used to be logged here — the time this ONE
+        // stage took. That is my number, not his. He waited from the
+        // moment he stopped talking, through every tier above this one,
+        // and the log claimed a fraction of it. Same clock everywhere now.
         ChappyEarcon.shared.stopThinking()
 
         if let intent, intent.action != "ask" {
             print("🧠 [Intent] '\(c)' → \(intent.action) \(intent.parameter ?? "")")
             CostMeter.shared.addTTSChars(c.count) // AUDIT P2: was invisible to "cost check"
-            ChappyRouterLog.shared.add(heard: c, tier: "intent", tool: intent.action,
-                                       outcome: "classifier took it", ms: planMs)
-            if await runIntent(intent, utterance: c) { return }
+            // BUILD 253 — LOG THE OUTCOME, NOT THE INTENTION.
+            //
+            // This logged "classifier took it" BEFORE running the intent.
+            // But runIntent's switch covers ten actions and returns
+            // false on anything else, and the classifier is a model — it
+            // invents actions outside that list ("weather", "search",
+            // "timer"). When it did, routing carried on down the ladder
+            // and the sentence was logged a second time by whatever
+            // finally handled it. Two lines for one sentence, the first
+            // naming a tool that never ran.
+            //
+            // Logged after, on success only, so the entry means what it
+            // says. A rejected action now leaves no entry here and gets
+            // one from the tier that really took it.
+            //
+            // The ms is stamped BEFORE runIntent, not after. Moving the
+            // log down moved the clock reading with it, and runIntent
+            // awaits a geocode and a route for "take me to the airport" —
+            // so the entry would have said four seconds and gone red for
+            // a decision that took six hundred milliseconds. This column
+            // means time-to-decision everywhere it is not explicitly
+            // documented otherwise, and a diagnostic whose own units
+            // wander is a diagnostic nobody can act on.
+            let decisionMs = Self.msSinceRouteStart
+            if await runIntent(intent, utterance: c) {
+                ChappyRouterLog.shared.add(heard: c, tier: "intent", tool: intent.action,
+                                           outcome: "classifier took it", ms: decisionMs)
+                return
+            }
+            ChappyStandbyLog.note("🧠 [Standby] Classifier said '\(intent.action)' — no handler for it, carrying on down the ladder")
         }
 
         // ================= TIER 3.5: THE PLAN (BUILD 198) =================
@@ -7552,7 +8198,7 @@ final class ChappyStandby: NSObject, ObservableObject {
                 // §16: low confidence asks. It does not have a go.
                 ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: top.toolID,
                                            confidence: top.confidence,
-                                           outcome: "too unsure — asked", ms: planMs)
+                                           outcome: "too unsure — asked", ms: Self.msSinceRouteStart)
                 // BUILD 203: if something is parked, offering it costs one
                 // clause and is far more useful than admitting defeat into
                 // silence. This is also the only place parkedTitle is read —
@@ -7570,10 +8216,12 @@ final class ChappyStandby: NSObject, ObservableObject {
                 guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
                 ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
                                            confidence: top.confidence,
-                                           outcome: "clarifying", ms: planMs)
+                                           outcome: "clarifying", ms: Self.msSinceRouteStart)
                 pendingPlanTool = t.id
                 pendingPlanValues = top.values
                 pendingPlanAskedAt = Date()
+                // BUILD 254: asking restarts the mic's run clock.
+                followUpOpenedAt = Date()
                 // BUILD 203: offer the runner-up when the planner had one
                 // of near-equal confidence. "Did you mean visas?" invites
                 // a no and then a silence; naming both invites an answer.
@@ -7601,13 +8249,13 @@ final class ChappyStandby: NSObject, ObservableObject {
                     // A multi-step answer that arrives in silence reads as
                     // a hang, not as work.
                     if let p = plan.preamble { speak(p) }
-                    await runPlan(plan, heard: c, ms: planMs)
+                    await runPlan(plan, heard: c)
                     return
                 }
                 guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
                 ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
                                            confidence: top.confidence,
-                                           outcome: "executing", ms: planMs)
+                                           outcome: "executing", ms: Self.msSinceRouteStart)
                 if let screen = t.screen {
                     NotificationCenter.default.post(name: screen, object: nil)
                 }
@@ -7617,51 +8265,47 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
         }
 
-        // AUDIT P1 (SB-LOOP2): the ANSWER branch used to sit BELOW the ask, so a
-        // short reply — "find one", "tell me" — was itself ≤3 words and simply
-        // re-triggered the question. "Chappy, petrol station" → "find you one
-        // nearby, or tell you about it?" → "Chappy, find one" → "Find One -
-        // find you one nearby, or tell you about it?" forever. The either/or
-        // could not be answered by voice at all, which for a wearer with the
-        // phone in his pocket meant it could not be answered.
+        // ============================================================
+        // BUILD 254 — THE WORST LINE IN THE APP IS GONE.
         //
-        // AUDIT P1 (SB-STICKY): pendingAmbiguous also never expired. Ignore the
-        // question and walk on, and ten minutes later an unrelated command was
-        // answered as if it were the reply.
-        if let pending = pendingAmbiguous {
-            if Date().timeIntervalSince(ambiguousAskedAt) > 45 {
-                pendingAmbiguous = nil // stale — treat this as a fresh command
-            } else {
-                pendingAmbiguous = nil
-                let wantsNav = ["near", "find", "go", "take me", "one", "closest",
-                                "nearest", "there", "yes"].contains { c.contains($0) }
-                if wantsNav {
-                    speak("Finding \(pending).")
-                    let reply = await NavEngine.shared.navigate(to: pending, driving: false)
-                    speak(NavEngine.shared.spokenRouteSummary ?? reply)
-                    if NavEngine.shared.isNavigating { armMapsAnswerWindow() }
-                    return
-                }
-                await quickAsk("Tell me briefly about \(pending) near \(ContextEngine.shared.snapshot.city ?? "here")")
-                return
-            }
-        }
-
-        let words = c.split(separator: " ")
-        // 3c. Only now, and only for something place-shaped. A word that
-        //     names a screen, a verb, or anything Chappy owns is not a
-        //     place, and asking "find you one nearby?" about it is how a
-        //     mis-heard command turned into nonsense.
-        if words.count <= 3, !c.contains("?"),
-           !ChappyTiles.looksLikeOurs(c),
-           !c.hasPrefix("what"), !c.hasPrefix("how"), !c.hasPrefix("who"),
-           !c.hasPrefix("when"), !c.hasPrefix("where"), !c.hasPrefix("why"),
-           !c.hasPrefix("is "), !c.hasPrefix("are "), !c.hasPrefix("can ") {
-            pendingAmbiguous = c
-            ambiguousAskedAt = Date()
-            speak("\(c.capitalized) - find you one nearby, or tell you about it?")
-            return
-        }
+        // What used to be here: any unmatched utterance of three words or
+        // fewer got "<word> - find you one nearby, or tell you about it?"
+        // and a 45-second window waiting for the answer.
+        //
+        // Its guards were ≤3 words, no question mark, not a tile name, and
+        // not starting with what/how/who/when/where/why/is/are/can. That
+        // let through every acknowledgement, apology and repair phrase a
+        // person says out loud:
+        //
+        //   "pardon"  -> "Pardon - find you one nearby, or tell you about it?"
+        //   "sorry"   -> "Sorry - find you one nearby..."
+        //   "huh"     -> "Huh - find you one nearby..."
+        //   "yes"     -> "Yes - find you one nearby..."
+        //   "cheers"  -> "Cheers - find you one nearby..."
+        //   "louder"  -> "Louder - find you one nearby..."
+        //   "call mum"-> "Call Mum - find you one nearby..."
+        //
+        // Offline it was unconditional: the two tiers above that could
+        // have rescued those are network calls that return nil with no
+        // signal, so with one bar EVERY short unmatched sentence landed
+        // here.
+        //
+        // And then it poisoned the next 45 seconds. The answer test used
+        // substrings — "go" matched inside mango, google and ago; "one"
+        // inside money, phone and gone. Say "pardon", ignore the question,
+        // and twenty seconds later say "mango juice": "Finding pardon."
+        // and it starts navigating.
+        //
+        // Nothing replaces it, because nothing needs to. Everything that
+        // reached this point now falls one tier further to quickAsk — one
+        // cheap call, an actual answer, and no state latched behind it.
+        // A wrong answer he can correct beats a question he cannot escape.
+        //
+        // The two AUDIT P1 fixes that used to live here (SB-LOOP2, the
+        // self-retriggering loop, and SB-STICKY, the window that never
+        // expired) both go with it. They were repairs to a branch that
+        // should not have existed.
+        // ============================================================
 
         // Everything else question-shaped → the cheap brain
         // ================= TIER 3: FLASH INTENT =================
@@ -7686,7 +8330,282 @@ final class ChappyStandby: NSObject, ObservableObject {
         // falls through to the paid brain exactly as before.
         // (BUILD 196: Pocket now runs above, before the place guess. It
         // used to sit here, below a branch that swallowed "time".)
-        await quickAsk(c)
+
+        // ============================================================
+        // BUILD 253 — THE ONE PLACE A QUESTION MAY BE PROMOTED.
+        //
+        // This line is the end of the ladder. Every tier has been offered
+        // this sentence and every tier has declined it. THIS is the
+        // fall-through — not ChappyRouterHook.intercept(), which runs
+        // before the ladder and where the first cut of 253 wrongly put
+        // this test.
+        //
+        // quickAsk is a one-shot Claude call with a context header and no
+        // tools at all. For "how many inches in a foot" that is perfect:
+        // fast, cheap, no session left latched behind it.
+        //
+        // But it is exactly wrong for a question about HIM. "Where was
+        // that warung I photographed", "what did I spend on food", "what
+        // do you know about me" — quickAsk answers those from a context
+        // header, which is to say it makes them up, confidently, while
+        // the recall engine that holds the real answer sits one tool call
+        // away in ChappyConversation. That is the "memory and recall" gap
+        // he named, and it is the whole difference between his glasses
+        // and a search box.
+        //
+        // So: a question that reaches for his own history gets the brain
+        // with hands. Everything else keeps the cheap one-shot. Narrow on
+        // purpose — a session latches for 45 s of silence afterwards, and
+        // latching one behind "what time is it" would take the next
+        // command off the router for no gain.
+        if Self.wantsHisOwnHistory(c) {
+            ChappyRouterLog.shared.add(
+                heard: c, tier: "model", tool: "conversation",
+                confidence: nil,
+                outcome: "Nothing matched, and it asks about his own history — session with recall",
+                ms: Self.msSinceRouteStart)
+            ChappyStandbyLog.note("🧠 [Standby] Fall-through about his own history — opening a session with recall")
+            ChappyConversation.shared.open(carrying: c)
+            return
+        }
+        // ============================================================
+        // BUILD 254 — THE FREE ANSWERS, BEFORE THE PAID ONE.
+        //
+        // Deleting the either/or guess (see the note further up) sent
+        // everything short and unmatched to quickAsk. Review pointed out
+        // what that means for the words a person actually says out loud:
+        // "pardon", "sorry", "huh", "yes", "cheers", "okay" would each
+        // open a paid Sonnet call — and with one bar, a twenty-five
+        // second stall ending in "That one didn't come back."
+        //
+        // The old branch answered those instantly and free. It answered
+        // them with nonsense, which is why it is gone, but instant and
+        // free is worth keeping. These are handled here, locally, with no
+        // network and no state latched behind them.
+        if let quick = Self.smallReply(to: c) {
+            ChappyRouterLog.shared.add(
+                heard: c, tier: "pocket", tool: "smallReply",
+                confidence: nil,
+                outcome: quick.isEmpty ? "a filler — deliberately said nothing"
+                                       : "answered locally, free",
+                ms: Self.msSinceRouteStart)
+            // An empty string means HANDLED, SAY NOTHING. "Um" and "hang on"
+            // are not questions; answering them is the chattiness he asked
+            // to be rid of. nil, by contrast, means "not mine" and falls on
+            // through to the paid brain below.
+            if !quick.isEmpty { speak(quick) }
+            return
+        }
+        let answered = await quickAsk(c)
+        // Logged AFTER, deliberately. Everywhere else the ms is time to a
+        // DECISION, because the decision is the slow part. Here the
+        // decision is instant and the network is the whole wait, so an ms
+        // taken before the call would read 40 while he stood there for
+        // three seconds. Log what he actually waited.
+        //
+        // And logged with the OUTCOME, not the intention — a failed ask
+        // is written as a failure and does NOT count as a decision, so
+        // the gap check still fires behind it.
+        ChappyRouterLog.shared.add(
+            heard: c, tier: "ask", tool: "quickAsk",
+            confidence: nil,
+            outcome: answered
+                ? "Nothing matched — answered as a general question"
+                : "Nothing matched, and the general-question brain didn't come back either.",
+            ms: Self.msSinceRouteStart,
+            routeDecision: answered)
+    }
+
+    // =================================================================
+    // BUILD 253 — THE BACKSTOP, AND THE TWO CLAIMS IT REFUSES TO MAKE.
+    //
+    // The job: no sentence leaves without a trace, including the ones no
+    // tier logs — navigation, briefs, timers, lists, the screen openers,
+    // and anything that falls through.
+    //
+    // IT TOOK TWO REVIEWS TO GET THIS HONEST, AND BOTH FOUND ME LYING.
+    //
+    // Version one ran the instant route() returned and asked "did Chappy
+    // speak?". About twenty-five branches answer from inside their own
+    // Task because they must fetch before they can speak. route() returns
+    // when that Task is CREATED, and there is no suspension point in
+    // between, so the child cannot have spoken. Not usually — never.
+    // Every weather question, every web search, every model answer would
+    // have been painted red with "nothing happened". Working code,
+    // reported as the fault.
+    //
+    // Version two waited eight seconds and kept the speech test. Review
+    // took that apart too:
+    //
+    //   - "Chappy spoke" is a single global stamp. An expired pasta timer
+    //     speaking during the wait would have been read as this sentence
+    //     being answered — and the entry would have quoted the timer.
+    //   - Some branches CANNOT speak. "Start" on the translate screen
+    //     hands the microphone away and posts a notification. Silence
+    //     there means it worked.
+    //   - Eight seconds does not cover a weather fetch on one bar. The
+    //     request timeouts in this file run to forty.
+    //
+    // Every one of those turns a working command into a red flag. So the
+    // speech test is gone, and with it both claims it was making. What
+    // remains is the one thing that is actually verifiable from here:
+    //
+    //     NO TIER RECORDED A DECISION FOR THIS SENTENCE.
+    //
+    // That is stated as exactly that and nothing more. It does not say
+    // nothing ran. It does not say it failed. It is a gap in the LOGGING,
+    // which is a to-do list for the next build written by his real use
+    // instead of my guesses about it — and when a command really does
+    // vanish, this is the line that will be sitting there next to it.
+    //
+    // The entry carries the DECISION's timestamp, not the verdict's, so
+    // it still sorts beside the sentence it belongs to, and it is written
+    // with routeDecision: false so that one gap cannot mask the next.
+    //
+    // KNOWN LIMIT, stated rather than buried: if he speaks again inside
+    // the grace window, the token cancels this verdict and the sentence
+    // gets no line at all. A missing line is a gap; a line pinned on the
+    // wrong sentence sends the next hour of debugging at the wrong file.
+    // Failing silent is the right direction to fail.
+    // =================================================================
+
+    /// Long enough that a tier which logs after a network round trip has
+    /// almost always logged by now, short enough to still be attributable
+    /// to the sentence that caused it.
+    private static let backstopGrace = 8.0
+
+    private static func closeTheBooks(on part: String, token: Int) {
+        guard !part.isEmpty else { return }
+        let decidedAt = routeStartedAt
+        let ms = msSinceRouteStart
+        DispatchQueue.main.asyncAfter(deadline: .now() + backstopGrace) {
+            MainActor.assumeIsolated {
+                // He has moved on. Whatever happened here, it is no longer
+                // this sentence's story to tell.
+                guard token == routeToken else {
+                    ChappyStandbyLog.note("⏱️ [Standby] Verdict on \u{201C}\(part)\u{201D} dropped — he spoke again first")
+                    return
+                }
+                guard ChappyRouterLog.lastDecisionAt < decidedAt else {
+                    ChappyStandbyLog.note("⏱️ [Standby] Handled in \(ms)ms")
+                    return
+                }
+                ChappyRouterLog.shared.add(
+                    heard: part,
+                    tier: "untagged",
+                    tool: nil,
+                    confidence: nil,
+                    outcome: "No tier recorded a working decision for this one. It may still have worked — several tiers don't log yet — but if nothing happened, this is the sentence to look at.",
+                    ms: ms, routeDecision: false, at: decidedAt)
+                ChappyStandbyLog.note("❔ [Standby] NO TIER CLAIMED \u{201C}\(part)\u{201D} — \(ms)ms to the decision, nothing logged")
+            }
+        }
+    }
+
+
+    /// BUILD 254 — the acknowledgements, apologies and repair phrases.
+    ///
+    /// Free, instant, offline, and no session or pending state behind
+    /// them. Everything here used to be answered with "<word> - find you
+    /// one nearby, or tell you about it?" and would otherwise now be
+    /// answered by a paid model call.
+    ///
+    /// Whole-utterance matching only. A word from this list inside a real
+    /// sentence is not an acknowledgement, and this branch sits at the
+    /// very bottom of the ladder anyway — everything above has already
+    /// declined it.
+    private static func smallReply(to c: String) -> String? {
+        let t = c.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        if repeatWords.contains(t) {
+            let again = TTSService.shared.lastSpokenLine
+            return again.isEmpty ? "I hadn't said anything yet." : again
+        }
+        if fillerWords.contains(t) { return "" }   // handled: say nothing
+        switch t {
+        case "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "righto", "alright":
+            return ChappyVoice.line("bare_yes", ["Yes to what, sorry?", "What am I saying yes to?"])
+        case "no", "nope", "nah":
+            return ChappyVoice.line("bare_no", ["Righto.", "No worries."])
+        case "cheers", "ta", "nice one", "good one", "lovely", "beautiful":
+            return ChappyVoice.line("bare_thanks", ["Any time.", "No worries.", "Pleasure."])
+        case "hello", "hi", "hey", "morning", "g'day", "gday":
+            return ChappyVoice.line("bare_hello", ["I'm here.", "Go on.", "Right here."])
+        case "louder", "speak up", "turn it up", "volume up",
+             "quieter", "turn it down", "volume down":
+            return "I can't change the volume myself - use the buttons on your glasses or the phone."
+        default:
+            return nil
+        }
+    }
+
+    /// BUILD 253 — is this fall-through question about HIS OWN PAST,
+    /// rather than about the world?
+    ///
+    /// It matters because the two get opposite treatment. A question about
+    /// the world goes to quickAsk: one cheap call, no session latched
+    /// behind it, and a general model answers it well. A question about
+    /// his own past goes to quickAsk too, today — and quickAsk has no
+    /// memory, so it answers from a context header, which is to say it
+    /// invents an answer and says it confidently. The recall engine that
+    /// holds the real answer is one tool call away in ChappyConversation.
+    /// That is the "memory and recall" gap he named.
+    ///
+    /// What it catches: "what did I photograph today", "where did we
+    /// park", "how much have I spent", "what do you know about me".
+    /// What it deliberately misses: "where was that warung I
+    /// photographed" — the shape is "I photographed", past tense but not
+    /// on the list, and I would rather add shapes from his real log than
+    /// guess at them here. That is the erring-shut policy doing its job,
+    /// not an oversight, and the untagged lines will show which shapes to
+    /// add next.
+    ///
+    /// TWO DESIGNS WERE WRONG BEFORE THIS ONE, both caught by review.
+    /// First a substring match, which fired on "place" inside REPLACE.
+    /// Then whole words plus a personal marker, which still promoted "my
+    /// notes app keeps crashing", "are we spending too much" and "can we
+    /// spot the volcano" — every one of them latching a 45-second session
+    /// in front of his next command, for a question the session has no
+    /// better answer to than the cheap one-shot did.
+    ///
+    /// The mistake both times was matching on the SUBJECT. Bali has
+    /// places, a phone has memory, a camera has pictures; none of that
+    /// says he is asking about himself. What does say it is FIRST PERSON
+    /// IN THE PAST — "did I", "have we", "I went", "I bought". A person
+    /// asking what he did uses one of those, and a person asking about
+    /// the world almost never does. So the subject list is gone and the
+    /// whole test is that one shape.
+    ///
+    /// Erring shut on purpose. A miss leaves the old behaviour exactly as
+    /// it was; a false hit takes the NEXT command off the router too.
+    private static func wantsHisOwnHistory(_ c: String) -> Bool {
+        let recallShapes = [
+            // interrogative, first person, past
+            "did i ", "did we ", "have i ", "have we ", "had i ", "had we ",
+            "was i ", "were we ",
+            // declarative first-person past, as in "that place i went to"
+            "i went", "i ate", "i bought", "i parked", "i visited", "i saw",
+            "i took", "i saved", "i logged", "i stayed", "i paid", "i met",
+            "we went", "we ate", "we stayed", "we visited", "we paid",
+            "i've been", "ive been", "we've been", "weve been",
+            "i said", "i told you", "i showed you",
+            // The identity question, which is the same need without a
+            // verb. Just "about me" — "know about me" and "remember about
+            // me" both contain it, so listing them too would be two
+            // entries that can never be reached.
+            //
+            // TRAILING SPACE, and it is not decorative. Without it this
+            // matched "tell me about medan", "what do you know about
+            // melbourne", "how do you feel about meat" — the same missing
+            // word boundary that put "place" inside REPLACE two versions
+            // ago. The padding adds a trailing space, so "about me" and
+            // "about me?" both still match.
+            "about me ",
+        ]
+        let padded = " " + c.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: ",", with: " ")
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "?", with: " ") + " "
+        return recallShapes.contains { padded.contains(" " + $0) }
     }
 
 
@@ -7866,7 +8785,12 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// needs. A step that cannot be completed does not kill the plan; it
     /// says so and the rest carries on, because "the visa check failed"
     /// is not a reason to throw away the weather you already had.
-    private func runPlan(_ plan: ChappyOrchestrator.Plan, heard: String, ms: Int) async {
+    /// BUILD 253: the `ms` parameter is gone. It carried one stage's
+    /// elapsed time in, to be logged against step one and zero against
+    /// every step after — an unread number for most steps and the wrong
+    /// number for the first. Every step reads the shared clock now, so
+    /// there is nothing to pass.
+    private func runPlan(_ plan: ChappyOrchestrator.Plan, heard: String) async {
         var carried: [String: String] = [:]
         for (i, step) in plan.steps.enumerated() {
             guard let t = ChappyRegistry.tool(id: step.toolID) else { continue }
@@ -7879,6 +8803,11 @@ final class ChappyStandby: NSObject, ObservableObject {
                 pendingPlanTool = t.id
                 pendingPlanValues = values
                 pendingPlanAskedAt = Date()
+                // BUILD 254: asking him a question restarts the mic's run
+                // clock. Without this the ear could shut before he had
+                // finished thinking, and the reminder he confirmed was
+                // never created.
+                followUpOpenedAt = Date()
                 return                      // the rest waits on a yes
             case .go:
                 break
@@ -7886,7 +8815,13 @@ final class ChappyStandby: NSObject, ObservableObject {
 
             ChappyRouterLog.shared.add(heard: heard, tier: "plan",
                                        tool: t.id, confidence: step.confidence,
-                                       outcome: "step \(i + 1) of \(plan.steps.count)", ms: i == 0 ? ms : 0)
+                                       // BUILD 253: was `i == 0 ? ms : 0`, so every step
+                                       // after the first rendered 0ms — the same
+                                       // meaningless-instant the rest of this build
+                                       // removed. Each step reads the same clock, so
+                                       // a plan now shows where its time actually went.
+                                       outcome: "step \(i + 1) of \(plan.steps.count)",
+                                       ms: ChappyStandby.msSinceRouteStart)
             if let screen = t.screen {
                 NotificationCenter.default.post(name: screen, object: nil)
             }
@@ -7917,8 +8852,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         let line = ChappyFlow.shared.startWith(t, values: values)
         if !line.isEmpty { speak(line) }
         followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+        // BUILD 253: routeDecision: false — a Siri shortcut, not a spoken
+        // sentence going through finish(). It gets its own entry, but it
+        // does not speak for anything the router is holding.
         ChappyRouterLog.shared.add(heard: "siri:\(id)", tier: "intent", tool: id,
-                                   outcome: "started from outside the app", ms: 0)
+                                   outcome: "started from outside the app", ms: 0,
+                                   routeDecision: false)
     }
 
     /// BUILD 199 — the tools with an engine behind them. Returns true
@@ -7958,7 +8897,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             let line = "\(ChappyFX.money(amount, from)) is \(ChappyFX.money(out, target))\(ChappyFXLite.ageNote)."
             ChappyRouterLog.shared.add(heard: amountText, tier: "flow", tool: "currency",
-                                       outcome: "converted offline", ms: 1)
+                                       outcome: "converted offline", ms: ChappyStandby.msSinceRouteStart)
             speak(line)
             return true
 
@@ -7991,7 +8930,11 @@ final class ChappyStandby: NSObject, ObservableObject {
                                        outcome: result.ok
                                            ? "\(result.options.count) ranked"
                                            : "nothing usable",
-                                       ms: 0)
+                                       // BUILD 253: was a hardcoded 0, logged
+                                       // AFTER a places search that goes to the
+                                       // network — so a two-second wait rendered
+                                       // as instant. Same clock as everything else.
+                                       ms: ChappyStandby.msSinceRouteStart)
             NotificationCenter.default.post(name: .chappyOpenPlaces, object: nil)
             // BUILD 202: hold it, so "the second one" and "take me there"
             // mean something for the next two minutes.
@@ -8127,10 +9070,20 @@ final class ChappyStandby: NSObject, ObservableObject {
 
     // MARK: Tier 1 brain — one call, spoken, then back to sleep
 
-    private func quickAsk(_ question: String) async {
+    /// BUILD 253 — returns whether it actually answered.
+    ///
+    /// It used to return Void, and the fall-through logged "answered as a
+    /// general question" unconditionally after it. But this has three
+    /// failure exits — no key, no network, empty reply — and all three
+    /// speak an apology and come back looking exactly like success. So
+    /// offline, or on one bar, the log would have coloured the one case
+    /// this build exists to make visible ("I said something and nothing
+    /// useful happened") as a normal handled answer, in blue.
+    @discardableResult
+    private func quickAsk(_ question: String) async -> Bool {
         let key = APIKeyManager.shared.getAPIKey(for: .anthropic) ?? ""
         guard !key.isEmpty, let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-            escalate("I can't reach my brain - no key configured."); return
+            escalate("I can't reach my brain - no key configured."); return false
         }
         CostMeter.shared.addQuickVision() // one-shot call, same rough cost bracket
         var req = URLRequest(url: url)
@@ -8150,13 +9103,14 @@ final class ChappyStandby: NSObject, ObservableObject {
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]] else {
-            escalate("That one didn't come back."); return
+            escalate("That one didn't come back."); return false
         }
         let text = content.compactMap { ($0["type"] as? String) == "text" ? ($0["text"] as? String) : nil }
             .joined(separator: " ")
-        if text.isEmpty { escalate("I got nothing back on that."); return }
+        if text.isEmpty { escalate("I got nothing back on that."); return false }
         strikes = 0
         speak(text)
+        return true
     }
 
     // MARK: Tier 3 — computer jobs (queued when the PC is asleep)
@@ -8377,7 +9331,212 @@ final class ChappyStandby: NSObject, ObservableObject {
         return out.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;-"))
     }
 
+    // =================================================================
+    // BUILD 254 — ONE DOOR FOR EVERYTHING THAT SPEAKS UNINVITED.
+    //
+    // TTSService.speak() opens with `currentTask?.cancel(); stop()`. There
+    // is no queue. So ANY speaker destroys whatever is being said — and
+    // while TTS is speaking, heard() returns early, so it also stops
+    // Chappy hearing HIM.
+    //
+    // ELEVEN things called it with no check worth the name: the due
+    // reminder tick, a timer expiring, a place reminder, a leave-by
+    // reminder, the pulse boost expiry, the pulse battery stand-down, the
+    // ride trip watch, announce(), a border crossing, and the morning and
+    // evening briefs.
+    //
+    // I counted seven, then nine, then ten before review found the rest.
+    // The count is written here as a number that can be checked against
+    // the call sites rather than trusted.
+    //
+    // The scenario he described, exactly: he says "hey chappy, remind me to
+    // call the landlord about the—" and a pasta timer set eight minutes ago
+    // fires. It speaks. isSpeaking goes true. The rest of his sentence is
+    // heard, gated, and dropped. No log line, no error. The command is gone
+    // and he has no idea why.
+    //
+    // So nothing UNINVITED speaks over him any more. It waits for a gap.
+    // (Turn-by-turn is the deliberate exception: NavEngine.speakNav still
+    // speaks directly on every fix, because a late "turn left" is worse
+    // than an interrupted sentence.) It waits for a gap. If the gap
+    // never comes, something that must be heard — a timer, a reminder —
+    // says itself anyway once its patience runs out, because a silent
+    // timer is worse than an interruption. Something that can wait just
+    // doesn't. The default budget is 8 tries at 1.2s, plus a bounded
+    // 5-try grace: 15.6s worst case, and callers can ask for more.
+    // =================================================================
+
+    /// Is this a moment when Chappy may speak without being asked?
+    static var isClearToSpeak: Bool {
+        if TTSService.shared.isSpeaking { return false }
+        if ChappyConversation.shared.isActive { return false }
+        if LiveAIManager.shared.isRunning { return false }
+        if ContinuousVisionManager.shared.isRunning { return false }
+        if shared.busy { return false }
+        // The wake word has landed and his command is still coming. This is
+        // the check every one of the eleven speakers was missing: they all
+        // asked whether CHAPPY was talking and none asked whether HE was.
+        //
+        // `awake`, not a lastHeardAt timestamp. My first cut used the
+        // timestamp and review pointed out it is stamped on EVERY
+        // recogniser partial — a television, a café, his wife — so in any
+        // occupied room it is fresh several times a second and this guard
+        // would never once have opened. A guard that never opens is not a
+        // guard; it is a mute button with extra steps.
+        if shared.awake { return false }
+
+        // BUILD 254, SECOND CUT — AND THE FOLLOW-UP WINDOW.
+        //
+        // `awake` alone covers only the second or two between the wake word
+        // landing and the command firing. Review pointed at the far bigger
+        // hole: after every answer the door is open for 12 seconds, or 75
+        // after a question, with `awake` false the whole time. That is
+        // exactly when a timer used to land on top of "…shall I set that
+        // reminder?" and take his "yes" with it.
+        // BUILD 254: and the run's own ceiling, not just the door.
+        // followUpUntil is 75 seconds after a question, but nothing can
+        // route past followUpMaxRun (45) from followUpOpenedAt. For those
+        // thirty seconds the door reads open, every utterance is refused,
+        // and this would have gone on refusing to speak into a window that
+        // was already dead.
+        if Date() < shared.followUpUntil,
+           Date().timeIntervalSince(shared.followUpOpenedAt) < Self.followUpMaxRun {
+            return false
+        }
+        return true
+    }
+
+    private static let deferStep = 1.2
+    private static let maxDeferTries = 8      // ~10 seconds
+
+    /// Speak, but wait for him to finish first.
+    static func speakWhenClear(_ line: String,
+                               mustBeHeard: Bool = true,
+                               patience: Int = maxDeferTries,
+                               tries: Int = 0,
+                               onSpoken: (() -> Void)? = nil,
+                               onDropped: (() -> Void)? = nil) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        // BUILD 254 — EXACTLY ONE CALLBACK ALWAYS RUNS. This returned
+        // without either, and every caller's bookkeeping hangs off them:
+        // an empty line would have left a reminder's id in `announcing`
+        // forever, so it never got deliveredAt, stayed first in the ready
+        // list, and the in-flight guard then silenced the whole spoken
+        // reminder system for the life of the process. A one-line early
+        // return that bricks a subsystem is exactly the kind of thing a
+        // callback contract exists to prevent, so it honours it.
+        guard !trimmed.isEmpty else { onDropped?(); return }
+        if isClearToSpeak {
+            if tries > 0 {
+                ChappyStandbyLog.note("🤝 [Standby] Waited \(String(format: "%.1f", Double(tries) * deferStep))s for a gap, saying it now")
+            }
+            // Before the speak, so a caller's chime or buzz leads the words
+            // rather than landing on top of them.
+            //
+            // KNOWN LIMIT: `speak()` returns before any audio plays, so
+            // "spoken" here means "handed to TTS", not "heard". If another
+            // speaker cancels it in the next instant, a reminder is marked
+            // delivered that he never heard. Closing that needs a
+            // completion signal out of TTSService, which does not exist
+            // today. The isClearToSpeak gate and the per-reminder in-flight
+            // set make it unlikely rather than impossible.
+            onSpoken?()
+            TTSService.shared.speak(trimmed)
+            return
+        }
+        guard tries < patience else {
+            if mustBeHeard {
+                // One last look — the FULL test, not just "is Chappy
+                // talking". My first cut re-checked TTSService.isSpeaking
+                // alone, which meant the one path that fires when the door
+                // is shut was the one path that never asked whether HE was
+                // talking. The morning brief took it on every single launch
+                // (the greeting opens a 25-second window at t+1.6s; the
+                // brief starts at t+2.5s and gives up at t+12.1s) and spoke
+                // straight over his reply to the greeting.
+                //
+                // BOUNDED, though, and it took two goes to get that right
+                // too: my first version re-armed without incrementing
+                // tries, so a stuck flag would have re-checked every 1.2s
+                // forever.
+                // Just the bound. `!isClearToSpeak` was also tested here in
+                // an earlier cut and it is provably always true — the top
+                // of this function evaluated it false in the same
+                // synchronous scope, with no suspension point between. A
+                // condition that cannot be false reads as a safety check
+                // and is not one.
+                if tries < patience + 5 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + deferStep) {
+                        MainActor.assumeIsolated {
+                            speakWhenClear(trimmed, mustBeHeard: true, patience: patience,
+                                           tries: tries + 1,
+                                           onSpoken: onSpoken, onDropped: onDropped)
+                        }
+                    }
+                    return
+                }
+                ChappyStandbyLog.note("⏰ [Standby] No gap in \(String(format: "%.0f", Double(tries) * deferStep))s — saying it anyway: \u{201C}\(trimmed.prefix(50))\u{201D}")
+                onSpoken?()
+                TTSService.shared.speak(trimmed)
+            } else {
+                ChappyStandbyLog.note("🤫 [Standby] Dropped an unprompted line — he was busy: \u{201C}\(trimmed.prefix(50))\u{201D}")
+                onDropped?()
+            }
+            return
+        }
+        // The callbacks MUST be forwarded here. This is the path taken on
+        // every deferral — tries starts at 0 and maxDeferTries is 8, so a
+        // caller's onSpoken/onDropped went through this line first, every
+        // time, and my first cut dropped them on the floor. The result was
+        // that markDelivered never ran and announce never posted its
+        // banner: two silent data-losing bugs behind a callback API added
+        // specifically to prevent silent data loss.
+        DispatchQueue.main.asyncAfter(deadline: .now() + deferStep) {
+            MainActor.assumeIsolated {
+                speakWhenClear(trimmed, mustBeHeard: mustBeHeard, patience: patience,
+                               tries: tries + 1,
+                               onSpoken: onSpoken, onDropped: onDropped)
+            }
+        }
+    }
+
     private func speak(_ text: String) {
+        // =================================================================
+        // BUILD 254 — THE GUARD I PUT HERE, AND WHY I TOOK IT OUT AGAIN.
+        //
+        // route() is 2,500 lines with 234 speak calls and no cancellation
+        // check, so `routeTask?.cancel()` has always been decorative. The
+        // obvious fix is one line here: `guard !Task.isCancelled`. I wrote
+        // it, and on paper it covered every call site at once.
+        //
+        // Review took it apart on the one path that matters most.
+        //
+        //   "chappy take me to Ubud walking"
+        //   -> speak("Finding Ubud.")
+        //   -> he says "shut up"; routeTask is cancelled
+        //   -> NavEngine.navigate is `async -> String`, non-throwing, with
+        //      no cancellation check of its own. It runs to completion.
+        //      TURN-BY-TURN STARTS.
+        //   -> the guard then swallows the route summary
+        //   -> a detached Task 350ms later, which never inherited the
+        //      cancellation, asks "want turn-by-turn in Google Maps?"
+        //
+        // So he cancelled, navigation is running, he was never told where
+        // or how far, and Chappy speaks anyway about a route he does not
+        // know exists. In 253 he at least heard the summary.
+        //
+        // That is the lesson worth keeping: silencing the NARRATION of an
+        // action that already happened does not cancel anything. It just
+        // makes the app quieter about what it did. Cancel has to reach the
+        // work, and the work is behind non-throwing async functions that
+        // would each need their own check.
+        //
+        // The guard survives in exactly one place — escalate() — where the
+        // line being suppressed is an apology for work that genuinely did
+        // not happen, so suppressing it is honest. Everything else is a
+        // real piece of work: threading cancellation into NavEngine,
+        // ChappyPlaces and the rest, and its own build.
+        // =================================================================
         ChappyHaptics.shared.straightStep()
         // BUILD 219: speakSmart, not speak. A cached line still plays
         // whole and instantly; a long unseen one starts on its first
@@ -8422,6 +9581,19 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// THREE-STRIKE ESCAPE: never loop "didn't catch that" — offer the deep
     /// layer instead. This is the on-ramp to full Live AI.
     private func escalate(_ reason: String) {
+        // BUILD 254: the ONLY place this guard survives — speak() had one
+        // and it was taken out again, see the long note there. Here it is
+        // honest, because the line being suppressed is an apology for work
+        // that genuinely did not happen. Review found that
+        // cancelling a question mid-flight made things WORSE than before:
+        // routeTask?.cancel() propagates into URLSession, quickAsk's
+        // request fails, and this spoke "That one didn't come back" over
+        // him — an unwanted utterance in place of an unwanted answer, plus
+        // a strike towards offering Live AI he never asked for.
+        guard !Task.isCancelled else {
+            ChappyStandbyLog.note("🤐 [Standby] Swallowed a failure line for a command he'd cancelled")
+            return
+        }
         strikes += 1
         if strikes >= 2 {
             strikes = 0
@@ -13172,27 +14344,65 @@ final class ChappyReminders: NSObject, ObservableObject {
         // half past seven whether Chappy is or not. Self-throttled to
         // once every thirty minutes.
         ChappyCalendar.shared.scheduleUpcoming()
-        guard !TTSService.shared.isSpeaking else { return }
+        // BUILD 254: was `guard !TTSService.shared.isSpeaking` and nothing
+        // else — the exact check this build's own header calls
+        // insufficient, on the most frequent uninvited speaker in the app.
+        // It asked whether CHAPPY was talking and never whether HE was, so
+        // a reminder coming due mid-sentence ate the command outright.
+        // Review found it after all the others were done.
+        guard ChappyStandby.isClearToSpeak else { return }
         let ready = due().filter {
             $0.deliveredAt == nil && Self.categoryPings(Self.category(of: $0))
         }
         guard let first = ready.first else { return }
-        // QUIET HOURS: still marked delivered and still on the list, just not
-        // spoken aloud at 3am. It surfaces in the morning brief instead.
+        // QUIET HOURS: not spoken aloud at 3am; it surfaces in the morning
+        // brief instead. (This used to say "still marked delivered" — it
+        // never was. This return sits ABOVE markDelivered and always has.)
         if inQuietHours && first.escalate != true { return }
-        markDelivered(first)
-        if first.escalate == true { ChappyHaptics.shared.reminderUrgent() }
-        else { ChappyHaptics.shared.reminderDue() }
-        ChappyEarcon.shared.wake()
+        guard !announcing.contains(first.id) else { return }
+        announcing.insert(first.id)
         var line = first.title
         if ready.count > 1 { line += ". And \(ready.count - 1) more." }
-        TTSService.shared.speak(line)
+        // BUILD 254: through the one door, and filed only once said. It
+        // used to markDelivered first and speak second, so a reminder
+        // could be filed as done having been spoken straight over the top
+        // of him. (An earlier draft of this note also blamed quiet hours;
+        // that was wrong — the quiet-hours return sits ABOVE markDelivered
+        // and always has. The pre-existing comment on that branch saying
+        // it is "still marked delivered" is wrong for the same reason.)
+        ChappyStandby.speakWhenClear(line, onSpoken: { [weak self] in
+            if first.escalate == true { ChappyHaptics.shared.reminderUrgent() }
+            else { ChappyHaptics.shared.reminderDue() }
+            ChappyEarcon.shared.wake()
+            self?.markDelivered(first)
+            self?.announcing.remove(first.id)
+        }, onDropped: { [weak self] in
+            // The other half of the contract. The empty-line guard fires
+            // this REGARDLESS of mustBeHeard, so without it an empty title
+            // would leak this id into `announcing` for good and the guard
+            // above would silence every spoken reminder for the life of
+            // the process.
+            self?.announcing.remove(first.id)
+        })
         lastSpoken = first.title
         // A spoken reminder is worth remembering that it happened. If it fired
         // while you were asleep, you can still find it.
         ChappyMemory.shared.remember(.note, title: "Reminder fired: \(first.title)",
                                      tags: ["reminder-fired"], source: "reminders")
     }
+
+    /// BUILD 254 — reminders whose line is written but not yet spoken.
+    ///
+    /// checkPlaceTriggers and checkLeaveBy run on EVERY location fix —
+    /// about once a second while walking, with no distance filter. Since
+    /// the delivery mark now waits for the line to be spoken, the same
+    /// reminder stayed un-delivered for the whole deferral and was picked
+    /// up again on every fix: ten stacked chains, ten buzzes, ten earcons,
+    /// each speak cancelling the last mid-word. Left alone it never
+    /// terminated.
+    ///
+    /// One entry per reminder, cleared when it is finally said.
+    private var announcing = Set<UUID>()
 
     private func markDelivered(_ e: ChappyMemory.Entry) {
         var c = e
@@ -13214,8 +14424,25 @@ final class ChappyReminders: NSObject, ObservableObject {
         briefedOn = key
         let line = briefText()
         guard !line.isEmpty else { return }
-        ChappyEarcon.shared.wake()
-        TTSService.shared.speak(line)
+        // BUILD 254: through the one door, with the chime moved inside it.
+        // The morning brief is the longest unprompted utterance in the app
+        // and it fires from a delayed dispatch shortly after launch — which
+        // is exactly when he is most likely to be saying something to it.
+        //
+        // mustBeHeard FALSE, and patience 30 (~36s) rather than the
+        // default 8 (~10s). Two decisions, one reason: this is the longest
+        // and least time-critical unprompted line in the app. The launch
+        // greeting opens a 25-second window at t+1.6s and the brief starts
+        // at t+2.5s, so the default budget expires INSIDE that window —
+        // and with mustBeHeard true it would then have spoken anyway, which
+        // makes the brief the one utterance GUARANTEED to talk over him.
+        // If there is no gap in thirty-six seconds the brief is not worth
+        // interrupting for. Being straight about the cost: a dropped brief
+        // is gone for the day — briefedOn is already set — and unlike an
+        // alert it is not filed anywhere. Its ingredients are all still on
+        // their own screens; the assembled paragraph is not.
+        ChappyStandby.speakWhenClear(line, mustBeHeard: false, patience: 30,
+                                     onSpoken: { ChappyEarcon.shared.wake() })
     }
 
     /// BUILD 113 — TOMORROW, TONIGHT.
@@ -13243,8 +14470,10 @@ final class ChappyReminders: NSObject, ObservableObject {
         let line = tomorrowText()
         guard !line.isEmpty else { eveningBriefedOn = key; return }
         eveningBriefedOn = key
-        ChappyEarcon.shared.wake()
-        TTSService.shared.speak(line)
+        // BUILD 254: same treatment as the morning brief, same reasons —
+        // droppable, and patient enough not to fight a follow-up window.
+        ChappyStandby.speakWhenClear(line, mustBeHeard: false, patience: 30,
+                                     onSpoken: { ChappyEarcon.shared.wake() })
     }
 
     func tomorrowText() -> String {
@@ -13440,10 +14669,40 @@ final class ChappyReminders: NSObject, ObservableObject {
                 hit = TripRecorder.meters(la, lo, spot.lat, spot.lon) < 150
             }
             guard hit else { continue }
-            markDelivered(r)
-            ChappyHaptics.shared.reminderPlace()
-            ChappyEarcon.shared.wake()
-            TTSService.shared.speak("You're at \(r.placeTrigger ?? "the place") - \(r.title)")
+            // BUILD 254 — ONE AT A TIME, AND ONLY MARK WHAT HE ACTUALLY HEARD.
+            //
+            // This loop marked every matching reminder delivered and then
+            // spoke each one — and since every speak() cancels the last, he
+            // heard only the final one. Three reminders on "supermarket"
+            // meant two silently marked done and lost forever.
+            //
+            // Now it delivers one and stops. The rest stay pending and come
+            // round on the next fix, a few seconds later, in a gap. The buzz
+            // and the chime moved into onSpoken so they land with the words
+            // rather than up to fifteen seconds ahead of them.
+            //
+            // The `return` at the bottom is load-bearing — a `continue`
+            // would let a second reminder start its own chain in the same
+            // pass, and two chains exhausting together is the very
+            // only-the-last-one-is-heard bug this block fixes.
+            guard !announcing.contains(r.id) else { return }
+            announcing.insert(r.id)
+            let line = "You're at \(r.placeTrigger ?? "the place") - \(r.title)"
+            ChappyStandby.speakWhenClear(line, onSpoken: { [weak self] in
+                ChappyHaptics.shared.reminderPlace()
+                ChappyEarcon.shared.wake()
+                self?.markDelivered(r)
+                self?.announcing.remove(r.id)
+            }, onDropped: { [weak self] in
+                // Belt to onSpoken's braces. Unreachable today only
+                // because these lines are never empty — NOT because
+                // "mustBeHeard is always true", which is what an earlier
+                // draft of this comment said and is wrong: the empty-line
+                // guard fires onDropped whatever mustBeHeard is. Getting
+                // that reasoning wrong is what left tick() without one.
+                self?.announcing.remove(r.id)
+            })
+            return
         }
     }
 
@@ -13463,13 +14722,39 @@ final class ChappyReminders: NSObject, ObservableObject {
             // Only worth a lookup inside a sensible window.
             let mins = due.timeIntervalSinceNow / 60
             guard mins > 0, mins < Double(lead) + 45 else { continue }
+            // BUILD 254: checked on BOTH sides of the await, and it took
+            // three goes to get here. Below it, the duplicate storm still
+            // cost a route lookup per location fix. Above it only, the
+            // lookup was spared but the storm came back — three fixes a
+            // second apart all pass an empty set, all suspend on the
+            // network, and all resume and announce. A guard before a
+            // suspension point guarantees nothing after it.
+            guard !announcing.contains(r.id) else { return }
             guard let travel = await NavEngine.shared.travelMinutes(to: r.placeTrigger ?? "") else { continue }
             let leaveAt = due.addingTimeInterval(-Double(travel + lead) * 60)
             guard Date() >= leaveAt else { continue }
-            markDelivered(r)
-            ChappyHaptics.shared.reminderUrgent()
-            ChappyEarcon.shared.wake()
-            TTSService.shared.speak("Time to go - \(r.title). It's about \(travel) minutes from here.")
+            // BUILD 254: one at a time — same cancel-each-other bug as
+            // checkPlaceTriggers above.
+            // The second half of the pair: re-checked after the await,
+            // where the answer can have changed under us.
+            guard !announcing.contains(r.id) else { return }
+            announcing.insert(r.id)
+            let line = "Time to go - \(r.title). It's about \(travel) minutes from here."
+            ChappyStandby.speakWhenClear(line, onSpoken: { [weak self] in
+                ChappyHaptics.shared.reminderUrgent()
+                ChappyEarcon.shared.wake()
+                self?.markDelivered(r)
+                self?.announcing.remove(r.id)
+            }, onDropped: { [weak self] in
+                // Belt to onSpoken's braces. Unreachable today only
+                // because these lines are never empty — NOT because
+                // "mustBeHeard is always true", which is what an earlier
+                // draft of this comment said and is wrong: the empty-line
+                // guard fires onDropped whatever mustBeHeard is. Getting
+                // that reasoning wrong is what left tick() without one.
+                self?.announcing.remove(r.id)
+            })
+            return
         }
     }
 
@@ -13886,7 +15171,13 @@ enum ChappyNotify {
                      body: String,
                      critical: Bool = false,
                      opens: Notification.Name? = nil,
-                     force: Bool = false) {
+                     force: Bool = false,
+                     // BUILD 254: announce()'s dropped-line path files the
+                     // alert itself, because it has to file even when the
+                     // channel is switched off — the guard below returns
+                     // before the record. Passing false here is what stops
+                     // that becoming two entries for one alert.
+                     fileHistory: Bool = true) {
         guard UserDefaults.standard.object(forKey: channel.key) == nil
                 || UserDefaults.standard.bool(forKey: channel.key) else { return }
         // BUILD 244: written down BEFORE the delivery decision, deliberately.
@@ -13895,9 +15186,11 @@ enum ChappyNotify {
         // channel he left switched on, including the ones that were spoken
         // instead of shown, so "I'm sure Chappy said something about that"
         // has somewhere to be checked.
-        History.shared.record(Alert(at: Date(), channel: channel.rawValue,
-                                    title: title, body: body,
-                                    critical: critical, opens: opens?.rawValue))
+        if fileHistory {
+            History.shared.record(Alert(at: Date(), channel: channel.rawValue,
+                                        title: title, body: body,
+                                        critical: critical, opens: opens?.rawValue))
+        }
         if !force && !voiceCouldNotReach() { return }
 
         let c = UNMutableNotificationContent()
@@ -14012,10 +15305,35 @@ enum ChappyNotify {
         // BUILD 244: spoken and gone was the one path with no record at all.
         // Every other branch above calls post(), which files it; this one
         // talked to an empty room and kept nothing.
-        History.shared.record(Alert(at: Date(), channel: channel.rawValue,
-                                    title: title, body: body ?? spoken,
-                                    critical: critical, opens: opens?.rawValue))
-        TTSService.shared.speak(spoken)
+        // BUILD 254: filed on the way OUT, not on the way in. It used to
+        // record here and then, if speakWhenClear dropped the line, post()
+        // recorded it a second time — the same alert twice in the centre,
+        // a few seconds apart.
+        // BUILD 254 — one of the eleven, and the one with twenty call
+        // sites behind it.
+        //
+        // A non-critical line that cannot find a gap is DROPPED, so it must
+        // land somewhere else or the build has quietly deleted an alert.
+        // My first cut relied on History alone; review pointed out that
+        // every other silenced branch in this function calls post(force:)
+        // and gets him a banner, and History is a screen he has to think to
+        // open. So a dropped line posts, exactly like a muted one.
+        ChappyStandby.speakWhenClear(spoken, mustBeHeard: critical, onSpoken: {
+            History.shared.record(Alert(at: Date(), channel: channel.rawValue,
+                                        title: title, body: body ?? spoken,
+                                        critical: critical, opens: opens?.rawValue))
+        }, onDropped: {
+            // post() files it in History itself — but its FIRST statement is
+            // a channel-enabled guard, above the record. So on a switched-off
+            // channel it returns without filing, and a non-critical line that
+            // found no gap would vanish entirely: worse than 253, which
+            // recorded unconditionally. File first, then post.
+            History.shared.record(Alert(at: Date(), channel: channel.rawValue,
+                                        title: title, body: body ?? spoken,
+                                        critical: critical, opens: opens?.rawValue))
+            post(channel, title: title, body: body ?? spoken,
+                 critical: critical, opens: opens, force: true, fileHistory: false)
+        })
     }
 }
 
@@ -17392,7 +18710,8 @@ final class ChappyRide: ObservableObject {
             let fromStart = here.distance(from: CLLocation(latitude: start.latitude, longitude: start.longitude))
             if !rolling, fromStart > 400 {
                 rolling = true
-                TTSService.shared.speak("Trip's rolling.")
+                // BUILD 254: two words, and not worth cutting him off for.
+                ChappyStandby.speakWhenClear("Trip's rolling.", mustBeHeard: false)
             } else if !rolling, !nudged,
                       Date().timeIntervalSince(watchBegan) > 8 * 60, fromStart < 150 {
                 nudged = true
@@ -24765,7 +26084,10 @@ final class ChappyBorder: ObservableObject {
         // this is worth knowing and never again for a fortnight.
         let line = "You're in \(country). That's \(rule.days) days on arrival — "
                  + "I'll count them and warn you before it runs out."
-        TTSService.shared.speak(line)
+        // BUILD 254 — another uninvited speaker. Rare, but a border
+        // crossing is exactly when he might be talking to Chappy about
+        // where he is, and this fired straight over it.
+        ChappyStandby.speakWhenClear(line)
     }
 
     /// He can set it himself when the app wasn't running at the border.
@@ -32271,8 +33593,12 @@ final class ChappyFareSource {
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                // BUILD 253: routeDecision: false — this is a background
+                // HTTP result, not a decision about a spoken sentence. It
+                // must not switch off the backstop for whatever is routing.
                 ChappyRouterLog.shared.add(heard: "fares", tier: "net", tool: "flights",
-                                           outcome: "fare source said \(http.statusCode)", ms: 0)
+                                           outcome: "fare source said \(http.statusCode)", ms: 0,
+                                           routeDecision: false)
                 return []
             }
             let rows = Self.parseMatrix(data, currency: currency)
@@ -34703,14 +36029,49 @@ final class ChappyRouterLog {
     struct Entry: Codable {
         let at: Date
         let heard: String
-        let tier: String         // pocket | tiles | flow | intent | plan | ask
+        // BUILD 253: the list was six tiers out of date, and one of the
+        // six it named — pocket — has no producer at all. Written out
+        // properly because the
+        // Settings screen colours off these strings, and a tier missing
+        // from the list renders grey and reads as "nothing special".
+        //   answer     — a module answered outright (flights, bags, fares)
+        //   reference  — "that one", "there" resolved to a saved place
+        //   tiles      — matched a screen by name
+        //   flow       — a multi-step tool took it
+        //   intent     — the eleven-action classifier took it
+        //   plan       — the orchestrator ran a plan, one entry per step
+        //   ask        — nothing matched; answered as a general question
+        //   model      — handed to the session, which has tools
+        //   untagged   — no tier recorded a decision; the LOG has a gap,
+        //                which is not the same claim as "it failed"
+        //   net        — a background network result, not a routing decision
+        //   pocket     — declared since build 198, never once written
+        let tier: String
         let tool: String?
         let confidence: Double?
         let outcome: String
         let ms: Int
     }
 
-    private(set) var entries: [Entry] = []
+    private var store: [Entry] = []
+    /// BUILD 253 — a lock, because this array is genuinely written from
+    /// two threads and always has been.
+    ///
+    /// `add` is called from the router on the main actor, and also from
+    /// ChappyFareSource.month, which is a nonisolated async method whose
+    /// continuation resumes on the concurrent executor. So a background
+    /// fare failure could append while the Settings screen was reading —
+    /// undefined behaviour, and the kind that shows up as a crash nobody
+    /// can reproduce. It was survivable while the screen read the array
+    /// once on appear; 253 makes it read every two seconds, which is
+    /// exactly the wrong direction to leave it.
+    private let lock = NSLock()
+
+    /// A copy, taken under the lock. Callers get a snapshot they own.
+    var entries: [Entry] {
+        lock.lock(); defer { lock.unlock() }
+        return store
+    }
     /// BUILD 221: 100 in memory was a display cap. On disk it can afford
     /// to be a real history without being a burden — a few hundred
     /// kilobytes for weeks of decisions.
@@ -34742,12 +36103,21 @@ final class ChappyRouterLog {
         // origin/main`, a stale-but-broken file on the remote lands on the
         // Mac at pull time and fails the archive — with an error in a file
         // nobody touched this build, which is the worst kind to debug.
-        entries = Array(rows.suffix(Self.cap))
+        lock.lock()
+        store = Array(rows.suffix(Self.cap))
+        lock.unlock()
     }
 
     private func scheduleSave() {
+        // BUILD 253: under the same lock as the array. The lock was added
+        // because `add` is reachable off the main thread from the fare
+        // fetch; leaving this work item unsynchronised beside it would
+        // have fixed the array and left the DispatchWorkItem next to it
+        // racing — two concurrent adds can over-release it. Half a fix
+        // to a data race reads like a whole one, which is worse than none.
+        lock.lock(); defer { lock.unlock() }
         saveWork?.cancel()
-        let snapshot = entries
+        let snapshot = store
         let work = DispatchWorkItem { [weak self] in
             guard let self, let url = self.url,
                   let d = try? JSONEncoder().encode(snapshot) else { return }
@@ -34758,22 +36128,55 @@ final class ChappyRouterLog {
     }
 
     /// Everything Chappy decided, newest first, as plain readable lines.
-    /// This is the export for "why did it do that" — and the first thing
-    /// worth reading when a route goes somewhere strange.
+    ///
+    /// BUILD 253: sorted by time rather than reversed by append order,
+    /// because a gap entry is written eight seconds late while carrying
+    /// its decision's own timestamp. Worth knowing that NOTHING CALLS
+    /// THIS — the export he actually uses is the Copy button on the "What
+    /// Chappy did" screen, which builds its own string. Kept and corrected
+    /// rather than deleted only because it is one line either way.
     func readableHistory(limit: Int = 200) -> String {
         let f = DateFormatter(); f.dateFormat = "d MMM HH:mm:ss"
-        return entries.suffix(limit).reversed().map { e in
+        return entries.sorted { $0.at > $1.at }.prefix(limit).map { e in
             let c = e.confidence.map { String(format: " %.2f", $0) } ?? ""
             let t = e.tool.map { " → \($0)" } ?? ""
             return "\(f.string(from: e.at))  [\(e.tier)\(c)]  \"\(e.heard)\"\(t)  \(e.outcome)  \(e.ms)ms"
         }.joined(separator: "\n")
     }
 
+    /// BUILD 253 — when a ROUTING DECISION was last recorded.
+    ///
+    /// The backstop compares this against the moment the sentence started
+    /// routing. A timestamp rather than the boolean latch the first cut of
+    /// 253 used, because a latch never cleared: once any tier had logged,
+    /// the backstop stayed off for good.
+    ///
+    /// IT IS STILL GLOBAL, AND THAT IS A REAL LIMIT, SO IT IS WRITTEN
+    /// DOWN RATHER THAN GLOSSED. If he barges in over a tier that is
+    /// mid-await, the cancelled tier's continuation still runs and still
+    /// logs — stamping this clock after the NEW sentence started, so the
+    /// new sentence looks accounted for and gets no gap line. Closing
+    /// that needs the route token carried into every one of the router's
+    /// twenty-odd log calls, which is a bigger change than this build
+    /// should make on top of everything else in it. The failure is a
+    /// missing line rather than a wrong one, which is the right way for
+    /// it to fail.
+    ///
+    /// `routeDecision: false` is for callers that are not deciding about
+    /// a spoken sentence at all — the fare matrix logging an HTTP failure
+    /// from a background thread, a Siri shortcut. Those get their entry
+    /// but must not speak for whatever the router is holding.
+    nonisolated(unsafe) static var lastDecisionAt = Date.distantPast
+
     func add(heard: String, tier: String, tool: String? = nil,
-             confidence: Double? = nil, outcome: String, ms: Int) {
-        entries.append(Entry(at: Date(), heard: heard, tier: tier, tool: tool,
-                             confidence: confidence, outcome: outcome, ms: ms))
-        if entries.count > Self.cap { entries.removeFirst(entries.count - Self.cap) }
+             confidence: Double? = nil, outcome: String, ms: Int,
+             routeDecision: Bool = true, at: Date = Date()) {
+        if routeDecision { Self.lastDecisionAt = Date() }
+        lock.lock()
+        store.append(Entry(at: at, heard: heard, tier: tier, tool: tool,
+                           confidence: confidence, outcome: outcome, ms: ms))
+        if store.count > Self.cap { store.removeFirst(store.count - Self.cap) }
+        lock.unlock()
         // BUILD 221: coalesced two seconds out, so a run of commands
         // costs one write rather than one per sentence, and the router
         // never waits on the disk.

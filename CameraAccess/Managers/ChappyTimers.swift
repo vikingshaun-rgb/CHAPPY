@@ -175,10 +175,32 @@ final class ChappyTimers: ObservableObject {
         let t = Timer(fire: c.fireAt, interval: 0, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.active.contains(where: { $0.id == c.id }) else { return }
-                ChappyEarcon.shared.done()
-                ChappyHaptics.shared.arrival()
-                TTSService.shared.speak("\(c.name) — time's up.")
-                self.remove(c.id, cancelNotification: false)
+                // BUILD 254: through the one door. A timer firing mid-sentence
+                // used to destroy his command outright — it cancelled whatever
+                // Chappy was saying AND deafened the ear for the length of its
+                // own line. It waits for a gap now, and says itself anyway
+                // once its patience runs out, because a silent timer is the
+                // one thing worse than an interruption.
+                //
+                // The chime and the buzz moved INSIDE the callback. My first
+                // cut left them firing immediately, so on a deferred timer he
+                // got the alert up to fifteen seconds before the words telling him
+                // which timer it was — two events where there had been one.
+                ChappyStandby.speakWhenClear("\(c.name) — time's up.", onSpoken: { [weak self] in
+                    // Re-checked here, not only at queue time. The
+                    // announcement can now be deferred, and cancelling a
+                    // timer inside that window used to leave Chappy
+                    // announcing a timer that no longer exists.
+                    guard self?.active.contains(where: { $0.id == c.id }) == true else { return }
+                    ChappyEarcon.shared.done()
+                    ChappyHaptics.shared.arrival()
+                    // Removed when it is announced, not when it is queued.
+                    // My first cut removed it here immediately, so on a
+                    // deferred timer the countdown vanished from the list up
+                    // to fifteen seconds before he was told about it — the
+                    // mirror image of the chime bug on the line above.
+                    self?.remove(c.id, cancelNotification: false)
+                })
             }
         }
         RunLoop.main.add(t, forMode: .common)
