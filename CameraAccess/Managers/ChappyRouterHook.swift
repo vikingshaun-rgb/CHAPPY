@@ -60,8 +60,25 @@ enum ChappyRouterHook {
         // A sentence that names a real module now escapes the session and
         // the session stays open behind it.
         if ChappyConversation.shared.isActive {
-            if isSignOff(c) { ChappyConversation.shared.close(sayBye: true); return true }
+            if isSignOff(c) {
+                ChappyRouterLog.shared.add(
+                    heard: c, tier: "model", tool: "conversation",
+                    confidence: nil, outcome: "Signed off — session closed",
+                    ms: ChappyStandby.msSinceRouteStart)
+                ChappyConversation.shared.close(sayBye: true)
+                return true
+            }
             if hasAModule(c) { return false }
+            // BUILD 253: logged. This is EVERY sentence after the first in
+            // an open session — the most expensive path in the app — and
+            // it wrote nothing at all. Worse, `send` answers from its own
+            // Task, so it is silent when routing returns: without this the
+            // new backstop would have filed each follow-up turn as
+            // "nothing happened" while the model was mid-answer.
+            ChappyRouterLog.shared.add(
+                heard: c, tier: "model", tool: "conversation",
+                confidence: nil, outcome: "Follow-up turn in the open session",
+                ms: ChappyStandby.msSinceRouteStart)
             ChappyConversation.shared.send(c)
             return true
         }
@@ -90,6 +107,14 @@ enum ChappyRouterHook {
         // to get milk" is swallowed by the nav branch and the reminder never
         // happens.
         if carriesMultipleJobs(c) {
+            // BUILD 253: logged. `open()` plays an earcon, not speech, so
+            // this path was both unlogged AND silent at the moment routing
+            // returned — the exact combination the backstop would have
+            // called "nothing happened".
+            ChappyRouterLog.shared.add(
+                heard: c, tier: "model", tool: "conversation",
+                confidence: nil, outcome: "Several jobs in one breath — opened a session",
+                ms: ChappyStandby.msSinceRouteStart)
             ChappyConversation.shared.open(carrying: c)
             return true
         }
@@ -123,8 +148,16 @@ enum ChappyRouterHook {
             return true
         }
 
-        // ── 8. Judgement, planning, advice → session ────────────────────
+        // ── 8. Judgement, planning, advice → the model ──────────────────
         if wantsThinking(c) {
+            // BUILD 253: logged, because until now this path recorded
+            // nothing at all. A sentence handed to the model looked
+            // identical, in the router log, to a sentence that vanished.
+            ChappyRouterLog.shared.add(
+                heard: c, tier: "model", tool: "conversation",
+                confidence: nil,
+                outcome: "Open question — handed to the model with its tools",
+                ms: ChappyStandby.msSinceRouteStart)
             ChappyConversation.shared.open(carrying: c)
             return true
         }
@@ -277,6 +310,42 @@ enum ChappyRouterHook {
         // Long multi-clause sentences are conversations wearing a command's
         // hat — unless they name a module, which the check above caught.
         return c.split(separator: " ").count > 22
+
+        // ============================================================
+        // BUILD 253 — WHY THE OBVIOUS FIX IS NOT HERE.
+        //
+        // The first cut of 253 widened this list to "anything starting
+        // with what / why / how / where / is / can / do", to make Chappy
+        // answer open questions the way "Hey Meta" does. Review killed it,
+        // and was right to.
+        //
+        // The reason is WHERE this function is called from. `intercept()`
+        // runs BEFORE the entire keyword router — every tier, all of it.
+        // So a test here is not a fall-through catcher, it is a first
+        // claim on the sentence. "What time is it", "what's my battery",
+        // "what did I photograph today", "how many days can I stay",
+        // "what does this sign say" all have working local homes further
+        // down, and every one of them would have been taken away from
+        // those homes and handed to a session whose tool list is photo,
+        // navigate, translate, maps, reminders, lists, timers, recall and
+        // context — no weather, no battery, no spend, no visa, no flight,
+        // no OCR, no web. Slower, dearer, and wrong.
+        //
+        // Worse, it would have been INTERMITTENT. "What's the weather"
+        // contracts to "what's", which does not match "what ", so half
+        // his phrasings would keep working and half would not.
+        //
+        // The bottom of ChappyStandby.route() is where a test like this
+        // belongs, because that is where nothing matched and the
+        // fall-through is real. 253 did NOT add a general question test
+        // even there — `quickAsk` already answers anything question-shaped
+        // that gets that far, and it does it in one cheap call with no
+        // session latched behind it. What 253 added at that spot is
+        // narrower: a test for questions about HIS OWN history, which
+        // quickAsk answers from a context header, which is to say it
+        // makes them up. Those go to the session, because the session has
+        // a recall tool. See wantsHisOwnHistory in LiveAIManager.
+        // ============================================================
     }
 
     /// Does a real engine own this? Kept deliberately concrete: these are
@@ -299,6 +368,40 @@ enum ChappyRouterHook {
             "look up", "search the web", "translate", "remember this",
             "take a photo", "navigate to", "take me to",
         ]
+        // ============================================================
+        // BUILD 253 — WHAT I TRIED TO ADD HERE, AND WHY IT IS NOT HERE.
+        //
+        // I added timer, alarm, list, "what time", battery and "where am
+        // i" to this list, so those would escape an open session and be
+        // answered locally and free. The comment I wrote said "not one of
+        // those is in the session's tool set".
+        //
+        // That was false, and review proved it by opening the file.
+        // ChappyConversation declares set_timer, read_timers,
+        // cancel_timer, add_to_list, read_lists and tick_off. Meanwhile
+        // the LEGACY ladder has no timer code at all — grep the manager
+        // for ChappyTimers and you get nothing. hook step 6 is the only
+        // timer router in the app, and step 2 returns before step 6 ever
+        // runs.
+        //
+        // So "set a timer for ten minutes" during a session would have
+        // escaped the one brain that can set a timer, fallen the whole
+        // length of the ladder to a toolless one-shot, and been answered
+        // "ten minutes, starting now" with NO TIMER SET. A confident lie,
+        // billed, replacing a path that worked.
+        //
+        // This is the second time in this project I have written a fix
+        // whose justification was contradicted by code a few lines away —
+        // the first was cutting the TTS timeout to 8s, four comments
+        // under the note explaining why 8s had been removed. Both were
+        // caught by review rather than by him, and both would have felt
+        // reasonable right up until they cost a build.
+        //
+        // The real gap is narrower than I claimed: "what's my battery" and
+        // "where am i" have no session tool. That is one small tool to add
+        // to ChappyConversation, not a rewrite of this list, and it is not
+        // worth risking the timers to get.
+        // ============================================================
         // AUDIT: this matched SUBSTRINGS, which is a trap with short words.
         // "leg" fired on legal, college and delegate; "rain" on training and
         // brain; "uv" on louvre. That both blocked real conversations ("help
@@ -498,8 +601,14 @@ enum ChappyRouterHook {
             }
         }
         d = d.replacingOccurrences(of: "  ", with: " ")
-        for prefix in ["the ", "a ", "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
+        // BUILD 257 — kept identical to navDestination's list ON PURPOSE, and
+        // this time verified rather than asserted. The 255 flights bug was a
+        // comment claiming these two lists were the same while one had five
+        // openers the other lacked. If you add one here, add it there.
+        for prefix in ["my own ", "our own ", "my ", "our ", "the ", "a ",
+                       "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
             d = String(d.dropFirst(prefix.count))
+            break
         }
         d = d.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
         return d.count > 1 ? d : nil

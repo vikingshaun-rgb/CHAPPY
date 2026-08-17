@@ -6984,7 +6984,8 @@ final class ChappyStandby: NSObject, ObservableObject {
         if Self.looksLikeReminder(c), let p = Self.parseReminder(c) {
             let r = ChappyReminders.shared.add(
                 title: p.title, at: p.date, floatingTime: p.floating,
-                place: p.place, repeatRule: p.rule, leadMinutes: p.lead,
+                place: p.place, destination: p.destination,
+                repeatRule: p.rule, leadMinutes: p.lead,
                 escalate: p.escalate,
                 thumbnail: LiveAIManager.shared.streamViewModel?.currentVideoFrame?
                     .jpegData(compressionQuality: 0.4))
@@ -7424,9 +7425,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("unread") || c.contains("check my")
             || c.contains("check the mail") || c.contains("inbox")
             || c.contains("who emailed") || c.contains("reply")
+        // BUILD 257: "send this" and "send that" added to the gate. Without
+        // them the new "email this" branch inside could only ever be reached
+        // by a sentence that ALSO said "email" — so "send this to my wife"
+        // fell through the entire mail route and did nothing at all.
         if !readingMail,
            c.contains("email") || c.contains("send it to")
-            || c.contains("send that to") || c.contains("mail it") {
+            || c.contains("send that to") || c.contains("mail it")
+            || c.contains("send this") || c.contains("send that") {
 
             let toPartner = c.contains("partner") || c.contains("my wife")
                 || c.contains("my husband") || c.contains("her") || c.contains("him")
@@ -7443,14 +7449,14 @@ final class ChappyStandby: NSObject, ObservableObject {
                         body: ChappyTravel.shared.spokenItinerary(t),
                         to: to.isEmpty ? [] : [to]))
                 } else {
-                    speak("No trip planned, so there's no flight report to send yet.")
+                    speak(ChappyHandoff.remember(ourLine: "No trip planned, so there's no flight report to send yet."))
                 }
                 return
             }
             if c.contains("compar") {
                 let trips = ChappyTravel.shared.trips
                 guard trips.count > 1 else {
-                    speak("There's only one trip, so there's nothing to compare it against.")
+                    speak(ChappyHandoff.remember(ourLine: "There's only one trip, so there's nothing to compare it against."))
                     return
                 }
                 speak(ChappyHandoff.shared.offerReport(
@@ -7460,12 +7466,24 @@ final class ChappyStandby: NSObject, ObservableObject {
                     to: to.isEmpty ? [] : [to]))
                 return
             }
+            // BUILD 257 — THE TRAIL, WHICH HAD NO FILE UNTIL NOW.
+            if c.contains("trail") || c.contains("my day") || c.contains("where i've been")
+                || c.contains("where ive been") || c.contains("my movements") {
+                let day = ChappyTrail.dayMentioned(in: c) ?? Date()
+                let df = DateFormatter(); df.dateFormat = "EEEE d MMMM"
+                speak(ChappyHandoff.shared.offerReport(
+                    ChappyTrail.shared.writeDayReport(for: day),
+                    subject: "Chappy trail — \(df.string(from: day))",
+                    body: ChappyTrail.shared.spokenSummary(for: day),
+                    to: to.isEmpty ? [] : [to]))
+                return
+            }
             if c.contains("memory") || c.contains("memories") || c.contains("diary") {
                 // exportAll writes on a background queue and calls back,
                 // so this one has to speak twice: once to say it started,
                 // once when there is something to attach. Saying nothing
                 // in between is how the app feels broken.
-                speak("Building the export - I'll put it in an email when it's ready.")
+                speak(ChappyHandoff.remember(ourLine: "Building the export - I'll put it in an email when it's ready."))
                 ChappyMemory.shared.exportAll { url in
                     Task { @MainActor in
                         let line = ChappyHandoff.shared.offerReport(
@@ -7483,8 +7501,34 @@ final class ChappyStandby: NSObject, ObservableObject {
                 if let t = ChappyTravel.shared.active {
                     speak(ChappyTravel.shared.emailReport(t, to: to))
                 } else {
-                    speak("Nothing to email yet — there's no trip planned.")
+                    speak(ChappyHandoff.remember(ourLine: "Nothing to email yet — there's no trip planned."))
                 }
+                return
+            }
+            // BUILD 257 — "EMAIL THIS", THE SENTENCE HE ACTUALLY SAYS.
+            //
+            // Every branch above needs him to NAME the thing. But he is
+            // wearing glasses, looking at whatever Chappy just produced, and
+            // the natural sentence is "email this" — which matched nothing at
+            // all, so the most obvious phrasing was the one that failed.
+            //
+            // Placed above the bare-"email" trip fallback deliberately: with
+            // a trip open, "email this" would otherwise mean the trip
+            // whatever he was actually looking at, because of the
+            // c.count < 24 test below. It sits BELOW the named branches, so
+            // "email this trip report" still means the trip report — naming
+            // the thing beats pointing at it.
+            //
+            // REVIEW: bare `c == "email"` was in this list and had to come
+            // out. It stole the one case the next branch exists for, and
+            // "email" on its own with a trip open has always meant the trip.
+            // "send this"/"send that" were also dead until the outer gate
+            // above learned them — a condition that can never be true is
+            // worse than a missing one, because it reads as covered.
+            if c.contains("email this") || c.contains("email that")
+                || c.contains("send this") || c.contains("send that")
+                || c.contains("email it") {
+                speak(ChappyHandoff.shared.offerLast(to: to.isEmpty ? [] : [to]))
                 return
             }
             // "email" on its own, with a trip open, means the trip.
@@ -9902,9 +9946,15 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
         }
         d = d.replacingOccurrences(of: "  ", with: " ")
-        // Clean the query the way the in-session bridge does
-        for prefix in ["the ", "a ", "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
+        // Clean the query the way the in-session bridge does.
+        // BUILD 257: "my " and "our " added. Their absence is the entire
+        // reason "take me to my gym" searched Google for a gym while a place
+        // called "gym" sat in his own saved list — see TripRecorder.savedSpot.
+        // Longest first, so "my own " is not left as "own ".
+        for prefix in ["my own ", "our own ", "my ", "our ", "the ", "a ",
+                       "closest ", "nearest "] where d.lowercased().hasPrefix(prefix) {
             d = String(d.dropFirst(prefix.count))
+            break
         }
         d = d.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
         // Belt and braces: a pronoun means the tail-chopper missed something.
@@ -10181,6 +10231,12 @@ final class ChappyStandby: NSObject, ObservableObject {
         // ChappyPlaces and the rest, and its own build.
         // =================================================================
         ChappyHaptics.shared.straightStep()
+        // BUILD 257: remember anything substantial he was just told, so
+        // "email this" has something to send when no file was produced. The
+        // 40-character floor inside note() keeps acknowledgements ("Having a
+        // look.", "Done.") out of it — emailing one of those would be worse
+        // than saying there is nothing to send.
+        ChappyHandoff.note(answer: text, label: "From Chappy")
         // BUILD 219: speakSmart, not speak. A cached line still plays
         // whole and instantly; a long unseen one starts on its first
         // sentence rather than after the whole thing has rendered.
@@ -10988,6 +11044,138 @@ final class TripRecorder {
         return spot
     }
 
+    /// BUILD 257 — ONE PLACE MATCHER, AND "MY GYM" FINDS IT.
+    ///
+    /// THE BUG HE REPORTED. "Take me to the gym" worked. "Take me to MY gym"
+    /// did not, and the reason is one word: the destination parser strips
+    /// "the ", "a ", "closest " and "nearest " and does not strip "my ". So
+    /// the query stayed "my gym", and against a spot named "the gym" neither
+    /// `"my gym".contains("the gym")` nor the reverse is true. It fell
+    /// through to a Google Places search for any gym nearby — which is
+    /// exactly the behaviour of an assistant that does not know you.
+    ///
+    /// TWO MORE THINGS THE OLD MATCHER GOT WRONG, both in one line:
+    ///
+    ///     spots.last(where: { q.contains(name) || name.contains(q) })
+    ///
+    ///   - `last` means MOST RECENTLY SAVED, not nearest. Two gyms and it
+    ///     picks whichever you starred later, even if it is in another city.
+    ///   - bare `contains` is substring, not word. A query of "uv" matched a
+    ///     spot called "Souvenirs"; "key" matched "Turkey". That is the same
+    ///     defect class as the router's substring mis-routes, and this one
+    ///     starts a route to the wrong place.
+    ///
+    /// So: normalise possessives and articles away, match on WHOLE WORDS,
+    /// require at least one real word (three letters or more) to carry the
+    /// match, and break ties by distance when we know where he is.
+    static func normalisedPlaceQuery(_ raw: String) -> String {
+        var q = raw.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        // Possessives and articles, longest first so "my own " beats "my ".
+        for lead in ["my own ", "our own ", "my ", "our ", "the ", "a ", "an ",
+                     "closest ", "nearest ", "local ", "usual "] where q.hasPrefix(lead) {
+            q = String(q.dropFirst(lead.count))
+            break
+        }
+        return q.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+    }
+
+    /// REVIEW CAUGHT THE FALLBACK, AND IT MATTERED. Dropping stop-words
+    /// unconditionally erased any name made only of them: a spot saved as
+    /// "Our Place" reduced to [] on BOTH sides, so "take me to our place"
+    /// became unroutable — something the crude old `contains` matcher
+    /// handled fine. Filtering that empties a name is filtering that has
+    /// gone wrong, so fall back to the raw words.
+    private static func placeWords(_ s: String) -> [String] {
+        let stop: Set<String> = ["the", "a", "an", "my", "our", "at", "to", "in",
+                                 "on", "of", "and", "place", "spot"]
+        let raw = s.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let trimmed = raw.filter { !stop.contains($0) }
+        return trimmed.isEmpty ? raw : trimmed
+    }
+
+    /// The one lookup. Everything that turns a spoken name into a saved place
+    /// goes through here, so NavEngine, the travel estimate and the walk-or-
+    /// drive decision can never disagree about which place he meant — which
+    /// they could before, because each had its own hand-written copy.
+    static func savedSpot(matching raw: String,
+                          nearLat: Double? = nil, nearLon: Double? = nil) -> Spot? {
+        let q = normalisedPlaceQuery(raw)
+        guard q.count > 1 else { return nil }
+        let qWords = placeWords(q)
+        guard !qWords.isEmpty else { return nil }
+
+        // MATCHED WORDS FIRST, SHAPE SECOND — and review had to point that
+        // out. My first cut ranked by shape: "every word of the saved name
+        // appears in the query" beat "every word of the query appears in the
+        // saved name", always. With spots called "Gym" and "Gym Kawana" and a
+        // query of "gym kawana", the first rule matched "Gym" and won —
+        // throwing away the exact word he added to tell them apart. The
+        // distance tie-break never even ran, because the ranks differed.
+        //
+        // How many of his words the name actually accounts for is the real
+        // measure. Shape only breaks ties.
+        struct Score { let overlap: Int; let exact: Bool; let extraWords: Int; let metres: Double; let t: Date }
+        var best: (spot: Spot, s: Score)?
+        for spot in shared.spots {
+            let name = normalisedPlaceQuery(spot.name)
+            let nWords = placeWords(name)
+            guard !nWords.isEmpty else { continue }
+
+            let exact = (name == q)
+            guard exact
+                    || nWords.allSatisfy({ qWords.contains($0) })
+                    || qWords.allSatisfy({ nWords.contains($0) })
+            else { continue }
+
+            // THE GUARD THAT KILLS THE SUBSTRING CLASS. Word matching already
+            // stops "uv" finding "Souvenirs" — that was a substring problem.
+            // This is the remaining case: a match resting on ONE two-letter
+            // word ("st", "dr"). Two short words agreeing is a real signal,
+            // so "Ku De Ta" still matches.
+            let shared_ = Set(qWords).intersection(nWords)
+            guard exact || shared_.count >= 2 || shared_.contains(where: { $0.count >= 3 })
+            else { continue }
+
+            var metres = Double.greatestFiniteMagnitude
+            if let la = nearLat, let lo = nearLon {
+                metres = CLLocation(latitude: la, longitude: lo)
+                    .distance(from: CLLocation(latitude: spot.lat, longitude: spot.lon))
+            }
+            let score = Score(overlap: shared_.count, exact: exact,
+                              extraWords: max(0, nWords.count - shared_.count),
+                              metres: metres, t: spot.t)
+            func beats(_ a: Score, _ b: Score) -> Bool {
+                if a.overlap != b.overlap { return a.overlap > b.overlap }
+                if a.exact != b.exact { return a.exact }
+                if a.extraWords != b.extraWords { return a.extraWords < b.extraWords }
+                // Nearest when we know where he is; otherwise the one saved
+                // most recently, which is the old behaviour and the only
+                // sane fallback with nothing else to go on.
+                if nearLat != nil { return a.metres < b.metres }
+                return a.t > b.t
+            }
+            if best == nil || beats(score, best!.s) { best = (spot, score) }
+        }
+        if let b = best {
+            print("📍 [Places] '\(raw)' -> saved place '\(b.spot.name)' (\(b.s.overlap) word(s) matched)")
+        }
+        return best?.spot
+    }
+
+    /// BUILD 257 — the coordinate half of the lookup, used by the trail to
+    /// put his own names on his own stops.
+    ///
+    /// Delegates to `spotNear`, which has done exactly this since build 158
+    /// for arrival notes. My first cut wrote the filter-and-min loop out a
+    /// second time — in the build whose entire stated purpose is replacing
+    /// hand-written copies of one lookup with a single one. Review caught the
+    /// irony before it shipped.
+    static func nearestSavedSpot(toLat lat: Double, lon: Double, within metres: Double) -> Spot? {
+        shared.spotNear(lat: lat, lon: lon, metres: metres)
+    }
+
     /// BUILD 138: save a spot at EXPLICIT coordinates — starring a Trail
     /// visit from earlier in the day, or marking one as Home, must pin the
     /// place you WERE, not the place you're standing now.
@@ -10997,6 +11185,15 @@ final class TripRecorder {
         var spot = Spot(name: name.isEmpty ? "Starred place" : name, t: Date(),
                         lat: lat, lon: lon,
                         street: nil, city: nil, country: nil)
+        // BUILD 257 — A STAR THAT DOESN'T STAR ANYTHING.
+        //
+        // This is the "Star — save this place" action on the Trail. It has
+        // never set `starred`, and the Places screen's Favourites filter is
+        // literally `s.starred == true`. So starring a place from the Trail
+        // put it in Places and never in Favourites, and the star icon you
+        // tapped was the only evidence it had happened. Two words.
+        spot.starred = true
+        spot.category = "Favourites"
         let mem = ChappyMemory.shared.rememberAt(.place, title: spot.name,
                                                  lat: lat, lon: lon,
                                                  tags: ["spot", "favourite"],
@@ -11522,8 +11719,10 @@ final class NavEngine: NSObject, ObservableObject {
         }
         var destName = query
         var dest: CLLocationCoordinate2D?
-        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if let spot = TripRecorder.shared.spots.last(where: { q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q) }) {
+        // BUILD 257: one shared matcher, and it knows where he is standing —
+        // so with two places called "gym" it takes the near one. See the long
+        // note on TripRecorder.savedSpot.
+        if let spot = TripRecorder.savedSpot(matching: query, nearLat: lat, nearLon: lon) {
             dest = CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon)
             destName = spot.name
         }
@@ -11692,9 +11891,11 @@ final class NavEngine: NSObject, ObservableObject {
         guard let lat = snap.latitude, let lon = snap.longitude, !query.isEmpty else { return nil }
         var dest: CLLocationCoordinate2D?
         var name = query
-        let q = query.lowercased()
-        if let spot = TripRecorder.shared.spots.last(where: {
-            q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q) }) {
+        // BUILD 257: the third copy of the old matcher, now the same call as
+        // the other two. This one feeds ride pricing and the leave-by clock,
+        // so disagreeing with the route about which place he meant produced
+        // a distance to somewhere he was never going.
+        if let spot = TripRecorder.savedSpot(matching: query, nearLat: lat, nearLon: lon) {
             dest = CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon)
             name = spot.name
         }
@@ -12387,6 +12588,18 @@ final class ChappyMemory: ObservableObject {
         var repeatRule: String?
         /// A place name or keyword that fires it instead of a clock.
         var placeTrigger: String?
+        /// BUILD 257 — WHERE HE HAS TO GET TO, which is not the same thing as
+        /// a geofence.
+        ///
+        /// "Remind me to go to the gym by ten" is a DESTINATION with a
+        /// deadline. The only field that could carry a place was
+        /// `placeTrigger`, and that one means "fire when I arrive" — so
+        /// reusing it would have him arrive at the gym and be told to go to
+        /// the gym. Two different ideas that happened to be one field.
+        ///
+        /// checkLeaveBy reads this first; checkPlaceTriggers never reads it.
+        /// Optional, so every reminder written before today still decodes.
+        var destination: String?
         /// Minutes of buffer on top of real travel time for a leave-by warning.
         var leadMinutes: Int?
         /// When it was ticked off. Nil means still open.
@@ -14790,6 +15003,9 @@ final class ChappyReminders: NSObject, ObservableObject {
              at when: Date? = nil,
              floatingTime: String? = nil,
              place: String? = nil,
+             /// BUILD 257: somewhere to GET TO. Defaulted, so not one of the
+             /// dozen existing callers has to change.
+             destination: String? = nil,
              repeatRule: String? = nil,
              leadMinutes: Int? = nil,
              escalate: Bool = false,
@@ -14804,6 +15020,7 @@ final class ChappyReminders: NSObject, ObservableObject {
         e.dueAt = when
         e.floatingTime = floatingTime
         e.placeTrigger = place
+        e.destination = destination
         e.repeatRule = repeatRule
         e.leadMinutes = leadMinutes
         e.escalate = escalate
@@ -15076,10 +15293,24 @@ final class ChappyReminders: NSObject, ObservableObject {
     /// One entry per reminder, cleared when it is finally said.
     private var announcing = Set<UUID>()
 
+    /// BUILD 257 — walk-or-drive, decided once per reminder rather than once
+    /// per GPS fix. See the note in checkLeaveBy: the uncached version issued
+    /// a billed Places search roughly once a second for the whole warning
+    /// window.
+    ///
+    /// WITH WHERE AND WHEN, because review showed a bare cache is wrong over
+    /// a fifty-minute window. Decide "walk" at home 400 m from the gym, then
+    /// drive across town, and the frozen answer produces "about 150 minutes'
+    /// walk from here" for a twelve-kilometre trip. A decision made
+    /// somewhere else is not a decision about here.
+    private struct ModeGuess { let driving: Bool; let at: Date; let lat: Double; let lon: Double }
+    private var leaveByMode: [UUID: ModeGuess] = [:]
+
     private func markDelivered(_ e: ChappyMemory.Entry) {
         var c = e
         c.deliveredAt = Date()
         ChappyMemory.shared.replaceReminderFields(c)
+        leaveByMode[e.id] = nil
     }
 
     // MARK: - The morning brief
@@ -15385,12 +15616,16 @@ final class ChappyReminders: NSObject, ObservableObject {
     // difference between a list and a secretary.
 
     func checkLeaveBy() async {
+        // BUILD 257: `destination` first, then `placeTrigger`. A reminder
+        // that names somewhere he has to GET TO now qualifies for the
+        // leave-by clock without also becoming an arrival geofence.
         let candidates = open.filter {
             $0.leadMinutes != nil && $0.dueAt != nil && $0.deliveredAt == nil
-                && !($0.placeTrigger ?? "").isEmpty
+                && !(($0.destination ?? $0.placeTrigger) ?? "").isEmpty
         }
         for r in candidates {
             guard let due = r.dueAt, let lead = r.leadMinutes else { continue }
+            let where_ = (r.destination ?? r.placeTrigger) ?? ""
             // Only worth a lookup inside a sensible window.
             let mins = due.timeIntervalSinceNow / 60
             guard mins > 0, mins < Double(lead) + 45 else { continue }
@@ -15402,7 +15637,37 @@ final class ChappyReminders: NSObject, ObservableObject {
             // network, and all resume and announce. A guard before a
             // suspension point guarantees nothing after it.
             guard !announcing.contains(r.id) else { return }
-            guard let travel = await NavEngine.shared.travelMinutes(to: r.placeTrigger ?? "") else { continue }
+            // BUILD 257 — IN THE WAY HE IS ACTUALLY TRAVELLING.
+            //
+            // travelMinutes defaults to driving: true, so a leave-by on foot
+            // was computed at car speed and told him to leave far too late.
+            // ChappyNavMode decides walk-or-drive from the same distance
+            // probe the route itself uses, so the number he is given is for
+            // the journey he will actually make.
+            //
+            // CACHED PER REMINDER, and review is why. checkLeaveBy runs on
+            // EVERY location fix — about once a second while walking — and
+            // for a destination that is not a saved spot, likelyDriving
+            // falls through MapKit to a BILLED Google Places search. One per
+            // second for the length of the window. ChappyNavMode's own note
+            // warns about exactly this doubling. The answer cannot
+            // meaningfully change inside one warning window, so ask once.
+            let snap = ContextEngine.shared.snapshot
+            let driving: Bool
+            if let g = leaveByMode[r.id],
+               Date().timeIntervalSince(g.at) < 300,
+               let la = snap.latitude, let lo = snap.longitude,
+               TripRecorder.meters(la, lo, g.lat, g.lon) < 500 {
+                driving = g.driving
+            } else {
+                driving = await ChappyNavMode.likelyDriving(to: where_)
+                leaveByMode[r.id] = ModeGuess(driving: driving, at: Date(),
+                                              lat: snap.latitude ?? 0,
+                                              lon: snap.longitude ?? 0)
+            }
+            guard let travel = await NavEngine.shared.travelMinutes(to: where_,
+                                                                   driving: driving)
+            else { continue }
             let leaveAt = due.addingTimeInterval(-Double(travel + lead) * 60)
             guard Date() >= leaveAt else { continue }
             // BUILD 254: one at a time — same cancel-each-other bug as
@@ -15411,7 +15676,11 @@ final class ChappyReminders: NSObject, ObservableObject {
             // where the answer can have changed under us.
             guard !announcing.contains(r.id) else { return }
             announcing.insert(r.id)
-            let line = "Time to go - \(r.title). It's about \(travel) minutes from here."
+            // BUILD 257: name the place and the mode. "About 11 minutes"
+            // means nothing on its own — 11 minutes to WHERE, and walking or
+            // driving? Those are the two things that decide whether he moves.
+            let mode = driving ? "drive" : "walk"
+            let line = "Time to head off - \(r.title). \(where_) is about \(travel) minutes' \(mode) from here."
             ChappyStandby.speakWhenClear(line, onSpoken: { [weak self] in
                 ChappyHaptics.shared.reminderUrgent()
                 ChappyEarcon.shared.wake()
@@ -16031,6 +16300,8 @@ extension ChappyStandby {
         var date: Date?
         var floating: String?      // "HH:mm" — 8am wherever I am
         var place: String?
+        /// BUILD 257 — somewhere he has to GET TO, as opposed to a geofence.
+        var destination: String?
         var rule: String?          // "d3", "d3!", "w1:mon,fri"
         var lead: Int?
         var escalate = false
@@ -16187,12 +16458,65 @@ extension ChappyStandby {
         return finish(out)
     }
 
+    /// BUILD 257 — "GO TO THE GYM BY TEN" IS A LEAVE-BY, NOT A LIST ITEM.
+    ///
+    /// The parser had no idea that a reminder could name somewhere he has to
+    /// BE. It had place TRIGGERS — "when I'm at the supermarket" — which are
+    /// the opposite arrangement: fire on arrival. So "remind me to go up the
+    /// gym today by ten" parsed as a plain 10am alarm with the text "go up
+    /// the gym", and at ten o'clock it told him to go to the gym. By then the
+    /// useful moment — leave now, it's eleven minutes away — had passed.
+    ///
+    /// THE GUARD THAT MAKES THIS SAFE: it only counts if the tail resolves to
+    /// a place HE HAS SAVED. "Remind me to go to the shops" with no saved
+    /// shop is still just a reminder; it does not start doing route lookups
+    /// against arbitrary sentence fragments on every GPS fix.
+    static func destinationIn(_ title: String) -> String? {
+        let t = " " + title.lowercased() + " "
+        // Longest forms first so " go to " cannot claim " go to the ".
+        let openers = [" go up to ", " go down to ", " go over to ", " go round to ",
+                       " go around to ", " go back to ", " go up the ", " go down the ",
+                       " get up to ", " get down to ", " get back to ", " get to ",
+                       " head over to ", " head back to ", " head to ", " head up to ",
+                       " pop over to ", " pop into ", " pop down to ", " drop into ",
+                       " call in at ", " swing by ", " drive to ", " walk to ",
+                       " ride to ", " be at ", " go to "]
+        for o in openers {
+            guard let r = t.range(of: o) else { continue }
+            var tail = String(t[r.upperBound...])
+            // Everything from the first time word on belongs to the clock,
+            // not to the place name.
+            for cut in [" by ", " before ", " after ", " today", " tomorrow",
+                        " tonight", " this morning", " this arvo", " this afternoon",
+                        " at ", " on ", " and "] {
+                if let c = tail.range(of: cut) { tail = String(tail[..<c.lowerBound]) }
+            }
+            tail = tail.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+            guard tail.count > 1 else { continue }
+            if let spot = TripRecorder.savedSpot(matching: tail) { return spot.name }
+        }
+        return nil
+    }
+
     private static func finish(_ p: ParsedReminder) -> ParsedReminder {
         var o = p
         o.title = stripTimeWords(o.title)
             .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
         if o.title.count < 2 { o.title = "Reminder" }
         o.title = o.title.prefix(1).uppercased() + o.title.dropFirst()
+        // BUILD 257: every branch above returns through here, so the
+        // destination test only needs writing once. A reminder that already
+        // has a geofence keeps it — that is a deliberate arrival ping and
+        // this must not quietly turn it into something else.
+        if o.place == nil, o.destination == nil,
+           let dest = destinationIn(o.title) {
+            o.destination = dest
+            if o.lead == nil { o.lead = 5 }
+            if !o.confirmation.isEmpty {
+                o.confirmation = o.confirmation.replacingOccurrences(
+                    of: ", got it.", with: ", and I'll tell you when to leave for \(dest).")
+            }
+        }
         // Escalate anything that reads like it must not be missed.
         let urgent = ["flight", "check in", "check-in", "passport", "visa", "boarding",
                       "ferry", "train", "bus", "medication", "tablet", "pill", "insulin"]
@@ -17603,13 +17927,61 @@ final class ChappyTrail: NSObject, ObservableObject {
         var lon: Double
         var name: String?          // reverse-geocoded, lazily
 
+        /// BUILD 257 — THE NAME YOU GAVE IT BEATS THE NAME APPLE GAVE IT.
+        ///
+        /// `name` above is Apple's reverse-geocoded placemark, and nothing in
+        /// this app ever cross-referenced a trail stop against the places he
+        /// has actually saved. So the map drew a star labelled "Gym" and the
+        /// list directly underneath it said "6 Cresthaven Ct" — for the same
+        /// coordinates, on the same screen. That is the gap between his
+        /// mockup and what he was looking at.
+        ///
+        /// 140 m rather than the 150 m used for arrival notes: a stop is a
+        /// point, an arrival is a walk-in, and a tighter radius stops two
+        /// saved places on one street block trading names.
+        var displayName: String {
+            if let s = TripRecorder.nearestSavedSpot(toLat: lat, lon: lon, within: 140) {
+                return s.name
+            }
+            return name ?? "Stopped here"
+        }
+
+        /// True when the label above came from a place he saved, so the row
+        /// can show a star and mean it.
+        var isSavedPlace: Bool {
+            TripRecorder.nearestSavedSpot(toLat: lat, lon: lon, within: 140) != nil
+        }
+
         var spokenWindow: String {
             let f = DateFormatter(); f.dateFormat = "h:mm a"
-            if let d = depart {
-                let mins = max(1, Int(d.timeIntervalSince(arrive) / 60))
+            guard let d = depart else { return "since \(f.string(from: arrive))" }
+            let mins = max(1, Int(d.timeIntervalSince(arrive) / 60))
+            // BUILD 257 — "ABOUT 1127 MINUTES", AND WHY IT SAID THAT.
+            //
+            // 1127 minutes is eighteen hours forty-seven: an evening arrival
+            // that was closed the following afternoon. The format string is
+            // "h:mm a" with NO DATE, so an overnight span printed as
+            // "1:37 pm to 8:24 am" and read as one impossible afternoon.
+            //
+            // The root cause is fixed in rollIfNeeded/saveToday below. This
+            // is the display half: if a stop really does cross midnight —
+            // which is legitimate, you slept there — say so in hours, with
+            // the day attached, instead of a four-digit minute count nobody
+            // can parse.
+            let sameDay = Calendar.current.isDate(arrive, inSameDayAs: d)
+            if sameDay {
+                if mins >= 90 {
+                    let h = Double(mins) / 60.0
+                    return String(format: "%@ to %@, about %.1f hours",
+                                  f.string(from: arrive), f.string(from: d), h)
+                }
                 return "\(f.string(from: arrive)) to \(f.string(from: d)), about \(mins) minutes"
             }
-            return "since \(f.string(from: arrive))"
+            let withDay = DateFormatter()
+            withDay.dateFormat = "EEE h:mm a"
+            let h = Double(mins) / 60.0
+            return String(format: "%@ to %@, about %.1f hours overnight",
+                          withDay.string(from: arrive), withDay.string(from: d), h)
         }
     }
 
@@ -17721,7 +18093,24 @@ final class ChappyTrail: NSObject, ObservableObject {
                 // span is real. Nothing here needs the guess above.
                 todayVisits[i].depart = visit.departureDate
             } else {
-                var v = Visit(arrive: arrive, depart: visit.departureDate,
+                // BUILD 257 — CLAMP THE ARRIVAL TO THE DAY WE ARE WRITING.
+                //
+                // Review caught this, and without it the midnight fix made
+                // the symptom WORSE rather than better. After the roll,
+                // yesterday's open stop has been closed at 23:59:59 in
+                // yesterday's file and is no longer in `todayVisits` — so
+                // when iOS finally delivers the departure this afternoon,
+                // the match above fails and we land here with iOS's original
+                // arrival time from LAST NIGHT. That files a second copy of
+                // the same stop into TODAY's file, spanning eighteen hours.
+                // One stop, two rows, one of them on the wrong day.
+                //
+                // The part of the stay that belongs to today starts at
+                // midnight. Anything earlier is yesterday's record, and
+                // yesterday already has it.
+                let startOfDay = Calendar.current.startOfDay(for: visit.departureDate)
+                let clamped = max(arrive, startOfDay)
+                var v = Visit(arrive: clamped, depart: visit.departureDate,
                               lat: coord.latitude, lon: coord.longitude, name: nil)
                 todayVisits.append(v)
                 geocode(&v)
@@ -17770,22 +18159,109 @@ final class ChappyTrail: NSObject, ObservableObject {
 
     private var loadedDayKey = ""
 
+    /// BUILD 257 — THE MIDNIGHT CLOBBER. This is the "about 1127 minutes".
+    ///
+    /// `saveToday()` wrote to `url(Date())` — TODAY's file — regardless of
+    /// which day was actually loaded in memory. And `rollIfNeeded()` calls it
+    /// on the way past midnight, while `loadedDayKey` still says yesterday:
+    ///
+    ///     if !loadedDayKey.isEmpty { saveToday() }   // yesterday's arrays…
+    ///     loadedDayKey = today                       // …into TODAY's file
+    ///     let day = read(Date())                     // …and read straight back
+    ///
+    /// So at midnight yesterday's points and visits were copied into today's
+    /// file and immediately reloaded as "today". Yesterday's final state was
+    /// never written under yesterday's key at all — which is why the day
+    /// chips further back look thin, and why an evening arrival could still
+    /// be sitting open the next afternoon waiting to be closed into an
+    /// eighteen-hour "stop".
+    ///
+    /// The fix is one parameter: save to the day you are HOLDING, not to the
+    /// day it happens to be now.
     private func rollIfNeeded() {
         let today = Self.key(Date())
         guard loadedDayKey != today else { return }
-        if !loadedDayKey.isEmpty { saveToday() }
+        if !loadedDayKey.isEmpty {
+            // Close anything left open, rather than carrying it across the
+            // date line to be closed tomorrow against yesterday's arrival. A
+            // stop that ran to the end of the day ended there as far as that
+            // day's record is concerned.
+            //
+            // One write, not two: my first cut saved, closed, then saved
+            // again — a full JSON encode of the whole day for nothing.
+            closeOpenVisitsAtEndOf(dayKey: loadedDayKey)
+            saveDay(key: loadedDayKey)
+        }
         loadedDayKey = today
         let day = read(Date())
         todayPoints = day.points
         todayVisits = day.visits
     }
 
-    private func loadToday() { loadedDayKey = ""; rollIfNeeded() }
+    /// BUILD 257 — AND THE CASE WHERE THE APP WASN'T RUNNING AT MIDNIGHT.
+    ///
+    /// `rollIfNeeded` only closes an open stop if the process happened to be
+    /// alive as the date changed. Killed at 9pm and relaunched the next
+    /// morning, `loadedDayKey` is empty, the close is skipped entirely, and
+    /// yesterday's last stop reads "since 7:00 pm" forever — which is the
+    /// commoner case by far, because iOS suspends the app overnight.
+    ///
+    /// So on load, sweep the last week of files and close anything left
+    /// hanging in a day that is over.
+    private func loadToday() {
+        loadedDayKey = ""
+        closeStaleOpenVisitsOnDisk()
+        rollIfNeeded()
+    }
 
-    private func saveToday() {
+    private func closeStaleOpenVisitsOnDisk() {
+        let cal = Calendar.current
+        for back in 1...7 {
+            guard let d = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
+            let key = Self.key(d)
+            var day = read(d)
+            guard day.visits.contains(where: { $0.depart == nil }) else { continue }
+            guard let end = cal.date(bySettingHour: 23, minute: 59, second: 59,
+                                     of: cal.startOfDay(for: d)) else { continue }
+            for i in day.visits.indices where day.visits[i].depart == nil {
+                day.visits[i].depart = max(end, day.visits[i].arrive)   // see above
+            }
+            if let data = try? JSONEncoder().encode(day) {
+                try? data.write(to: dirURL.appendingPathComponent(key + ".json"), options: .atomic)
+                print("👣 [Trail] Closed a stop left open on \(key)")
+            }
+        }
+    }
+
+    private func saveToday() { saveDay(key: loadedDayKey.isEmpty ? Self.key(Date()) : loadedDayKey) }
+
+    private func saveDay(key: String) {
         let day = Day(points: todayPoints, visits: todayVisits)
         if let data = try? JSONEncoder().encode(day) {
-            try? data.write(to: url(Date()), options: .atomic)
+            try? data.write(to: dirURL.appendingPathComponent(key + ".json"), options: .atomic)
+        }
+    }
+
+    /// Close every still-open visit at 23:59:59 of the day being rolled off,
+    /// so a stop never spans the date line in the record.
+    ///
+    /// The other half of this is in `handle(visit:)`: once the stop has been
+    /// closed here it is no longer in `todayVisits`, so tomorrow's departure
+    /// finds no match and files a fresh visit — which is why that branch
+    /// clamps the arrival to the start of the day it is writing into. Either
+    /// fix alone leaves an eighteen-hour row somewhere.
+    private func closeOpenVisitsAtEndOf(dayKey: String) {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        guard let day = f.date(from: dayKey),
+              let endOfDay = Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: day)
+        else { return }
+        for i in todayVisits.indices where todayVisits[i].depart == nil {
+            // max(), not a guard. Review found the sub-second hole: an
+            // arrival stamped after 23:59:59 failed the old `arrive < end`
+            // test here AND on every later disk sweep, so it stayed open
+            // forever and rendered as "since 11:59 pm". Clamping instead
+            // makes it an honest zero-length stop.
+            todayVisits[i].depart = max(endOfDay, todayVisits[i].arrive)
         }
     }
 
@@ -17833,11 +18309,87 @@ final class ChappyTrail: NSObject, ObservableObject {
             if pts.isEmpty { return "\(dayName): no trail recorded. Tracking may not have been on yet." }
             return "\(dayName): you were on the move but didn't stop anywhere long enough to count. \(pts.count) points on the trail — say 'show my trail' to see the line."
         }
+        // BUILD 257: displayName, so a day spoken aloud uses HIS names for
+        // his places — "Gym" and "Home", not "6 Cresthaven Ct". Same source
+        // as the list on screen, so the two cannot disagree.
         let stops = vs.prefix(5).map { v in
-            "\(v.name ?? "a stop"), \(v.spokenWindow)"
+            "\(v.displayName), \(v.spokenWindow)"
         }.joined(separator: ". ")
         let more = vs.count > 5 ? " And \(vs.count - 5) more stops." : ""
         return "\(dayName): \(stops).\(more) Say 'show my trail' for the map."
+    }
+
+    /// BUILD 257 — THE TRAIL HAD NOTHING TO ATTACH.
+    ///
+    /// Every other artefact in this app can be emailed because something
+    /// writes it to a file first — the trip report, the flights, the
+    /// comparison, the memory export. The trail had no writer at all, only a
+    /// spoken summary, so "email me today's trail" had literally nothing to
+    /// put in the message. This is that file.
+    ///
+    /// HTML rather than CSV on purpose: the stops carry times, durations and
+    /// a link per stop, and he reads these on a phone. A table that renders
+    /// beats a table that downloads.
+    @discardableResult
+    func writeDayReport(for date: Date) -> URL? {
+        let vs = visits(for: date).sorted { $0.arrive < $1.arrive }
+        let pts = points(for: date)
+        let df = DateFormatter(); df.dateFormat = "EEEE d MMMM yyyy"
+        let title = df.string(from: date)
+
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+        }
+
+        var rows = ""
+        for v in vs {
+            let link = "https://www.google.com/maps/search/?api=1&query=\(v.lat),\(v.lon)"
+            let star = v.isSavedPlace ? "★ " : ""
+            rows += """
+            <tr><td><a href="\(link)">\(star)\(esc(v.displayName))</a></td>\
+            <td>\(esc(v.spokenWindow))</td></tr>
+            """
+        }
+        if rows.isEmpty {
+            rows = "<tr><td colspan=\"2\">No stops recorded — \(pts.count) points on the trail.</td></tr>"
+        }
+
+        let html = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Trail — \(esc(title))</title>
+        <style>
+          body{font:16px -apple-system,system-ui,sans-serif;margin:24px;color:#111}
+          h1{font-size:20px;margin:0 0 4px}
+          p.sub{color:#666;margin:0 0 18px;font-size:14px}
+          table{border-collapse:collapse;width:100%}
+          td{padding:9px 6px;border-bottom:1px solid #e6e6e6;vertical-align:top}
+          td:nth-child(2){color:#666;font-size:14px;white-space:nowrap}
+          a{color:#0a58ca;text-decoration:none}
+          footer{margin-top:22px;color:#888;font-size:12px}
+        </style></head><body>
+        <h1>\(esc(title))</h1>
+        <p class="sub">\(vs.count) stop\(vs.count == 1 ? "" : "s") · \(pts.count) points on the trail. ★ marks a place you saved.</p>
+        <table>\(rows)</table>
+        <footer>Recorded by Chappy. Times are from your phone's own visit detection; a stop that ran past midnight is shown as overnight.</footer>
+        </body></html>
+        """
+
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let name = "Chappy trail — \(f.string(from: date)).html"
+        guard let dir = FileManager.default.urls(for: .documentDirectory,
+                                                 in: .userDomainMask).first else { return nil }
+        let url = dir.appendingPathComponent(name)
+        do {
+            try html.data(using: .utf8)?.write(to: url)
+            ChappyHandoff.note(artifact: url, label: "Chappy trail — \(title)")
+            return url
+        } catch {
+            print("⚠️ [Trail] Couldn't write the day report: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     /// The day a sentence refers to, if it names one.
@@ -18208,10 +18760,17 @@ final class ChappyMail: ObservableObject {
         !address.isEmpty && APIKeyManager.shared.getMailPassword() != nil
     }
 
-    func configure(address: String, host: String, password: String) {
+    /// BUILD 257: `password` is now optional, and nil means KEEP THE STORED
+    /// ONE. Changing just the email address used to require retyping a
+    /// forty-character app password from another device, because the setup
+    /// screen could not save without a non-empty password field and could
+    /// not read the stored one back to fill it.
+    func configure(address: String, host: String, password: String?) {
         UserDefaults.standard.set(address, forKey: Key.address)
         UserDefaults.standard.set(host, forKey: Key.host)
-        _ = APIKeyManager.shared.saveMailPassword(password)
+        if let p = password, !p.isEmpty {
+            _ = APIKeyManager.shared.saveMailPassword(p)
+        }
     }
 
     // MARK: the check
@@ -23238,6 +23797,7 @@ extension ChappyTravel {
         let url = dir.appendingPathComponent(name)
         do {
             try reportHTML(trip).data(using: .utf8)?.write(to: url)
+            ChappyHandoff.note(artifact: url, label: "Trip report — \(trip.name)")   // BUILD 257
             return url
         } catch {
             print("⚠️ [Travel] Couldn't write the report: \(error.localizedDescription)")
@@ -24610,12 +25170,14 @@ final class ChappyHandoff: ObservableObject {
         let addr = to.isEmpty && !Self.partner.isEmpty ? [Self.partner] : to
         pending = Payload(to: addr, subject: subject, body: body,
                           attachment: attachment, mime: mime)
+        // BUILD 257: every line this class hands back is registered, so it
+        // can never come back around as the thing "email this" sends.
         if attachment == nil {
-            return "Email's on screen — one tap sends it."
+            return Self.remember(ourLine: "Email's on screen — one tap sends it.")
         }
-        return addr.isEmpty
+        return Self.remember(ourLine: addr.isEmpty
             ? "Report's attached and the email is on screen. Add who it's going to and hit send."
-            : "Report's attached, addressed to \(Self.partnerName). One tap sends it."
+            : "Report's attached, addressed to \(Self.partnerName). One tap sends it.")
     }
 
     /// Nothing to attach is a real answer, not an error to swallow.
@@ -24623,9 +25185,86 @@ final class ChappyHandoff: ObservableObject {
     func offerReport(_ url: URL?, subject: String, body: String,
                      to: [String] = []) -> String {
         guard let url, FileManager.default.fileExists(atPath: url.path) else {
-            return "I couldn't build that report, so there's nothing to attach yet."
+            return Self.remember(ourLine:
+                "I couldn't build that report, so there's nothing to attach yet.")
         }
         return offer(subject: subject, body: body, attachment: url, to: to)
+    }
+
+    // MARK: - BUILD 257: "email this"
+    //
+    // The composer, the attachment support and the payload bus have all
+    // existed since 231. What was missing is the plainest sentence he would
+    // actually say. Every email route was tied to a NAMED artefact — "email
+    // the flights", "email the trip report" — so "email this", said while
+    // looking at the thing, matched nothing at all.
+    //
+    // `lastArtifact` is set by whatever last produced a file, and
+    // `lastAnswer` by whatever Chappy last said. Between them, "this" almost
+    // always has an honest referent.
+
+    /// The most recent file Chappy generated, with a human name and WHEN.
+    ///
+    /// REVIEW CAUGHT THE MISSING TIMESTAMP, and it was the difference
+    /// between useful and absurd. Without one, `offerLast` preferred the
+    /// artifact unconditionally: write a flights report on Monday, ask a
+    /// long question on Friday, say "email this" — and it attached Monday's
+    /// flights instead of Friday's answer. Once ANY file had ever been
+    /// written, the spoken answer became unreachable for the life of the
+    /// install.
+    static var lastArtifact: (url: URL, label: String, at: Date)?
+    /// The most recent thing Chappy said out loud that was worth keeping.
+    static var lastAnswer: (text: String, label: String, at: Date)?
+
+    /// Lines this class itself produced. Without this, "Nothing to email
+    /// yet — ask me for something first" is 71 characters, sails past the
+    /// floor in note(answer:), and becomes the thing the NEXT "email this"
+    /// sends. Review found that one by reading the length.
+    private static var ourOwnLines = Set<String>()
+
+    /// Not private: the email branches in route() speak refusals of their
+    /// own ("No trip planned, so there's no flight report to send yet.")
+    /// which are all over the 40-character floor. Review found that leaving
+    /// them unregistered meant saying "email the trip" with no trip, then
+    /// "email this", attached Chappy's own apology as the message.
+    static func remember(ourLine s: String) -> String {
+        ourOwnLines.insert(s.trimmingCharacters(in: .whitespacesAndNewlines))
+        if ourOwnLines.count > 40 { ourOwnLines.removeFirst() }
+        return s
+    }
+
+    static func note(artifact url: URL?, label: String) {
+        guard let url else { return }
+        lastArtifact = (url, label, Date())
+    }
+
+    static func note(answer text: String, label: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count > 40 else { return }   // a one-liner is not a document
+        guard !ourOwnLines.contains(t) else { return }
+        lastAnswer = (t, label, Date())
+    }
+
+    /// "Email this." Whichever is more recent — the file or the answer.
+    @discardableResult
+    func offerLast(to: [String] = []) -> String {
+        let art = Self.lastArtifact.flatMap {
+            FileManager.default.fileExists(atPath: $0.url.path) ? $0 : nil
+        }
+        let ans = Self.lastAnswer
+        // More recent wins. "This" means the thing that just happened, not
+        // the last thing that happened to be a file.
+        if let a = art, ans == nil || a.at >= ans!.at {
+            return offer(subject: a.label,
+                         body: "\(a.label) — attached, from Chappy.",
+                         attachment: a.url, to: to)
+        }
+        if let a = ans {
+            return offer(subject: a.label, body: a.text, attachment: nil,
+                         to: to, mime: "text/plain")
+        }
+        return Self.remember(ourLine:
+            "Nothing to email yet — ask me for something first, then say email this.")
     }
 }
 
@@ -35310,7 +35949,13 @@ extension ChappyTravel {
         guard let dir = FileManager.default.urls(for: .documentDirectory,
                                                  in: .userDomainMask).first else { return nil }
         let url = dir.appendingPathComponent(name)
-        do { try flightsHTML(trip).data(using: .utf8)?.write(to: url); return url }
+        do {
+            try flightsHTML(trip).data(using: .utf8)?.write(to: url)
+            // BUILD 257: so "email this" can find it without being told what
+            // "this" is.
+            ChappyHandoff.note(artifact: url, label: "Flights — \(trip.name)")
+            return url
+        }
         catch { return nil }
     }
 }

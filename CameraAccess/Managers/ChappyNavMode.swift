@@ -108,6 +108,39 @@ enum ChappyNavMode {
         return .ask(clean, "\(probe.name) is about \(distText) away. Walk or drive?")
     }
 
+    /// BUILD 257 — THE SAME WALK-OR-DRIVE DECISION, WITHOUT STARTING A ROUTE.
+    ///
+    /// The leave-by clock needs to know how he will travel, and it was
+    /// asking `travelMinutes(to:)` which defaults to driving. So a leave-by
+    /// for somewhere ten minutes' walk away was computed at car speed —
+    /// about three minutes — and he was told to leave seven minutes too
+    /// late, every time, for the short trips where being late is easiest.
+    ///
+    /// Deliberately the SAME thresholds and the same probe as go() rather
+    /// than a second opinion: if the leave-by says walk and the route then
+    /// drives, the number he was given was for a journey he did not make.
+    /// It reads live motion and distance only — it does NOT remember what he
+    /// chose last time, and an earlier version of this comment claimed it
+    /// did. Nothing in this file consults NavEngine.lastDriving.
+    ///
+    /// CALLERS MUST CACHE. On a destination that is not a saved spot this
+    /// falls through MapKit to a billed Places search — see the cost note at
+    /// the top of the file — so calling it on a timer is expensive.
+    /// The ambiguous band drives here, because go() only asks the question
+    /// when he is standing there ready to answer it — a leave-by warning has
+    /// nobody to ask, and being early is the safe direction.
+    static func likelyDriving(to destination: String) async -> Bool {
+        let clean = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return true }
+        let snap = ContextEngine.shared.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else { return true }
+        if snap.motion == "in a vehicle" { return true }
+        guard let probe = await probeDistance(query: clean,
+                                              from: CLLocation(latitude: lat, longitude: lon))
+        else { return true }
+        return probe.metres >= alwaysWalk
+    }
+
     /// Resolve an answer to the walk-or-drive question and route.
     /// Anything ambiguous drives — see the note in go().
     static func answerMode(_ reply: String, destination: String) async -> ChappyNavDecision {
@@ -150,12 +183,19 @@ enum ChappyNavMode {
         return await placesProbe(query: query, from: here)
     }
 
-    /// Mirrors NavEngine's own spot lookup so both agree on the destination.
+    /// BUILD 257 — CALLS NavEngine's lookup rather than mirroring it.
+    ///
+    /// The old comment said "mirrors NavEngine's own spot lookup so both
+    /// agree on the destination", and the two copies were in fact identical —
+    /// but that is exactly the arrangement that produced the flights bug in
+    /// 255, where navDestination had openers the router hook did not under a
+    /// comment claiming the two lists were the same. Hand-kept copies agree
+    /// right up until one of them is edited. Now there is one.
     private static func savedSpot(matching query: String, from here: CLLocation) -> Probe? {
-        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let spot = TripRecorder.shared.spots.last(where: {
-            q.contains($0.name.lowercased()) || $0.name.lowercased().contains(q)
-        }) else { return nil }
+        guard let spot = TripRecorder.savedSpot(matching: query,
+                                                nearLat: here.coordinate.latitude,
+                                                nearLon: here.coordinate.longitude)
+        else { return nil }
         let d = here.distance(from: CLLocation(latitude: spot.lat, longitude: spot.lon))
         print("🗺️ [NavMode] matched saved spot '\(spot.name)'")
         return Probe(metres: d, name: spot.name)
