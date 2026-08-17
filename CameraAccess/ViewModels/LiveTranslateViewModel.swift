@@ -598,7 +598,28 @@ class LiveTranslateViewModel: ObservableObject {
     func startRecording() {
         // Give the microphone back to the translate session — two recognisers
         // on one mic is how both of them end up deaf.
-        ChappyStandby.shared.handOff()
+        //
+        // BUILD 256 — WHY TRANSLATE WENT DEAF AND STAYED DEAF.
+        //
+        // This called handOff() UNCONDITIONALLY, and handOff() does
+        // `wasListeningBeforeHandoff = isListening` as its first line. By the
+        // time we get here the ear has usually already been handed off once —
+        // beginSession() does it properly, guarded, a few hundred lines up —
+        // so isListening is false and this second call overwrites the true
+        // flag with false. resumeAfterHandOff() then returns on its very
+        // first guard and the wake word never comes back.
+        //
+        // That is the whole reason he could not close Translate by voice.
+        // Not a missing command: "stop translate", "close translate" and
+        // "chappy stop" were all already recognised over the socket. There
+        // was simply no ear left anywhere in the app to hear them the moment
+        // recording paused.
+        //
+        // Same guard beginSession() has used since build 56. Only hand off a
+        // mic that is actually being held.
+        if ChappyStandby.shared.isListening {
+            ChappyStandby.shared.handOff()
+        }
         // BUILD 56: asleep? Wake up first, then start listening the moment the
         // line is live. You just tap the mic; you never see the difference.
         if isAsleep || lostConnection {
