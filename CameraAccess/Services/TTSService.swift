@@ -293,6 +293,44 @@ class TTSService: NSObject, ObservableObject {
     private let continuationLock = NSLock()
 
     private var currentTask: Task<Void, Never>?
+
+    /// BUILD 254 — THE QUEUE BEHIND THE SENTENCE.
+    ///
+    /// `speakLong` splits a long answer into chunks and speaks them from a
+    /// loop. That loop used to live in an unstored `Task`, so `stop()` —
+    /// which cancels `currentTask`, the PLAYBACK of the chunk being spoken —
+    /// could not reach it. Its own `if Task.isCancelled` could never be true,
+    /// because nobody held the task to cancel.
+    ///
+    /// The wearer's experience: he says "shut up", the sentence stops, and
+    /// the next chunk starts a tenth of a second later. On a four-chunk
+    /// answer he has to say it four times. That is the single loudest half
+    /// of "it talks over the top of me".
+    private var chunkTask: Task<Void, Never>?
+
+    /// True only for the instant the chunk loop is calling `speak()` itself.
+    ///
+    /// Without it the fix eats its own tail: `speak()` calls `stop()`, which
+    /// would cancel `chunkTask` — the loop cancelling itself on its way to
+    /// chunk two, so chunks three onward would never play.
+    ///
+    /// Both this and `chunkTask` are guarded by `chunkLock`. My first
+    /// argument for leaving them bare was "set and cleared around one
+    /// synchronous call on the main actor, with no await between" — which
+    /// is true of the WRITER and says nothing about the reader. The
+    /// SB-DEADLOCK note further down this file states plainly that `stop()`
+    /// is "called from wherever the caller happens to be: URLSession
+    /// completion handlers, audio callbacks, Timer fires, async contexts."
+    /// BE PRECISE ABOUT WHAT THE LOCK BUYS: memory coherence, not
+    /// exclusion. An off-main `stop()` landing inside that window still
+    /// reads true, still skips the cancel, and still lets chunks three and
+    /// four play on. What it gets is a coherent value rather than a torn
+    /// one, and a window bounded to one real synchronous call. The race is
+    /// closed in practice only because the barge-in path's `stop()` comes
+    /// from @MainActor ChappyStandby, which cannot interleave with the
+    /// loop — and that, not the lock, is the guarantee.
+    private var chunkLoopIsSpeaking = false
+    private let chunkLock = NSLock()
     private var playbackResilienceInstalled = false
     /// Once the network voice has failed, stop asking it. Chappy changing voice
     /// every other sentence is worse than never using the nicer one.
@@ -992,21 +1030,44 @@ class TTSService: NSObject, ObservableObject {
         // Now: warm only ONE chunk ahead, and only after the current one is
         // actually speaking. Same seamlessness, a quarter of the requests,
         // no thundering herd.
-        Task { @MainActor in
+        // No chunkTask?.cancel() here: speak(chunks[0]) above already ran
+        // stop(), which cancelled and nilled any previous answer's queue —
+        // and chunkLoopIsSpeaking is false out here, so that cancel lands.
+        // A second one would be a line that can never do anything.
+        //
+        // Built first, published second. Holding the lock across the Task
+        // literal would work — there is no suspension point before the
+        // unlock, so the body cannot start and deadlock on the same
+        // non-recursive lock — but "works because of where the suspension
+        // points happen to be" is not a property worth relying on.
+        let task = Task { @MainActor in
             for chunk in rest {
                 self.prerenderNow([chunk])
                 // Wait for the current line to finish, with a hard ceiling
                 // so a stuck player can never freeze the rest of the answer.
                 var waited = 0
                 while self.isSpeaking && waited < 600 {
+                    // BUILD 254: bail on cancel rather than spinning. Once
+                    // the task is cancelled Task.sleep returns instantly,
+                    // so this loop would burn six hundred immediate awaits
+                    // on the main actor before reaching the check below.
+                    if Task.isCancelled { return }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                     waited += 1
                 }
                 if Task.isCancelled { return }
+                // BUILD 254: flagged, so the stop() inside speak() does not
+                // cancel the very loop that is calling it.
+                self.chunkLock.lock(); self.chunkLoopIsSpeaking = true; self.chunkLock.unlock()
                 self.speak(chunk, languageCode: languageCode)
+                self.chunkLock.lock(); self.chunkLoopIsSpeaking = false; self.chunkLock.unlock()
                 try? await Task.sleep(nanoseconds: 250_000_000)
+                if Task.isCancelled { return }
             }
         }
+        chunkLock.lock()
+        chunkTask = task
+        chunkLock.unlock()
     }
 
     /// Like prerender, but without the eight-second politeness delay —
@@ -1222,10 +1283,19 @@ class TTSService: NSObject, ObservableObject {
         }
     }
 
-    /// Stop speaking
+    /// Stop speaking — the sentence AND everything queued behind it.
     func stop() {
         currentTask?.cancel()
         currentTask = nil
+        // BUILD 254: the rest of the answer, not just the sentence in the
+        // wearer's ear. Skipped when the chunk loop itself is the caller —
+        // see chunkLoopIsSpeaking.
+        chunkLock.lock()
+        let loopIsCalling = chunkLoopIsSpeaking
+        let queued = chunkTask
+        if !loopIsCalling { chunkTask = nil }
+        chunkLock.unlock()
+        if !loopIsCalling { queued?.cancel() }
         stopPlaybackEngine()
         systemSynthesizer?.stopSpeaking(at: .immediate)
         // SB-DEADLOCK FIX: atomic, single-resume. The old code read the
