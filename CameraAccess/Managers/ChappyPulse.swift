@@ -267,7 +267,13 @@ final class ChappyPulse: ObservableObject {
 
         let wasStreaming = LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming
         if !wasStreaming {
-            NotificationCenter.default.post(name: .chappyWakeCameraForSnap, object: nil)
+            // BUILD 255: snap FALSE — Pulse runs its own frame loop and
+            // stands the camera down itself at the end of it. The observer
+            // taking a photo and stopping the session 600ms later was
+            // killing that loop after frame one. Review found this caller;
+            // I had only fixed Clip, Burst and Reader.
+            NotificationCenter.default.post(name: .chappyWakeCameraForSnap,
+                                            object: nil, userInfo: ["snap": false])
             for _ in 0..<20 {                                    // up to ~5s
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 if LiveAIManager.shared.streamViewModel?.streamingStatus == .streaming { break }
@@ -286,7 +292,20 @@ final class ChappyPulse: ObservableObject {
 
         // Put it back to sleep — but only if we were the ones who woke it, and
         // only if nothing else is relying on the session.
-        if !wasStreaming, taken > 0 {
+        // BUILD 255 — WAS `taken > 0`, AND THAT WAS A CAMERA LEAK.
+        //
+        // This build stopped the wake observer standing the camera down for
+        // us, which transferred ownership here. The zero-frame exit then had
+        // no stand-down at all — and zero frames is the NORMAL outcome on
+        // cold Ray-Bans, because the wake loop above waits about five
+        // seconds against a wake this codebase documents as eight to ten.
+        //
+        // The session would start, no frame would arrive, nothing would stop
+        // it, and the next tick would see wasStreaming == true and neither
+        // wake nor stand down. Permanently on: capture light lit, battery
+        // draining, nothing in the app looking wrong. Build 126's bug, put
+        // back by the fix for a different one.
+        if !wasStreaming {
             try? await Task.sleep(nanoseconds: 600_000_000)
             if !someoneElseNeedsTheCamera() {
                 await LiveAIManager.shared.streamViewModel?.stopSession()
@@ -298,6 +317,14 @@ final class ChappyPulse: ObservableObject {
     private func someoneElseNeedsTheCamera() -> Bool {
         if ContinuousVisionManager.shared.isRunning { return true }
         if GeminiLiveService.activeInstance != nil { return true }
+        // BUILD 255: Clip and Burst added, to match the guard in the home
+        // view's wake observer. Removing the `taken > 0` condition above
+        // means this stand-down now runs on the zero-frame exit too — and
+        // without these two, a recording that claimed the camera in the
+        // last six hundred milliseconds could have it stopped underneath
+        // it. Two guards asking the same question have to ask it the same.
+        if ChappyClip.shared.isRecording { return true }
+        if ChappyBurst.shared.isFiring { return true }
         return false
     }
 
