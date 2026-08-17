@@ -71,6 +71,93 @@ class StreamSessionViewModel: ObservableObject {
   @Published var errorMessage: String = ""
   @Published var hasActiveDevice: Bool = false
 
+  // ==================================================================
+  // BUILD 250 — GOING BLIND OUT LOUD.
+  //
+  // iOS stalls the video frame pipeline when the display sleeps. That is
+  // the operating system, not our code, and no amount of background
+  // modes changes it: with the phone locked in a pocket Chappy can hear
+  // and talk, but it cannot see.
+  //
+  // What was wrong was not the pause — it was the SILENCE. The frames
+  // simply stopped, nothing said so, and from the outside a frozen
+  // camera is indistinguishable from a dead session. Ask "what am I
+  // looking at" through the glasses with the phone locked and Chappy
+  // would either say nothing or, worse, confidently describe the last
+  // frame it saw before the screen went off.
+  //
+  // So: say it once, plainly, and pick the stream back up on unlock
+  // without being asked. An honest "I can't see with the phone locked"
+  // is worth far more than a stale answer delivered confidently.
+  // ==================================================================
+  private var lifecycleTokens: [NSObjectProtocol] = []
+  private var wasStreamingBeforeLock = false
+  private var announcedBlindAt = Date.distantPast
+
+  func installLockAwareness() {
+    guard lifecycleTokens.isEmpty else { return }
+    let nc = NotificationCenter.default
+
+    lifecycleTokens.append(nc.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil, queue: .main) { [weak self] _ in
+        Task { @MainActor in
+          guard let self, self.streamingStatus != .stopped else { return }
+          // WHO owns the camera decides whether we resume it later. A
+          // transient wake for a voice snap must never be remembered as
+          // "he was streaming" — see the note on the resume side.
+          let owned = LiveAIManager.shared.isRunning
+                   || ContinuousVisionManager.shared.isRunning
+          self.wasStreamingBeforeLock = owned
+          ChappyLiveLog.note("📹 [Stream] Screen off — iOS stalls video here; pausing rather than pretending (owned by a module: \(owned))")
+          // Once every two minutes at most, and never over the top of a
+          // live conversation. TTSService is a different player from the
+          // Live AI playback engine, so speaking here while Gemini is
+          // mid-reply puts two voices in his ear at once — and build 250
+          // deliberately keeps that conversation alive through the lock.
+          if owned, !LiveAIManager.shared.isRunning,
+             Date().timeIntervalSince(self.announcedBlindAt) > 120 {
+            self.announcedBlindAt = Date()
+            TTSService.shared.speak("I can't see while the phone's locked — still listening though.")
+          }
+          await self.stopSession()
+        }
+      })
+
+    lifecycleTokens.append(nc.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil, queue: .main) { [weak self] _ in
+        Task { @MainActor in
+          guard let self, self.wasStreamingBeforeLock else { return }
+          // A MODULE MUST STILL WANT IT. Without this, a camera woken for
+          // a one-off voice snap — which starts the session, polls for a
+          // frame, then stops it — gets restarted on unlock with nothing
+          // left alive to ever stop it again. The glasses light stays on,
+          // the battery drains, and nothing in the app looks wrong. That
+          // is the build-126 bug, exactly, and it must not come back.
+          guard LiveAIManager.shared.isRunning
+                  || ContinuousVisionManager.shared.isRunning else {
+            self.wasStreamingBeforeLock = false
+            ChappyLiveLog.note("📹 [Stream] Back on screen, but no module wants the camera — leaving it asleep")
+            return
+          }
+          // The flag is cleared only once we are genuinely going to act.
+          // hasActiveDevice is driven by the DAT device monitor and lags a
+          // wake by a beat — clearing first would drop the restart on the
+          // floor and never retry, which is the one thing this exists to do.
+          guard self.hasActiveDevice, self.streamingStatus == .stopped else { return }
+          self.wasStreamingBeforeLock = false
+          ChappyLiveLog.note("📹 [Stream] Back on screen — restarting the glasses camera")
+          await self.startSession()
+        }
+      })
+  }
+
+  deinit {
+    let nc = NotificationCenter.default
+    for t in lifecycleTokens { nc.removeObserver(t) }
+  }
+
   var isStreaming: Bool {
     streamingStatus != .stopped
   }

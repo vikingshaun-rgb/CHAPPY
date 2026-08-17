@@ -351,7 +351,22 @@ class OmniRealtimeViewModel: ObservableObject {
                 // locks (SwiftUI stops rendering), freezing vision on the last
                 // image. Pull straight from the stream source so Chappy keeps
                 // seeing with the phone locked in a pocket.
-                if let liveFrame = LiveAIManager.shared.streamViewModel?.currentVideoFrame {
+                // BUILD 250 — STOP SHIPPING A FRAME FROM BEFORE THE LOCK.
+                //
+                // The comment above is now only half true. iOS stalls the
+                // frame pipeline when the display sleeps, so 250 pauses the
+                // camera honestly on lock instead of pretending. But this
+                // drip kept the LAST frame in `currentVideoFrame` and went
+                // on sending it at 2fps for the whole time the phone was
+                // locked — so "what am I looking at" got a confident answer
+                // about a room he left ten minutes ago.
+                //
+                // A stale frame is worse than no frame. Wrong and certain
+                // beats right and late in almost nothing, and never here.
+                let stream = LiveAIManager.shared.streamViewModel
+                if stream?.streamingStatus == .stopped {
+                    self.currentVideoFrame = nil
+                } else if let liveFrame = stream?.currentVideoFrame {
                     self.currentVideoFrame = liveFrame
                 }
                 guard let frame = self.currentVideoFrame else { return }
