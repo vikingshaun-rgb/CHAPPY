@@ -60,16 +60,31 @@ class APIKeyManager {
     private let keySeedVersion = 9   // BUILD 141: billed-project Gemini key
     private let keySeedVersionDefaultsKey = "chappy_key_seed_version"
 
+    /// BUILD 257 — one flag per key, so "cleared" means cleared for all of
+    /// them and not just for Maps. Build 183 fixed this for the Maps key
+    /// alone with a hand-written UserDefaults key; the other two kept
+    /// resurrecting the built-in key on the next cold launch, so clearing
+    /// Gemini or Claude appeared to work and then quietly resumed billing to
+    /// somebody else's account.
+    static func clearedFlag(for account: String) -> String {
+        "chappy_key_cleared_" + account
+    }
+
     private func seedDefaultKeys() {
         let defaults = UserDefaults.standard
         let force = defaults.integer(forKey: keySeedVersionDefaultsKey) < keySeedVersion
+        // A key HE cleared is never re-seeded, not even by a version bump —
+        // a bump means "the built-in key changed", not "override his choice".
+        func clearedByUser(_ account: String) -> Bool {
+            defaults.bool(forKey: Self.clearedFlag(for: account))
+        }
 
-        if (force || getKey(for: anthropicAccount) == nil),
+        if (force || getKey(for: anthropicAccount) == nil), !clearedByUser(anthropicAccount),
            defaultAnthropicKey.hasPrefix("sk-ant") {
             _ = saveKey(defaultAnthropicKey, for: anthropicAccount)
             print("✅ Seeded built-in Claude API key (force=\(force))")
         }
-        if (force || getKey(for: googleAccount) == nil),
+        if (force || getKey(for: googleAccount) == nil), !clearedByUser(googleAccount),
            (defaultGoogleKey.hasPrefix("AIza") || defaultGoogleKey.hasPrefix("AQ.")) {
             _ = saveKey(defaultGoogleKey, for: googleAccount)
             print("✅ Seeded built-in Gemini API key (force=\(force))")
@@ -78,7 +93,13 @@ class APIKeyManager {
         // cleared. This used to put the built-in key back on the next cold
         // launch, so "Cleared" lasted until you closed the app and Google
         // lookups quietly resumed on somebody else's billing account.
+        // BUILD 257: both flags are now written — deleteMapsAPIKey goes
+        // through clear(account:) like every other delete, and the Maps
+        // field also still writes 183's own key. Either alone is enough;
+        // the OR is here so an install that only has the old flag from a
+        // previous build keeps its setting across the upgrade.
         let mapsClearedByUser = defaults.bool(forKey: "chappy_maps_key_cleared")
+            || clearedByUser(googleMapsAccount)
         if (force || getKey(for: googleMapsAccount) == nil), !mapsClearedByUser,
            defaultGoogleMapsKey.hasPrefix("AIza") {
             _ = saveKey(defaultGoogleMapsKey, for: googleMapsAccount)
@@ -123,7 +144,7 @@ class APIKeyManager {
 
     func deleteAPIKey(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> Bool {
         let account = accountName(for: provider, endpoint: endpoint)
-        return deleteKey(for: account)
+        return clear(account: account)      // BUILD 257: and it stays deleted
     }
 
     func hasAPIKey(for provider: APIProvider, endpoint: AlibabaEndpoint? = nil) -> Bool {
@@ -134,6 +155,10 @@ class APIKeyManager {
 
     func saveMailPassword(_ p: String) -> Bool { saveKey(p, for: "chappy-mail-imap") }
     func getMailPassword() -> String? { getKey(for: "chappy-mail-imap") }
+    /// BUILD 257: a wrong app password could previously only be REPLACED,
+    /// never removed — there was no path to a blank one anywhere.
+    @discardableResult
+    func deleteMailPassword() -> Bool { clear(account: "chappy-mail-imap") }
 
     // BUILD 151: AviationStack — live flight status, split-chunk baked.
     private var defaultAviationStackKey: String {
@@ -162,7 +187,7 @@ class APIKeyManager {
     }
 
     func deleteGoogleAPIKey() -> Bool {
-        return deleteKey(for: googleAccount)
+        return clear(account: googleAccount)    // BUILD 257: and it stays deleted
     }
 
     func hasGoogleAPIKey() -> Bool {
@@ -180,7 +205,7 @@ class APIKeyManager {
     }
 
     func deleteMapsAPIKey() -> Bool {
-        return deleteKey(for: googleMapsAccount)
+        return clear(account: googleMapsAccount)   // BUILD 257: and it stays deleted
     }
 
     func hasMapsAPIKey() -> Bool {
@@ -226,8 +251,34 @@ class APIKeyManager {
         }
     }
 
+    /// BUILD 257 — CLEARING A KEY, AND MAKING IT STICK.
+    ///
+    /// Two separate problems, and my first cut only fixed the cosmetic one.
+    ///
+    /// FIRST: `saveKey("")` returned false and did nothing, so select-all,
+    /// delete, Save was a silent no-op. That is fixed by the guard below.
+    /// But review then showed the fix was UNREACHABLE — every caller has its
+    /// own `guard !apiKey.isEmpty` above it, so an empty string never gets
+    /// here. Which means it was never the real bug.
+    ///
+    /// SECOND, AND THIS IS THE ONE HE FEELS: the explicit Delete buttons
+    /// DO work — and then `seedDefaultKeys()` puts the built-in key straight
+    /// back on the next cold launch, because its test is "is this slot
+    /// empty". So deleting the Gemini or Claude key appeared to work and
+    /// silently resumed on someone else's billing account the next morning.
+    /// Build 183 fixed exactly this for the Maps key alone, with a
+    /// hand-written UserDefaults flag. This generalises it, and the flag is
+    /// now written by `clear(account:)` — which every delete path funnels
+    /// through — rather than by any one caller.
+    private func clear(account: String) -> Bool {
+        let ok = deleteKey(for: account)
+        UserDefaults.standard.set(true, forKey: Self.clearedFlag(for: account))
+        print("🗑️ [Keys] Cleared '\(account)' — and it stays cleared through a cold launch")
+        return ok
+    }
+
     private func saveKey(_ key: String, for account: String) -> Bool {
-        guard !key.isEmpty else { return false }
+        guard !key.isEmpty else { return clear(account: account) }
 
         let data = key.data(using: .utf8)!
 
@@ -266,6 +317,14 @@ class APIKeyManager {
         let status = SecItemAdd(query as CFDictionary, nil)
         if status == errSecSuccess {
             Self.memo[account] = key      // BUILD 175: see getKey
+            // BUILD 257: putting a key back un-clears it, so the seed is
+            // allowed to look after it again. Written HERE, after the write
+            // succeeded — an earlier draft set it before deleteKey() above,
+            // which then set it straight back to true.
+            UserDefaults.standard.set(false, forKey: Self.clearedFlag(for: account))
+            if account == googleMapsAccount {
+                UserDefaults.standard.set(false, forKey: "chappy_maps_key_cleared")
+            }
         }
         return status == errSecSuccess
     }
