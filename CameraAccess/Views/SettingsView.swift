@@ -2381,6 +2381,22 @@ struct CommandLogView: View {
     @State private var entries: [ChappyRouterLog.Entry] = []
     @State private var copied = false
 
+    /// BUILD 253 — A STORED PUBLISHER, and the reason is already written
+    /// out in this same file, on VoiceCheckView's `logTick`.
+    ///
+    /// `.onReceive(Timer.publish(...).autoconnect())` written inline builds
+    /// a fresh Autoconnect on every body evaluation, so SwiftUI resubscribes
+    /// and restarts the countdown on every redraw. This handler assigns a
+    /// non-Equatable array, which forces a redraw, which restarts the timer —
+    /// and the "Copied" flag flipping back after two seconds is enough on its
+    /// own to reset it forever. It can end up never firing at all.
+    ///
+    /// I wrote the inline version anyway. Review found it by reading the
+    /// comment already in this file. That is three times in one build that a
+    /// change of mine was contradicted by something a few lines away, which
+    /// is worth recording rather than quietly correcting.
+    private let logTick = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+
     private static let clock: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
     }()
@@ -2393,8 +2409,33 @@ struct CommandLogView: View {
         case "intent": return .orange
         case "plan": return .yellow
         case "ask": return .blue
+        // BUILD 253 — two tiers that could not appear before this build
+        // (model, untagged), and three that always could and were
+        // rendered grey because nobody checked this list against what the
+        // router actually writes (answer, reference, net). "pocket" is
+        // still here and still has no producer anywhere in the app; left
+        // in place because that is a routing gap to look at, not a colour
+        // to delete.
+        case "answer": return .teal
+        case "reference": return .indigo
+        case "net": return .brown
+        case "model": return .pink
+        // Amber, not red. UNTAGGED means the LOG has a gap, not that the
+        // command failed — several tiers still don't name themselves. Red
+        // would be a claim this screen cannot back up.
+        case "untagged": return .orange
         default: return AppColors.textSecondary
         }
+    }
+
+    /// BUILD 253 — the delay, coloured, because a number in grey next to
+    /// twenty other numbers in grey is not a diagnostic. Under a second is
+    /// what it should feel like; past two and a half he has already said
+    /// "it's not listening" and repeated himself.
+    private func msColour(_ ms: Int) -> Color {
+        if ms >= 2500 { return .red }
+        if ms >= 1000 { return .orange }
+        return AppColors.textSecondary
     }
 
     var body: some View {
@@ -2418,8 +2459,10 @@ struct CommandLogView: View {
                                     .foregroundColor(tierColour(e.tier))
                                 Spacer(minLength: 0)
                                 Text("\(e.ms)ms")
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundColor(AppColors.textSecondary)
+                                    .font(.system(size: 9,
+                                                  weight: e.ms >= 1000 ? .bold : .regular,
+                                                  design: .monospaced))
+                                    .foregroundColor(msColour(e.ms))
                             }
                             Text("\u{201C}\(e.heard)\u{201D}")
                                 .font(.system(size: 12, weight: .medium))
@@ -2455,7 +2498,7 @@ struct CommandLogView: View {
                         .foregroundColor(AppColors.textSecondary)
                 }
             } footer: {
-                Text("TIER is which layer claimed the sentence \u{2014} pocket is a free phone action, tiles is a screen name, flow is a multi-step tool, intent and plan are the smart layers, ask is a paid question. A sentence landing in the wrong tier is why the answer felt wrong.")
+                Text("TIER is which layer claimed the sentence \u{2014} tiles is a screen name, answer is a module answering outright, reference resolved \u{201C}that one\u{201D} to a saved place, flow is a multi-step tool, intent and plan are the smart layers, ask is a general question answered by the cheap brain, model is the session with tools, net is a background network result rather than a routing decision, and UNTAGGED in amber means no tier recorded a working decision at all.\n\nUNTAGGED does NOT mean it failed. Navigation, briefs, timers, lists and the screen openers still don\u{2019}t name themselves in this log, so a command that worked perfectly can land there. It means the RECORD has a gap. If the command also did nothing, that is the line to send me.\n\nThe ms is the wait from when you stopped talking to when that decision was made. Amber past a second, red past two and a half. Before build 253 most tiers wrote a hardcoded 1ms, which looked instant and meant nothing; they all read the same clock now.\n\nTwo limits worth knowing. Say something else within eight seconds and the first sentence\u{2019}s gap check is dropped, rather than risk pinning it on the wrong sentence. And on a compound (\u{201C}do this and do that\u{201D}) a later half can make an earlier half look accounted for.")
             }
 
             Section {
@@ -2475,7 +2518,23 @@ struct CommandLogView: View {
         }
         .navigationTitle("What Chappy did")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { entries = ChappyRouterLog.shared.entries.reversed() }
+        // BUILD 253: sorted, not just reversed. A gap entry is written
+        // eight seconds after the decision it describes but carries the
+        // decision's own timestamp, so append order and time order are no
+        // longer the same thing. Reversing alone would have put the gap
+        // line above the command that came after it.
+        //
+        // And refreshed on a tick, not only onAppear. With a gap entry
+        // landing eight seconds after the decision, the most interesting
+        // line on this screen is routinely written WHILE he is looking at
+        // it — and a screen that only shows it if you leave and come back
+        // is a screen that will be blamed for the gap.
+        .onAppear { reload() }
+        .onReceive(logTick) { _ in reload() }
+    }
+
+    private func reload() {
+        entries = ChappyRouterLog.shared.entries.sorted { $0.at > $1.at }
     }
 }
 
@@ -2749,6 +2808,38 @@ struct CodexFactsList: View {
 // app-specific password (appleid.apple.com → Sign-In & Security →
 // App-Specific Passwords) — the real account password will NOT work and
 // is never asked for.
+// BUILD 257 — WHY HE COULD NEVER SAVE HIS APP PASSWORD.
+//
+// Build 227 fixed this exact bug for every API key in the app and this
+// screen was missed. It was the LAST SecureField in a Form holding a secret
+// anywhere in the settings tree. Read 227's note below ChappyKeyField: iOS
+// treats a SecureField in a Form as a new-password field, AutoFill claims
+// it, and the binding stays empty however carefully you paste. Then:
+//
+//     guard !addr.isEmpty, !password.isEmpty, !host.isEmpty else {
+//         status = "Fill in the address and password first."; return
+//     }
+//
+// …fires, and he is told to fill in a field he has just filled in. Which is
+// precisely what he reported: "I can't enter and save my iCloud app
+// password, thought you fixed that."
+//
+// THREE MORE IN THE SAME SCREEN, all from @State that is never loaded back:
+//
+//   - `customHost` starts empty and `useICloud` starts true, neither read
+//     from what is stored. So a custom IMAP user reopens this screen, sees
+//     "iCloud" selected, changes nothing, taps Save — and his host is
+//     silently overwritten with imap.mail.me.com.
+//   - `password` is never read back either, so the guard above blocks a save
+//     of anything ELSE. Changing only the email address was impossible
+//     without retyping the app password from scratch.
+//   - `mail` was observed and never used, so the view did not re-render.
+//     Now it IS used — load() and save() read and write through it. Review
+//     caught that my first cut listed this in the fix list and then left the
+//     property dangling exactly as it found it.
+//
+// Every other key screen in this app repopulates in onAppear. This one just
+// never did.
 struct MailSetupView: View {
     @ObservedObject private var mail = ChappyMail.shared
     @State private var address = ChappyMail.shared.address
@@ -2756,6 +2847,9 @@ struct MailSetupView: View {
     @State private var useICloud = true
     @State private var customHost = ""
     @State private var status = ""
+    /// True when a password is already stored, so the field can be left
+    /// blank to keep it rather than demanding a retype.
+    @State private var hasStoredPassword = false
 
     var body: some View {
         Form {
@@ -2776,22 +2870,30 @@ struct MailSetupView: View {
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                 }
-                SecureField("App-specific password", text: $password)
+                // BUILD 257: the same field every other key in the app has
+                // used since 227. textContentType(.none) is the whole fix.
+                ChappyKeyField(title: hasStoredPassword
+                               ? "App-specific password (saved — leave blank to keep)"
+                               : "App-specific password",
+                               text: $password,
+                               onSave: { save() })
             } footer: {
                 Text(useICloud
                      ? "Make the password at appleid.apple.com → Sign-In & Security → App-Specific Passwords. Your real Apple password will not work and is never wanted."
                      : "Your mail host's IMAP server, port 993. Use an app password if the provider offers them.")
             }
             Section {
-                Button("Save & test") {
-                    let host = useICloud ? "imap.mail.me.com" : customHost.trimmingCharacters(in: .whitespaces)
-                    let addr = address.trimmingCharacters(in: .whitespaces)
-                    guard !addr.isEmpty, !password.isEmpty, !host.isEmpty else {
-                        status = "Fill in the address and password first."; return
-                    }
-                    ChappyMail.shared.configure(address: addr, host: host, password: password)
-                    status = "Checking…"
-                    Task { status = await ChappyMail.shared.check() }
+                Button("Save & test") { save() }
+                // BUILD 257: a wrong password could only ever be REPLACED.
+                // There was no way to get back to "not set up", so a bad
+                // paste left mail permanently half-configured.
+                if hasStoredPassword {
+                    Button(role: .destructive) {
+                        APIKeyManager.shared.deleteMailPassword()
+                        hasStoredPassword = false
+                        password = ""
+                        status = "Password forgotten. Paste a new one when you're ready."
+                    } label: { Text("Forget the stored password") }
                 }
                 if !status.isEmpty {
                     Text(status).font(.footnote).foregroundColor(.secondary)
@@ -2802,6 +2904,38 @@ struct MailSetupView: View {
         }
         .navigationTitle("Mail & Messages")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: load)
+    }
+
+    /// BUILD 257: read the stored setup back, so reopening this screen shows
+    /// what is actually configured instead of the defaults.
+    private func load() {
+        address = mail.address
+        let host = mail.host
+        useICloud = host.isEmpty || host == "imap.mail.me.com"
+        customHost = useICloud ? "" : host
+        hasStoredPassword = mail.isConfigured
+        password = ""
+    }
+
+    private func save() {
+        let host = useICloud ? "imap.mail.me.com" : customHost.trimmingCharacters(in: .whitespaces)
+        let addr = address.trimmingCharacters(in: .whitespaces)
+        let pw = password.trimmingCharacters(in: .whitespaces)
+        guard !addr.isEmpty, !host.isEmpty else {
+            status = "Fill in the address first."; return
+        }
+        // BUILD 257: a blank password with one already stored means "keep the
+        // one I have", not "refuse to save". That is what made changing the
+        // email address alone impossible.
+        guard !pw.isEmpty || hasStoredPassword else {
+            status = "Paste the app-specific password first."; return
+        }
+        mail.configure(address: addr, host: host, password: pw.isEmpty ? nil : pw)
+        hasStoredPassword = true
+        password = ""
+        status = "Checking…"
+        Task { status = await ChappyMail.shared.check() }
     }
 }
 
@@ -3149,9 +3283,9 @@ struct ChappyKeysView: View {
 }
 
 struct FlightKeysView: View {
-    @State private var apiKey = ""
-    @State private var apiSecret = ""
-    @State private var status = ChappyFlights.shared.isConfigured ? "Keys are saved." : ""
+    @State private var status = ChappyFlights.shared.isConfigured
+        ? "Old Amadeus keys are still stored and still work."
+        : "No Amadeus keys — nothing needs them."
     // BUILD 217 — the one on this screen that actually does something.
     @State private var fareKey = ChappyFareSource.token
     @State private var fareStatus = ""
@@ -3203,19 +3337,23 @@ struct FlightKeysView: View {
             //
             // The flight day always ran on AviationStack, which is baked
             // in and now has a light on it in API keys.
+            // BUILD 257 — AND NOW THE SAVE BUTTON IS GONE TOO.
+            //
+            // The comment above has said "the Amadeus fields are gone" since
+            // 230, and the fields were indeed removed — but the Save button
+            // was left behind, wired to two @State strings that no input
+            // control in this view was ever bound to. So `apiKey` and
+            // `apiSecret` were permanently "", the guard could never pass,
+            // and tapping Save cleared the status line and did nothing else.
+            //
+            // A button that cannot work is worse than no button: it reads as
+            // "you did not fill this in properly". Removed, and the state it
+            // used with it. If old enterprise keys ever matter again they
+            // come back as real ChappyKeyFields, like every other key.
             Section {
-                Button("Save") {
-                    let k = apiKey.trimmingCharacters(in: .whitespaces)
-                    let sec = apiSecret.trimmingCharacters(in: .whitespaces)
-                    guard !k.isEmpty, !sec.isEmpty else { status = ""; return }
-                    _ = APIKeyManager.shared.saveAmadeusKey(k)
-                    _ = APIKeyManager.shared.saveAmadeusSecret(sec)
-                    apiKey = ""; apiSecret = ""
-                    status = "Saved. Say: watch flights to Bali in September."
-                }
                 if !status.isEmpty { Text(status).font(.footnote).foregroundColor(.secondary) }
             } footer: {
-                Text("AMADEUS IS GONE. Amadeus paused self-service registrations in March 2026 and decommissioned the developer portal entirely on 17 July 2026 - keys disabled, no signup form left. This is not an accreditation problem; there is nothing to sign up for. Your flight day runs on AviationStack instead and always did, so these fields do nothing unless you happen to hold old enterprise keys. Leave them empty.")
+                Text("AMADEUS IS GONE. Amadeus paused self-service registrations in March 2026 and decommissioned the developer portal entirely on 17 July 2026 - keys disabled, no signup form left. This is not an accreditation problem; there is nothing to sign up for. Your flight day runs on AviationStack instead and always did. The entry fields and Save button that used to be here have been removed - they were wired to nothing and did nothing when tapped. Any old enterprise keys already in the Keychain are still read and still used.")
             }
         }
         .navigationTitle("Flights")

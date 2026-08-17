@@ -4086,6 +4086,21 @@ struct TodayMapSheet: View {
             .navigationTitle(isToday ? "Today's Trail" : Self.dayTitle(selectedDay))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // BUILD 257: the trail had no export of any kind, so there
+                // was nothing to email, share or keep. One button, the same
+                // file the voice route builds.
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        let df = DateFormatter(); df.dateFormat = "EEEE d MMMM"
+                        let line = ChappyHandoff.shared.offerReport(
+                            trail.writeDayReport(for: selectedDay),
+                            subject: "Chappy trail — \(df.string(from: selectedDay))",
+                            body: trail.spokenSummary(for: selectedDay))
+                        TTSService.shared.speak(line)
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") { dismiss() }
                 }
@@ -4133,6 +4148,54 @@ struct TodayMapSheet: View {
             .sorted { $0.at < $1.at }
     }
 
+    /// BUILD 257 — ASK GOOGLE WHAT IS STANDING AT THIS STOP.
+    ///
+    /// Nearest first, not "most relevant": at a set of coordinates the
+    /// question is "what is HERE", and Google's relevance ordering for a
+    /// generic query happily returns the branch of the same chain two suburbs
+    /// away. A 120 m radius and a distance sort answer the question actually
+    /// being asked.
+    ///
+    /// Saves under the real name and speaks what it found, because the whole
+    /// point is that the stop stops being "6 Cresthaven Ct".
+    private func identify(_ v: ChappyTrail.Visit) async {
+        let found = await ChappyGooglePlaces.shared.search(
+            "point of interest", near: v.lat, lon: v.lon, radiusM: 120, limit: 8)
+        let nearest = found
+            .filter { $0.lat != 0 || $0.lon != 0 }
+            .min { a, b in
+                TripRecorder.meters(v.lat, v.lon, a.lat, a.lon)
+                    < TripRecorder.meters(v.lat, v.lon, b.lat, b.lon)
+            }
+        // REVIEW CAUGHT THIS AND IT WOULD HAVE MISLABELLED HIS TRAIL.
+        //
+        // `radiusM` becomes Google's locationBias, and a bias RANKS — it does
+        // not exclude. At a rural stop with nothing within 120 m, Google
+        // happily returns the nearest town's servo four kilometres away, and
+        // the code below would have saved a spot named after it AT THIS
+        // STOP'S OWN COORDINATES. Since displayName then prefers a saved
+        // place within 140 m, the trail would show that wrong business name
+        // forever, with no way to tell it was wrong.
+        //
+        // So the radius has to be enforced on this side, after the fact.
+        guard let p = nearest,
+              TripRecorder.meters(v.lat, v.lon, p.lat, p.lon) <= 120 else {
+            TTSService.shared.speak("Google doesn't have anything at that spot.")
+            return
+        }
+        _ = TripRecorder.shared.saveSpot(named: p.name, lat: v.lat, lon: v.lon)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        var line = "\(p.name), saved to your favourites."
+        if let r = p.googleRating ?? p.rating {
+            let n = p.googleCount ?? p.reviews ?? 0
+            line += n > 0
+                ? " \(String(format: "%.1f", r)) on Google from \(n) reviews."
+                : " \(String(format: "%.1f", r)) on Google."
+        }
+        if p.openNow == true { line += " Open now." }
+        TTSService.shared.speak(line)
+    }
+
     private var visitList: some View {
         let visits = trail.visits(for: selectedDay).sorted { $0.arrive < $1.arrive }
         return Group {
@@ -4153,10 +4216,14 @@ struct TodayMapSheet: View {
                     VStack(spacing: 8) {
                         ForEach(visits) { v in
                             HStack(alignment: .top, spacing: 10) {
-                                Image(systemName: "mappin.circle.fill")
-                                    .font(.system(size: 18)).foregroundColor(.blue)
+                                // BUILD 257: a star when this is one of HIS
+                                // places, a pin when it's just an address.
+                                Image(systemName: v.isSavedPlace
+                                      ? "star.circle.fill" : "mappin.circle.fill")
+                                    .font(.system(size: 18))
+                                    .foregroundColor(v.isSavedPlace ? .yellow : .blue)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(v.name ?? "Stopped here")
+                                    Text(v.displayName)
                                         .font(.subheadline).fontWeight(.semibold)
                                         .foregroundColor(.primary)
                                     Text(v.spokenWindow)
@@ -4168,7 +4235,7 @@ struct TodayMapSheet: View {
                                 Button {
                                     NavEngine.shared.navigateBack(
                                         to: CLLocationCoordinate2D(latitude: v.lat, longitude: v.lon),
-                                        name: v.name ?? "that stop")
+                                        name: v.displayName)
                                     dismiss()
                                 } label: {
                                     Image(systemName: "arrow.uturn.backward.circle")
@@ -4185,14 +4252,43 @@ struct TodayMapSheet: View {
                             // the place itself in Google Maps — reviews,
                             // website, opening hours, the lot.
                             .contextMenu {
+                                // BUILD 257: saveSpot now sets starred and the
+                                // Favourites category, so this really does put
+                                // it where the Places screen looks. It never
+                                // did before — see the note on saveSpot.
                                 Button {
-                                    TripRecorder.shared.saveSpot(
+                                    _ = TripRecorder.shared.saveSpot(
                                         named: v.name ?? "Starred place",
                                         lat: v.lat, lon: v.lon)
                                     UINotificationFeedbackGenerator().notificationOccurred(.success)
-                                } label: { Label("Star — save this place", systemImage: "star.fill") }
+                                    TTSService.shared.speak("Saved to your favourites.")
+                                } label: { Label("Star — save to Favourites", systemImage: "star.fill") }
+                                // BUILD 257 — WHAT IS THIS PLACE, ACTUALLY.
+                                //
+                                // The trail knew a street address and nothing
+                                // else. This asks Google what is standing at
+                                // those coordinates, speaks the answer with
+                                // its rating, and saves it under the REAL
+                                // name rather than the street number — which
+                                // is the difference between a list of
+                                // addresses and a list of places.
+                                //
+                                // Only offered when a Maps key is set and the
+                                // month's free lookups are not spent, because
+                                // a menu item that silently costs money or
+                                // silently does nothing is worse than no menu
+                                // item.
+                                if ChappyGooglePlaces.shared.isConfigured,
+                                   ChappyGooglePlaces.shared.remaining > 0 {
+                                    Button {
+                                        Task { await identify(v) }
+                                    } label: {
+                                        Label("What's here? — save with its real name",
+                                              systemImage: "sparkle.magnifyingglass")
+                                    }
+                                }
                                 Button {
-                                    TripRecorder.shared.saveSpot(named: "Home", lat: v.lat, lon: v.lon)
+                                    _ = TripRecorder.shared.saveSpot(named: "Home", lat: v.lat, lon: v.lon)
                                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                                 } label: { Label("Set as Home", systemImage: "house.fill") }
                                 Button {
@@ -8604,8 +8700,11 @@ struct AtlasView: View {
     }
 
     private func flyTo(_ query: String) async {
-        if let spot = TripRecorder.shared.spots.last(where: {
-            $0.name.lowercased().contains(query.lowercased()) }) {
+        // BUILD 257: shared matcher, so flying the Atlas to "my gym" lands on
+        // the same pin that "take me to my gym" would route to.
+        if let spot = TripRecorder.savedSpot(matching: query,
+                                             nearLat: region.center.latitude,
+                                             nearLon: region.center.longitude) {
             withAnimation(.easeInOut(duration: 0.8)) {
                 camera = .region(MKCoordinateRegion(
                     center: CLLocationCoordinate2D(latitude: spot.lat, longitude: spot.lon),
@@ -9945,7 +10044,19 @@ private struct PlaceEditor: View {
                     Button {
                         if let s = spot {
                             dismiss()
-                            Task { _ = await NavEngine.shared.navigate(to: s.name, driving: true) }
+                            // BUILD 257 — ROUTE TO THE PIN, NOT TO ITS NAME.
+                            //
+                            // This passed s.name to navigate(), which throws
+                            // away the coordinates it is literally holding and
+                            // starts a name search — so tapping "Take me here"
+                            // on a place called "Gym" could route you to a
+                            // different gym, or to a Google Places result, or
+                            // to nothing. navigateBack exists for exactly this
+                            // and the Trail has used it since build 158; the
+                            // Places editor never got the same treatment.
+                            NavEngine.shared.navigateBack(
+                                to: CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon),
+                                name: s.name, driving: true)
                         }
                     } label: { Label("Take me here", systemImage: "location.fill") }
 
