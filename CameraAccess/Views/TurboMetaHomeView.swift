@@ -2303,7 +2303,11 @@ struct TurboMetaHomeView: View {
                 }
                 .sheet(isPresented: $showNotifDoctor) { NotificationDoctor() }
                 .fullScreenCover(isPresented: $showWeather) { WeatherStation() }
-                .fullScreenCover(isPresented: $showTravel) { TravelDeskView() }
+                // BUILD 251: Travel opens the HUB, not straight into the
+                // trip planner. The planner is still one tap inside — it is
+                // now one of the options rather than the gate in front of
+                // all of them.
+                .fullScreenCover(isPresented: $showTravel) { ChappyTravelHub() }
                 .fullScreenCover(isPresented: $showAtlasMap) { TripAtlasView() }
                 .sheet(isPresented: $showVisas) { VisaDeskView() }
                 .sheet(isPresented: $showOptions) { TripOptionsSheet() }
@@ -2518,9 +2522,43 @@ struct TurboMetaHomeView: View {
         // use on purpose, for the batteries. Nothing anywhere was listening,
         // so Snap and "take a photo" did precisely nothing and said nothing
         // about it. (The scan equivalent was wired; this one was missed.)
-        .onReceive(NotificationCenter.default.publisher(for: .chappyWakeCameraForSnap)) { _ in
+        // ============================================================
+        // BUILD 255 — WHY "TAKE A VIDEO" TOOK A PHOTO AND STOPPED.
+        //
+        // His report: "Video doesn't work. It took, like, a photo, and then
+        // it stopped."
+        //
+        // This notification has five posters. FOUR of them — ChappyClip
+        // (video), ChappyBurst, ChappyReader and ChappyPulse — mean "wake
+        // the camera, I'll do the rest"; only snapSilently() wants a photo.
+        // This observer heard all five as "wake the camera, TAKE A SNAP,
+        // then put it back to sleep."
+        // (I counted three wake-only callers; review found the fourth.)
+        //
+        // So the sequence he actually got: the recorder asked for the
+        // camera; this fired the shutter earcon, flashed the screen, wrote
+        // a real photo to his camera roll and filed a .photo memory; then
+        // 600 ms later it called stopSession(), which nils the frame and
+        // stops the stream. The recorder's sampling loop then ran against a
+        // dead camera, collected nothing, and gave up twenty seconds later
+        // with "the camera never settled".
+        //
+        // A photo, and then it stopped. Exactly as described.
+        //
+        // The stand-down guard was checking Live AI, Continuous Vision and
+        // four sheet flags — it did not know Clip, Burst or Reader existed.
+        //
+        // Fixed by saying which kind of wake this is. `wantsSnap: false`
+        // means wake it and leave it alone; the poster owns it from there.
+        // ============================================================
+        .onReceive(NotificationCenter.default.publisher(for: .chappyWakeCameraForSnap)) { note in
+            let wantsSnap = (note.userInfo?["snap"] as? Bool) ?? true
             Task { @MainActor in
                 await streamViewModel.startSession()
+                guard wantsSnap else {
+                    print("📷 [Snap] Woke the camera for another module — no snap, no stand-down")
+                    return
+                }
                 // WAIT FOR A FRAME, DON'T GUESS AT ONE.
                 // A fixed 1.8s sleep was optimistic: the glasses light comes on
                 // well before the first frame lands, so the check ran early and
@@ -2552,8 +2590,13 @@ struct TurboMetaHomeView: View {
                 // Live AI and Continuous Vision both legitimately hold the
                 // camera, and stealing it back from them would be a far worse
                 // bug than the one being fixed.
+                // BUILD 255: Clip and Burst added. Even on a genuine snap,
+                // a recorder that started in the meantime owns the camera and
+                // must not have it taken away underneath it.
                 if !LiveAIManager.shared.isRunning,
                    !ContinuousVisionManager.shared.isRunning,
+                   !ChappyClip.shared.isRecording, !ChappyBurst.shared.isFiring,
+                   !ChappyPulse.shared.isAwake,
                    !showLiveAI, !showQuickVision, !showLiveStream, !showRTMPStreaming {
                     // A beat, so a capture still in flight isn't cut off.
                     try? await Task.sleep(nanoseconds: 600_000_000)
@@ -2664,6 +2707,9 @@ struct TurboMetaHomeView: View {
                     ChappyMemory.shared.fileDayRoute()
                 }
             }
+            // BUILD 250: the camera now pauses honestly on lock and comes
+            // back on unlock, instead of freezing silently.
+            streamViewModel.installLockAwareness()
             // Ensure QuickVisionManager has the streamViewModel reference
             quickVisionManager.setStreamViewModel(streamViewModel)
             // Ensure LiveAIManager has the streamViewModel reference
@@ -3156,6 +3202,14 @@ enum ChappyHomeTiles {
                          tint: Color(red: 0.45, green: 0.65, blue: 1.0)),
         "memory":   Spec(label: "Memory",   icon: "brain.head.profile",
                          tint: Color(red: 0.65, green: 0.75, blue: 1.0)),
+        // BUILD 251: the Flights quick tile added in 250 is REMOVED. He
+        // asked for everything travel to live under Travel, and a second
+        // door on the home screen is the opposite of that. Flights is the
+        // first tile in the hub's own grid now.
+        //
+        // Nothing to migrate: the `order` getter filters out any id this
+        // build no longer knows, so a saved list containing "flights"
+        // self-heals on the next read.
     ]
 }
 
@@ -3998,6 +4052,22 @@ struct TodayMapSheet: View {
                         // to be looking at a different day is lying to you.
                         spots: showPlaces ? TripRecorder.shared.spots : [],
                         journalPins: dayPins + photoPins)
+                        // BUILD 250 — WITHOUT THIS THE LAYER BAR DOES NOTHING.
+                        //
+                        // RouteMapView adds its polyline, spots and pins in
+                        // makeUIView only; updateUIView is empty. So SwiftUI
+                        // rebuilding the struct when a chip is tapped reuses
+                        // the same MKMapView and draws nothing new — the
+                        // capsule fills in, and the map sits there unchanged.
+                        // (It is also why the day strip has never redrawn the
+                        // map for a different day.)
+                        //
+                        // Changing the identity forces a fresh MKMapView, so
+                        // makeUIView runs again with the new layers. The real
+                        // fix is to implement updateUIView properly; this is
+                        // the version that does not risk a rewrite of the map
+                        // renderer on the day before he flies.
+                        .id("\(showTrail)-\(showPhotos)-\(showPlaces)-\(selectedDay.timeIntervalSince1970)")
                         .ignoresSafeArea(edges: [])
 
                     Button {
@@ -12747,11 +12817,427 @@ struct LegEditorSheet: View {
     }
 }
 
+// =====================================================================
+// MARK: - BUILD 251: THE TRAVEL HUB
+// =====================================================================
+//
+// Travel was one thing: plan a whole trip, or nothing. Every capability
+// underneath it — flights, stays, restaurants, visas, currency, the
+// atlas — already worked on its own, and every one of them was reachable
+// only by first building a trip with legs and nights and a party size.
+//
+// "I just want to look at accommodation" had no answer. Neither did "what
+// is there to eat around here". You had to commit to planning a holiday
+// to ask a question about dinner.
+//
+// So: a hub. One shared date window at the top — 21 October to 5 November
+// — set once and used by everything under it. Then each thing on its own,
+// openable directly, no trip required. The full trip planner is still
+// here, as ONE of the options rather than the gate in front of all of
+// them.
+struct ChappyTravelHub: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    private var theme: ChappyTheme { ChappyTheme.named(themeName) }
+
+    @ObservedObject private var desk = ChappyTravel.shared
+
+    // THE SHARED WINDOW. Persisted as seconds since 1970 — @AppStorage
+    // cannot hold a Date, and storing an ISO string would need parsing on
+    // every read of a value this screen reads constantly.
+    @AppStorage("chappy_travel_from") private var fromStamp: Double = 0
+    @AppStorage("chappy_travel_to") private var toStamp: Double = 0
+
+    @State private var showPlanner = false
+    @State private var showFlights = false
+    @State private var showVisas = false
+    @State private var showCurrency = false
+    @State private var showAtlas = false
+    @State private var showSavedPlaces = false
+    @State private var lookup: ChappyPlaces.Kind?
+    @State private var whereTo = ""
+    /// BUILD 251 — WHERE "UBUD" ACTUALLY IS.
+    ///
+    /// Typing a destination and passing only its NAME searched around the
+    /// phone: Google got "best restaurants in Ubud" with a 12km location
+    /// bias centred on Brisbane, and TripAdvisor got the name with the
+    /// wrong lat/long beside it. The results were a mix of two cities,
+    /// which is worse than either on its own. Geocoded on submit, so the
+    /// search is centred where he means.
+    @State private var resolvedLat: Double?
+    @State private var resolvedLon: Double?
+    @State private var resolving = false
+
+    /// How many months from now the window starts, so Flights opens on the
+    /// month he asked about rather than this one.
+    private var monthOffsetForWindow: Int {
+        let cal = Calendar.current
+        let a = cal.dateComponents([.year, .month], from: Date())
+        let b = cal.dateComponents([.year, .month], from: from)
+        guard let ay = a.year, let am = a.month,
+              let by = b.year, let bm = b.month else { return 0 }
+        return max(0, (by - ay) * 12 + (bm - am))
+    }
+
+    private func resolveDestination() {
+        let q = whereTo.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else {
+            resolvedLat = nil; resolvedLon = nil
+            return
+        }
+        resolving = true
+        CLGeocoder().geocodeAddressString(q) { marks, _ in
+            Task { @MainActor in
+                resolving = false
+                guard let c = marks?.first?.location?.coordinate else { return }
+                resolvedLat = c.latitude
+                resolvedLon = c.longitude
+            }
+        }
+    }
+
+    private var from: Date {
+        fromStamp > 0 ? Date(timeIntervalSince1970: fromStamp) : Date()
+    }
+    private var to: Date {
+        toStamp > 0 ? Date(timeIntervalSince1970: toStamp)
+                    : Calendar.current.date(byAdding: .day, value: 14, to: from) ?? from
+    }
+    private var nights: Int {
+        max(0, Calendar.current.dateComponents([.day], from: from, to: to).day ?? 0)
+    }
+
+    /// What the place lookups search around. A typed destination wins;
+    /// otherwise it is wherever he is standing, which is the right answer
+    /// for "somewhere to eat" far more often than not.
+    private var searchName: String {
+        let t = whereTo.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { return t }
+        let snap = ContextEngine.shared.snapshot
+        return snap.city ?? snap.country ?? "Nearby"
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                AuroraBackdrop(theme: theme)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        dateCard
+                        whereCard
+                        lookupGrid
+                        toolsGrid
+                        plannerCard
+                    }
+                    .padding(14)
+                    .padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("Travel")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+            }
+            .onAppear {
+                if fromStamp == 0 { fromStamp = Date().timeIntervalSince1970 }
+                if toStamp == 0 {
+                    toStamp = (Calendar.current.date(byAdding: .day, value: 14, to: Date())
+                               ?? Date()).timeIntervalSince1970
+                }
+            }
+            .sheet(isPresented: $showPlanner) { TravelDeskView() }
+            // BUILD 251: the window is not decoration — Flights opens on the
+            // month he actually asked about.
+            .sheet(isPresented: $showFlights) {
+                ChappyFlightsView(initialMonthOffset: monthOffsetForWindow)
+            }
+            .sheet(isPresented: $showVisas) { VisaDeskView() }
+            .sheet(isPresented: $showCurrency) { CurrencyView() }
+            // BUILD 251: AtlasView, not TripAtlasView. TripAtlasView draws
+            // the legs of an ACTIVE TRIP and nothing else — so from a hub
+            // whose whole point is "no trip required" it opened a blank map
+            // titled Atlas with no explanation. AtlasView is the real world
+            // atlas, the one the home tile opens, and it works standalone.
+            .fullScreenCover(isPresented: $showAtlas) {
+                AtlasView(initialTarget: whereTo.isEmpty ? nil : whereTo,
+                          initialLayer: nil)
+            }
+            .fullScreenCover(isPresented: $showSavedPlaces) { PlacesView() }
+            .sheet(item: $lookup) { k in
+                LegPlacesSheet(theme: theme,
+                               standaloneName: searchName,
+                               standaloneLat: resolvedLat,
+                               standaloneLon: resolvedLon,
+                               initialKind: k)
+            }
+        }
+    }
+
+    // MARK: The window
+
+    private var dateCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("WHEN")
+                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+                    .tracking(1.1)
+                    .foregroundColor(theme.textSecondary)
+                Spacer()
+                Text(nights == 0 ? "same day"
+                     : "\(nights) night\(nights == 1 ? "" : "s")")
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(theme.accent)
+            }
+            DatePicker("From",
+                       selection: Binding(
+                        get: { from },
+                        set: { newValue in
+                            fromStamp = newValue.timeIntervalSince1970
+                            // Keep the window sane without arguing with him:
+                            // a "to" before the "from" is a typo, not intent.
+                            if toStamp <= fromStamp {
+                                toStamp = (Calendar.current.date(
+                                    byAdding: .day, value: 1, to: newValue)
+                                           ?? newValue).timeIntervalSince1970
+                            }
+                        }),
+                       displayedComponents: .date)
+            DatePicker("To",
+                       selection: Binding(
+                        get: { to },
+                        set: { toStamp = $0.timeIntervalSince1970 }),
+                       in: from...,
+                       displayedComponents: .date)
+            // Says what it ACTUALLY does. The first draft claimed the window
+            // drove everything below it; nothing read it at all. A caption
+            // that overstates the feature is how you stop trusting captions.
+            Text("Set once. Flights opens on this month, and the planner starts from these dates. Eat and See & do are about where, not when.")
+                .font(.caption2)
+                .foregroundColor(theme.textSecondary.opacity(0.8))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .stroke(theme.accent.opacity(0.22), lineWidth: 1))
+    }
+
+    private var whereCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("WHERE")
+                .font(.system(size: 11, weight: .heavy, design: .rounded))
+                .tracking(1.1)
+                .foregroundColor(theme.textSecondary)
+            HStack(spacing: 9) {
+                Image(systemName: "mappin.and.ellipse")
+                    .font(.system(size: 14))
+                    .foregroundColor(theme.accent)
+                TextField("Leave empty for where you are", text: $whereTo)
+                    .font(.subheadline)
+                    .foregroundColor(theme.textPrimary)
+                    .submitLabel(.search)
+                    .onSubmit { resolveDestination() }
+                if resolving {
+                    ProgressView().scaleEffect(0.7)
+                } else if !whereTo.isEmpty {
+                    Button {
+                        whereTo = ""
+                        resolvedLat = nil; resolvedLon = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.06)))
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(0.05)))
+    }
+
+    // MARK: Look up one thing
+
+    private var lookupGrid: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("LOOK UP ONE THING")
+                .font(.system(size: 11, weight: .heavy, design: .rounded))
+                .tracking(1.1)
+                .foregroundColor(theme.textSecondary)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                GridItem(.flexible(), spacing: 9)],
+                      spacing: 9) {
+                hubTile("Flights", "airplane",
+                        Color(red: 0.55, green: 0.75, blue: 1.0),
+                        "Fares, deals, route watch") { showFlights = true }
+                hubTile("Stay", "bed.double.fill",
+                        Color(red: 0.65, green: 0.55, blue: 1.0),
+                        "Hotels and places to stay") { lookup = .hotels }
+                hubTile("Eat", "fork.knife",
+                        Color(red: 1.0, green: 0.62, blue: 0.35),
+                        "Restaurants, rated") { lookup = .restaurants }
+                hubTile("Cheap eats", "takeoutbag.and.cup.and.straw.fill",
+                        Color(red: 1.0, green: 0.78, blue: 0.35),
+                        "Warungs and street food") { lookup = .cheapEats }
+                hubTile("See & do", "figure.walk",
+                        Color(red: 0.45, green: 0.85, blue: 0.6),
+                        "Attractions and sights") { lookup = .attractions }
+                hubTile("Massage & spa", "hands.sparkles.fill",
+                        Color(red: 1.0, green: 0.55, blue: 0.75),
+                        "Recovery and treatments") { lookup = .massage }
+            }
+        }
+    }
+
+    private var toolsGrid: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("TOOLS")
+                .font(.system(size: 11, weight: .heavy, design: .rounded))
+                .tracking(1.1)
+                .foregroundColor(theme.textSecondary)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 9),
+                                GridItem(.flexible(), spacing: 9)],
+                      spacing: 9) {
+                hubTile("Visas", "doc.text.magnifyingglass",
+                        Color(red: 0.55, green: 0.85, blue: 0.95),
+                        "Rules and how long you get") { showVisas = true }
+                hubTile("Currency", "dollarsign.arrow.circlepath",
+                        Color(red: 1.0, green: 0.78, blue: 0.35),
+                        "Live rates and what it buys") { showCurrency = true }
+                hubTile("Atlas", "globe.asia.australia.fill",
+                        Color(red: 0.45, green: 0.65, blue: 1.0),
+                        "The world map") { showAtlas = true }
+                hubTile("Saved places", "mappin.and.ellipse",
+                        Color(red: 0.45, green: 0.85, blue: 0.55),
+                        "Everywhere you pinned") { showSavedPlaces = true }
+            }
+        }
+    }
+
+    private var plannerCard: some View {
+        Button {
+            showPlanner = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "suitcase.rolling.fill")
+                    .font(.title3)
+                    .foregroundColor(theme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Plan a whole trip")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(theme.textPrimary)
+                    Text(desk.active.map { "Open: \($0.name)" }
+                         ?? "Legs, costs, the map and the full report")
+                        .font(.caption)
+                        .foregroundColor(theme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption).foregroundColor(theme.textSecondary)
+            }
+            .padding(13)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(theme.accent.opacity(0.3), lineWidth: 1))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+
+    private func hubTile(_ title: String, _ icon: String, _ tint: Color,
+                         _ sub: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 7) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(tint.opacity(0.18))
+                        .frame(width: 38, height: 38)
+                    Image(systemName: icon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(tint)
+                }
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(theme.textPrimary)
+                Text(sub)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(theme.textSecondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, minHeight: 118, alignment: .topLeading)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.09), lineWidth: 1))
+        }
+        .buttonStyle(ChappyPressStyle())
+    }
+}
+
 // MARK: - Eat & see
 
+/// BUILD 251 — SEED THE STATE, DON'T MUTATE IT ON APPEAR.
+///
+/// `kind` is @State with a default of .restaurants, and `.task(id: kind)`
+/// fires on that default before any onAppear could change it. So opening
+/// "Stay" ran a full restaurant search first, then restarted for hotels:
+/// two metered Google Places calls per open, and a visible flash of the
+/// wrong results. An explicit init writes the State's initial value before
+/// the first body evaluation, so only one search ever runs.
+///
+/// In an extension deliberately — declaring it inside the struct would
+/// suppress the synthesised memberwise init that the trip-leg call site
+/// still uses.
+extension LegPlacesSheet {
+    init(theme: ChappyTheme,
+         standaloneName: String?,
+         standaloneLat: Double? = nil,
+         standaloneLon: Double? = nil,
+         initialKind: ChappyPlaces.Kind) {
+        self.legID = nil
+        self.theme = theme
+        self.standaloneName = standaloneName
+        self.standaloneLat = standaloneLat
+        self.standaloneLon = standaloneLon
+        self.initialKind = initialKind
+        _kind = State(initialValue: initialKind)
+    }
+}
+
 struct LegPlacesSheet: View {
-    let legID: UUID
+    // ==============================================================
+    // BUILD 251 — THE SAME SCREEN, WITHOUT NEEDING A TRIP.
+    //
+    // Nine categories of place lookup — Eat, Stay, See & do, Cheap
+    // eats, Massage, Gyms, Dive — all of it worked, and all of it was
+    // locked behind planning a whole trip and picking a leg of it.
+    // "I just want to find somewhere to eat tonight" had no way in.
+    //
+    // legID is now Optional. With one, this behaves exactly as it
+    // always has: titled by the leg, shortlisting onto the leg. With
+    // none, it searches wherever you point it and saves finds as
+    // ordinary places instead. One screen, both jobs, no fork.
+    // ==============================================================
+    var legID: UUID? = nil
     let theme: ChappyTheme
+    /// Standalone mode: where to look, and what it is called.
+    var standaloneName: String? = nil
+    var standaloneLat: Double? = nil
+    var standaloneLon: Double? = nil
+    var initialKind: ChappyPlaces.Kind = .restaurants
+
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var places = ChappyPlaces.shared
     @ObservedObject private var reviews = ChappyReviews.shared
@@ -12759,7 +13245,23 @@ struct LegPlacesSheet: View {
     @State private var kind: ChappyPlaces.Kind = .restaurants
 
     private var trip: ChappyTravel.Trip? { desk.active }
-    private var leg: ChappyTravel.Leg? { trip?.legs.first { $0.id == legID } }
+    private var leg: ChappyTravel.Leg? {
+        guard let legID else { return nil }
+        return trip?.legs.first { $0.id == legID }
+    }
+    /// Where this screen is looking, whichever mode it is in.
+    private var targetName: String {
+        leg?.place ?? standaloneName ?? "Nearby"
+    }
+    private var targetCoord: (lat: Double, lon: Double)? {
+        if let l = leg { return (l.lat, l.lon) }
+        if let la = standaloneLat, let lo = standaloneLon { return (la, lo) }
+        // Fall back to wherever he actually is — "somewhere to eat"
+        // almost always means "near me".
+        let snap = ContextEngine.shared.snapshot
+        if let la = snap.latitude, let lo = snap.longitude { return (la, lo) }
+        return nil
+    }
 
     var body: some View {
         NavigationView {
@@ -12829,7 +13331,7 @@ struct LegPlacesSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .navigationTitle(leg?.place ?? "Places")
+            .navigationTitle(targetName)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -12841,13 +13343,21 @@ struct LegPlacesSheet: View {
     }
 
     private func reload() async {
-        guard let l = leg else { return }
-        await places.search(near: l.lat, lon: l.lon, place: l.place, kind: kind)
+        // BUILD 251: coordinates from the leg, from the caller, or from
+        // where he is standing — in that order. Only the SOURCE changed;
+        // the search and the review digest are untouched.
+        // BUILD 251: 0,0 rather than a bail-out. Every search path below
+        // already handles "no coordinates" by leaning on the place NAME —
+        // and returning here instead meant that with location denied, or
+        // indoors, or on a cold start, a destination he had typed produced
+        // an empty screen for ever with nothing to explain it.
+        let c = targetCoord ?? (lat: 0, lon: 0)
+        await places.search(near: c.lat, lon: c.lon, place: targetName, kind: kind)
         // BUILD 186: digest the top few in the background. Only the ones
         // Tripadvisor supplied — Google's licence does not permit us to
         // hold its review text, even in memory for a screen.
         for spot in places.results.prefix(4) where spot.fromTripAdvisor {
-            _ = await reviews.digest(for: spot, place: l.place)
+            _ = await reviews.digest(for: spot, place: targetName)
         }
     }
 
@@ -12974,7 +13484,19 @@ struct LegPlacesSheet: View {
     }
 
     private func toggle(_ spot: ChappyPlaces.Spot) {
-        guard var t = trip, let i = t.legs.firstIndex(where: { $0.id == legID }) else { return }
+        // BUILD 251: with no leg there is no shortlist to add to, so the
+        // star does the obvious other thing — saves it as a place, which
+        // is what "I want to remember this restaurant" means when you are
+        // not planning a trip. Findable in Places, and "take me there"
+        // works on it immediately.
+        guard let legID, var t = trip,
+              let i = t.legs.firstIndex(where: { $0.id == legID }) else {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            TripRecorder.shared.saveSpot(named: spot.name,
+                                         lat: spot.lat, lon: spot.lon)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            return
+        }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         if let at = t.legs[i].shortlist.firstIndex(of: spot.name) {
             t.legs[i].shortlist.remove(at: at)
@@ -15731,6 +16253,12 @@ struct ChappyFlightsView: View {
 
     @State private var tab: Tab = .trip
     @State private var monthOffset = 0
+    /// BUILD 251: which month to open on. The Travel hub's shared date
+    /// window sets this, so "21 October to 5 November" lands on October's
+    /// fare calendar instead of on this month regardless of what he asked
+    /// for. Defaulted, so every existing `ChappyFlightsView()` is untouched.
+    var initialMonthOffset: Int = 0
+    @State private var didApplyInitialMonth = false
     @State private var live: [ChappyFareSource.DayPrice] = []
     @State private var quotes: [ChappyFareSource.CarrierQuote] = []
     @State private var loading = false
@@ -15855,7 +16383,16 @@ struct ChappyFlightsView: View {
                                           fromHint: origin, toHint: dest)
                 }
             }
-            .onAppear { reload() }
+            .onAppear {
+                // BUILD 251: honour the window the hub set, once, before the
+                // first load — not on every reappearance, or paging months
+                // by hand would keep snapping back.
+                if !didApplyInitialMonth {
+                    didApplyInitialMonth = true
+                    monthOffset = initialMonthOffset
+                }
+                reload()
+            }
             .onReceive(NotificationCenter.default
                 .publisher(for: .chappyFaresChanged)) { _ in reload() }
         )
