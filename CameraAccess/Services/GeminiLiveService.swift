@@ -254,6 +254,11 @@ class GeminiLiveService: NSObject {
     private var speechFrameFired = false
     private var endFrameFired = false
     private var journalCommandFired = false
+    /// BUILD 256 — once per turn, like the two flags above it. The
+    /// transcription arrives in fragments and the accumulated line is tested
+    /// on every one of them, so without this a single "let's stop" would
+    /// fire the exit four or five times as the words landed.
+    private var exitCommandFired = false
     // ECO DRIP: cost saver — full frame rate only around conversation
     private var lastInteractionAt = Date()
     private var ecoSkipCounter = 0
@@ -435,6 +440,140 @@ class GeminiLiveService: NSObject {
         heartbeat?.invalidate()
         heartbeat = nil
     }
+
+    /// BUILD 250 — is anything actually on his head right now?
+    ///
+    /// Read live from the audio route, never from our own bookkeeping.
+    ///
+    /// BUILD 256 — THE FIRST HALF OF THIS COMMENT USED TO CONTRADICT THE
+    /// SECOND HALF AND THE CODE. It opened by claiming this asks the same
+    /// question as Translate's `headsetConnected`, "deliberately answered the
+    /// same way… checked on BOTH the input and output side", and then said
+    /// the opposite two lines later. The code has only ever checked inputs.
+    /// Whoever read the top and trusted it would have concluded Live AI and
+    /// Translate behave identically on lock, and they do not.
+    ///
+    /// THE INPUT SIDE DECIDES, and that is NOT the question Translate asks.
+    /// Translate checks both sides because it cares about the ear as well as
+    /// the mouth. This decision is only ever about the MICROPHONE.
+    ///
+    /// A2DP is output-only. Under playAndRecord the route can perfectly well
+    /// be A2DP out and built-in mic in — glasses on his head for listening,
+    /// phone microphone face-down in a pocket. Counting that as "on his head"
+    /// would hold a metered Gemini session open on the sound of fabric.
+    ///
+    /// I was asked to align this with Translate's broader test and I have not
+    /// done it, because it is not a bug — it is the narrower question being
+    /// asked on purpose, and widening it costs money for audio nobody can
+    /// use. What WAS wrong is that the stand-down was completely silent, so
+    /// the difference showed up as "Live AI randomly dies in my pocket and
+    /// Translate doesn't". `headsetInEar` below exists to say so out loud.
+    private static var headsetOnHead: Bool {
+        let route = AVAudioSession.sharedInstance().currentRoute
+        let inputTypes: Set<AVAudioSession.Port> = [
+            .bluetoothHFP, .bluetoothLE, .headsetMic, .headphones
+        ]
+        return route.inputs.contains { inputTypes.contains($0.portType) }
+    }
+
+    /// BUILD 256 — is anything in his EAR, whether or not it is the mic?
+    ///
+    /// The confusing case, exactly: glasses connected for sound (A2DP out),
+    /// phone microphone in a pocket. `headsetOnHead` is false, so the session
+    /// stands down — correctly — but from where he is standing the glasses
+    /// are plainly connected and Live AI just went dead for no visible
+    /// reason. This is how we tell him which of the two it was.
+    private static var headsetInEar: Bool {
+        let route = AVAudioSession.sharedInstance().currentRoute
+        let outTypes: Set<AVAudioSession.Port> = [
+            .bluetoothA2DP, .bluetoothHFP, .bluetoothLE, .headphones
+        ]
+        return route.outputs.contains { outTypes.contains($0.portType) }
+    }
+
+    /// BUILD 256 — "LET ME OUT", ANCHORED.
+    ///
+    /// Two tiers, and the split is the whole safety argument.
+    ///
+    /// ANYWHERE: phrases that name the mode or name Chappy and tell it to
+    /// go. Nobody says "close live AI" in the middle of asking what a sign
+    /// means, so these can match as substrings of a longer sentence.
+    ///
+    /// WHOLE UTTERANCE ONLY: phrases that are perfectly ordinary English in
+    /// another context. "That's it" is agreement; "we're done" could be about
+    /// the meal. They end the session only when they are the entire thing he
+    /// said — which is why this takes `turnIsComplete` rather than checking
+    /// them on the streaming path.
+    ///
+    /// REVIEW CAUGHT THE VERSION WITHOUT THAT FLAG. Input transcription
+    /// arrives in fragments and `currentUserLine` accumulates them, so the
+    /// accumulated line PASSES THROUGH every prefix of the sentence. "I'm done
+    /// with this one — what's that sign say?" is exactly equal to "i'm done"
+    /// for one fragment, and the session closed mid-question. A whole-utterance
+    /// rule tested on a partial utterance is not a whole-utterance rule.
+    ///
+    /// Bare "stop" is deliberately in NEITHER list, and I went back and forth
+    /// on it. Everywhere else in this app "stop" means stop TALKING — it kills
+    /// the voice and leaves the session alone. Making the same word close a
+    /// metered session here, and only here, is the kind of inconsistency that
+    /// makes an assistant feel unpredictable. "Chappy stop" ends it, and that
+    /// is one extra word for a much clearer rule.
+    static func asksToLeaveLiveAI(_ line: String, turnIsComplete: Bool) -> Bool {
+        let s = line.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        guard !s.isEmpty else { return false }
+        let anywhere = ["close live ai", "close live a i", "stop live ai",
+                        "exit live ai", "end live ai", "leave live ai",
+                        "close live", "chappy stop", "chappy close",
+                        "chappy exit", "chappy reset", "chappy that's enough",
+                        "close everything", "shut it all down",
+                        "back to standby", "go back to standby",
+                        "end the chat", "close the chat", "stop the chat",
+                        "get me out of here", "let me out of here"]
+        if anywhere.contains(where: { s.contains($0) }) { return true }
+        guard turnIsComplete else { return false }
+        let whole: Set<String> = [
+            "that's enough", "thats enough", "we're done", "were done",
+            "i'm done", "im done", "all done", "let's stop", "lets stop",
+            "that's it", "thats it", "goodbye chappy", "bye chappy",
+            "that will do", "thatll do", "that'll do",
+        ]
+        return whole.contains(s)
+    }
+
+    /// BUILD 256 — one exit, two detection points (streaming fragment for the
+    /// anchored phrases, end of turn for the ambiguous ones). Written once so
+    /// the two can never drift apart.
+    private func closeLiveAIBecauseHeAskedTo() {
+        ChappyLiveLog.note("🚪 [Gemini] Exit heard in the wearer's own words — closing Live AI")
+        Task { @MainActor in
+            TTSService.shared.stop()
+            LiveAIManager.shared.triggerStop()
+            NotificationCenter.default.post(name: .chappyCloseModules, object: nil)
+        }
+    }
+
+    /// BUILD 250 — THE OTHER HALF OF STAYING ALIVE IN A POCKET.
+    ///
+    /// Keeping the mic through a lock means `teardownCapture()` is skipped,
+    /// so `isRecording` stays true. That flag gates EVERY recovery path in
+    /// this class — reclaimMic, didBecomeActive, interruption-ended all
+    /// begin `guard !isRecording`. If the engine then dies quietly in the
+    /// pocket (a media-services reset posts no notification this class
+    /// listens for), the flag is stale-true, every recovery no-ops, and the
+    /// microphone is dead until the chat is closed and reopened.
+    ///
+    /// That is this file's own oldest bug, described in the build-125 note
+    /// above: "the engine stopped and isRecording stayed true… silent
+    /// forever." Trading a mic that dies on lock for a mic that dies in the
+    /// pocket and never comes back would be a worse deal than the one being
+    /// fixed. So on the way back in, believe the ENGINE, not the flag.
+    private func reclaimIfEngineDiedInPocket() {
+        guard wantsRecording, isRecording else { return }
+        guard audioEngine?.isRunning != true else { return }
+        ChappyLiveLog.note("🎤 [Gemini] Engine died while pocketed — clearing the stale flag and reclaiming")
+        teardownCapture()               // this is what clears isRecording
+        reclaimMic(why: "engine died while backgrounded")
+    }
     private var restartAttempt = 0
     private static let restartDelays: [TimeInterval] = [0.4, 1.0, 2.5]
     /// Deferrals while waiting for the mic format to settle. Bounded so a
@@ -594,7 +733,55 @@ class GeminiLiveService: NSObject {
                     }
                     return
                 }
-                ChappyLiveLog.note("🎤 [Gemini] Backgrounded — standing the mic down cleanly (this handler does NOT check the audio background mode; Standby's equivalent does)")
+                // ============================================================
+                // BUILD 250 — THE POCKET LAW, FINALLY APPLIED HERE TOO.
+                //
+                // This handler tore the microphone down unconditionally, and
+                // that is the whole of "Live AI dies on the lock screen". It
+                // was the only one of the three audio modules with no check
+                // at all:
+                //
+                //   Standby   asks whether the `audio` background mode is
+                //             declared, and stays live because it is
+                //   Translate asks whether a headset is connected, and
+                //             carries on in your ear if it is (build 59)
+                //   Live AI   asked nothing, and always let go
+                //
+                // Translate's comment from build 59 says it better than I
+                // can: iOS fires this when the screen LOCKS, not just when
+                // you leave the app — so putting the phone in your pocket
+                // mid-conversation, with the glasses on, killed the very
+                // thing the glasses exist for.
+                //
+                // Same rule here, and deliberately the SAME rule rather than
+                // a new one. Glasses on your head means this is a pocket,
+                // not an exit: keep listening. Nothing on your head means you
+                // have genuinely walked away, and holding a metered session
+                // open would be waste.
+                // ============================================================
+                if Self.headsetOnHead {
+                    ChappyLiveLog.note("🎧 [Live] Backgrounded ON THE GLASSES — carrying on, this is a pocket not an exit")
+                    ChappyLiveLog.note("🎧 [Live]   background budget: \(ChappyLiveLog.backgroundBudget())")
+                    ChappyLiveLog.shared.flushNow()
+                    return
+                }
+                // BUILD 256 — SAY WHICH OF THE TWO IT WAS.
+                //
+                // A stand-down used to be completely silent, so the two very
+                // different situations below were indistinguishable from a
+                // pocket: one means "you walked away", the other means "your
+                // glasses are playing sound but the PHONE is the microphone,
+                // and I am not paying Google to listen to your jacket".
+                // Without a word, both read as "Live AI is unreliable" —
+                // which is the same complaint as build 255's failed arm
+                // sounding identical to a successful one.
+                if Self.headsetInEar {
+                    ChappyLiveLog.note("🎧 [Gemini] Glasses are the EAR but not the MIC — standing down and saying so")
+                    Task { @MainActor in
+                        TTSService.shared.speak("Live chat's paused — the phone's the microphone, not the glasses.")
+                    }
+                }
+                ChappyLiveLog.note("🎤 [Gemini] Backgrounded with nothing on your head — standing the mic down cleanly")
                 self.wasRecordingBeforeBackground = true
                 self.teardownCapture()
                 ChappyLiveLog.note("🌑 [Live] Mic stood down. If the next line is a launch marker, iOS killed us here.")
@@ -611,6 +798,11 @@ class GeminiLiveService: NSObject {
                     ChappyLiveLog.note("🌅 [Live] WILL ENTER FOREGROUND — socket:\(self.socketStateWord) recording:\(self.isRecording) wasRecording:\(self.wasRecordingBeforeBackground)")
                     ChappyLiveLog.note("🌅 [Live]   audio: \(ChappyLiveLog.audioState())")
                 }
+                // BUILD 250: we may have STAYED live through the lock, in
+                // which case there is no wasRecordingBeforeBackground to act
+                // on — but the engine may still have died while we were not
+                // looking. Check that first, unconditionally.
+                self.reclaimIfEngineDiedInPocket()
                 guard self.wasRecordingBeforeBackground else { return }
                 self.wasRecordingBeforeBackground = false
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -642,7 +834,14 @@ class GeminiLiveService: NSObject {
         lifecycleTokens.append(nc.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil, queue: .main) { [weak self] _ in
-                guard let self, self.wantsRecording, !self.isRecording else { return }
+                guard let self else { return }
+                // BUILD 250: same check here. This observer's own guard is
+                // `!isRecording`, which is precisely the flag that goes stale
+                // when we keep the mic through a lock — so without this line
+                // the belt-and-braces path cannot catch the failure it exists
+                // for.
+                self.reclaimIfEngineDiedInPocket()
+                guard self.wantsRecording, !self.isRecording else { return }
                 self.reclaimMic(why: "became active")
             })
 
@@ -2110,6 +2309,22 @@ class GeminiLiveService: NSObject {
             speechFrameFired = false
             endFrameFired = false
             journalCommandFired = false
+            // BUILD 256 — the whole-utterance half of the exit test, here and
+            // only here, because this is the one place the user's line is
+            // actually finished. "That's it" said on its own ends the session;
+            // "that's it, the red one" does not.
+            //
+            // ABOVE the exitCommandFired re-arm, deliberately. Below it the
+            // guard would have been reading a flag set false two lines
+            // earlier — protection that isn't protection, and it would have
+            // stopped being harmless the moment anyone put an overlapping
+            // phrase in both tiers and got two exits from one sentence.
+            if !exitCommandFired, !currentUserLine.isEmpty,
+               Self.asksToLeaveLiveAI(currentUserLine.lowercased(), turnIsComplete: true) {
+                exitCommandFired = true
+                closeLiveAIBecauseHeAskedTo()
+            }
+            exitCommandFired = false
             // STEP 8: roll the finished turn into the conversation memory
             if !currentUserLine.isEmpty {
                 recentLines.append("User: " + currentUserLine)
@@ -2152,6 +2367,35 @@ class GeminiLiveService: NSObject {
                 onReadRequest?()
             }
 
+            // BUILD 256 — THE WAY OUT OF LIVE AI, IN HIS OWN WORDS.
+            //
+            // Live AI is the only genuinely open-mic mode in this app, and it
+            // was the only mode with no spoken exit. Three separate things
+            // had to be true at once for that to happen, and all three were:
+            //
+            //   1. The tool bridge below has a case for stop_navigation and
+            //      no case for stopping ITSELF.
+            //   2. ChappyStandby's exit words — "close", "I'm done", "chappy
+            //      reset" — are unreachable, because Standby handed the
+            //      microphone to this class in order to get here. There is
+            //      no other ear listening.
+            //   3. The only remaining exit is a button, on a phone, in a
+            //      pocket, on a screen he cannot see with the glasses on.
+            //
+            // So a metered session could only be ended by taking the phone
+            // out. Detected here rather than declared as a tool, on purpose:
+            // a tool call is the MODEL choosing to leave. This is the wearer
+            // choosing, and it has to work while the model is mid-sentence
+            // about something else entirely.
+            //
+            // Tested against the accumulated line, not this fragment —
+            // "that's" and "enough" arrive separately.
+            if !exitCommandFired,
+               Self.asksToLeaveLiveAI(currentUserLine.lowercased(), turnIsComplete: false) {
+                exitCommandFired = true
+                closeLiveAIBecauseHeAskedTo()
+            }
+
             // PHASE 4 STEP 4 — JOURNAL VOICE COMMANDS (pre-tool-calling
             // bridge, same trick as "read this"): the app does the work,
             // then hands Chappy the answer to speak in its own voice.
@@ -2165,19 +2409,38 @@ class GeminiLiveService: NSObject {
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                             .trimmingCharacters(in: .punctuationCharacters)
                     }
-                    let spot = TripRecorder.shared.rememberSpot(named: name)
-                    sendAppReply("The app just saved this location as a remembered spot named '\(spot.name)'. Briefly confirm this to the user in one short sentence.")
+                    // BUILD 255 — ONTO THE MAIN ACTOR FIRST.
+                    //
+                    // handleServerContent runs on the websocket's own
+                    // OperationQueue, not main. TripRecorder is a plain
+                    // non-isolated class holding three unsynchronised arrays
+                    // (crumbs, spots, notes) that ContextEngine appends to
+                    // from the location callback on MAIN, once a second while
+                    // he is moving. Reading or appending them from here is
+                    // the same unsynchronised-array-COW race that produced
+                    // the "chappy look" crash this build fixes elsewhere —
+                    // the third instance of it, found by review.
+                    Task { @MainActor in
+                        let spot = TripRecorder.shared.rememberSpot(named: name)
+                        self.sendAppReply("The app just saved this location as a remembered spot named '\(spot.name)'. Briefly confirm this to the user in one short sentence.")
+                    }
                 } else if lower.contains("where was i today") || lower.contains("where have i been")
                     || lower.contains("where did i go") {
                     journalCommandFired = true
-                    sendAppReply("Journal answer: \(TripRecorder.shared.todaySummary()) Relay this to the user naturally and briefly.")
+                    Task { @MainActor in    // BUILD 255: see the note above — main actor only.
+                        self.sendAppReply("Journal answer: \(TripRecorder.shared.todaySummary()) Relay this to the user naturally and briefly.")
+                    }
                 } else if lower.contains("i'm lost") || lower.contains("im lost") || lower.contains("i am lost") {
                     journalCommandFired = true
-                    sendAppReply("Location help: \(TripRecorder.shared.lostReport()) Relay this calmly and briefly, then offer to retrace their steps.")
+                    Task { @MainActor in    // BUILD 255: see the note above — main actor only.
+                        self.sendAppReply("Location help: \(TripRecorder.shared.lostReport()) Relay this calmly and briefly, then offer to retrace their steps.")
+                    }
                 } else if lower.contains("trace my steps") || lower.contains("retrace my steps")
                     || lower.contains("way i came") {
                     journalCommandFired = true
-                    sendAppReply("Retrace data: \(TripRecorder.shared.retraceGuidance()) Relay the route back to the user briefly.")
+                    Task { @MainActor in    // BUILD 255: see the note above — main actor only.
+                        self.sendAppReply("Retrace data: \(TripRecorder.shared.retraceGuidance()) Relay the route back to the user briefly.")
+                    }
                 } else if lower.contains("chappy emergency") || lower.contains("emergency emergency") {
                     journalCommandFired = true
                     Task { @MainActor in
