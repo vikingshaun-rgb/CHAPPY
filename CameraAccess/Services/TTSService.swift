@@ -162,10 +162,100 @@ class TTSService: NSObject, ObservableObject {
     @Published var isSpeaking = false
 
     // Gemini TTS models — primary, with fallback name if Google renames tiers.
-    // BUILD 143: 2.5 promoted to PRIMARY — half the price of 3.1 ($10 vs $20
-    // per million audio tokens) and typically faster to first byte, and the
-    // voice test proved latency is the whole battle. 3.1 stays as fallback.
-    private let ttsModels = ["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview"]
+    // BUILD 143 (SUPERSEDED, kept for its reasoning): "2.5 promoted to
+    // PRIMARY — half the price of 3.1 ($10 vs $20 per million audio tokens)
+    // and typically faster to first byte." The latency half stopped being
+    // true the day 3.1 shipped streaming, and nobody noticed. The price half
+    // may still hold — but see the note on rendering below: it rests on a
+    // figure nobody has re-checked, and it is not worth a voice that changes
+    // halfway through a conversation.
+    // BUILD 259 — 3.1 FIRST, AND THIS ORDER IS THE WHOLE BUILD.
+    //
+    // These two were the other way round, and 3.1 was only ever reached if
+    // 2.5 outright failed. Google's own docs: "Streaming is supported for
+    // Text-to-Speech models starting with version 3.1." So the app has been
+    // pinned to the one model in its own list that CANNOT stream, and every
+    // reply waited for the entire clip to render before a single sample
+    // played. His log, repeatedly:
+    //
+    //     🐢 took 3462ms to render 10 characters
+    //     🐢 took 4939ms to render 17 characters
+    //
+    // Ten characters and three and a half seconds, because the cost is
+    // almost all round-trip and render setup — it barely varies with length.
+    // That is why it felt like nothing was responding.
+    //
+    // Why it was this way: when the voice was built, 2.5 preview was the only
+    // Gemini TTS there was. 3.1 arrived later with streaming, went into the
+    // list as a safety fallback, and nobody went back and asked whether the
+    // assumption behind the ordering still held. It didn't.
+    //
+    // 2.5 stays as the fallback, so a bad day on 3.1 lands exactly where the
+    // old primary was rather than on the robot voice.
+    private let ttsModels = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+
+    // BUILD 259 — ONE MODEL RENDERS EVERYTHING, AND I TRIED IT THE OTHER WAY
+    // FIRST.
+    //
+    // Four call sites render WITHOUT going through speakWithGemini — the
+    // voice self-test, warmCache, the per-step nav pre-render and the chunk
+    // warm. None of them stream, so I pinned them to 2.5 to keep build 143's
+    // half-the-price saving. Review killed it on two counts, both right:
+    //
+    //   1. VoiceCache's key is SHA256(voice|text) — THE MODEL IS NOT IN IT.
+    //      So a nav step pre-rendered by 2.5 and a live line streamed by 3.1
+    //      share a keyspace, and any prosodic difference between the two
+    //      model versions becomes the voice changing mid-conversation. That
+    //      is the exact complaint build 125 exists to prevent.
+    //   2. The self-test would have been pinned to the FALLBACK. Its whole
+    //      job is to say why the real voice is failing; on a key where 3.1
+    //      is quota-limited and 2.5 is fine it would have rendered happily
+    //      and announced "working fine" while every real line failed.
+    //
+    // So everything renders with ttsModels[0]. The price question is real,
+    // but it rests on a figure from build 143 that nobody has re-checked
+    // against current pricing, and a stale number is not a reason to ship a
+    // voice that changes halfway through a sentence. If it matters: verify
+    // the pricing, then put the model in the cache key, then split them.
+
+    /// Only 3.1 and later return audio progressively. A version test rather
+    /// than a substring one: `contains("-4")` matched any model with a `-4`
+    /// anywhere in its name, so a date- or size-suffixed non-streaming model
+    /// would have been classified as streaming and cost a failed attempt —
+    /// up to the twenty-second timeout — before falling back.
+    private func modelStreams(_ model: String) -> Bool {
+        guard let r = model.range(of: #"gemini-(\d+)\.(\d+)"#, options: .regularExpression) else {
+            return false
+        }
+        let nums = model[r].dropFirst("gemini-".count).split(separator: ".")
+        guard nums.count == 2, let major = Int(nums[0]), let minor = Int(nums[1]) else { return false }
+        return major > 3 || (major == 3 && minor >= 1)
+    }
+
+    /// BUILD 259 — one bad streaming attempt turns streaming off for the rest
+    /// of the session and everything falls back to the proven whole-clip path.
+    ///
+    /// This is deliberate cowardice. This file has a documented history of
+    /// silent-forever bugs — a dropped completion handler, a detached node, a
+    /// stopped engine — and a new progressive playback path is exactly the
+    /// kind of change that can produce one. The worst case has to be "no
+    /// better than yesterday", never "no voice at all".
+    /// Stored as a MOMENT, not a flag, and it clears itself after five
+    /// minutes. Review pointed at this file's own argument against a
+    /// permanent latch, twenty lines from here: geminiVoiceGaveUp decays for
+    /// exactly this reason, because "half an hour of robot over one bad
+    /// moment was the real insult." A single 429 or a dropped socket must not
+    /// switch off this build's whole point for the rest of the day — and this
+    /// app stays resident for hours, so "the session" meant the day.
+    nonisolated(unsafe) private static var streamingGaveUpAt: Date?
+    private static var streamingGaveUp: Bool {
+        get {
+            guard let t = streamingGaveUpAt else { return false }
+            if Date().timeIntervalSince(t) > 300 { streamingGaveUpAt = nil; return false }
+            return true
+        }
+        set { streamingGaveUpAt = newValue ? Date() : nil }
+    }
 
     /// Gemini prebuilt voice. Change via UserDefaults key "chappy_tts_voice".
     /// Nice options: Kore (warm female), Puck (male), Aoede, Charon, Fenrir, Leda.
@@ -293,6 +383,11 @@ class TTSService: NSObject, ObservableObject {
     private let continuationLock = NSLock()
 
     private var currentTask: Task<Void, Never>?
+    /// BUILD 258 — lines currently being pre-rendered, so the same uncached
+    /// short line asked for twice inside one render window costs one call
+    /// rather than two. See the note in prerenderNow.
+    nonisolated(unsafe) private static var rendersInFlight = Set<String>()
+    private let inFlightLock = NSLock()
 
     /// BUILD 254 — THE QUEUE BEHIND THE SENTENCE.
     ///
@@ -386,7 +481,34 @@ class TTSService: NSObject, ObservableObject {
     /// left the flag true forever: the ear stayed armed, the chip stayed lit,
     /// and not one word was ever routed again. Generation + watchdog below make
     /// that state unreachable.
-    private var speechGeneration = 0
+    /// BUILD 259 — BEHIND A LOCK, because 259 made it load-bearing.
+    ///
+    /// Before this build ONE site made a teardown decision on this counter.
+    /// Now three do, and one of them is an error path that stops the SHARED
+    /// player node. beginSpeaking's own doc still says "callers are
+    /// main-thread in practice" — which is word for word the justification
+    /// this file identifies, forty lines up, as the cause of the build-80
+    /// hang. Leaving that phrase load-bearing in three places is how this
+    /// file has been bitten twice.
+    ///
+    /// A lock rather than @MainActor, deliberately: annotating beginSpeaking
+    /// is exactly what failed the build-69 archive and got the isolation
+    /// stripped out in the first place. This is the same NSLock pattern
+    /// already used four times in this file, and it drops a main-actor hop
+    /// out of the audio teardown path as a bonus — the hop at the top of the
+    /// stream catch sat between a failed render and clearing the node, at the
+    /// moment the main queue is busiest with barge-in work.
+    private let genLock = NSLock()
+    private var _speechGeneration = 0
+    private func bumpGeneration() -> Int {
+        genLock.lock(); defer { genLock.unlock() }
+        _speechGeneration &+= 1
+        return _speechGeneration
+    }
+    private func generationIsCurrent(_ g: Int) -> Bool {
+        genLock.lock(); defer { genLock.unlock() }
+        return _speechGeneration == g
+    }
     private var speakingWatchdog: Task<Void, Never>?
     /// When the current utterance was started — lets callers detect a stuck flag.
     private(set) var speakingSince: Date?
@@ -536,8 +658,7 @@ class TTSService: NSObject, ObservableObject {
     /// was a compile error (build 69, caught at archive). State mutation here
     /// matches the file's existing pattern: callers are main-thread in practice.
     private func beginSpeaking(estimatedCharacters: Int) -> Int {
-        speechGeneration &+= 1
-        let gen = speechGeneration
+        let gen = bumpGeneration()
         setSpeaking(true, since: Date())
 
         // Ceiling: no utterance Chappy produces runs longer than this. Even a
@@ -549,7 +670,7 @@ class TTSService: NSObject, ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(ceiling * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             await MainActor.run {
-                guard self.speechGeneration == gen, self.isSpeaking else { return }
+                guard self.generationIsCurrent(gen), self.isSpeaking else { return }
                 print("⏱️ [TTS] Watchdog: speech never reported completion after \(Int(ceiling))s — releasing the mic gate")
                 self.setSpeaking(false, since: nil)
                 // Unblock anything still parked on a continuation.
@@ -564,7 +685,7 @@ class TTSService: NSObject, ObservableObject {
     /// Callers hop to the main thread via Task { @MainActor in ... } — the
     /// method itself stays nonisolated so those Tasks compile.
     private func endSpeaking(_ gen: Int) {
-        guard speechGeneration == gen else { return }
+        guard generationIsCurrent(gen) else { return }
         setSpeaking(false, since: nil)
         speakingWatchdog?.cancel()
         speakingWatchdog = nil
@@ -1000,6 +1121,74 @@ class TTSService: NSObject, ObservableObject {
             speak(trimmed, languageCode: languageCode)
             return
         }
+
+        // BUILD 258 — SHORT ACKNOWLEDGEMENTS GO OUT INSTANTLY.
+        //
+        // Measured in his own log, not guessed:
+        //
+        //     🐢 took 3462ms to render 10 characters
+        //     🐢 took 4939ms to render 17 characters
+        //     🐢 took 4080ms to render 24 characters
+        //
+        // Three to five seconds to say "Done." That is most of what "it's not
+        // responding" actually is. Google's TTS latency barely varies with
+        // length, so the shorter the line, the worse the ratio — and the
+        // shortest lines are exactly the ones that need to land immediately:
+        // "Done.", "Route's off.", "Right here.", "Opening Google Maps."
+        //
+        // So: under thirty characters and not already cached, use the device
+        // voice, which starts in milliseconds. Anything longer — a real
+        // answer, where the voice quality is what he is listening to — still
+        // goes to Gemini.
+        //
+        // The cache line above stays first, so a short line he hears often
+        // keeps the good voice from its second use onward. This only bites on
+        // the first time a short line is ever spoken.
+        //
+        // This is NOT the failure fallback and must never be confused with
+        // it: nothing is latched, no failure is recorded, and the next long
+        // line renders normally. It is a deliberate choice of voice for a
+        // class of line, made on latency grounds.
+        // BRACKETED, and I nearly shipped it without. `isSpeaking` is written
+        // only by beginSpeaking/endSpeaking/stop, and it is the gate for
+        // barge-in, for the mic suppression that stops Chappy transcribing
+        // himself, and for the follow-up door that build 256 exists to fix.
+        // Calling the system path directly leaves it false for the whole
+        // utterance — so the ear would route his own voice back at him and no
+        // door would ever open after a short line. stop() first, exactly as
+        // speak() does, or the previous line keeps playing underneath.
+        if !wantsSystemVoice, trimmed.count <= 30 {
+            print("🔊 [TTS] Short line (\(trimmed.count) chars) — device voice now, Gemini cached for next time")
+            stop()
+            lastSpokenLine = trimmed
+            let gen = beginSpeaking(estimatedCharacters: trimmed.count)
+            // ASSIGNED TO currentTask, and review caught that it wasn't. stop()
+            // and the next speak() both cancel through that handle; an orphan
+            // Task is unreachable by either, so a nav summary landing a
+            // millisecond later would have played Gemini over the top of this
+            // device voice — two lines at once. The isCancelled check closes
+            // the remaining gap between assignment and the first await.
+            currentTask = Task { [weak self] in
+                guard let self else { return }
+                defer { Task { @MainActor in self.endSpeaking(gen) } }
+                guard !Task.isCancelled else { return }
+                await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
+            }
+            // AND WARM THE CACHE, or this becomes the bug build 125 removed.
+            //
+            // My first cut claimed the good voice returned "from its second
+            // use onward". It would not have: the cache is only written by the
+            // Gemini render path, which this branch skips — so any short line
+            // outside the hardcoded warm list would have used the device voice
+            // FOREVER, alternating with Gemini on every longer sentence. This
+            // file's own note at build 125 is blunt about that: "it made
+            // Chappy change sex every other sentence. Length is not a sane way
+            // to choose a voice." Rendering it quietly in the background makes
+            // the length rule a first-time-only latency dodge, which is what
+            // it was always meant to be.
+            prerenderNow([trimmed])
+            return
+        }
         if trimmed.count >= 80, Self.sentenceChunks(trimmed).count > 1 {
             speakLong(trimmed, languageCode: languageCode)
             return
@@ -1077,10 +1266,31 @@ class TTSService: NSObject, ObservableObject {
         guard voice != "System" else { return }
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty else { return }
-        let missing = lines.filter { !VoiceCache.shared.has(text: $0, voice: voice) }
+        // BUILD 258 — DON'T RENDER THE SAME LINE TWICE AT ONCE.
+        //
+        // `has()` stays false for the three or four seconds a render takes, so
+        // asking for the same uncached line twice inside that window fired two
+        // identical Gemini renders, charged the meter twice and wrote the same
+        // cache file twice. Harmless before, when this was only called from
+        // the warm list; it matters now that every short line comes through
+        // here — say "flights" twice in quick succession and that is exactly
+        // the shape.
+        var missing = lines.filter { !VoiceCache.shared.has(text: $0, voice: voice) }
+        inFlightLock.lock()
+        missing = missing.filter { Self.rendersInFlight.insert($0).inserted }
+        inFlightLock.unlock()
         guard !missing.isEmpty else { return }
+        let claimed = missing
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
+            // Released on EVERY exit — the break paths above included, or a
+            // line that failed once could never be retried for the life of
+            // the process.
+            defer {
+                self.inFlightLock.lock()
+                for l in claimed { Self.rendersInFlight.remove(l) }
+                self.inFlightLock.unlock()
+            }
             for line in missing {
                 if Self.geminiVoiceGaveUp { break }
                 do {
@@ -1343,6 +1553,37 @@ class TTSService: NSObject, ObservableObject {
             // render, a slow PLAYBACK start, or the offline fallback kicking
             // in all look identical from the outside — silence, then a voice.
             let began = Date()
+
+            // BUILD 259 — TRY STREAMING FIRST, AND MEAN IT ONLY ONCE.
+            //
+            // On a streaming-capable model the audio starts on the first
+            // chunk, so this branch both renders AND plays, and returns
+            // straight out. Anything at all going wrong sends us down the
+            // proven whole-clip path below with nothing lost — and switches
+            // streaming off for FIVE MINUTES, because a path that failed once
+            // in this file has a habit of failing again and the failure mode
+            // is silence. Five, not forever: see the note on streamingGaveUp.
+            if !Self.streamingGaveUp, modelStreams(model) {
+                do {
+                    let streamed = try await streamGeminiAudio(text: text, model: model,
+                                                               apiKey: apiKey, gen: gen)
+                    let ms = Int(Date().timeIntervalSince(began) * 1000)
+                    ChappyStandbyLog.note("⚡ [TTS] \(model) streamed \(text.count) characters, \(ms)ms end to end")
+                    VoiceCache.shared.save(streamed, text: text, voice: voiceName)
+                    Self.geminiVoiceGaveUp = false
+                    return
+                } catch is CancellationError {
+                    return                     // barged in on — normal
+                } catch TTSError.modelNotFound {
+                    ChappyStandbyLog.note("⚠️ [TTS] \(model) has no streaming endpoint — whole-clip from here")
+                    Self.streamingGaveUp = true
+                } catch {
+                    if Task.isCancelled { return }
+                    ChappyStandbyLog.note("⚠️ [TTS] Streaming failed (\(error.localizedDescription)) — whole-clip for the next five minutes")
+                    Self.streamingGaveUp = true
+                }
+            }
+
             do {
                 audio = try await requestGeminiAudio(text: text, model: model, apiKey: apiKey)
                 try Task.checkCancellation()
@@ -1397,6 +1638,223 @@ class TTSService: NSObject, ObservableObject {
             }
         }
         throw lastError
+    }
+
+    /// BUILD 259 — SPEAK ON THE FIRST CHUNK, NOT THE LAST.
+    ///
+    /// `:streamGenerateContent?alt=sse` returns the audio in pieces as it is
+    /// generated. Each piece is scheduled into the player node the moment it
+    /// lands, so the voice starts after the FIRST chunk instead of after the
+    /// whole clip. On a short line that is the difference between three and a
+    /// half seconds and a few hundred milliseconds.
+    ///
+    /// The playback half needed almost nothing new: this file has always used
+    /// AVAudioEngine with a player node and scheduled PCM buffers, which is
+    /// already the right shape for progressive audio. What is new is a counter
+    /// and a gate, because the "am I finished" question changes from "did that
+    /// one buffer complete" to "has the stream ended AND has every buffer
+    /// drained".
+    ///
+    /// Returns the whole clip so the caller can still cache it — a cached line
+    /// then plays instantly next time and never touches the network at all.
+    ///
+    /// THROWS on any failure, so the caller can fall back to the whole-clip
+    /// path. If audio had already started, the node is stopped and reset on
+    /// the way out — otherwise the fallback's buffers QUEUE BEHIND the
+    /// fragment already playing and he hears the first half of the line
+    /// twice. An earlier draft of this comment claimed the function handled
+    /// that by returning rather than throwing; it did not, and review caught
+    /// the comment describing code that was never written.
+    private func streamGeminiAudio(text: String, model: String,
+                                   apiKey: String, gen: Int) async throws -> Data {
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse"
+        guard let url = URL(string: urlString) else { throw TTSError.invalidURL }
+
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": text]]]],
+            "generationConfig": [
+                "responseModalities": ["AUDIO"],
+                "speechConfig": [
+                    "voiceConfig": [
+                        "prebuiltVoiceConfig": ["voiceName": voiceName]
+                    ]
+                ]
+            ]
+        ]
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue(apiKey, forHTTPHeaderField: "X-goog-api-key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 20
+
+        // HEADERS FIRST, THEN THE ENGINE. Review caught the original order:
+        // the audio session was ducked and the engine started BEFORE a
+        // request with a twenty-second timeout. On a captive wifi or in
+        // aeroplane mode his music ducked instantly and then sat in silence
+        // for twenty seconds before anything fell back. bytes(for:) returns
+        // as soon as the headers land, which is still comfortably ahead of
+        // the first chunk — which is all "before the audio arrives" ever
+        // needed to mean.
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
+        if http.statusCode == 404 { throw TTSError.modelNotFound }
+        guard http.statusCode == 200 else { throw TTSError.httpError(http.statusCode) }
+
+        configureAudioSession()
+        startPlaybackEngine()
+        guard let playbackEngine, playbackEngine.isRunning,
+              let fmt = playbackFormat,
+              let node = playerNode, node.engine != nil else {
+            scheduleEngineIdle()      // reachable after a media-services reset
+            throw TTSError.noAudio
+        }
+        node.play()
+
+        var whole = Data()
+        var carry = Data()
+        var scheduled = 0
+        var drained = 0
+        var streamEnded = false
+        var firstChunkAt: Date?
+        let tally = NSLock()
+        let gate = ResumeGate()
+
+        // Resumed exactly once, by whichever gets there first: the last
+        // buffer draining, or the safety timeout below.
+        func settleIfDone() {
+            tally.lock()
+            let done = streamEnded && drained >= scheduled
+            tally.unlock()
+            if done { _ = gate.fire() }
+        }
+
+        do {
+            for try await line in bytes.lines {
+                if Task.isCancelled { break }
+                guard line.hasPrefix("data:") else { continue }
+                let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                guard !payload.isEmpty, payload != "[DONE]",
+                      let jsonData = payload.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                      let candidates = json["candidates"] as? [[String: Any]],
+                      let content = candidates.first?["content"] as? [String: Any],
+                      let parts = content["parts"] as? [[String: Any]] else { continue }
+
+                for part in parts {
+                    // Checked in here too. One SSE event can carry several
+                    // parts, and without this a fragment of a killed
+                    // utterance gets queued ahead of the new one and plays
+                    // first — stopPlaybackEngine leaves the node attached, so
+                    // the engine check below does not catch it.
+                    if Task.isCancelled { break }
+                    guard let inline = part["inlineData"] as? [String: Any],
+                          let b64 = inline["data"] as? String,
+                          let chunk = Data(base64Encoded: b64), !chunk.isEmpty else { continue }
+                    whole.append(chunk)
+
+                    // A CARRY BYTE, because PCM16 samples are two bytes and a
+                    // chunk boundary need not respect that. createPCMBuffer
+                    // does `count / 2` and drops an odd trailing byte — so
+                    // one odd-length chunk would shift every sample after it
+                    // by a byte, and PCM16 read one byte out of phase is
+                    // full-scale white noise for the rest of the line. It
+                    // would also have been invisible on the second play,
+                    // because the CACHED copy is byte-exact.
+                    // BUILT FROM A FRESH Data, and that is the fix, not a
+                    // style choice. `carry + chunk` starts from a COPY OF
+                    // carry, and a Data slice keeps its parent's indices — so
+                    // after the first odd chunk `joined.startIndex` was 4000,
+                    // not 0. `suffix(from:)` takes an INDEX while `usable` is
+                    // a LENGTH, so the two silently disagreed: one trace
+                    // re-scheduled an entire previous chunk (he hears 83ms
+                    // twice, and carry grows for the rest of the line), and
+                    // another indexed outside the slice and TRAPPED. Starting
+                    // from empty forces startIndex to 0, which makes the two
+                    // agree — and keeps the buffer's base pointer 2-byte
+                    // aligned for createPCMBuffer's bindMemory.
+                    var joined = Data()
+                    joined.append(carry)
+                    joined.append(chunk)
+                    let usable = joined.count - (joined.count % 2)
+                    carry = usable < joined.count ? joined.suffix(from: usable) : Data()
+                    guard usable > 0,
+                          let buf = createPCMBuffer(from: joined.prefix(usable), format: fmt),
+                          node.engine != nil else { continue }
+                    if firstChunkAt == nil {
+                        firstChunkAt = Date()
+                        ChappyStandbyLog.note("⚡ [TTS] First audio chunk — speaking now")
+                    }
+                    tally.lock(); scheduled += 1; tally.unlock()
+                    node.scheduleBuffer(buf) {
+                        tally.lock(); drained += 1; tally.unlock()
+                        settleIfDone()
+                    }
+                }
+            }
+        } catch {
+            // MID-STREAM FAILURE, AND THE COMMENT USED TO PROMISE SOMETHING
+            // THE CODE DID NOT DO. A thrown error here left the node playing
+            // whatever had already been scheduled, and the caller then fell
+            // through to the whole-clip path — which QUEUES behind it, so he
+            // heard "Turn left ont—Turn left onto Ann Street." The node has
+            // to be cleared before the fallback is allowed to start.
+            // ONLY IF THE VOICE IS STILL MINE. `node` is the SHARED player
+            // node, and review caught this reintroducing AUDIT P0
+            // (TTS-STALE) verbatim: a cancelled stream throws from
+            // bytes.lines a few milliseconds AFTER the barge-in's new line
+            // has already found a cache hit and scheduled its buffer — so
+            // stopping the node here would discard the new utterance and the
+            // map would open in silence with nothing logged.
+            let mine = generationIsCurrent(gen)
+            if mine {
+                // node.engine != nil, same as stopPlaybackEngine does. A media
+            // services reset swaps playerNode out from under the `let` bound
+            // 130 lines up, and this is the path most likely to meet one.
+            if firstChunkAt != nil, node.engine != nil { node.stop(); node.reset() }
+                scheduleEngineIdle()
+            }
+            throw error
+        }
+        tally.lock(); streamEnded = true; tally.unlock()
+
+        guard firstChunkAt != nil else {
+            scheduleEngineIdle()          // nothing played — don't leave the route held
+            throw TTSError.noAudio
+        }
+
+        // Wait for the audio already scheduled to actually finish. The ceiling
+        // is computed from what was scheduled, so it is exact rather than a
+        // guess — same reasoning as playPCM's.
+        let seconds = Double(whole.count / 2) / fmt.sampleRate
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            gate.arm(c)
+            settleIfDone()                     // everything may already have drained
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds + 3.0) {
+                if gate.fire() {
+                    print("⏱️ [TTS] Streaming completion dropped — unparking after \(String(format: "%.1f", seconds + 3.0))s")
+                }
+            }
+        }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        // THE CANCELLATION CHECK THAT REVIEW CAUGHT, AND IT WAS THE WORST BUG
+        // IN THE BUILD. A barge-in breaks the loop above and falls through
+        // here holding a PARTIAL clip — and the caller's next act is to write
+        // it to VoiceCache, atomically, over the good copy. Every later play
+        // of that line would then load the truncated file, succeed, and never
+        // re-render: "Turn left ont—" on that street forever. The whole-clip
+        // path has had this exact guard since build 248; the streaming path
+        // was written without it.
+        try Task.checkCancellation()
+
+        // Same ownership rule as playPCM: only the generation that still owns
+        // the voice may stand the engine down.
+        let mine = generationIsCurrent(gen)
+        if mine { scheduleEngineIdle() }
+        return whole
     }
 
     private func requestGeminiAudio(text: String, model: String, apiKey: String) async throws -> Data {
@@ -1533,7 +1991,7 @@ class TTSService: NSObject, ObservableObject {
         // stopped the shared engine out from under it. The new answer died
         // mid-sentence for no visible reason. Only the generation that still
         // owns the voice is allowed to tear it down.
-        let mine = await MainActor.run { self.speechGeneration == gen }
+        let mine = generationIsCurrent(gen)
         guard mine else {
             print("🔊 [TTS] Stale utterance finished — leaving the current one alone")
             return
