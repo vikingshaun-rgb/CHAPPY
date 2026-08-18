@@ -3738,8 +3738,80 @@ final class ChappyStandby: NSObject, ObservableObject {
         "one sec", "hold on", "wait a minute", "give me a second",
     ]
 
+    /// BUILD 258 — THE "HEY" LOOP. THIS IS THE ONE HE FELT MOST.
+    ///
+    /// From his router log, twice in two minutes:
+    ///
+    ///     [pocket] "hey" -> smallReply : answered locally, free (532ms)
+    ///
+    /// He said "hey, take me to the gym". The recogniser delivered "hey"
+    /// first, on its own. The follow-up door was open — correctly, 256 made
+    /// it work — so "hey" routed as a command, ChappyPocket's smallReply
+    /// answered it with "I'm here.", and TTS then took four seconds to say
+    /// those nine characters. By the time it finished he was mid-sentence,
+    /// barge-in fired, and the actual command was gone. His console, exactly:
+    ///
+    ///     127.41s  Heard: "hey"   -> Follow-up, waiting 0.50s
+    ///     127.78s  Waiting 0.50s for the rest of ""      <- "hey" already gone
+    ///     129.18s  Heard: "take"  -> a NEW follow-up
+    ///     129.81s  Command: take me to
+    ///
+    /// One sentence became two commands, neither of them what he asked for.
+    ///
+    /// An attention word is not an instruction. It means "I am about to say
+    /// something" — which is a reason to HOLD THE DOOR OPEN and stay silent,
+    /// the exact treatment fillerWords already get. Kept separate from
+    /// fillerWords because these are also the bare greetings smallReply
+    /// answers on purpose when he leads with the wake word: "Chappy, hello"
+    /// still gets "I'm here." What must never happen is answering a greeting
+    /// he did not address to anyone.
+    ///
+    /// REVIEW CUT THREE ENTRIES AND EACH WOULD HAVE BROKEN SOMETHING REAL:
+    ///   - "right" is in ChappySlots.yeses, so holding it silently would have
+    ///     stalled every confirm — Chappy asks "did you mean the travel
+    ///     desk?", he says "right", nothing happens, ever.
+    ///   - "listen" is the spoken resume word for a paused Translate, which
+    ///     necessarily arrives through this very door.
+    ///   - "so um" is filler with a filler already in it; fillerWords has it.
+    /// Anything added here must be checked against the yes/no words and the
+    /// module resume words first.
+    static let attentionWords: Set<String> = [
+        "hey", "hi", "hello", "yo", "oi", "hiya", "morning", "g'day", "gday",
+        "hey there", "hi there", "excuse me",
+    ]
+
+    /// BUILD 258 — MIS-HEARD NAMES MUST NOT COST MONEY.
+    ///
+    /// Also from his log:
+    ///
+    ///     [ask] "jack"   -> quickAsk : Nothing matched (4549ms)
+    ///     [ask] "chucky" -> quickAsk : Nothing matched (4296ms)
+    ///
+    /// Those are the recogniser's attempts at "Chappy". He said the name, it
+    /// came back wrong, the wake-word scan missed, and the leftover token was
+    /// sent to the PAID brain as a general question — four and a half seconds
+    /// and real money to answer a word he never said.
+    ///
+    /// Every entry here is a real mis-hearing seen in his logs or a close
+    /// neighbour of one. Deliberately NOT including "happy" on its own: it is
+    /// a word he might genuinely use, and the cost of ignoring a real one is
+    /// worse than the cost of one stray lookup.
+    static let misheardNames: Set<String> = [
+        "chappe", "chappie", "chappi", "chapy", "chappy", "chappys",
+        "chucky", "chuckie", "checky", "shappy", "shabby", "chatty",
+        "tappy", "zappy", "jappy", "jack", "jeffy", "jeff", "jiffy",
+        "geoffrey", "jeffrey", "cheffy", "chevy",
+    ]
+
     /// Words that cannot end a finished sentence. If the last thing you said
     /// was one of these, you were still going.
+    /// BUILD 258 — the subset of danglingWords that CANNOT end a sentence.
+    /// "Take me to" needs a place; "help me" does not need anything.
+    static let danglingPrepositions: Set<String> = [
+        "to", "at", "in", "on", "for", "from", "with", "into", "onto",
+        "near", "by", "towards", "toward", "about", "over",
+    ]
+
     static let danglingWords: Set<String> = [
         "to", "at", "in", "on", "for", "from", "with", "into", "onto", "near",
         "by", "about", "of", "and", "or", "but", "the", "a", "an", "my", "our",
@@ -3771,12 +3843,43 @@ final class ChappyStandby: NSObject, ObservableObject {
         let text = t.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !text.isEmpty else { return false }
 
+        // A complete command is never unfinished, however it happens to end.
+        if terminalCommands.contains(text) { return false }
+
+        // BUILD 258 — A DANGLING PREPOSITION BEATS THE EXTENDABLE ESCAPE.
+        //
+        // THIS ORDER IS THE BUG HE HIT. The extendableCommands escape below
+        // used to come FIRST, and "take me to" is in extendableCommands. So a
+        // phrase that ends in a bare "to" — which is the clearest possible
+        // signal that he has not finished — got the 0.60s extendable window
+        // instead of the 3.0s hesitation window. His console:
+        //
+        //     129.20s  Waiting 3.00s for the rest of "take me"
+        //     129.20s  Waiting 0.60s for the rest of "take me to"
+        //     129.81s  Command: take me to
+        //
+        // It got MORE patient at "take me" and then LESS patient the moment
+        // he added the word that proves a destination is coming. It fired
+        // with nowhere to go, and the router logged it untagged.
+        //
+        // Nobody finishes a sentence on "to", "at", "from" or "into". The
+        // dangling test has to win.
+        // PREPOSITIONS ONLY, and review is why. danglingWords also contains
+        // "me", "it", "us" and "the" — perfectly good ways to END a sentence.
+        // Using the whole set here made bare "help me" wait three seconds
+        // before the coach line, which is dead air on a command that is
+        // complete as spoken. A trailing PREPOSITION is the narrow case where
+        // something must follow.
+        let earlyWords = text.split(separator: " ").map(String.init)
+        if earlyWords.count > 1, let tail = earlyWords.last,
+           Self.danglingPrepositions.contains(tail) {
+            return true
+        }
+
         // Words the extendable branch already handles get their own, SHORTER
         // window. Routing them here would make a bare "translate" sit silent
         // for three seconds, which is the opposite of the point.
         if extendableCommands.contains(text) { return false }
-        // A complete command is never unfinished, however it happens to end.
-        if terminalCommands.contains(text) { return false }
 
         if fillerWords.contains(text) { return true }
         if openerFragments.contains(text) { return true }
@@ -4755,7 +4858,14 @@ final class ChappyStandby: NSObject, ObservableObject {
                                             Date().addingTimeInterval(Self.followUpSeconds))
                     }
 
+                    // BUILD 258: attention words and mis-heard names join the
+                    // filler rule — hold the door, say NOTHING, and wait for
+                    // the sentence he was actually starting. See the notes on
+                    // attentionWords and misheardNames; between them they are
+                    // most of what routed as a command in his 09:09-09:13 run.
                     if t.count < 3 || Self.fillerWords.contains(t)
+                        || Self.attentionWords.contains(t)
+                        || Self.misheardNames.contains(t)
                         || Self.fillerWords.contains(where: { t == $0 || t.hasSuffix(" " + $0) }) {
                         if Date().timeIntervalSince(followUpOpenedAt) < Self.followUpMaxRun {
                             followUpUntil = Date().addingTimeInterval(Self.followUpSeconds)
@@ -4894,6 +5004,33 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// navDestination had openers the router hook did not, under a comment
     /// claiming they were identical.
     static func debounceWindow(for cleanTail: String, whole: String) -> Double {
+        // BUILD 259 — THE NAME ON ITS OWN IS NOT A FINISHED SENTENCE.
+        //
+        // "I say hey Chappy, and then it cuts in and relistens, and I can't
+        // talk any further." Here is why, from his own console:
+        //
+        //     21.63s  Heard: "hi chappy"  -> Woken
+        //     21.63s  Waiting 0.50s for the rest of ""
+        //     22.18s  Fresh transcript — tap left running
+        //
+        // An empty tail has zero words, so the word-count branch at the
+        // bottom handed it 0.50s. Half a second after saying the name — while
+        // he is still drawing breath — finish() ran on an empty command and
+        // called resetRecognition(), which THROWS AWAY THE TRANSCRIPT. The
+        // words he said next arrived as a brand-new fragment with no wake
+        // word in front of them, which is precisely the chopping 258 was
+        // fixing at the other end.
+        //
+        // Nobody says a name and means nothing by it. Two seconds.
+        //
+        // The "Yes?" that eventually answers a genuinely bare name is timed
+        // from finish(), so it was moved from 2.2s to 1.2s to compensate —
+        // total time to "Yes?" is unchanged at about three seconds, and the
+        // ear now stays intact for all of it. Precisely: 0.50 + 2.2 = 2.7s
+        // before, 2.0 + 1.2 = 3.2s now — half a second longer, not
+        // "unchanged" as an earlier draft of this said. The half second buys
+        // a transcript that survives, which is the entire point.
+        if cleanTail.isEmpty { return 2.0 }
         // ============ THINKING TIME ============
         // 0.6s of silence meant "he's finished". Real speech does not work
         // that way: "take me to… um… that place near the beach" pauses in the
@@ -5351,7 +5488,56 @@ final class ChappyStandby: NSObject, ObservableObject {
         // ============================================================
     ]
 
-    private func finish(_ raw: String) {
+    private func finish(_ raw: String, typed: Bool = false) {
+        // BUILD 258 — HIS OWN NAME, MIS-HEARD, IS NOT A QUESTION.
+        //
+        // From his log: [ask] "jack" -> quickAsk (4549ms) and [ask] "chucky"
+        // -> quickAsk (4296ms). Both are the recogniser's attempts at
+        // "Chappy". The wake-word scan missed, barge-in fired on the near
+        // miss, and the leftover token was routed as a general question to
+        // the PAID brain — four and a half seconds and real money to answer a
+        // word he never said. Twice in thirty seconds.
+        //
+        // Caught here rather than in the follow-up branch because the live
+        // case arrives with `awake` already true: he says the name, it comes
+        // back as something else, and the leftover token is the command tail.
+        //
+        // HONEST SCOPE, corrected after review: about a third of misheardNames
+        // are themselves wake words, so those can never reach here — the wake
+        // scan claims them and leaves an empty tail, which the bare-"Chappy"
+        // path below already handles. The entries that actually bite are the
+        // ones that are NOT wake words: chucky, jack, jeffy, chevy and their
+        // neighbours. The rest are listed for the next reader's benefit.
+        //
+        // NOT for typed input. The ask field exists precisely for when the
+        // ear is broken, so silently dropping a word he TYPED is the worst
+        // possible place for a mishearing guard — nothing can be misheard
+        // through a keyboard.
+        //
+        // AND IT DOES NOT TOUCH `busy`. My first cut cleared it here, above
+        // the re-entry guard below — so a stray token arriving during a paid
+        // call would have unlocked the door on a route still in flight, and
+        // the next sentence would have started a second one. Two paid calls,
+        // two voices: verbatim the failure the AUDIT FIX note below prevents.
+        let bare = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).lowercased()
+        if !typed, Self.misheardNames.contains(bare) {
+            ChappyStandbyLog.note("👂 [Standby] '\(bare)' is the name mis-heard — holding, not answering")
+            awake = false
+            // Both clocks, not just the deadline. Setting followUpUntil alone
+            // opened a door the run ceiling then slammed on the NEXT sentence
+            // — because followUpOpenedAt was still minutes old — and that
+            // sentence was discarded with "name required again". The haptic
+            // matters too: in a pocket, "heard and held" and "never heard"
+            // are otherwise identical.
+            if Date().timeIntervalSince(followUpOpenedAt) > Self.followUpMaxRun {
+                followUpRunStartedAt = Date()
+            }
+            followUpOpenedAt = Date()
+            followUpUntil = max(followUpUntil, Date().addingTimeInterval(Self.followUpSeconds))
+            ChappyHaptics.shared.straightStep()
+            resetRecognition()
+            return
+        }
         // AUDIT FIX (HIGH — re-entry): a second command arriving while one is
         // still routing used to run BOTH concurrently — two paid calls, two
         // voices, and a `busy` flag that stopped meaning anything.
@@ -5509,7 +5695,14 @@ final class ChappyStandby: NSObject, ObservableObject {
             }
             emptyPromptWork?.cancel()
             emptyPromptWork = waitWork
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: waitWork)
+            // BUILD 259: 2.2 -> 1.2. The debounce above now spends 2.0s
+            // waiting for the command before this branch is reached at all,
+            // so the old value would have pushed "Yes?" out past four
+            // seconds. Time to "Yes?" goes 0.50+2.2 = 2.7s to 2.0+1.2 =
+            // 3.2s — half a second LONGER, not unchanged as an earlier draft
+            // of this claimed. The half second buys a transcript that
+            // survives instead of being thrown away while he draws breath.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: waitWork)
             resetRecognition()
             return
         }
@@ -5730,7 +5923,7 @@ final class ChappyStandby: NSObject, ObservableObject {
         // reported this route as having taken eight thousand milliseconds. The
         // moment he hit send IS the moment his input ended.
         lastWordAt = Date()
-        finish(cleaned)
+        finish(cleaned, typed: true)   // BUILD 258: nothing typed was misheard
     }
 
     /// Discard the accumulated transcript and listen fresh.
@@ -6561,6 +6754,14 @@ final class ChappyStandby: NSObject, ObservableObject {
         // is. What ends is Chappy's route and Chappy's card.
         if Self.asksToCloseTheMap(c) {
             let hadRoute = NavEngine.shared.isNavigating
+            // Logged AFTER hadRoute, and saying which of the two it was. My
+            // first cut always claimed "route stopped" — in the build whose
+            // point is a log that stops lying by omission, that would have
+            // been lying by commission.
+            ChappyRouterLog.shared.add(heard: c, tier: "nav", tool: "closeMap",
+                                       outcome: hadRoute ? "route stopped, map cleared"
+                                                         : "map cleared, no route was running",
+                                       ms: ChappyStandby.msSinceRouteStart)
             pendingMapsHandoff = false
             expectingMapsAnswerUntil = .distantPast
             NavEngine.shared.stop(announce: false)
@@ -6578,6 +6779,11 @@ final class ChappyStandby: NSObject, ObservableObject {
             "i'm done", "im done", "all done", "we're done", "were done",
             "get out", "back out", "cancel that", "never mind that",
             "close it down", "shut this"].contains(where: { c == $0 || c.hasPrefix($0 + " ") }) {
+            // BUILD 258: tagged. "close", "open" and friends were the other
+            // half of his untagged log.
+            ChappyRouterLog.shared.add(heard: c, tier: "module", tool: "close",
+                                       outcome: "closed everything on screen",
+                                       ms: ChappyStandby.msSinceRouteStart)
             ChappyEarcon.shared.done()
             // NOT stop() — LiveAIManager has stopSession() (async) and
             // triggerStop() (the fire-and-forget wrapper the UI uses).
@@ -8636,6 +8842,22 @@ final class ChappyStandby: NSObject, ObservableObject {
 
         // 3b. A screen, said out loud, however he happened to say it.
         if let tile = ChappyTiles.match(c) {
+            // BUILD 258 — TAGGED, BECAUSE THE LOG HAS BEEN LYING BY OMISSION.
+            //
+            // This one branch handles "open translate", "open atlas", "open
+            // google maps", "flights", "navigate" — most of what he says. It
+            // has never logged a tier, so every one of them came back as
+            // [untagged] "may still have worked", and I have spent two builds
+            // reading a log that under-reports its own successes. From his
+            // 09:09-09:13 run, nine of thirteen lines were untagged and at
+            // least one of them — "open translate" — plainly worked, because
+            // the console shows the ear handing off a moment later.
+            //
+            // Logged at the TOP so all three exits below are covered.
+            ChappyRouterLog.shared.add(heard: c, tier: "tile",
+                                       tool: tile.words.first ?? "screen",
+                                       outcome: "opened the screen",
+                                       ms: ChappyStandby.msSinceRouteStart)
             ChappyEarcon.shared.done()
             NotificationCenter.default.post(name: tile.note, object: nil)
             // BUILD 197: opening the screen is the least a screen can do.
