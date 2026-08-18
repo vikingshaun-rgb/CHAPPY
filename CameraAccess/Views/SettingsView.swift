@@ -2380,6 +2380,22 @@ struct LiveAICheckView: View {
 struct CommandLogView: View {
     @State private var entries: [ChappyRouterLog.Entry] = []
     @State private var copied = false
+    /// BUILD 262 — the switch that decides whether the shadow router runs
+    /// at all. @AppStorage on the SAME key ChappyShadow reads, so this is
+    /// the one control, not a copy of one.
+    @AppStorage("chappy_shadow") private var shadowOn = true
+    /// And a separate control for whether the rows are SHOWN. The two are
+    /// not the same question: with shadowing on, this screen carries twice
+    /// as many rows, and there are days when he wants to read what Chappy
+    /// actually did without the commentary.
+    ///
+    /// BUILD 262, AFTER REVIEW: @AppStorage, not @State. As @State it reset
+    /// to false on every visit, which is not a setting, it is a fidget. It
+    /// is also NOT disabled when shadowing is off — my first cut greyed it
+    /// out, which meant following the footer's own instruction (hide the
+    /// rows, then turn shadowing off) left the old mint rows hidden behind
+    /// a switch he could no longer touch.
+    @AppStorage("chappy_shadow_hide") private var hideShadow = false
 
     /// BUILD 253 — A STORED PUBLISHER, and the reason is already written
     /// out in this same file, on VoiceCheckView's `logTick`.
@@ -2424,6 +2440,12 @@ struct CommandLogView: View {
         // command failed — several tiers still don't name themselves. Red
         // would be a claim this screen cannot back up.
         case "untagged": return .orange
+        // BUILD 262 — mint, and deliberately not a colour any real tier
+        // uses. A SHADOW row did not happen. It is the model saying what
+        // it WOULD have done with the sentence directly above it, and the
+        // one thing this screen must never do is let a hypothetical be
+        // mistaken for a decision.
+        case "shadow": return .mint
         default: return AppColors.textSecondary
         }
     }
@@ -2493,12 +2515,48 @@ struct CommandLogView: View {
                 HStack {
                     Text("Newest first")
                     Spacer()
-                    Text("\(entries.count) routed")
+                    // BUILD 262: shadow rows counted separately. They are
+                    // not routed sentences, and folding them into a number
+                    // labelled "routed" would inflate the one figure on
+                    // this screen that is supposed to be a count of things
+                    // that actually happened.
+                    Text("\(entries.filter { $0.tier != "shadow" }.count) routed")
                         .font(AppTypography.caption)
                         .foregroundColor(AppColors.textSecondary)
                 }
             } footer: {
-                Text("TIER is which layer claimed the sentence \u{2014} tiles is a screen name, answer is a module answering outright, reference resolved \u{201C}that one\u{201D} to a saved place, flow is a multi-step tool, intent and plan are the smart layers, ask is a general question answered by the cheap brain, model is the session with tools, net is a background network result rather than a routing decision, and UNTAGGED in amber means no tier recorded a working decision at all.\n\nUNTAGGED does NOT mean it failed. Navigation, briefs, timers, lists and the screen openers still don\u{2019}t name themselves in this log, so a command that worked perfectly can land there. It means the RECORD has a gap. If the command also did nothing, that is the line to send me.\n\nThe ms is the wait from when you stopped talking to when that decision was made. Amber past a second, red past two and a half. Before build 253 most tiers wrote a hardcoded 1ms, which looked instant and meant nothing; they all read the same clock now.\n\nTwo limits worth knowing. Say something else within eight seconds and the first sentence\u{2019}s gap check is dropped, rather than risk pinning it on the wrong sentence. And on a compound (\u{201C}do this and do that\u{201D}) a later half can make an earlier half look accounted for.")
+                Text("TIER is which layer claimed the sentence \u{2014} tiles is a screen name, answer is a module answering outright, reference resolved \u{201C}that one\u{201D} to a saved place, flow is a multi-step tool, intent and plan are the smart layers, ask is a general question answered by the cheap brain, model is the session with tools, net is a background network result rather than a routing decision, and UNTAGGED in amber means no tier recorded a working decision at all.\n\nSHADOW in mint is the odd one out and is not a tier at all: it is build 262 asking the smart router what it WOULD have done with the sentence above it. Nothing on a mint row happened. The switch for it is at the bottom of this screen.\n\nUNTAGGED does NOT mean it failed. Navigation, briefs, timers, lists and the screen openers still don\u{2019}t name themselves in this log, so a command that worked perfectly can land there. It means the RECORD has a gap. If the command also did nothing, that is the line to send me.\n\nThe ms is the wait from when you stopped talking to when that decision was made. Amber past a second, red past two and a half. Before build 253 most tiers wrote a hardcoded 1ms, which looked instant and meant nothing; they all read the same clock now.\n\nTwo limits worth knowing. Say something else within eight seconds and the first sentence\u{2019}s gap check is dropped, rather than risk pinning it on the wrong sentence. And on a compound (\u{201C}do this and do that\u{201D}) a later half can make an earlier half look accounted for.")
+            }
+
+            // ============================================================
+            // BUILD 262 — THE SHADOW ROUTER. STAGE ONE OF THREE.
+            // ============================================================
+            Section {
+                Toggle(isOn: $shadowOn) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Ask the smart router too")
+                            .foregroundColor(AppColors.textPrimary)
+                        Text("It never acts. It only says what it would have done.")
+                            .font(AppTypography.caption)
+                            .foregroundColor(AppColors.textSecondary)
+                    }
+                }
+                Toggle(isOn: $hideShadow) {
+                    Text("Hide those rows")
+                        .foregroundColor(AppColors.textPrimary)
+                }
+                HStack {
+                    Text("Asked today")
+                        .foregroundColor(AppColors.textSecondary)
+                    Spacer()
+                    Text("\(ChappyShadow.usedToday) of \(ChappyShadow.capPerDay)")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(AppColors.textSecondary)
+                }
+            } header: {
+                Text("Shadow")
+            } footer: {
+                Text("Every command you give still routes exactly as it does now \u{2014} same branches, same answers, same speed. In parallel, the model that reads the tool list is asked what IT would have done with the same sentence, and the answer is written here as a MINT row underneath. It is never spoken and never run.\n\nThis is how the next two builds get decided. Where the mint row and the row above it agree, the ladder is doing its job. Where they disagree \u{2014} and especially where the row above says UNTAGGED or ASK \u{2014} that is a sentence the model understood and the ladder did not, and it is the evidence for handing that sentence to the model first.\n\nIt costs a fraction of a cent per command and stops on its own after 300 in a day. Turn it off once there is enough in the log to read.")
             }
 
             Section {
@@ -2531,10 +2589,15 @@ struct CommandLogView: View {
         // is a screen that will be blamed for the gap.
         .onAppear { reload() }
         .onReceive(logTick) { _ in reload() }
+        // Without this the filter takes up to two seconds to appear to do
+        // anything, and a switch that looks broken gets flicked twice.
+        .onChange(of: hideShadow) { _, _ in reload() }
     }
 
     private func reload() {
-        entries = ChappyRouterLog.shared.entries.sorted { $0.at > $1.at }
+        let all = ChappyRouterLog.shared.entries
+        entries = (hideShadow ? all.filter { $0.tier != "shadow" } : all)
+            .sorted { $0.at > $1.at }
     }
 }
 
