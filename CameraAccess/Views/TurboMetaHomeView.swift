@@ -8324,32 +8324,37 @@ struct AtlasView: View {
     @State private var selectedStop: ChappyAtlas.Stop?
     @State private var selectedPlace: ChappyAtlas.Place?
     // ============================================================
-    // BUILD 265 — TAPPING APPLE'S OWN MAP LABELS.
+    // BUILD 269 — THE iOS 18 API IS OUT. IT FAILED HIS ARCHIVE.
     //
-    // The Atlas draws Woolworths, Pizza Hut, Australia Zoo and the rest as
-    // part of the base map, and until this build not one of them was
-    // interactive: only pins Chappy drew ITSELF could be tapped, which is
-    // why his own trail point opened a card and everything around it was
-    // dead. His words: "can't click on any place and pull up places or
-    // Google Maps on entire atlas or map".
+    // 265 made Apple's own base-map labels tappable here with
+    // MapSelection / MapFeature. I wrote in that build's notes that it was
+    // the one block I could not verify, because MapKit is not in this repo
+    // and there was no existing call site to check against. Review judged
+    // it iOS 17. It is iOS 18:
     //
-    // ⚠️ THE SELECTION BINDING IS THE ONE PART OF THIS BUILD I CANNOT
-    // VERIFY FROM SOURCE. MapKit is not in this repo, so unlike every
-    // other change I ship I cannot read the declaration and check the
-    // signature — I am going on the iOS 17 API as I know it. If the
-    // archive fails, it fails HERE, and the fix is three deletions: this
-    // state pair, the `selection:` argument on Map, and the .onChange
-    // block that reads it. Nothing else in 265 depends on them.
+    //   'MapSelection' is only available in iOS 18.0 or newer
+    //
+    // The deployment target is 17.0, so it is a hard error and it cost him
+    // an archive. Removed rather than guarded, because a stored property of
+    // an iOS-18-only type cannot be wrapped in #available — it would need
+    // the whole Atlas split behind @available, which is a bigger change
+    // than this fix should carry while he is blocked.
+    //
+    // WHAT SURVIVES: the ROUTE map keeps its tappable labels. That half
+    // uses MKMapView.selectableMapFeatures, which is iOS 16, so tapping a
+    // shop on the trail map still hands off to Google Maps.
+    //
+    // TO BRING IT BACK on the Atlas, iOS 17 has no equivalent — base-map
+    // feature selection is MKMapView only. It needs either the deployment
+    // target raised to 18, or the Atlas rebuilt on a UIViewRepresentable.
+    // Worth doing; not worth doing at midnight on a blocked build.
+    //
+    // AND THE FOUR LINES BELOW ARE WHY YOU CHECK A DELETION, NOT JUST AN
+    // INSERTION. My first cut of this removal deleted a RANGE — from my
+    // 265 comment down to `var initialTarget` — and took weather,
+    // satellite, pulse and showLegend with it. Ten "cannot find in scope"
+    // errors, and a second failed archive on a fix for a failed archive.
     // ============================================================
-    @State private var mapSelection: MapSelection<MKMapItem>?
-    @State private var tappedPOI: TappedPOI?
-
-    struct TappedPOI: Identifiable {
-        let id = UUID()
-        let name: String
-        let category: String
-        let coord: CLLocationCoordinate2D
-    }
     @State private var weather: ChappyAtlas.Weather?
     @State private var satellite = false
     @State private var pulse = false
@@ -8365,8 +8370,7 @@ struct AtlasView: View {
                 topFurniture
                 VStack {
                     Spacer()
-                    if let poi = tappedPOI { poiCard(poi) }
-                    else if let s = selectedStop { stopCard(s) }
+                    if let s = selectedStop { stopCard(s) }
                     else if let p = selectedPlace { placeCard(p) }
                     else { bottomBar }
                 }
@@ -8387,26 +8391,6 @@ struct AtlasView: View {
                     }
                 }
             }
-            // BUILD 265 — read the tapped base-map label. `feature` is set
-            // when he taps one of Apple's own POIs; `value` is set when a
-            // pin Chappy drew carries a tag, which none of ours do, so a
-            // nil feature means he tapped bare map and the card closes.
-            .onChange(of: mapSelection) { _, sel in
-                guard let f = sel?.feature, let name = f.title, !name.isEmpty else {
-                    withAnimation { tappedPOI = nil }
-                    return
-                }
-                withAnimation(.spring(response: 0.35)) {
-                    selectedStop = nil
-                    selectedPlace = nil
-                    tappedPOI = TappedPOI(
-                        name: name,
-                        category: f.pointOfInterestCategory?.rawValue
-                            .replacingOccurrences(of: "MKPOICategory", with: "") ?? "",
-                        coord: f.coordinate)
-                }
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            }
             .task {
                 atlas.build(span: span)
                 pulse = true
@@ -8421,7 +8405,7 @@ struct AtlasView: View {
     }
 
     private var map: some View {
-        Map(position: $camera, selection: $mapSelection) {
+        Map(position: $camera) {
             ForEach(atlas.legs) { leg in
                 MapPolyline(coordinates: leg.coords)
                     .stroke(leg.mode.tint.opacity(0.22), style: StrokeStyle(
@@ -8435,9 +8419,6 @@ struct AtlasView: View {
                 Annotation(stop.name, coordinate: stop.coord, anchor: .center) {
                     Button {
                         withAnimation(.spring(response: 0.35)) {
-                            // BUILD 265: clear the POI card too, or a tapped
-                            // shop label stays up and hides the stop card.
-                            tappedPOI = nil; mapSelection = nil
                             selectedPlace = nil
                             selectedStop = stop
                         }
@@ -8451,7 +8432,6 @@ struct AtlasView: View {
                 Annotation(p.name, coordinate: p.coord, anchor: .bottom) {
                     Button {
                         withAnimation(.spring(response: 0.35)) {
-                            tappedPOI = nil; mapSelection = nil
                             selectedStop = nil
                             selectedPlace = p
                         }
@@ -8701,53 +8681,6 @@ struct AtlasView: View {
         .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
         .overlay(RoundedRectangle(cornerRadius: 17).stroke(glowTint(s).opacity(0.5), lineWidth: 1))
         .shadow(color: glowTint(s).opacity(0.4), radius: 12)
-        .padding(.horizontal, 12).padding(.bottom, 14)
-        .transition(.move(edge: .bottom).combined(with: .opacity))
-    }
-
-    /// BUILD 265 — the card for one of Apple's own map labels.
-    ///
-    /// Same three things his own pins offer, because they are the three
-    /// things he actually does with a place: go there, keep it, or open it
-    /// properly. "Save here" writes a real ChappyMemory place, so the next
-    /// time he says "take me to the big mower" it resolves — which is the
-    /// whole point of being able to tap the thing in the first place.
-    private func poiCard(_ p: TappedPOI) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "mappin.circle.fill").foregroundStyle(.orange)
-                Text(p.name).font(.headline).foregroundStyle(.white).lineLimit(2)
-                Spacer()
-                Button { withAnimation { tappedPOI = nil; mapSelection = nil } } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-            }
-            if !p.category.isEmpty {
-                Text(p.category).font(.caption).foregroundStyle(.white.opacity(0.7))
-            }
-            HStack(spacing: 9) {
-                Button {
-                    Task { _ = await NavEngine.shared.navigate(to: p.name, driving: true) }
-                } label: { pill("Take me", "location.fill", .cyan) }
-                .buttonStyle(.plain)
-                Button {
-                    _ = TripRecorder.shared.saveSpot(named: p.name,
-                                                     lat: p.coord.latitude,
-                                                     lon: p.coord.longitude)
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    TTSService.shared.speak("Saved \(p.name).")
-                } label: { pill("Save here", "bookmark.fill", .yellow) }
-                .buttonStyle(.plain)
-                Button { Self.openInGoogleMaps(name: p.name, coord: p.coord) }
-                    label: { pill("Google Maps", "map.fill", .green) }
-                    .buttonStyle(.plain)
-            }
-        }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
-        .overlay(RoundedRectangle(cornerRadius: 17).stroke(Color.orange.opacity(0.5), lineWidth: 1))
-        .shadow(color: Color.orange.opacity(0.4), radius: 12)
         .padding(.horizontal, 12).padding(.bottom, 14)
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }

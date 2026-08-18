@@ -10,6 +10,17 @@ import UniformTypeIdentifiers
 import Combine   // BUILD 244: Timer.publish for the live standby log
 
 struct SettingsView: View {
+
+    /// BUILD 272. Read once from the bundle. `?? "?"` rather than a plausible
+    /// default on purpose - a question mark is a signal, and a made-up number
+    /// is the bug this row exists to end.
+    static var bundleVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    }
+    static var bundleBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+    }
+
     // BUILD 157 — the advanced-tools switch, read by the Home grid.
     @AppStorage("chappy_show_advanced") private var showAdvancedTools = false
     @ObservedObject var streamViewModel: StreamSessionViewModel
@@ -998,11 +1009,30 @@ struct SettingsView: View {
                 }
 
                 // About
+                //
+                // BUILD 272 — THE ROW I PROMISED FOUR BUILDS AGO, AND THE ONE
+                // THAT WOULD HAVE SAVED A WEEK.
+                //
+                // Builds 262 to 268 never reached his phone. Seven builds. The
+                // cause was a stale git remote, but the reason it went
+                // UNDETECTED for seven rounds is that nothing in the app ever
+                // said which build it was — so "is 264 installed?" could only
+                // be answered by me guessing from log symptoms, and I guessed
+                // wrong and told him it was.
+                //
+                // This row used to read a HARDCODED "2.0.0", which is worse
+                // than nothing: a version display that cannot be wrong looks
+                // authoritative and is never right. Read from the bundle now,
+                // so it is the truth about the binary that is running.
                 Section {
-                    InfoRow(title: "settings.version".localized, value: "2.0.0")
+                    InfoRow(title: "settings.version".localized,
+                            value: Self.bundleVersion)
+                    InfoRow(title: "Build", value: Self.bundleBuild)
                     InfoRow(title: "settings.sdkversion".localized, value: "0.7.0")
                 } header: {
                     Text("settings.about".localized)
+                } footer: {
+                    Text("Read from the app itself. If this build number is not the one you just archived, the code you are running is not the code you think it is \u{2014} which is exactly what happened for seven builds in August.")
                 }
             }
             .navigationTitle("settings.title".localized)
@@ -1959,6 +1989,8 @@ struct GoogleAPIKeySettingsView: View {
 
 struct ChappyVoiceSettingsView: View {
     @AppStorage("chappy_tts_voice") private var selectedVoice: String = "Kore"
+    @AppStorage("chappy_voice_provider") private var provider: String = "elevenLabs"
+    @AppStorage("chappy_11l_voice_name") private var elevenName: String = ""
     @ObservedObject private var tts = TTSService.shared
 
     // BUILD 139: the deep end added — Google ships 30 voices and the picker
@@ -1981,10 +2013,62 @@ struct ChappyVoiceSettingsView: View {
 
     var body: some View {
         List {
+            // BUILD 272 — WHO SPEAKS, ABOVE WHICH VOICE.
+            //
+            // The picker below chooses a GOOGLE voice, and it was the only
+            // voice control in the app. That is how Chappy ended up mute on 18
+            // August with no way out: one provider, on a preview tier, with a
+            // quota that could refuse him and no second door.
+            Section {
+                Picker("Voice from", selection: $provider) {
+                    Text("Google").tag("gemini")
+                    Text("ElevenLabs").tag("elevenLabs")
+                }
+                .pickerStyle(.segmented)
+
+                // BUILD 273 — ALWAYS VISIBLE, not gated on the switch above.
+                //
+                // This row used to appear only once the provider was already
+                // set to ElevenLabs, which meant the only way to reach the key
+                // field was to first switch Chappy onto a provider it had no
+                // key for. Set up back to front, and it would have looked
+                // broken in between.
+                NavigationLink {
+                    ElevenLabsVoiceView()
+                } label: {
+                    HStack {
+                        Text("ElevenLabs voice")
+                            .foregroundColor(AppColors.textPrimary)
+                        Spacer()
+                        Text(elevenName.isEmpty ? "ready" : elevenName)
+                            .font(AppTypography.caption)
+                            .foregroundColor(AppColors.textSecondary)
+                    }
+                }
+            } header: {
+                Text("Who speaks")
+            } footer: {
+                // One Text, not two with an empty one stacked under it.
+                Text(provider == "elevenLabs"
+                     ? "Chappy speaks through ElevenLabs \u{2014} about 75ms to first sound against Google's measured 4,200ms, billed per character rather than sharing your Google project's quota. If it fails, Chappy falls back to Google and then to the phone's own voice. Three doors, not one.\n\nONE EXCEPTION, worth knowing: Live AI and Live Translate are realtime sockets with Google's voice built into them, so those two still speak in the Google voice picked below. There is no ElevenLabs equivalent inside a live session."
+                     : "Google's speech models are all PREVIEW models, which is where Google caps hardest. That is what left Chappy silent on 18 August. Switching to ElevenLabs puts the voice on a different company, a different key and a different quota.")
+            }
+
             Section {
                 ForEach(voices, id: \.name) { voice in
                     Button {
                         selectedVoice = voice.name
+                        // REVIEW FIX (BUILD 273) - symmetric with the
+                        // ElevenLabs list, and auto-adoption makes it likely
+                        // rather than obscure: paste a key, get switched to
+                        // ElevenLabs, come back to this screen, tap Algenib -
+                        // and hear ElevenLabs announce "this is my Algenib
+                        // voice". The System row was the nasty one: it says
+                        // "this is the offline Apple voice" while rendering
+                        // through ElevenLabs, so he would believe he was on
+                        // the free offline voice while being billed per
+                        // character.
+                        provider = "gemini"
                         let sample = voice.name == "System"
                             ? "G'day Shaun, this is the offline Apple voice."
                             : "G'day Shaun, I'm Chappy - this is my \(voice.name) voice."
@@ -2098,6 +2182,326 @@ struct CostMeterView: View {
             today = CostMeter.shared.today()
             monthCost = CostMeter.shared.monthCostUSD()
         }
+    }
+}
+
+// MARK: - ElevenLabs (Build 272)
+//
+// The voice list is FETCHED, never baked in. ElevenLabs' Default voices
+// expire on 31 December 2026 and are only available to accounts created
+// before March 2026 — so shipping George, Lily and Alice as constants would
+// have 404'd on his brand new Starter account, on his very first render, and
+// the symptom would have read as "the new voice is broken".
+//
+// What he picks from is what his own account actually has.
+
+struct ElevenLabsVoiceView: View {
+    // BUILD 274 — these defaults MUST match ChappyVoiceProvider's, or the
+    // screen shows one thing while the app does another. That mismatch is
+    // exactly the class of bug that made "is 264 installed?" unanswerable.
+    @AppStorage("chappy_11l_voice_id") private var voiceID: String = "wDsJlOXPqcvIUKdLXjDs"
+    @AppStorage("chappy_11l_voice_name") private var voiceLabel: String = ""
+    @AppStorage("chappy_voice_provider") private var provider: String = "elevenLabs"
+    @AppStorage("chappy_11l_model") private var model: String = "eleven_flash_v2_5"
+
+    @State private var key: String = ""
+    @State private var keySaved = false
+    @State private var voices: [ElevenLabsAccount.Voice] = []
+    @State private var usage: ElevenLabsAccount.Usage?
+    @State private var loading = false
+    @State private var loadError: String?
+    @State private var adopted: String?
+
+    /// British first, then everything else, each alphabetical. He asked for a
+    /// British voice; putting them at the top is the whole difference between
+    /// a list and an answer. Not a filter though — hiding the rest would be a
+    /// bug the first time he wants a different accent.
+    private var ordered: [ElevenLabsAccount.Voice] {
+        let brit = voices.filter { $0.accent.lowercased().contains("brit") }
+            .sorted { $0.name < $1.name }
+        let rest = voices.filter { !$0.accent.lowercased().contains("brit") }
+            .sorted { $0.name < $1.name }
+        return brit + rest
+    }
+
+    var body: some View {
+        List {
+            Section {
+                // BUILD 274. There is a key built in, so this field is an
+                // OVERRIDE, not a requirement. Saying so matters: a blank
+                // password-style box with no explanation reads as "fill this
+                // in first", and he would have gone looking for something that
+                // is already done.
+                if !keySaved {
+                    Label("Working on the built-in key — nothing to do here.",
+                          systemImage: "checkmark.circle.fill")
+                        .font(AppTypography.caption)
+                        .foregroundColor(.green)
+                }
+                SecureField(keySaved ? "xi-..." : "paste your own key to replace it", text: $key)
+                    .font(.system(size: 13, design: .monospaced))
+                    .autocorrectionDisabled(true)
+                    .textInputAutocapitalization(.never)
+                Button(keySaved ? "Saved — tap to refresh" : "Use this key instead") {
+                    let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        keySaved = APIKeyManager.shared.saveElevenLabsKey(trimmed)
+                    }
+                    load(adopt: true)
+                }
+                .disabled(loading)
+                // hasOWNElevenLabsKey, not hasElevenLabsKey - the latter is
+                // always true now that one is built in, so this button would
+                // have offered to forget a key it cannot forget.
+                if APIKeyManager.shared.hasOwnElevenLabsKey() {
+                    Button("Forget my key, use the built-in one", role: .destructive) {
+                        _ = APIKeyManager.shared.deleteElevenLabsKey()
+                        key = ""; keySaved = false; voices = []; usage = nil
+                        adopted = nil
+                        // REVIEW FIX - AND THE VOICE, back to the built-in one.
+                        //
+                        // Dropping a personal key while still pointing at a
+                        // voice from THAT account leaves every line 404ing and
+                        // falling through to Google, with the screen showing no
+                        // error until you navigate away and back. Reverting the
+                        // key has to revert the voice it belonged to.
+                        voiceID = "wDsJlOXPqcvIUKdLXjDs"
+                        voiceLabel = ""
+                        load()
+                        // BUILD 274: NOT back to Google, and NOT clearing the
+                        // voice. There is a working key underneath this one, so
+                        // dropping a personal key means "go back to the
+                        // built-in setup", not "turn the voice off".
+                        //
+                        // The 273 reasoning still applies to the state this
+                        // must never reach: provider on elevenLabs with an
+                        // EMPTY voice ID makes voiceName the bare string
+                        // "11l:", a keyspace nothing ever writes to - cache
+                        // reads and writes then disagree permanently and the
+                        // voice cache goes cold for good. The baked-in default
+                        // is what keeps that unreachable now.
+                    }
+                }
+            } header: {
+                Text("Your ElevenLabs key")
+            } footer: {
+                Text("elevenlabs.io \u{2014} your profile, then API Keys.\n\nPaste it and you are done. Chappy fetches your voices, picks a British one, switches itself over and says so out loud. You can change the voice below afterwards, or switch back to Google on the previous screen.\n\nThe key goes in the Keychain, never in a settings file, because this one bills per character.")
+            }
+
+            Section {
+                Picker("Model", selection: $model) {
+                    Text("Flash v2.5 — fastest").tag("eleven_flash_v2_5")
+                    Text("Turbo v2.5").tag("eleven_turbo_v2_5")
+                    Text("Multilingual v2 — richest").tag("eleven_multilingual_v2")
+                }
+            } header: {
+                Text("Which engine")
+            } footer: {
+                Text("Your snippet used Multilingual v2, so it's here. Flash v2.5 is the default because speed is the whole reason for this change \u{2014} about 75ms to first sound against Google's measured 4,200ms \u{2014} and it costs half as many characters. Multilingual v2 sounds a shade richer and takes noticeably longer to start. Same voice either way. Switch and listen.")
+            }
+
+            if let u = usage {
+                Section {
+                    HStack {
+                        Text("Plan").foregroundColor(AppColors.textPrimary)
+                        Spacer()
+                        Text(u.tier.capitalized).foregroundColor(AppColors.textSecondary)
+                    }
+                    HStack {
+                        Text("Used this period").foregroundColor(AppColors.textPrimary)
+                        Spacer()
+                        Text("\(u.used) of \(u.limit)").foregroundColor(AppColors.textSecondary)
+                    }
+                    if u.limit > 0 {
+                        ProgressView(value: Double(u.used), total: Double(u.limit))
+                    }
+                } header: {
+                    Text("What it is costing")
+                } footer: {
+                    Text("Read from your account, not estimated on the phone. Chappy caches every line it renders, so anything it has said before costs nothing to say again.")
+                }
+            }
+
+            if loading {
+                Section { HStack { ProgressView(); Text("  Asking ElevenLabs…") } }
+            }
+
+            if let a = adopted {
+                Section {
+                    Label("Done — Chappy is on ElevenLabs, using \(a). Tap any voice below to change it.",
+                          systemImage: "checkmark.circle.fill")
+                        .font(AppTypography.caption)
+                        .foregroundColor(.green)
+                }
+            }
+
+            if let e = loadError {
+                Section {
+                    Label(e, systemImage: "exclamationmark.triangle.fill")
+                        .font(AppTypography.caption)
+                        .foregroundColor(.orange)
+                }
+            }
+
+            if !ordered.isEmpty {
+                Section {
+                    ForEach(ordered) { v in
+                        Button {
+                            voiceID = v.id
+                            voiceLabel = v.name
+                            // REVIEW FIX (BUILD 273) - AND THE PROVIDER.
+                            //
+                            // This row only ever used to be reachable when the
+                            // provider was already ElevenLabs. Making it always
+                            // visible removed that guarantee: on Google, tapping
+                            // a voice moved the checkmark, left elevenReady
+                            // false, and previewed "This is George" IN KORE.
+                            // That is the silent-failure trap this build exists
+                            // to delete, moved one row down.
+                            provider = "elevenLabs"
+                            adopted = nil        // the banner would name the old one
+                            TTSService.shared.speak(
+                                "G'day Shaun, I'm Chappy. This is \(v.name), and this is how I'll sound from now on.",
+                                forceNetworkVoice: true)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(v.name).foregroundColor(AppColors.textPrimary)
+                                    Text([v.accent.capitalized, v.descriptor]
+                                            .filter { !$0.isEmpty }
+                                            .joined(separator: " \u{2014} "))
+                                        .font(AppTypography.caption)
+                                        .foregroundColor(AppColors.textSecondary)
+                                }
+                                Spacer()
+                                if voiceID == v.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.orange)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Tap to hear it \u{2014} British voices first")
+                } footer: {
+                    Text("This list comes from your own account, live. It is not a list I chose: ElevenLabs is retiring its old stock voices at the end of 2026 and new accounts cannot use them at all, so anything hardcoded here would stop working on you.")
+                }
+            }
+        }
+        .navigationTitle("ElevenLabs")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            keySaved = APIKeyManager.shared.hasOwnElevenLabsKey()
+            if voices.isEmpty { load() }
+        }
+    }
+
+    /// REVIEW FIX (BUILD 273) - `adopt` defaults to FALSE.
+    ///
+    /// onAppear calls this too, and adopting from there means merely opening
+    /// the screen to look at it switches the whole app over and starts
+    /// talking. Navigation must not mutate global state. Only the Save button
+    /// passes true, because only that is him saying "use this".
+    private func load(adopt: Bool = false) {
+        guard let k = APIKeyManager.shared.getElevenLabsKey(), !k.isEmpty else {
+            loadError = "No key saved yet."
+            return
+        }
+        loading = true
+        loadError = nil
+        Task {
+            let v = await ElevenLabsAccount.voices(key: k)
+            let u = await ElevenLabsAccount.usage(key: k)
+            await MainActor.run {
+                voices = v
+                usage = u
+                loading = false
+                if v.isEmpty {
+                    loadError = "No voices came back. Check the key is right and that it has Text to Speech permission."
+                    return
+                }
+                // BUILD 274 - the voice ID is baked in but its NAME is not, so
+                // until the list loads the screen can only say "ready". Once
+                // the account answers, name it. Also the honest check on
+                // whether that baked ID is still real: if it is not in his
+                // account, say so here rather than letting it 404 on the first
+                // spoken line, where it would look like an outage.
+                if voiceLabel.isEmpty, let match = v.first(where: { $0.id == voiceID }) {
+                    voiceLabel = match.name
+                }
+                if !v.contains(where: { $0.id == voiceID }) {
+                    loadError = "The saved voice isn't in this account any more. Tap one below to pick a new one."
+                }
+                if adopt { adoptIfFirstTime(from: v) }
+            }
+        }
+    }
+
+    /// BUILD 273 — THE KEY IS THE WHOLE SETUP.
+    ///
+    /// 272 asked for three things: flip the provider switch, paste the key,
+    /// pick a voice. He asked, reasonably, why pasting the key is not enough.
+    /// It should be — and worse, the three-step version had a trap built into
+    /// it. `elevenReady` needs a provider AND a key AND a chosen voice, so
+    /// pasting the key and stopping left ElevenLabs switched off with no
+    /// visible sign: Chappy would carry on in Google's voice, exactly as if
+    /// the key had been rejected. The most likely first-run outcome of my own
+    /// design was "I set it up and nothing happened."
+    ///
+    /// So a successful fetch now adopts: picks a British voice, turns the
+    /// provider on, and says so out loud. It never overrides a voice he has
+    /// chosen - but it is NOT once-per-install, because "Forget the key"
+    /// clears the choice and re-adding a key should set him up again. Review
+    /// caught the earlier version of this comment claiming a stronger
+    /// invariant than the code has.
+    ///
+    /// Only on a SUCCESSFUL fetch. Switching the provider on the strength of a
+    /// key that has not been proven would be worse than the trap it replaces -
+    /// it would route the voice to a provider known not to answer.
+    private func adoptIfFirstTime(from list: [ElevenLabsAccount.Voice]) {
+        // REVIEW FIX - REPLACING A KEY HAS TO SAY SOMETHING TOO.
+        //
+        // With a voice already chosen this returned silently: no banner, no
+        // confirmation, nothing. Which is "I set it up and nothing happened"
+        // all over again, just for the second key instead of the first - the
+        // exact complaint this build exists to answer. Keep the voice he
+        // picked, make sure the provider is on, and say so.
+        // REVIEW FIX (BUILD 274) - THE OLD GUARD WENT DEAD.
+        //
+        // voiceID is @AppStorage with a baked-in default now, so
+        // `voiceID.isEmpty` is never true and the whole pick-a-British-voice
+        // body below could never run. Worse than dead: paste a PERSONAL key
+        // whose account does not own the baked voice, and adoption did nothing
+        // but flip the provider - then every line 404s and falls through to
+        // Google, silently.
+        //
+        // The real question is not "has he chosen one" but "does this account
+        // actually have the one he has". If it does, keep it.
+        if list.contains(where: { $0.id == voiceID }) {
+            provider = "elevenLabs"
+            adopted = voiceLabel.isEmpty ? "your saved voice" : voiceLabel
+            return
+        }
+
+        // British first, because that is what he asked for; then American,
+        // then whatever exists - a voice is better than a screen that quietly
+        // does nothing. (An earlier comment here said "then anything English".
+        // It did not: ElevenLabs' accent labels are british/american/
+        // australian/irish/transatlantic, so "english" matched none of them
+        // and that branch was American-only. Review caught the comment
+        // describing a wider net than the code casts.)
+        let brit = list.first { $0.accent.lowercased().contains("brit") }
+        let american = list.first { $0.accent.lowercased().contains("american") }
+        guard let chosen = brit ?? american ?? list.first else { return }
+
+        voiceID = chosen.id
+        voiceLabel = chosen.name
+        provider = "elevenLabs"
+        adopted = chosen.name
+
+        TTSService.shared.speak(
+            "Right, I'm on ElevenLabs now, using \(chosen.name). This is how I'll sound from here on.",
+            forceNetworkVoice: true)
     }
 }
 
@@ -2744,11 +3148,19 @@ struct CommandLogView: View {
 struct ModelChoiceView: View {
     @AppStorage("chappy_model_flash") private var flash = "gemini-3.7-flash"
     @AppStorage("chappy_model_flash_lite") private var lite = "gemini-flash-lite-latest"
+    @AppStorage("chappy_model_tts") private var tts = "gemini-3.1-flash-tts-preview"
+    @AppStorage("chappy_model_tts_fallback") private var ttsBackup = "gemini-2.5-flash-preview-tts"
     @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+    @State private var ttsDraft = ""
 
     private let thinking = ["gemini-3.7-flash", "gemini-3-flash-preview",
                             "gemini-flash-latest", "gemini-2.5-flash"]
     private let bulk = ["gemini-flash-lite-latest", "gemini-3.7-flash"]
+    // BUILD 271. Google lists three speech models and this is all of them.
+    // There is no 3.7 voice - 3.7 Flash writes words, it does not say them.
+    private let voices = ["gemini-3.1-flash-tts-preview",
+                          "gemini-2.5-flash-preview-tts",
+                          "gemini-2.5-pro-preview-tts"]
 
     var body: some View {
         Form {
@@ -2773,7 +3185,58 @@ struct ModelChoiceView: View {
             }
 
             Section {
-                row("Voice", "gemini-3.1-flash-tts-preview")
+                // REVIEW FIX - the free-text row below can set these to a
+                // name that is not one of the three tags, and a Picker whose
+                // selection matches no tag renders BLANK. The screen would
+                // have stopped answering the one question it exists to answer,
+                // in exactly the case the free-text row was added for. Fold
+                // the current value in so it is always selectable.
+                Picker("Voice", selection: $tts) {
+                    ForEach(options(including: tts), id: \.self) { Text($0).tag($0) }
+                }
+                Picker("If that fails", selection: $ttsBackup) {
+                    ForEach(options(including: ttsBackup), id: \.self) { Text($0).tag($0) }
+                }
+
+                // REVIEW FIX. The comment on ChappyModels.tts promised he
+                // could type a new model name in the day Google ships one;
+                // a Picker over a hardcoded list of three delivers the exact
+                // opposite. Here is the row that keeps the promise.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Or type a model name")
+                        .font(AppTypography.caption)
+                        .foregroundColor(AppColors.textSecondary)
+                    // Bound to a DRAFT, not to $tts. A TextField wired
+                    // straight to the stored value fires .onChange on every
+                    // keystroke, and .onChange here calls voiceChanged(),
+                    // which clears the voice cache and re-warms it over the
+                    // network. Typing a twenty-character model name would
+                    // have meant twenty cache wipes and twenty warm cycles.
+                    // Commit on return instead.
+                    TextField("gemini-...-tts", text: $ttsDraft)
+                        .font(.system(size: 13, design: .monospaced))
+                        .autocorrectionDisabled(true)
+                        .textInputAutocapitalization(.never)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            let v = ttsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !v.isEmpty { tts = v } else { ttsDraft = tts }
+                        }
+                }
+
+                if tts == ttsBackup {
+                    Label("Both are the same model, so there is no fallback.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(AppTypography.caption)
+                        .foregroundColor(.orange)
+                }
+            } header: {
+                Text("The voice")
+            } footer: {
+                Text("You asked for the voice on 3.7. There isn't one \u{2014} Google ships three speech models and the newest is 3.1 Flash TTS, which is what Chappy already uses. 3.7 Flash writes the words; it cannot say them.\n\nWhat was wrong was this being locked. All three are PREVIEW models and Google caps preview models hardest, so the day the voice model rate-limits you need to move off it without waiting for a build from me. Now you can, including by typing a name Chappy has never heard of.\n\nKeep the two DIFFERENT \u{2014} and note that Google caps per PROJECT as well as per model, so a second model only helps when the refusal was the model's own. The log now says which.")
+            }
+
+            Section {
                 row("Live AI", "gemini-3.1-flash-live-preview")
                 row("Conversation", "claude-sonnet-4-6")
                 row("Web search", "claude-opus-4-8")
@@ -2781,11 +3244,31 @@ struct ModelChoiceView: View {
             } header: {
                 Text("Fixed, and not switchable here")
             } footer: {
-                Text("These are different jobs, not different sizes of the same one. The voice and Live AI are speech models \u{2014} 3.7 Flash does not replace them, so moving to it will not change how long Chappy takes to start talking. That one needs a different provider.")
+                Text("These are different jobs, not different sizes of the same one. Live AI is a speech model \u{2014} 3.7 Flash does not replace it, so moving to it will not change how long Chappy takes to start talking. That one needs a different provider.")
             }
         }
         .navigationTitle("Which brain")
         .navigationBarTitleDisplayMode(.inline)
+        // REVIEW FIX - VoiceCache's key is SHA256(voice|text) and the MODEL IS
+        // NOT IN IT. That is called out by name in TTSService as the reason
+        // every render site is pinned to one model. Making the model
+        // switchable without clearing the cache would have meant old lines
+        // replaying in the old model's prosody while new ones render in the
+        // new - Chappy changing person mid-conversation, which is the exact
+        // fault builds 125 and 259 exist to prevent, now one tap away.
+        //
+        // voiceChanged() clears the cache, re-pins the fallback voice, drops
+        // the give-up latch and re-warms. All four are right here.
+        .onAppear { ttsDraft = tts }
+        .onChange(of: tts) { _, newValue in
+            ttsDraft = newValue
+            TTSService.shared.voiceChanged()
+        }
+        .onChange(of: ttsBackup) { _, _ in TTSService.shared.voiceChanged() }
+    }
+
+    private func options(including current: String) -> [String] {
+        voices.contains(current) ? voices : voices + [current]
     }
 
     private func row(_ k: String, _ v: String) -> some View {
