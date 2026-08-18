@@ -169,6 +169,48 @@ class APIKeyManager {
         getKey(for: "chappy-aviationstack") ?? defaultAviationStackKey
     }
 
+    // MARK: - ElevenLabs (Build 272) — the fast voice, Keychain only.
+    //
+    // Keychain and not UserDefaults, same as every other paid key here. This
+    // one bills per character, so a leaked key is a bill.
+
+    // BUILD 274 — HIS KEY, BAKED IN, SO THERE IS NO SETUP AT ALL.
+    //
+    // Same split-chunk shape as the AviationStack key above: never one
+    // contiguous string in the binary. That is not real security - anyone who
+    // can read the app can reassemble it - but it defeats a plain `strings`
+    // sweep, and it is the pattern this file already uses.
+    //
+    // A key saved in the Keychain always wins, so pasting a new one in
+    // Settings replaces this without a build. That matters: this key is
+    // rotatable, and the day it is rotated the app must not need me.
+    private var defaultElevenLabsKey: String {
+        ["f95fc2e06cc9e863", "89dc23a07374fd7b",
+         "14e8986a13893e30", "0e73b7b4f7d852f5"].joined()
+    }
+
+    func saveElevenLabsKey(_ k: String) -> Bool { saveKey(k, for: "chappy-elevenlabs") }
+
+    /// His own key first, the built-in one second. Never nil, so ElevenLabs
+    /// is available out of the box.
+    func getElevenLabsKey() -> String? {
+        if let saved = getKey(for: "chappy-elevenlabs"), !saved.isEmpty { return saved }
+        return defaultElevenLabsKey
+    }
+
+    /// True when he has saved his OWN key - which is what Settings needs to
+    /// know to decide whether "Forget the key" means anything.
+    func hasOwnElevenLabsKey() -> Bool {
+        !(getKey(for: "chappy-elevenlabs") ?? "").isEmpty
+    }
+
+    @discardableResult
+    func deleteElevenLabsKey() -> Bool { clear(account: "chappy-elevenlabs") }
+
+    /// Kept for call sites that only ask "can ElevenLabs be used at all".
+    /// Always true now, by design.
+    func hasElevenLabsKey() -> Bool { !(getElevenLabsKey() ?? "").isEmpty }
+
     // MARK: - Amadeus (Build 150) — flight data keys, Keychain only.
 
     func saveAmadeusKey(_ k: String) -> Bool { saveKey(k, for: "chappy-amadeus-key") }
