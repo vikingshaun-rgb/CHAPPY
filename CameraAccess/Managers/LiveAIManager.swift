@@ -3517,6 +3517,14 @@ final class ChappyStandby: NSObject, ObservableObject {
     /// word. Say "translate" → "Which language?" → "Indonesian" → it opens and
     /// starts listening. No menus, no exact wording to remember.
     private var expectingLanguageUntil = Date.distantPast
+    /// BUILD 261 — the fare shortlist has just been read out and Chappy has
+    /// asked whether to keep watching. A yes turns this into a real route
+    /// watch; anything else drops it. Held here rather than in ChappyFlights
+    /// because the question was asked by the VOICE and the answer arrives
+    /// through the follow-up door, which this class owns.
+    var pendingFareWatch: (from: ChappyPorts.Airport, to: ChappyPorts.Airport, month: Date)?
+    private var pendingFareWatchAskedAt = Date.distantPast
+
     /// While this is in the future, speech routes as a command with no wake
     /// word. Opened after every completed command; see the note in heard().
     private var followUpUntil = Date.distantPast
@@ -5712,6 +5720,38 @@ final class ChappyStandby: NSObject, ObservableObject {
         emptyPromptWork?.cancel(); emptyPromptWork = nil
         ChappyStandbyLog.note("👂➡️ [Standby] Command: \(cmd)")
         // ============================================================
+        // BUILD 262 — STAGE ONE OF THE ROUTER INVERSION. SHADOW ONLY.
+        //
+        // This line does not change what Chappy does. Not one branch, not
+        // one word spoken, not one millisecond added to the answer. It asks
+        // the resolver, in parallel and in the background, what it WOULD
+        // have done with this sentence, and writes that to the router log
+        // beside what the ladder actually did.
+        //
+        // WHY HERE AND NOT LOWER. This is the last point where the sentence
+        // is still whole. Four lines down, splitCompound may cut it in two,
+        // and the whole argument for a model router is that it sees the
+        // sentence the way it was said. Feeding it a half would test
+        // something nobody asked for.
+        //
+        // WHY NOT HIGHER. Everything above this returns: the mis-heard name,
+        // the interrupt, the busy drop, the bare wake word. None of them is
+        // a routing decision, so shadowing them would spend money to
+        // discover that "stop" means stop.
+        //
+        // AND IT CANNOT AFFECT THE ROUTE. It takes a copy of the string,
+        // hands it to a detached task at utility priority, and returns
+        // immediately. Nothing downstream reads anything it writes. If the
+        // key is missing, the network is down, or Gemini takes twenty
+        // seconds, the only consequence is a log line saying so.
+        //
+        // The actual call is twenty lines down, immediately after
+        // routeStartedAt is computed, so the shadow row carries the SAME
+        // timestamp as the ladder's row for the same sentence and the two
+        // sit together on the screen. Stamping it here would have used the
+        // PREVIOUS sentence's start time, which is the write-only-state
+        // habit 253 spent a build removing.
+        // ============================================================
         // BUILD 253 — TIME IT, AND LOG IT WHATEVER HAPPENS.
         //
         // Two holes this closes.
@@ -5769,6 +5809,9 @@ final class ChappyStandby: NSObject, ObservableObject {
         // in the mid-prompt path.
         let sinceLastWord = Date().timeIntervalSince(lastWordAt)
         Self.routeStartedAt = (sinceLastWord >= 0 && sinceLastWord < 30) ? lastWordAt : Date()
+        // BUILD 262 — see the long note above. Fire and forget, same clock
+        // as the ladder, whole sentence, before the compound splitter.
+        ChappyShadow.observe(cmd, at: Self.routeStartedAt)
         busy = true
         routeTask?.cancel()
         routeTask = Task { @MainActor in
@@ -6232,10 +6275,76 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
 
         // ------------------------------------------------ cheapest day
-        let cheapWords = ["cheapest day", "cheapest week", "cheapest time to fly",
-                          "best day to fly", "when should i fly", "when is it cheapest",
-                          "cheapest date"]
-        if cheapWords.contains(where: { c.contains($0) }) {
+        // BUILD 261 — THE ANSWER WAS ALWAYS HERE. THE LIST WAS TOO SHORT.
+        //
+        // He asked, in his own words: "can you find the best cheapest flight
+        // in October to go to Bali". Everything needed to answer that is in
+        // the twenty lines below — ChappyFareSource.month() returns a price
+        // for every day of a month and has since build 217.
+        //
+        // It never ran, because "cheapest flight" was not in this list.
+        // "cheapest day" was. "cheapest date" was. The one phrasing a person
+        // actually reaches for was not, so the sentence fell through to the
+        // flights TILE, which opened the screen and asked him for an exact
+        // departure date — the single question he was asking Chappy to answer
+        // for him.
+        //
+        // That is the whole bug, and it is worth being blunt about the shape
+        // of it: the capability was built, tested and paid for, and a
+        // seven-item string list stood between him and it. Widened to the way
+        // people ask, including the shape where the month does the work
+        // ("cheapest in October", "best deal in October").
+        //
+        // BUILD 262 — SPLIT IN TWO, AFTER REVIEW CAUGHT 261 OVERREACHING.
+        //
+        // My 261 list put "best price", "best deal", "how cheap", "cheapest
+        // in" and "cheapest to" in as plain substring tests — and this whole
+        // function is called on EVERY sentence, with nothing above it asking
+        // whether flying was ever mentioned. So "what's the best deal on a
+        // hotel in Ubud" and "how cheap is the train to Jakarta" would both
+        // have come back with a Brisbane-to-Denpasar fare and opened the
+        // flights screen, because routeIn finds no route and the saved
+        // defaults fill in silently.
+        //
+        // That is the same class of bug as "uv" matching souvenirs, which is
+        // already on the outstanding list — widened in the build that was
+        // supposed to be fixing over-narrow matching. Worth naming.
+        //
+        // STRONG phrases name flying themselves and fire on their own.
+        let cheapWordsStrong = ["cheapest day", "cheapest week", "cheapest time to fly",
+                                "best day to fly", "when should i fly", "when is it cheapest",
+                                "cheapest date",
+                                // BUILD 261 — how he actually said it, and the near neighbours.
+                                "cheapest flight", "cheapest flights", "cheapest airfare",
+                                "cheapest way to fly", "cheapest return", "best flight",
+                                "good deal on a flight", "deal on flights"]
+        // WEAK phrases are about price and say nothing about aircraft. They
+        // need the sentence to mention flying somewhere else in it.
+        //
+        // "cheapest fare", "cheapest fares" and "best fare" are down here on
+        // review's advice and it is right: in Asia a fare is a ferry, a bus
+        // or a Grab at least as often as a plane.
+        let cheapWordsWeak = ["best price", "best deal", "cheapest in", "cheapest to",
+                              "cheapest around", "how cheap", "cheapest fare",
+                              "cheapest fares", "best fare",
+                              "what's the cheapest", "whats the cheapest"]
+        // WHOLE WORDS, NOT SUBSTRINGS. "fly" is inside butterfly, flyover and
+        // mayfly; "plane" is inside planet and seaplane. Review found "how
+        // cheap is the butterfly park" answering with a month of airfares,
+        // which is the "uv" in souvenirs bug wearing a different hat.
+        //
+        // "airport" is deliberately NOT here. An airport is a destination,
+        // not a way of travelling — "what's the cheapest way to get to the
+        // airport" is a question about a taxi.
+        // "fare" is not here either, for the reason above.
+        let flightNouns: Set<String> = ["flight", "flights", "fly", "flying", "flew",
+                                        "airfare", "airfares", "airline", "airlines",
+                                        "plane", "planes"]
+        let spokenWords = Set(c.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        let cheapAsked = cheapWordsStrong.contains(where: { c.contains($0) })
+            || (cheapWordsWeak.contains(where: { c.contains($0) })
+                && !spokenWords.isDisjoint(with: flightNouns))
+        if cheapAsked {
             guard ChappyFareSource.isConfigured else {
                 return "I can't see the market's day-by-day prices without a fare key — that's Settings, Travel Desk, Fare data. What I can tell you is what you've seen yourself: \(ChappyFareJournal.trend(origin: ChappyFlightsPrefs.origin, dest: ChappyFlightsPrefs.dest) ?? "not enough readings yet.")"
             }
@@ -6256,6 +6365,45 @@ final class ChappyStandby: NSObject, ObservableObject {
                 line += "That's about \(ChappyFX.money(avg - best.price, best.currency)) under the month's average. "
             }
             line += "It's a fare somebody's search returned, \(best.ageNote), not a live quote."
+
+            // BUILD 261 — A SHORTLIST, NOT A SINGLE DAY.
+            //
+            // "He finds the best deal in that month, gives me a list of
+            // options." One date is an answer to a different question — it
+            // tells him when the floor was, not what his choices are. Nobody
+            // plans a trip around a single Tuesday.
+            //
+            // Three more, cheapest first, skipping anything within a couple
+            // of dollars of a day already named so it does not read out five
+            // near-identical numbers.
+            var alsoNamed: [Double] = [best.price]
+            var runnersUp: [ChappyFareSource.DayPrice] = []
+            for d in days.sorted(by: { $0.price < $1.price }).dropFirst() {
+                guard runnersUp.count < 3 else { break }
+                guard !alsoNamed.contains(where: { abs($0 - d.price) < 3 }) else { continue }
+                alsoNamed.append(d.price)
+                runnersUp.append(d)
+            }
+            if !runnersUp.isEmpty {
+                let others = runnersUp.map {
+                    "\(f.string(from: $0.date)) at \(ChappyFX.money($0.price, $0.currency))"
+                }.joined(separator: ", ")
+                line += " After that: \(others)."
+            }
+
+            // AND OFFER TO KEEP HUNTING, which is the half that makes it an
+            // assistant rather than a lookup. watchRoute has existed since
+            // build 218 and nothing in the voice path had ever offered it.
+            if let a = ChappyPorts.byIATA(oo), let b = ChappyPorts.byIATA(dd),
+               let monthDate = ChappyFlightsPrefs.dateFromMonthKey(month) {
+                pendingFareWatch = (a, b, monthDate)
+                pendingFareWatchAskedAt = Date()
+                line += " Want me to keep an eye on it and tell you if it drops?"
+                // A question earns the long door — he is being asked something
+                // and may take a moment.
+                followUpUntil = Date().addingTimeInterval(Self.flowFollowUpSeconds)
+                followUpOpenedAt = Date()
+            }
             NotificationCenter.default.post(name: .chappyOpenFlights, object: nil)
             ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
                                        outcome: "cheapest day \(oo)-\(dd)", ms: ChappyStandby.msSinceRouteStart)
@@ -6320,6 +6468,54 @@ final class ChappyStandby: NSObject, ObservableObject {
         return parts.joined(separator: " ")
     }
 
+    // ============================================================
+    // BUILD 262 — A YES/NO THAT CANNOT EAT THE NEXT COMMAND.
+    //
+    // ChappySlots.parse(_:as: .yesNo) matches by PREFIX, and its yes-list
+    // contains "ok", "right", "sure", "please" and "go on" while its no-list
+    // contains "skip", "don't" and "leave it". That is correct inside a
+    // ChappyFlow interview, where the only thing expected next IS an answer.
+    //
+    // 261 put one of those tests at the TOP of route(), armed for two whole
+    // minutes after the fare offer. So for two minutes, "ok take me to the
+    // airport", "right, what's the weather", "please read my messages" and
+    // "skip to the next one" were parsed as an answer to a question about
+    // watching a fare — Chappy would say "Watching BNE to DPS", return, and
+    // the command he actually gave would vanish with no log line at all.
+    //
+    // Found in review, not by him, and it would have been a nightmare to
+    // report: it only fires after a flights answer, and only for the one
+    // sentence after it.
+    //
+    // MY FIRST FIX WAS A THREE-WORD CEILING, AND REVIEW KILLED THAT TOO:
+    // "please call mum" and "skip this one" are three words and still
+    // prefix-match. So no fuzzy matching at all — this is an enumerated set
+    // and plain equality, which is verbatim the reasoning build 254 used for
+    // interruptPhrases. It cannot have a false positive by construction.
+    //
+    // "no worries" is deliberately ABSENT from the no-list: build 256
+    // already established it is Australian for agreement, not refusal.
+    // ============================================================
+    private static let fareYes: Set<String> = [
+        "yes", "yeah", "yep", "yup", "yeah ok", "yes ok", "sure", "ok", "okay",
+        "yes please", "yeah please", "please do", "yes do", "yes do it",
+        "do it", "go on", "go ahead", "keep an eye on it", "keep an eye out",
+        "watch it", "yes mate", "yeah mate", "affirmative", "of course",
+        "definitely", "absolutely", "yes thanks", "sounds good", "good idea",
+    ]
+    private static let fareNo: Set<String> = [
+        "no", "nope", "nah", "no thanks", "no thanks mate", "no thank you",
+        "not really", "leave it", "leave it alone", "don't", "dont",
+        "don't bother", "dont bother", "no need", "negative", "nah mate",
+        "no mate", "skip it", "forget it", "not now", "no don't",
+    ]
+    static func shortYesNo(_ c: String) -> String? {
+        let t = c.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).lowercased()
+        if fareYes.contains(t) { return "yes" }
+        if fareNo.contains(t) { return "no" }
+        return nil
+    }
+
     /// Pull an origin and a destination out of a spoken sentence.
     ///
     /// "who flies brisbane to bali" → (BNE, DPS)
@@ -6359,6 +6555,45 @@ final class ChappyStandby: NSObject, ObservableObject {
     // MARK: The router
 
     private func route(_ c: String) async {
+        // BUILD 261 — "WANT ME TO KEEP AN EYE ON IT?" NEEDS AN ANSWER THAT
+        // GOES SOMEWHERE.
+        //
+        // Above every keyword, because a yes to a question Chappy just asked
+        // must never be re-interpreted as a command. "Yes" on its own already
+        // has a smallReply ("Yes to what, sorry?") waiting further down, which
+        // is the wrong answer to a question he was just asked by name.
+        //
+        // Expires after two minutes so a shrug does not leave it armed.
+        if let want = pendingFareWatch {
+            if Date().timeIntervalSince(pendingFareWatchAskedAt) > 120 {
+                pendingFareWatch = nil
+            } else if let yn = Self.shortYesNo(c) {
+                pendingFareWatch = nil
+                if yn == "yes" {
+                    // BUILD 262 — ChappyWatch, not ChappyFlights. My 261 cut
+                    // wrote ChappyFlights.shared.watchRoute, and there is no
+                    // such method: watchRoute lives on ChappyWatch and always
+                    // has — the two existing call sites in TurboMetaHomeView
+                    // both use it correctly. That is a hard compile error, in
+                    // the zip I told him to archive, and only a review pass
+                    // reading the real declaration found it. An archive
+                    // failure costs him a full round trip.
+                    let w = ChappyWatch.shared.watchRoute(from: want.from, to: want.to,
+                                                          month: want.month,
+                                                          oneWay: false, party: 1)
+                    ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "flights",
+                                               outcome: "watching \(w.label)",
+                                               ms: ChappyStandby.msSinceRouteStart)
+                    speak("Watching \(want.from.iata) to \(want.to.iata). I'll tell you if it drops.")
+                } else {
+                    speak("Righto, I'll leave it.")
+                }
+                return
+            }
+            // Anything else: he has moved on. Drop the offer and let the
+            // sentence route normally rather than swallowing it.
+            pendingFareWatch = nil
+        }
         // BUILD 129: everything new lives behind one entry point. If the
         // hook doesn't recognise a command it returns false and the router
         // below runs exactly as it always has.
@@ -36669,6 +36904,15 @@ enum ChappyFlightsPrefs {
         let m = String(iso.prefix(7))
         return m.contains("-") ? m : nil
     }
+
+    /// BUILD 261 — the reverse, so a month the fare search resolved can be
+    /// handed to watchRoute, which wants a Date rather than a "yyyy-MM".
+    static func dateFromMonthKey(_ key: String) -> Date? {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.date(from: key)
+    }
 }
 
 enum ChappyProfileLite {
@@ -37968,7 +38212,13 @@ final class ChappyRouterLog {
     /// BUILD 221: 100 in memory was a display cap. On disk it can afford
     /// to be a real history without being a burden — a few hundred
     /// kilobytes for weeks of decisions.
-    private static let cap = 600
+    ///
+    /// BUILD 262: 600 -> 1200. The shadow router writes a second row for
+    /// every routed sentence, so at 600 the history this build depends on
+    /// reading back would have quietly halved during the one build whose
+    /// entire purpose is reading it back. Doubling the cap keeps the reach
+    /// the same and costs a few hundred kilobytes.
+    private static let cap = 1200
 
     private static let file = "chappy_routerlog.json"
 
@@ -38100,6 +38350,200 @@ final class ChappyRouterLog {
 // disagree the assistant lies about what it can do, and that is a
 // worse failure than not understanding.
 //
+// =====================================================================
+// MARK: - BUILD 262 — THE SHADOW. STAGE ONE OF INVERTING THE ROUTER.
+// =====================================================================
+//
+// THE PROBLEM, IN HIS WORDS: "I should be able to say any sentence to
+// Chappy and it should know what the fuck I'm talking about." He is right,
+// and the reason it doesn't is architectural, not a run of bugs.
+//
+// route() is 2,900 lines and roughly 780 `c.contains(...)` tests. The model
+// is reached only when EVERY ONE of them has missed. So the ceiling on how
+// well Chappy understands him is how well I guessed his phrasing in
+// advance — and when I guess wrong he does not get "I didn't understand",
+// he gets whichever branch happened to match a fragment. That is the
+// "random shit" he describes, and it is the same defect every time:
+//
+//   "cheapest flight in October"  ->  the month-price search has existed
+//                                     since 217; the trigger list had
+//                                     "cheapest day" and not "cheapest
+//                                     flight", so it opened a form and
+//                                     asked him the question he was asking.
+//
+// THE PLAN IS TO INVERT IT: a model that reads the sentence decides, and
+// the keyword ladder becomes a fast path for the twenty commands that must
+// be instant and free, plus a fallback when the model is slow or down.
+//
+// THIS FILE IS STAGE ONE, AND IT CANNOT BREAK ANYTHING BY CONSTRUCTION.
+// The ladder still decides everything. In parallel, the resolver is asked
+// what it WOULD have done, and the answer is written to the router log and
+// nowhere else. It never speaks, never acts, never touches memory, and its
+// failures are silent. What it produces is evidence: every sentence he says
+// for a day, with the ladder's answer and the model's answer side by side.
+//
+// Nothing gets promoted in stage two that has not been proven here.
+//
+// AND IT REUSES WHAT IS ALREADY THERE. ChappyOrchestrator.plan already
+// renders the registry into a prompt, asks Gemini Flash, and returns tool
+// steps with confidences. It has been called for years — but only after the
+// ladder has failed all the way through, which is why it shows up in his
+// log at three and a half seconds looking like the slow option. It is not
+// slow because it is a model; it is late because it runs last.
+enum ChappyShadow {
+
+    /// Default ON for stage one. A switch because this costs real money on
+    /// every sentence, and the moment the evidence is in it should go off.
+    static var enabled: Bool {
+        UserDefaults.standard.object(forKey: "chappy_shadow") as? Bool ?? true
+    }
+
+    /// Flash is cheap, but "cheap times every sentence for a week" is how a
+    /// bill surprises someone. Hard stop, per day, and it says so when it
+    /// trips rather than going quiet.
+    private static let dailyCap = 300
+    private static var todayKey: String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return "chappy_shadow_" + f.string(from: Date())
+    }
+
+    nonisolated(unsafe) private static var lastSeen = ""
+    /// BUILD 262, AFTER REVIEW. The first cut remembered the last sentence
+    /// FOREVER, so saying the same thing twice — which is exactly what a man
+    /// does when the ladder mis-routed it the first time — was silently
+    /// dropped. That repeat is the single most valuable row this build can
+    /// collect, and I had written the one line that guarantees it never
+    /// appears. Three seconds: long enough for a recogniser hiccup, far too
+    /// short to swallow a deliberate second try.
+    nonisolated(unsafe) private static var lastSeenAt = Date.distantPast
+    private static let lock = NSLock()
+
+    /// How many sentences have been shadowed today. On screen, because
+    /// "it costs a fraction of a cent" is a claim and this is the number.
+    ///
+    /// Clamped, because the cap branch writes one extra to latch its log
+    /// line and a settings row reading "301 of 300" is a bug report waiting
+    /// to be filed.
+    static var usedToday: Int { min(UserDefaults.standard.integer(forKey: todayKey), dailyCap) }
+    static var capPerDay: Int { dailyCap }
+
+    /// Fire and forget. Called from finish() on the whole sentence, before
+    /// the compound splitter, so the model sees what he actually said rather
+    /// than half of it.
+    static func observe(_ raw: String, at: Date) {
+        guard enabled else { return }
+        // NO KEY, NO SHADOW, AND NO ROW. Review caught this: plan() returns
+        // nil immediately when the Google key is missing, so without this
+        // guard a key-less day would burn all three hundred slots writing
+        // three hundred identical "the model had no answer" lines — and the
+        // one screen this build exists to make readable would be full of
+        // them.
+        guard !(APIKeyManager.shared.getGoogleAPIKey() ?? "").isEmpty else { return }
+        let c = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).lowercased()
+        guard c.count > 3 else { return }
+
+        // The recogniser delivers the same sentence more than once on a
+        // partial-heavy utterance. One look per sentence.
+        lock.lock()
+        let repeated = (c == lastSeen && Date().timeIntervalSince(lastSeenAt) < 3)
+        lastSeen = c
+        lastSeenAt = Date()
+        lock.unlock()
+        guard !repeated else { return }
+
+        let d = UserDefaults.standard
+        let used = d.integer(forKey: todayKey)
+        guard used < dailyCap else {
+            if used == dailyCap {
+                d.set(used + 1, forKey: todayKey)
+                ChappyStandbyLog.note("👁️ [Shadow] Daily cap of \(dailyCap) reached — shadowing paused until tomorrow")
+            }
+            return
+        }
+        // THE COUNTER IS BUMPED AFTER THE REQUEST GOES OUT, NOT HERE.
+        // Review's point, and it is the right one: this task sleeps five
+        // seconds first, and a phone that gets pocketed and suspended in
+        // that window never sends anything. Spending a slot for a request
+        // that was never made makes the number on the settings screen a
+        // lie in the one direction that matters — it would say he had used
+        // his budget when he had not.
+
+        // The row is stamped a millisecond BEFORE the sentence's own clock so
+        // that on the "What Chappy did" screen — sorted newest first — the
+        // mint row always lands directly UNDERNEATH the decision it is
+        // commenting on. Review found the tie: build 253's untagged backstop
+        // stamps its row with this same routeStartedAt value, Array.sort is
+        // not documented as stable, and the one pairing this whole build
+        // exists to show was the one that could come out in either order.
+        let stamp = at.addingTimeInterval(-0.001)
+
+        Task.detached(priority: .utility) {
+            // WAIT FIVE SECONDS BEFORE ASKING, AND THIS IS NOT PADDING.
+            //
+            // A sentence that falls all the way through the ladder reaches
+            // ChappyOrchestrator.plan itself, with a hard four-second ceiling
+            // and a fall-through behind it. Firing the shadow's copy at the
+            // same instant puts two requests to the same host in flight
+            // together on the shared URLSession — and on a weak link that is
+            // a plausible way to push the REAL one over its timeout and
+            // change how a sentence routed. "It cannot affect the route"
+            // has to be true, not nearly true.
+            //
+            // Nothing reads this result, so waiting costs exactly nothing.
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            await MainActor.run {
+                let ud = UserDefaults.standard
+                ud.set(ud.integer(forKey: todayKey) + 1, forKey: todayKey)
+            }
+            // Stamped after the sleep: this number must measure the model,
+            // not the delay in front of it.
+            let began = Date()
+            guard let plan = await ChappyOrchestrator.plan(c) else {
+                await MainActor.run {
+                    ChappyRouterLog.shared.add(
+                        heard: c, tier: "shadow", tool: nil,
+                        outcome: "the model had no answer — either no key, a timeout, or it declined",
+                        ms: Int(Date().timeIntervalSince(began) * 1000),
+                        routeDecision: false, at: stamp)
+                }
+                return
+            }
+            let ms = Int(Date().timeIntervalSince(began) * 1000)
+            guard let first = plan.steps.first else {
+                await MainActor.run {
+                    ChappyRouterLog.shared.add(
+                        heard: c, tier: "shadow", tool: "none",
+                        outcome: "the model says no tool is needed — this is a question, not a command",
+                        ms: ms, routeDecision: false, at: stamp)
+                }
+                return
+            }
+            // Every step, so a genuine two-part sentence is visible as one.
+            let described = plan.steps.map { s -> String in
+                let vals = s.values.isEmpty
+                    ? ""
+                    : " {" + s.values.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ") + "}"
+                return "\(s.toolID)\(vals)"
+            }.joined(separator: " then ")
+
+            await MainActor.run {
+                ChappyRouterLog.shared.add(
+                    heard: c, tier: "shadow", tool: first.toolID,
+                    confidence: first.confidence,
+                    outcome: "would run \(described)",
+                    // ROUTE DECISION: FALSE, AND THIS MATTERS. Build 253's
+                    // backstop uses lastDecisionAt to decide whether a
+                    // sentence went unhandled. A shadow row claiming to be a
+                    // decision would make every untagged sentence look
+                    // accounted for, and the one diagnostic that has been
+                    // telling the truth would start lying.
+                    ms: ms, routeDecision: false, at: stamp)
+            }
+        }
+    }
+}
+
 enum ChappyOrchestrator {
 
     struct Step {
