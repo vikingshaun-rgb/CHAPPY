@@ -4421,6 +4421,12 @@ struct RouteMapView: UIViewRepresentable {
         let map = MKMapView()
         map.showsUserLocation = true
         map.delegate = context.coordinator
+        // BUILD 265 — the labels on this map are tappable now. Same
+        // complaint, the other screen: the trail drew over a live map full
+        // of shops and none of them did anything. This is the UIKit half of
+        // the fix and, unlike the SwiftUI half in AtlasView, it is an API
+        // this file already leans on heavily.
+        map.selectableMapFeatures = [.pointsOfInterest]
         if !coords.isEmpty {
             let line = MKPolyline(coordinates: coords, count: coords.count)
             map.addOverlay(line)
@@ -4465,6 +4471,18 @@ struct RouteMapView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
+        // BUILD 265 — tap a shop on the trail map and it hands straight to
+        // Google Maps with the coordinate, which is what he reached for.
+        // Deliberately not a card here: this view is a small inline map
+        // inside another screen, and growing a sheet out of it would cover
+        // the trail he opened it to look at.
+        func mapView(_ mapView: MKMapView, didSelect annotation: MKAnnotation) {
+            guard let f = annotation as? MKMapFeatureAnnotation,
+                  let name = f.title ?? nil, !name.isEmpty else { return }
+            mapView.deselectAnnotation(annotation, animated: false)
+            AtlasView.openInGoogleMaps(name: name, coord: f.coordinate)
+        }
+
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let line = overlay as? MKPolyline {
                 let r = MKPolylineRenderer(polyline: line)
@@ -4481,6 +4499,9 @@ struct RouteMapView: UIViewRepresentable {
 
         // BUILD 146 — glyph markers with callouts, Apple-Journal style.
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            // BUILD 265: returning nil for a map feature lets MapKit draw its
+            // own balloon. Claiming it here would give every shop a blank pin.
+            if annotation is MKMapFeatureAnnotation { return nil }
             guard let j = annotation as? JournalAnnotation else { return nil }
             let id = "journal-pin"
             let v = (mapView.dequeueReusableAnnotationView(withIdentifier: id) as? MKMarkerAnnotationView)
@@ -8302,6 +8323,33 @@ struct AtlasView: View {
     @State private var searching = false
     @State private var selectedStop: ChappyAtlas.Stop?
     @State private var selectedPlace: ChappyAtlas.Place?
+    // ============================================================
+    // BUILD 265 — TAPPING APPLE'S OWN MAP LABELS.
+    //
+    // The Atlas draws Woolworths, Pizza Hut, Australia Zoo and the rest as
+    // part of the base map, and until this build not one of them was
+    // interactive: only pins Chappy drew ITSELF could be tapped, which is
+    // why his own trail point opened a card and everything around it was
+    // dead. His words: "can't click on any place and pull up places or
+    // Google Maps on entire atlas or map".
+    //
+    // ⚠️ THE SELECTION BINDING IS THE ONE PART OF THIS BUILD I CANNOT
+    // VERIFY FROM SOURCE. MapKit is not in this repo, so unlike every
+    // other change I ship I cannot read the declaration and check the
+    // signature — I am going on the iOS 17 API as I know it. If the
+    // archive fails, it fails HERE, and the fix is three deletions: this
+    // state pair, the `selection:` argument on Map, and the .onChange
+    // block that reads it. Nothing else in 265 depends on them.
+    // ============================================================
+    @State private var mapSelection: MapSelection<MKMapItem>?
+    @State private var tappedPOI: TappedPOI?
+
+    struct TappedPOI: Identifiable {
+        let id = UUID()
+        let name: String
+        let category: String
+        let coord: CLLocationCoordinate2D
+    }
     @State private var weather: ChappyAtlas.Weather?
     @State private var satellite = false
     @State private var pulse = false
@@ -8317,7 +8365,8 @@ struct AtlasView: View {
                 topFurniture
                 VStack {
                     Spacer()
-                    if let s = selectedStop { stopCard(s) }
+                    if let poi = tappedPOI { poiCard(poi) }
+                    else if let s = selectedStop { stopCard(s) }
                     else if let p = selectedPlace { placeCard(p) }
                     else { bottomBar }
                 }
@@ -8338,6 +8387,26 @@ struct AtlasView: View {
                     }
                 }
             }
+            // BUILD 265 — read the tapped base-map label. `feature` is set
+            // when he taps one of Apple's own POIs; `value` is set when a
+            // pin Chappy drew carries a tag, which none of ours do, so a
+            // nil feature means he tapped bare map and the card closes.
+            .onChange(of: mapSelection) { _, sel in
+                guard let f = sel?.feature, let name = f.title, !name.isEmpty else {
+                    withAnimation { tappedPOI = nil }
+                    return
+                }
+                withAnimation(.spring(response: 0.35)) {
+                    selectedStop = nil
+                    selectedPlace = nil
+                    tappedPOI = TappedPOI(
+                        name: name,
+                        category: f.pointOfInterestCategory?.rawValue
+                            .replacingOccurrences(of: "MKPOICategory", with: "") ?? "",
+                        coord: f.coordinate)
+                }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
             .task {
                 atlas.build(span: span)
                 pulse = true
@@ -8352,7 +8421,7 @@ struct AtlasView: View {
     }
 
     private var map: some View {
-        Map(position: $camera) {
+        Map(position: $camera, selection: $mapSelection) {
             ForEach(atlas.legs) { leg in
                 MapPolyline(coordinates: leg.coords)
                     .stroke(leg.mode.tint.opacity(0.22), style: StrokeStyle(
@@ -8366,6 +8435,9 @@ struct AtlasView: View {
                 Annotation(stop.name, coordinate: stop.coord, anchor: .center) {
                     Button {
                         withAnimation(.spring(response: 0.35)) {
+                            // BUILD 265: clear the POI card too, or a tapped
+                            // shop label stays up and hides the stop card.
+                            tappedPOI = nil; mapSelection = nil
                             selectedPlace = nil
                             selectedStop = stop
                         }
@@ -8379,6 +8451,7 @@ struct AtlasView: View {
                 Annotation(p.name, coordinate: p.coord, anchor: .bottom) {
                     Button {
                         withAnimation(.spring(response: 0.35)) {
+                            tappedPOI = nil; mapSelection = nil
                             selectedStop = nil
                             selectedPlace = p
                         }
@@ -8632,6 +8705,53 @@ struct AtlasView: View {
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
+    /// BUILD 265 — the card for one of Apple's own map labels.
+    ///
+    /// Same three things his own pins offer, because they are the three
+    /// things he actually does with a place: go there, keep it, or open it
+    /// properly. "Save here" writes a real ChappyMemory place, so the next
+    /// time he says "take me to the big mower" it resolves — which is the
+    /// whole point of being able to tap the thing in the first place.
+    private func poiCard(_ p: TappedPOI) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "mappin.circle.fill").foregroundStyle(.orange)
+                Text(p.name).font(.headline).foregroundStyle(.white).lineLimit(2)
+                Spacer()
+                Button { withAnimation { tappedPOI = nil; mapSelection = nil } } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            if !p.category.isEmpty {
+                Text(p.category).font(.caption).foregroundStyle(.white.opacity(0.7))
+            }
+            HStack(spacing: 9) {
+                Button {
+                    Task { _ = await NavEngine.shared.navigate(to: p.name, driving: true) }
+                } label: { pill("Take me", "location.fill", .cyan) }
+                .buttonStyle(.plain)
+                Button {
+                    _ = TripRecorder.shared.saveSpot(named: p.name,
+                                                     lat: p.coord.latitude,
+                                                     lon: p.coord.longitude)
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    TTSService.shared.speak("Saved \(p.name).")
+                } label: { pill("Save here", "bookmark.fill", .yellow) }
+                .buttonStyle(.plain)
+                Button { Self.openInGoogleMaps(name: p.name, coord: p.coord) }
+                    label: { pill("Google Maps", "map.fill", .green) }
+                    .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 17).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 17).stroke(Color.orange.opacity(0.5), lineWidth: 1))
+        .shadow(color: Color.orange.opacity(0.4), radius: 12)
+        .padding(.horizontal, 12).padding(.bottom, 14)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
     private func placeCard(_ p: ChappyAtlas.Place) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -8658,13 +8778,20 @@ struct AtlasView: View {
                     TTSService.shared.speak("\(p.name) saved.")
                 } label: { pill("Save", "bookmark.fill", .yellow) }
                 .buttonStyle(.plain)
-                Button {
-                    let q = p.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                    if let u = URL(string: "https://www.google.com/search?q=\(q)") {
-                        UIApplication.shared.open(u, options: [:], completionHandler: nil)
-                    }
-                } label: { pill("Look up", "magnifyingglass", .green) }
-                .buttonStyle(.plain)
+                // BUILD 265 — GOOGLE MAPS, NOT A WEB SEARCH.
+                //
+                // This opened google.com/search with the place NAME and
+                // nothing else, so tapping a warung in Ubud got a page of
+                // results about warungs, not that warung. The coordinate was
+                // sitting right there unused.
+                //
+                // Google Maps if it is installed — comgooglemaps:// keeps
+                // him in the app he actually navigates with — and the web
+                // map if it is not. Both carry the coordinate AND the name,
+                // so the pin lands on the right building.
+                Button { Self.openInGoogleMaps(name: p.name, coord: p.coord) }
+                    label: { pill("Google Maps", "map.fill", .green) }
+                    .buttonStyle(.plain)
             }
         }
         .padding(14)
@@ -8673,6 +8800,38 @@ struct AtlasView: View {
         .shadow(color: p.layer.tint.opacity(0.4), radius: 12)
         .padding(.horizontal, 12).padding(.bottom, 14)
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    // ============================================================
+    // BUILD 265 — ONE PLACE THAT KNOWS HOW TO HAND OFF TO GOOGLE MAPS.
+    //
+    // He asked for this directly: "can't click on any place and pull up
+    // places or Google Maps on entire atlas or map".
+    //
+    // Coordinates first and the name second, in that order, because a name
+    // alone lands on whichever branch Google likes best — there are four
+    // Woolworths within ten kilometres of Beerwah. The coordinate pins the
+    // building; the name is what makes the card read properly when it
+    // opens.
+    // ============================================================
+    static func openInGoogleMaps(name: String, coord: CLLocationCoordinate2D) {
+        let lat = coord.latitude, lon = coord.longitude
+        // .urlQueryAllowed PERMITS & = + ? — so "Fish & Chips" would split the
+        // query and Google Maps would show a truncated label plus a junk
+        // parameter. Subtract them.
+        let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+?"))
+        let label = name.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        // The installed app first — it is the one he navigates with.
+        if let app = URL(string: "comgooglemaps://?q=\(lat),\(lon)(\(label))&zoom=17"),
+           UIApplication.shared.canOpenURL(app) {
+            UIApplication.shared.open(app, options: [:], completionHandler: nil)
+            return
+        }
+        // Name AND coordinate on the web fallback too — the first draft kept
+        // only the coordinate while the comment above claimed otherwise.
+        if let web = URL(string: "https://www.google.com/maps/search/\(label)/@\(lat),\(lon),17z") {
+            UIApplication.shared.open(web, options: [:], completionHandler: nil)
+        }
     }
 
     private func pill(_ text: String, _ icon: String, _ tint: Color) -> some View {

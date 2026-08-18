@@ -574,6 +574,25 @@ struct SettingsView: View {
                                 .foregroundColor(AppColors.textPrimary)
                         }
                     }
+
+                    // BUILD 267 — "does Chappy use 3.7?" should not be a
+                    // question for me. It is a fact about the app and it now
+                    // lives on a screen he can open.
+                    NavigationLink {
+                        ModelChoiceView()
+                    } label: {
+                        HStack {
+                            Image(systemName: "cpu")
+                                .foregroundColor(.purple)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Which brain")
+                                    .foregroundColor(AppColors.textPrimary)
+                                Text(ChappyModels.flash)
+                                    .font(AppTypography.caption)
+                                    .foregroundColor(AppColors.textSecondary)
+                            }
+                        }
+                    }
                 } header: {
                     Text("Voice")
                 } footer: {
@@ -2380,6 +2399,24 @@ struct LiveAICheckView: View {
 struct CommandLogView: View {
     @State private var entries: [ChappyRouterLog.Entry] = []
     @State private var copied = false
+    // ============================================================
+    // BUILD 268 — ONE DAY AT A TIME.
+    //
+    // "I want to be able to clear the logs, or at least break it up in days
+    // so I don't send huge logs to you."
+    //
+    // Defaults to TODAY, not to everything, because sending me today is the
+    // thing he actually does. The whole log is still one tap away.
+    //
+    // This also closes a real bug: every row was stamped HH:mm:ss with NO
+    // DATE, so a multi-day log read as though time ran backwards. The last
+    // one he sent jumped 17:43 -> 09:09 -> 17:50 -> 23:57 and nothing on
+    // the screen said those were four different days.
+    // ============================================================
+    /// nil means "everything". Otherwise the start of the chosen day.
+    @State private var day: Date? = Calendar.current.startOfDay(for: Date())
+    @State private var days: [(day: Date, count: Int)] = []
+    @State private var confirmClear = false
     /// BUILD 262 — the switch that decides whether the shadow router runs
     /// at all. @AppStorage on the SAME key ChappyShadow reads, so this is
     /// the one control, not a copy of one.
@@ -2417,6 +2454,20 @@ struct CommandLogView: View {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
     }()
 
+    /// BUILD 268 — with the date, for the all-days view and for anything
+    /// copied out. A row I read in a message needs to say which day it is.
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "d MMM HH:mm:ss"; return f
+    }()
+
+    private static func dayLabel(_ d: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(d) { return "Today" }
+        if cal.isDateInYesterday(d) { return "Yesterday" }
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM"
+        return f.string(from: d)
+    }
+
     private func tierColour(_ t: String) -> Color {
         switch t {
         case "pocket": return .green
@@ -2429,9 +2480,10 @@ struct CommandLogView: View {
         // (model, untagged), and three that always could and were
         // rendered grey because nobody checked this list against what the
         // router actually writes (answer, reference, net). "pocket" is
-        // still here and still has no producer anywhere in the app; left
-        // in place because that is a routing gap to look at, not a colour
-        // to delete.
+        // BUILD 266: "pocket" has a producer now — the free offline tier
+        // logs itself, so the note that used to sit here calling it a
+        // routing gap would have sent the next reader hunting for
+        // something that no longer exists.
         case "answer": return .teal
         case "reference": return .indigo
         case "net": return .brown
@@ -2471,15 +2523,36 @@ struct CommandLogView: View {
     var body: some View {
         List {
             Section {
+                Picker("Day", selection: $day) {
+                    Text("Everything").tag(Date?.none)
+                    ForEach(days, id: \.day) { d in
+                        Text("\(Self.dayLabel(d.day))  (\(d.count))").tag(Date?.some(d.day))
+                    }
+                }
+                .pickerStyle(.menu)
+            } header: {
+                Text("Which day")
+            } footer: {
+                Text("Pick a day, then Copy — you get that day only. Clearing works the same way, so you can send me today and then wipe today without losing the rest.")
+            }
+
+            Section {
                 if entries.isEmpty {
-                    Text("Nothing routed yet. Say something to Chappy, or type it in the ask field, then come back.")
+                    Text(day == nil
+                         ? "Nothing routed yet. Say something to Chappy, or type it in the ask field, then come back."
+                         : "Nothing on this day. Pick another, or Everything.")
                         .font(AppTypography.caption)
                         .foregroundColor(AppColors.textSecondary)
                 } else {
                     ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(spacing: 6) {
-                                Text(Self.clock.string(from: e.at))
+                                // BUILD 268: the DATE comes back when the day
+                                // filter is off. Without it a week of rows is
+                                // unreadable, which is how I misread his log.
+                                Text(day == nil
+                                     ? Self.stamp.string(from: e.at)
+                                     : Self.clock.string(from: e.at))
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundColor(AppColors.textSecondary)
                                 Text(e.tier.uppercased())
@@ -2538,7 +2611,7 @@ struct CommandLogView: View {
                         .foregroundColor(AppColors.textSecondary)
                 }
             } footer: {
-                Text("TIER is which layer claimed the sentence \u{2014} tiles is a screen name, answer is a module answering outright, reference resolved \u{201C}that one\u{201D} to a saved place, flow is a multi-step tool, intent and plan are the smart layers, ask is a general question answered by the cheap brain, model is the session with tools, net is a background network result rather than a routing decision, and UNTAGGED in amber means no tier recorded a working decision at all.\n\nSHADOW in mint is the odd one out and is not a tier at all: it is build 262 asking the smart router what it WOULD have done with the sentence above it. Nothing on a mint row happened. The switch for it is at the bottom of this screen.\n\nUNTAGGED does NOT mean it failed. Navigation, briefs, timers, lists and the screen openers still don\u{2019}t name themselves in this log, so a command that worked perfectly can land there. It means the RECORD has a gap. If the command also did nothing, that is the line to send me.\n\nThe ms is the wait from when you stopped talking to when that decision was made. Amber past a second, red past two and a half. Before build 253 most tiers wrote a hardcoded 1ms, which looked instant and meant nothing; they all read the same clock now.\n\nTwo limits worth knowing. Say something else within eight seconds and the first sentence\u{2019}s gap check is dropped, rather than risk pinning it on the wrong sentence. And on a compound (\u{201C}do this and do that\u{201D}) a later half can make an earlier half look accounted for.")
+                Text("TIER is which layer claimed the sentence \u{2014} tiles is a screen name, answer is a module answering outright, reference resolved \u{201C}that one\u{201D} to a saved place, flow is a multi-step tool, intent and plan are the smart layers, ask is a general question answered by the cheap brain, model is the session with tools, net is a background network result rather than a routing decision, pocket in green is the free offline tier answering on the phone \u{2014} clock, calendar, conversions, arithmetic and days-until, no network and no cost \u{2014} and UNTAGGED in amber means no tier recorded a working decision at all.\n\nSHADOW in mint is the odd one out and is not a tier at all: it is build 262 asking the smart router what it WOULD have done with the sentence above it. Nothing on a mint row happened. The switch for it is at the bottom of this screen.\n\nUNTAGGED does NOT mean it failed. Navigation, briefs, timers, lists and the screen openers still don\u{2019}t name themselves in this log, so a command that worked perfectly can land there. It means the RECORD has a gap. If the command also did nothing, that is the line to send me.\n\nThe ms is the wait from when you stopped talking to when that decision was made. Amber past a second, red past two and a half. Before build 253 most tiers wrote a hardcoded 1ms, which looked instant and meant nothing; they all read the same clock now.\n\nTwo limits worth knowing. Say something else within eight seconds and the first sentence\u{2019}s gap check is dropped, rather than risk pinning it on the wrong sentence. And on a compound (\u{201C}do this and do that\u{201D}) a later half can make an earlier half look accounted for.")
             }
 
             // ============================================================
@@ -2574,17 +2647,51 @@ struct CommandLogView: View {
 
             Section {
                 Button {
-                    UIPasteboard.general.string = entries.map {
-                        "\(Self.clock.string(from: $0.at))  [\($0.tier)] \"\($0.heard)\" -> \($0.tool ?? "none") \($0.confidence.map { String(format: "%.2f", $0) } ?? "") : \($0.outcome) (\($0.ms)ms)"
-                    }.joined(separator: "\n")
+                    // BUILD 268: copies WHAT IS ON SCREEN, not everything, and
+                    // stamps which day it is. Every log he has sent me arrived
+                    // with no date on any row and I had to infer the day
+                    // boundaries from the times going backwards.
+                    let head = "Chappy log — \(day.map(Self.dayLabel) ?? "all days") — \(entries.count) rows"
+                    UIPasteboard.general.string = ([head] + entries.map {
+                        "\(Self.stamp.string(from: $0.at))  [\($0.tier)] \"\($0.heard)\" -> \($0.tool ?? "none") \($0.confidence.map { String(format: "%.2f", $0) } ?? "") : \($0.outcome) (\($0.ms)ms)"
+                    }).joined(separator: "\n")
                     copied = true
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
                 } label: {
-                    Label(copied ? "Copied" : "Copy the whole log",
+                    Label(copied
+                          ? "Copied \(entries.count) rows"
+                          : (day == nil ? "Copy the whole log" : "Copy \(Self.dayLabel(day!)) (\(entries.count))"),
                           systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
                 }
                 .foregroundColor(copied ? .green : AppColors.textPrimary)
+
+                Button(role: .destructive) {
+                    if let d = day {
+                        ChappyRouterLog.shared.clear(day: d)
+                        // Land on the next day that still has rows rather than
+                        // on an empty screen he has to fix himself.
+                        day = ChappyRouterLog.shared.daysPresent().first?.day
+                    } else {
+                        confirmClear = true
+                    }
+                    reload()
+                } label: {
+                    Label(day == nil ? "Clear everything" : "Clear \(Self.dayLabel(day!))",
+                          systemImage: "trash")
+                }
+            } footer: {
+                Text("Copy takes whichever day is selected above. Clearing one day keeps the others; clearing Everything asks first, because the log is the only record of what Chappy decided and it does not come back.")
+            }
+            .confirmationDialog("Clear the whole log?", isPresented: $confirmClear, titleVisibility: .visible) {
+                Button("Clear everything", role: .destructive) {
+                    ChappyRouterLog.shared.clearAll()
+                    day = nil
+                    reload()
+                }
+                Button("Keep it", role: .cancel) { }
+            } message: {
+                Text("Every day, gone. This is the only record of what Chappy decided and why.")
             }
         }
         .navigationTitle("What Chappy did")
@@ -2605,12 +2712,90 @@ struct CommandLogView: View {
         // Without this the filter takes up to two seconds to appear to do
         // anything, and a switch that looks broken gets flicked twice.
         .onChange(of: hideShadow) { _, _ in reload() }
+        .onChange(of: day) { _, _ in reload() }
     }
 
     private func reload() {
         let all = ChappyRouterLog.shared.entries
-        entries = (hideShadow ? all.filter { $0.tier != "shadow" } : all)
-            .sorted { $0.at > $1.at }
+        days = ChappyRouterLog.shared.daysPresent()
+        // If the chosen day has been cleared away, fall back to the newest
+        // day that still exists rather than showing a blank screen.
+        if let d = day, !days.contains(where: { $0.day == d }) {
+            day = days.first?.day
+        }
+        let cal = Calendar.current
+        var rows = hideShadow ? all.filter { $0.tier != "shadow" } : all
+        if let d = day { rows = rows.filter { cal.startOfDay(for: $0.at) == d } }
+        entries = rows.sorted { $0.at > $1.at }
+    }
+}
+
+// MARK: - Which brain (BUILD 267)
+//
+// He asked "does Chappy use Gemini 3.7?" and the honest answer was that I
+// could not tell him: the app sent `gemini-flash-latest`, an alias Google
+// hot-swaps, whose current target they do not publish and which the API
+// response does not report back. So the app knew less about itself than he
+// did.
+//
+// This screen is the answer, permanently. It also lets him put it back
+// without waiting for a build, which matters because the whole reason he
+// asked is speed, and a newer model is not automatically a faster one.
+struct ModelChoiceView: View {
+    @AppStorage("chappy_model_flash") private var flash = "gemini-3.7-flash"
+    @AppStorage("chappy_model_flash_lite") private var lite = "gemini-flash-lite-latest"
+    @AppStorage("chappy_theme") private var themeName = "Midnight Jade"
+
+    private let thinking = ["gemini-3.7-flash", "gemini-3-flash-preview",
+                            "gemini-flash-latest", "gemini-2.5-flash"]
+    private let bulk = ["gemini-flash-lite-latest", "gemini-3.7-flash"]
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Thinking", selection: $flash) {
+                    ForEach(thinking, id: \.self) { Text($0).tag($0) }
+                }
+            } header: {
+                Text("The thinking tier")
+            } footer: {
+                Text("The router, the classifier, the planner, the day summaries and translate. This is the one that decides what you meant, so it is the one you feel.\n\ngemini-3.7-flash is pinned by name and released 13 August 2026. gemini-flash-latest is an ALIAS \u{2014} Google points it at whatever they like and changes it on two weeks' notice, which is why Chappy could not tell you which model it was on. A newer model is not automatically a faster one, so if answers feel slower after this, come back here.")
+            }
+
+            Section {
+                Picker("Bulk", selection: $lite) {
+                    ForEach(bulk, id: \.self) { Text($0).tag($0) }
+                }
+            } header: {
+                Text("The bulk tier")
+            } footer: {
+                Text("Photo captions and background passes, which run in their hundreds. Lite is deliberate here \u{2014} high volume, low judgement, and a fraction of the cost per token.")
+            }
+
+            Section {
+                row("Voice", "gemini-3.1-flash-tts-preview")
+                row("Live AI", "gemini-3.1-flash-live-preview")
+                row("Conversation", "claude-sonnet-4-6")
+                row("Web search", "claude-opus-4-8")
+                row("Briefs", "claude-haiku-4-5")
+            } header: {
+                Text("Fixed, and not switchable here")
+            } footer: {
+                Text("These are different jobs, not different sizes of the same one. The voice and Live AI are speech models \u{2014} 3.7 Flash does not replace them, so moving to it will not change how long Chappy takes to start talking. That one needs a different provider.")
+            }
+        }
+        .navigationTitle("Which brain")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k).foregroundColor(AppColors.textPrimary)
+            Spacer()
+            Text(v)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(AppColors.textSecondary)
+        }
     }
 }
 
