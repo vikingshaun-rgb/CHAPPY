@@ -16752,10 +16752,52 @@ enum ChappyModels {
         UserDefaults.standard.string(forKey: "chappy_model_flash_lite") ?? "gemini-flash-lite-latest"
     }
 
-    /// What to show on screen, so the answer to "which model is it on"
-    /// is one tap away instead of a question for me.
+    /// BUILD 271 - THE VOICE, MADE SWITCHABLE, AFTER HE ASKED FOR 3.7.
+    ///
+    /// He asked for the voice on 3.7 as well. There is no 3.7 speech model:
+    /// Google lists three TTS models and the newest is 3.1 Flash TTS, which
+    /// is what Chappy already renders with. 3.7 Flash is a text model - it
+    /// writes the words, it cannot say them. So the answer to the request as
+    /// asked is "you already have the newest voice there is".
+    ///
+    /// What was wrong was the screen calling it FIXED. It was only fixed
+    /// because I hardcoded it, and that cost him a day: the voice model 429s,
+    /// and there was no way to move off it without a build from me. It is a
+    /// PREVIEW model, which is where Google puts its tightest caps.
+    ///
+    /// Now it is a setting, like the other two, with a free-text row on the
+    /// same screen - so when Google does ship a 3.7 voice he can type the name
+    /// in and have it that afternoon without a build from me.
+    static var tts: String {
+        UserDefaults.standard.string(forKey: "chappy_model_tts") ?? "gemini-3.1-flash-tts-preview"
+    }
+
+    /// The model tried when `tts` fails.
+    ///
+    /// Review corrected me here and it matters. I wrote that this defaults to
+    /// a "generally available model with its own separate allowance" - it does
+    /// not. gemini-2.5-flash-preview-tts has the word preview in it, and all
+    /// three speech models Google offers are previews. There is no GA speech
+    /// model to fall back to.
+    ///
+    /// So the honest claim is narrower: Google's per-model caps are separate,
+    /// so a fallback to a DIFFERENT model still helps when the refusal was
+    /// per-model. When the refusal is per-project - and Google enforces rate
+    /// limits per project, not per API key - it helps not at all, and the
+    /// extra round trip is pure added silence. That is exactly why the log now
+    /// prints which of the two it was instead of leaving me to guess.
+    static var ttsFallback: String {
+        UserDefaults.standard.string(forKey: "chappy_model_tts_fallback") ?? "gemini-2.5-flash-preview-tts"
+    }
+
+    /// A one-line summary of the tiers. NOTE: nothing currently reads this -
+    /// review checked, and the two `summaryLine` uses in SettingsView belong
+    /// to ChappyKeysView, a different symbol. The screen that answers "which
+    /// model is it on" is ModelChoiceView, which reads the defaults directly.
+    /// Kept because it costs nothing and is the obvious thing to reach for
+    /// next; do not trust the comment that used to claim it was on screen.
     static var summaryLine: String {
-        "Thinking: \(flash)  ·  Bulk: \(flashLite)"
+        "Thinking: \(flash)  ·  Bulk: \(flashLite)  ·  Voice: \(tts)"
     }
 }
 
