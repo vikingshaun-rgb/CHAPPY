@@ -222,7 +222,7 @@ class LiveTranslateViewModel: ObservableObject {
     static func readDocument(_ image: UIImage, into english: String, from foreign: String) async -> ScanResult? {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
               let jpeg = image.jpegData(compressionQuality: 0.6),
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
 
         let prompt = """
