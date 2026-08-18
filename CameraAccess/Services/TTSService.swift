@@ -1122,73 +1122,29 @@ class TTSService: NSObject, ObservableObject {
             return
         }
 
-        // BUILD 258 — SHORT ACKNOWLEDGEMENTS GO OUT INSTANTLY.
+        // BUILD 260 — THE SHORT-LINE DEVICE VOICE IS GONE, AND IT HAD TO GO.
         //
-        // Measured in his own log, not guessed:
+        // 258 sent every line of thirty characters or less to AVSpeechSynthesizer
+        // because Gemini took three and a half seconds to say "Done." That was
+        // the right call against a whole-clip renderer. 259 made the renderer
+        // stream, so the reason is gone — and the cost was not.
         //
-        //     🐢 took 3462ms to render 10 characters
-        //     🐢 took 4939ms to render 17 characters
-        //     🐢 took 4080ms to render 24 characters
+        // HE HEARD IT ON THE GLASSES AND THE PHONE AT THE SAME TIME, and this
+        // is why. Two different players were live in the same app:
+        // AVSpeechSynthesizer for short lines and AVAudioEngine for everything
+        // else. They do not share a route decision. TTSService has never
+        // called overrideOutputAudioPort — LiveTranslateService does, which is
+        // why translate has always had a working HEAR GLASSES / HEAR PHONE
+        // switch and this never did — so each player lands wherever the
+        // session's options leave it, and `.speaking` carries BOTH
+        // .defaultToSpeaker and .allowBluetooth. Two players, one ambiguous
+        // route each, and a window where both are running: stop() resets the
+        // engine node while the streaming task may still schedule a buffer or
+        // two behind it, and the synthesizer starts on top.
         //
-        // Three to five seconds to say "Done." That is most of what "it's not
-        // responding" actually is. Google's TTS latency barely varies with
-        // length, so the shorter the line, the worse the ratio — and the
-        // shortest lines are exactly the ones that need to land immediately:
-        // "Done.", "Route's off.", "Right here.", "Opening Google Maps."
-        //
-        // So: under thirty characters and not already cached, use the device
-        // voice, which starts in milliseconds. Anything longer — a real
-        // answer, where the voice quality is what he is listening to — still
-        // goes to Gemini.
-        //
-        // The cache line above stays first, so a short line he hears often
-        // keeps the good voice from its second use onward. This only bites on
-        // the first time a short line is ever spoken.
-        //
-        // This is NOT the failure fallback and must never be confused with
-        // it: nothing is latched, no failure is recorded, and the next long
-        // line renders normally. It is a deliberate choice of voice for a
-        // class of line, made on latency grounds.
-        // BRACKETED, and I nearly shipped it without. `isSpeaking` is written
-        // only by beginSpeaking/endSpeaking/stop, and it is the gate for
-        // barge-in, for the mic suppression that stops Chappy transcribing
-        // himself, and for the follow-up door that build 256 exists to fix.
-        // Calling the system path directly leaves it false for the whole
-        // utterance — so the ear would route his own voice back at him and no
-        // door would ever open after a short line. stop() first, exactly as
-        // speak() does, or the previous line keeps playing underneath.
-        if !wantsSystemVoice, trimmed.count <= 30 {
-            print("🔊 [TTS] Short line (\(trimmed.count) chars) — device voice now, Gemini cached for next time")
-            stop()
-            lastSpokenLine = trimmed
-            let gen = beginSpeaking(estimatedCharacters: trimmed.count)
-            // ASSIGNED TO currentTask, and review caught that it wasn't. stop()
-            // and the next speak() both cancel through that handle; an orphan
-            // Task is unreachable by either, so a nav summary landing a
-            // millisecond later would have played Gemini over the top of this
-            // device voice — two lines at once. The isCancelled check closes
-            // the remaining gap between assignment and the first await.
-            currentTask = Task { [weak self] in
-                guard let self else { return }
-                defer { Task { @MainActor in self.endSpeaking(gen) } }
-                guard !Task.isCancelled else { return }
-                await self.fallbackToSystemTTS(text: trimmed, languageCode: languageCode)
-            }
-            // AND WARM THE CACHE, or this becomes the bug build 125 removed.
-            //
-            // My first cut claimed the good voice returned "from its second
-            // use onward". It would not have: the cache is only written by the
-            // Gemini render path, which this branch skips — so any short line
-            // outside the hardcoded warm list would have used the device voice
-            // FOREVER, alternating with Gemini on every longer sentence. This
-            // file's own note at build 125 is blunt about that: "it made
-            // Chappy change sex every other sentence. Length is not a sane way
-            // to choose a voice." Rendering it quietly in the background makes
-            // the length rule a first-time-only latency dodge, which is what
-            // it was always meant to be.
-            prerenderNow([trimmed])
-            return
-        }
+        // One player. One route. If a short line is ever slow again the answer
+        // is to make the render faster or pre-warm the cache, not to run a
+        // second audio stack alongside the first.
         if trimmed.count >= 80, Self.sentenceChunks(trimmed).count > 1 {
             speakLong(trimmed, languageCode: languageCode)
             return
