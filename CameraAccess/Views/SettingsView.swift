@@ -2446,6 +2446,14 @@ struct CommandLogView: View {
         // one thing this screen must never do is let a hypothetical be
         // mistaken for a decision.
         case "shadow": return .mint
+        // BUILD 264 — the two halves of what used to all be UNTAGGED.
+        // ANSWERED in grey-green: it worked, the branch just didn't sign
+        // its name. TOOL in cyan: something the conversation brain did.
+        case "answered": return Color(red: 0.45, green: 0.72, blue: 0.55)
+        // Not cyan — "tiles" already owns that, and a screen whose whole
+        // premise is that the chip colour names the layer must not give two
+        // layers the same one.
+        case "tool": return Color(red: 0.85, green: 0.65, blue: 0.30)
         default: return AppColors.textSecondary
         }
     }
@@ -2520,7 +2528,12 @@ struct CommandLogView: View {
                     // labelled "routed" would inflate the one figure on
                     // this screen that is supposed to be a count of things
                     // that actually happened.
-                    Text("\(entries.filter { $0.tier != "shadow" }.count) routed")
+                    // BUILD 264: tool rows excluded too. One session turn can
+                    // make three tool calls, and folding those into a number
+                    // labelled "routed" inflates the one figure on this screen
+                    // that is meant to count things he actually said — which
+                    // is verbatim the reason 262 excluded the shadow rows.
+                    Text("\(entries.filter { $0.tier != "shadow" && $0.tier != "tool" }.count) routed")
                         .font(AppTypography.caption)
                         .foregroundColor(AppColors.textSecondary)
                 }
