@@ -517,6 +517,11 @@ class TTSService: NSObject, ObservableObject {
     /// someone, and it had no handler anywhere in the app.
     private(set) var lastSpokenLine: String = ""
 
+    /// BUILD 264 — when it was said, so the ear can tell Chappy's own voice
+    /// from the wearer's. Without a clock, a line spoken an hour ago would
+    /// still be treated as an echo and a genuine repeat would be swallowed.
+    private(set) var lastSpokenAt: Date = .distantPast
+
     override private init() {
         super.init()
         setupPlaybackEngine()
@@ -1312,6 +1317,7 @@ class TTSService: NSObject, ObservableObject {
         stop()
 
         lastSpokenLine = trimmed
+        lastSpokenAt = Date()
         noticeVoiceChange()
         let gen = beginSpeaking(estimatedCharacters: trimmed.count)
         currentTask = Task { [weak self] in
