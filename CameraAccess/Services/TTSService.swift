@@ -156,6 +156,197 @@ private final class ResumeGate {
     }
 }
 
+// =====================================================================
+// BUILD 272 — A SECOND VOICE PROVIDER, AND WHY
+// =====================================================================
+//
+// Chappy went completely mute on 18 August because a Gemini preview TTS
+// model returned 429. Everything build 271 did was damage control on that
+// fact. The underlying problem is that the voice of a wearable device sat
+// on a free preview tier of a general-purpose model, and preview tiers are
+// where a provider puts its tightest caps and its weakest promises.
+//
+// ElevenLabs Flash v2.5 is a purpose-built streaming speech engine: about
+// 75ms to first audio against the 4,200ms Chappy measured on Gemini. That
+// is not a tuning gap, it is an architecture gap - one generates audio
+// tokens through a general model, the other starts emitting sound before
+// it has finished thinking.
+//
+// THE PART THAT MADE THIS CHEAP: ElevenLabs will return `pcm_24000`, which
+// is signed 16-bit little-endian mono at 24 kHz - byte-for-byte the format
+// this file has fed AVAudioEngine since build 100. The whole playback half,
+// the carry-byte handling, the generation ownership rules, the cache: all
+// unchanged. Only the fetch is new.
+//
+// AND `pcm_24000` IS AVAILABLE ON THE STARTER PLAN. Only 44.1 kHz PCM is
+// gated to Pro and above. Checked before writing a line of this, because
+// the alternative was MP3, and MP3 would have meant a decoder, a second
+// audio path, and every hazard build 260 spent itself removing.
+//
+// ALL OF THIS LIVES IN TTSService.swift ON PURPOSE. A new file has to be
+// added to the Xcode target by hand, and files silently missing from the
+// target have already cost this project real builds. Nothing here is worth
+// that risk.
+
+enum ChappyVoiceProvider: String {
+    case gemini
+    case elevenLabs
+
+    /// BUILD 274 — ELEVENLABS IS THE DEFAULT NOW.
+    ///
+    /// With his key and his voice both baked in there is nothing left to set
+    /// up, so defaulting to Google would only mean one more switch to find.
+    /// Google is still one tap away and is still the automatic fallback when
+    /// ElevenLabs does not answer.
+    static var current: ChappyVoiceProvider {
+        let d = UserDefaults.standard
+        if let p = ChappyVoiceProvider(rawValue: d.string(forKey: "chappy_voice_provider") ?? "") {
+            return p
+        }
+        // REVIEW FIX - AN UPGRADE MUST NOT UNDO A CHOICE HE ALREADY MADE.
+        //
+        // chappy_voice_provider has never shipped, so EVERY existing install
+        // arrives here with it unset. Defaulting flatly to ElevenLabs would
+        // have moved a wearer who deliberately picked "System" - the free,
+        // offline, no-network Apple voice - onto a paid cloud provider on
+        // every line, without a tap, and voiceStatusLine's "Apple's voice by
+        // choice" branch would have become unreachable so he could not even
+        // ask why. That is the offline guarantee build 132 exists for, thrown
+        // away by a default.
+        //
+        // So: a stored Gemini voice IS a choice. Honour it, and let him move
+        // with the switch. A genuinely fresh install has neither key and gets
+        // the fast voice, which is the point.
+        if let chosen = d.string(forKey: "chappy_tts_voice"), !chosen.isEmpty {
+            return .gemini
+        }
+        return .elevenLabs
+    }
+
+    /// BUILD 272 — NO HARDCODED VOICE IDS, AND THIS IS NOT FUSSINESS.
+    ///
+    /// The obvious build here is a picker with George, Lily, Alice and Daniel
+    /// baked in. It would have shipped broken. ElevenLabs' Default voices
+    /// expire on 31 December 2026, AND they are only available to accounts
+    /// created before March 2026 - so a brand new Starter account, which is
+    /// exactly what he is buying, cannot use a single one of those IDs. Every
+    /// baked-in voice would have 404'd on his first render, and the symptom
+    /// would have been "the new voice doesn't work" with no clue why.
+    ///
+    /// So the list is fetched from his own account at runtime and cached. What
+    /// he can choose is whatever HE actually has, today, for as long as he has
+    /// it - which is also the only version of this that still works in 2027.
+    ///
+    /// Empty until the list has been fetched once and a voice chosen. An empty
+    /// ID must never reach the URL: see the guard in streamElevenLabsAudio.
+    /// BUILD 274 — his chosen voice, baked in as the default.
+    ///
+    /// The note above still stands and is the reason this is a DEFAULT rather
+    /// than a constant: ElevenLabs' stock voices expire at the end of 2026, so
+    /// any ID in source has a shelf life. This one is his own, from his own
+    /// account, which he sent me — and the moment he taps a different voice in
+    /// Settings, that one is used instead and this line stops mattering.
+    static var elevenVoiceID: String {
+        let saved = UserDefaults.standard.string(forKey: "chappy_11l_voice_id") ?? ""
+        return saved.isEmpty ? "wDsJlOXPqcvIUKdLXjDs" : saved
+    }
+
+    /// Flash v2.5: ~75ms, 32 languages, half the credits per character of the
+    /// multilingual models.
+    ///
+    /// BUILD 274 gave this a row next to the voice list - Flash, Turbo and
+    /// Multilingual v2 - so it is now his to change, not only mine. The model
+    /// is part of the voice cache key for the reason spelled out on
+    /// `voiceName`: the three do not sound the same.
+    static var elevenModel: String {
+        UserDefaults.standard.string(forKey: "chappy_11l_model") ?? "eleven_flash_v2_5"
+    }
+
+    /// True only when this provider can actually be attempted. Checked before
+    /// the attempt rather than discovered by a failed one, because a failed
+    /// attempt on the voice path costs silence.
+    /// NOT @MainActor. APIKeyManager is not actor-isolated - every other key
+    /// read on the speaking path calls it synchronously - and marking this
+    /// MainActor would have forced an await into a condition list inside a
+    /// nonisolated Task for no benefit.
+    static var elevenReady: Bool {
+        current == .elevenLabs
+            && !elevenVoiceID.isEmpty
+            && !(APIKeyManager.shared.getElevenLabsKey() ?? "").isEmpty
+    }
+}
+
+/// BUILD 272 — reading his account rather than guessing at it.
+///
+/// Two small calls, both used by Settings only, neither on the speaking path.
+enum ElevenLabsAccount {
+
+    struct Voice: Identifiable, Hashable {
+        let id: String          // voice_id
+        let name: String
+        let accent: String      // "british", "american", ... may be empty
+        let descriptor: String  // labels.description, may be empty
+    }
+
+    struct Usage {
+        let tier: String
+        let used: Int
+        let limit: Int
+        var remaining: Int { max(0, limit - used) }
+    }
+
+    private static func request(_ path: String, key: String) -> URLRequest? {
+        guard let url = URL(string: "https://api.elevenlabs.io" + path) else { return nil }
+        var r = URLRequest(url: url)
+        r.setValue(key, forHTTPHeaderField: "xi-api-key")
+        r.timeoutInterval = 15
+        return r
+    }
+
+    /// v2/voices, filtered to what a person would actually want to pick from.
+    /// page_size is capped at 100 by the API; one page is plenty for a
+    /// personal account and saves paginating for no reason.
+    static func voices(key: String) async -> [Voice] {
+        guard !key.isEmpty,
+              let r = request("/v2/voices?page_size=100", key: key) else { return [] }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: r)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                ChappyStandbyLog.note("⚠️ [11L] Could not read the voice list (HTTP \(code))")
+                return []
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let raw = json["voices"] as? [[String: Any]] else { return [] }
+            return raw.compactMap { v in
+                guard let id = v["voice_id"] as? String, !id.isEmpty,
+                      let name = v["name"] as? String else { return nil }
+                let labels = v["labels"] as? [String: Any]
+                return Voice(id: id,
+                             name: name,
+                             accent: (labels?["accent"] as? String) ?? "",
+                             descriptor: (labels?["description"] as? String) ?? "")
+            }
+        } catch {
+            ChappyStandbyLog.note("⚠️ [11L] Could not read the voice list: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// What it is costing him, from the source rather than from my arithmetic.
+    static func usage(key: String) async -> Usage? {
+        guard !key.isEmpty,
+              let r = request("/v1/user/subscription", key: key) else { return nil }
+        guard let (data, response) = try? await URLSession.shared.data(for: r),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return Usage(tier: (json["tier"] as? String) ?? "unknown",
+                     used: (json["character_count"] as? Int) ?? 0,
+                     limit: (json["character_limit"] as? Int) ?? 0)
+    }
+}
+
 class TTSService: NSObject, ObservableObject {
     static let shared = TTSService()
 
@@ -192,7 +383,31 @@ class TTSService: NSObject, ObservableObject {
     //
     // 2.5 stays as the fallback, so a bad day on 3.1 lands exactly where the
     // old primary was rather than on the robot voice.
-    private let ttsModels = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+    // BUILD 271 - COMPUTED, NOT STORED, AND NOT HARDCODED ANY MORE.
+    //
+    // Stored `let` meant the value was frozen when TTSService was first
+    // touched, so even once these became settings a change would not take
+    // effect until the app was killed and relaunched - the worst possible
+    // behaviour for a control whose entire reason to exist is "the voice is
+    // broken right now and I need to move off this model".
+    //
+    // Order still matters and still means what it meant: index 0 renders
+    // everything, index 1 is only reached when index 0 fails - and only its
+    // playback, never its cache, for the reason given at that call site.
+    //
+    // An earlier draft of this comment sent the reader to "the note above
+    // about why they must not both be preview models". There is no such note,
+    // and there could not be: Google offers three speech models and all three
+    // are previews, so both entries are previews by necessity, not by
+    // oversight. Review caught the comment inventing a rule the UI cannot
+    // satisfy - the same fault this file records against itself twice already.
+    private var ttsModels: [String] {
+        let primary = ChappyModels.tts
+        let fallback = ChappyModels.ttsFallback
+        // A fallback identical to the primary is not a fallback, it is the
+        // same request twice and twice the latency before the Apple voice.
+        return primary == fallback ? [primary] : [primary, fallback]
+    }
 
     // BUILD 259 — ONE MODEL RENDERS EVERYTHING, AND I TRIED IT THE OTHER WAY
     // FIRST.
@@ -232,6 +447,50 @@ class TTSService: NSObject, ObservableObject {
         return major > 3 || (major == 3 && minor >= 1)
     }
 
+    // BUILD 271 - NAME THE QUOTA, DO NOT GUESS AT IT.
+    //
+    // He asked a fair question: "is the voice dead because we moved the brain
+    // to 3.7?" I could not answer it from the log, because the log recorded
+    // "TTS HTTP error 429" and nothing else. Google DOES say which quota it
+    // refused on, in the error body, and the answer is different depending on
+    // what it says:
+    //
+    //   ...PerProjectPerModel...  -> the VOICE model's own cap. Nothing to do
+    //                                with the brain. Google applies the
+    //                                tightest caps to preview models, and the
+    //                                voice model is a preview model.
+    //   ...PerProject... (no model) -> the whole project's cap, which the
+    //                                brain and the voice share. Then the 3.7
+    //                                switch is a genuine suspect, because
+    //                                Google states rate limits are enforced
+    //                                per project, not per API key.
+    //
+    // One string decides it. Pull it out and put it in front of him.
+    static func quotaReason(from body: String) -> String {
+        guard !body.isEmpty,
+              let data = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let err = json["error"] as? [String: Any] else { return "" }
+
+        // The quota id is the precise answer; the message is the readable one.
+        if let details = err["details"] as? [[String: Any]] {
+            for d in details {
+                guard let violations = d["violations"] as? [[String: Any]] else { continue }
+                for v in violations {
+                    if let id = v["quotaId"] as? String, !id.isEmpty {
+                        let scope = id.contains("PerModel") ? "this voice model only"
+                                  : (id.contains("PerProject") ? "the WHOLE project, brain included" : "unclear scope")
+                        return " - quota \(id) (\(scope))"
+                    }
+                }
+            }
+        }
+        if let msg = err["message"] as? String, !msg.isEmpty {
+            return " - \(msg.prefix(160))"
+        }
+        return ""
+    }
+
     /// BUILD 259 — one bad streaming attempt turns streaming off for the rest
     /// of the session and everything falls back to the proven whole-clip path.
     ///
@@ -259,8 +518,37 @@ class TTSService: NSObject, ObservableObject {
 
     /// Gemini prebuilt voice. Change via UserDefaults key "chappy_tts_voice".
     /// Nice options: Kore (warm female), Puck (male), Aoede, Charon, Fenrir, Leda.
-    private var voiceName: String {
+    private var geminiVoiceName: String {
         UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore"
+    }
+
+    /// BUILD 272 — THE CACHE KEY, AND WHY THIS ONE LINE MATTERS MOST.
+    ///
+    /// VoiceCache keys on SHA256(voice|text) and NOTHING ELSE. Adding a second
+    /// provider without touching this would have meant an ElevenLabs line and
+    /// a Gemini line of the same text sharing one file on disk: switch
+    /// provider, and every sentence Chappy already knows replays in the OLD
+    /// provider's voice while new ones arrive in the new. That is the
+    /// changing-person fault builds 125 and 259 exist to prevent, and it would
+    /// have looked exactly like "the new voice doesn't work properly".
+    ///
+    /// Prefixing the provider makes the keyspaces disjoint for free. It also
+    /// means switching back and forth costs nothing: each provider keeps its
+    /// own cached copies rather than trampling the other's.
+    private var voiceName: String {
+        switch ChappyVoiceProvider.current {
+        // REVIEW FIX - THE MODEL IS IN THE KEY TOO.
+        //
+        // 274 added a Flash / Turbo / Multilingual picker, and those three do
+        // not sound the same. With only the voice in the key, switching engine
+        // would leave every already-cached line replaying in the old engine's
+        // prosody for ever while new lines arrived in the new one - the
+        // changing-person fault again, arriving through the one control added
+        // to let him compare them. Three keyspaces, disjoint, no wipe needed.
+        case .elevenLabs:
+            return "11l:\(ChappyVoiceProvider.elevenModel):\(ChappyVoiceProvider.elevenVoiceID)"
+        case .gemini:     return geminiVoiceName
+        }
     }
 
     /// BUILD 125: above this length a line is almost certainly a one-off AI
@@ -278,6 +566,11 @@ class TTSService: NSObject, ObservableObject {
     /// mid-conversation. Resolve it once, write the identifier down, and use
     /// that identifier forever after.
     private func pinnedSystemVoice(for language: String) -> AVSpeechSynthesisVoice? {
+        // TTSService has no initialiser to hang this off, and this is the only
+        // function in the app that reads a pin - so it is the one place the
+        // migration cannot be skipped.
+        Self.migratePinnedVoicesIfNeeded()
+
         let key = "chappy_pinned_voice_\(language)"
         if let saved = UserDefaults.standard.string(forKey: key),
            let v = AVSpeechSynthesisVoice(identifier: saved) {
@@ -292,21 +585,108 @@ class TTSService: NSObject, ObservableObject {
         // the fallback is as close a relative as the device can offer.
         var pool = candidates
         if #available(iOS 17.0, *) {
-            let wanted: AVSpeechSynthesisVoiceGender = Self.femaleGeminiVoices.contains(voiceName) ? .female : .male
+            // BUILD 272: geminiVoiceName. This matches the Apple fallback's sex
+            // to the chosen Gemini voice; with ElevenLabs selected the prefixed
+            // name matches nothing in the set and everyone silently became
+            // male. Reading the Gemini name keeps the old behaviour intact and
+            // is no worse than before for ElevenLabs, where the set does not
+            // describe the voice anyway.
+            let wanted: AVSpeechSynthesisVoiceGender = Self.femaleGeminiVoices.contains(geminiVoiceName) ? .female : .male
             let matched = candidates.filter { $0.gender == wanted }
             if !matched.isEmpty { pool = matched }
         }
 
-        // Prefer the nicest available, then settle it deterministically so two
-        // launches never disagree.
-        let ranked = pool.sorted { a, b in
-            if a.quality.rawValue != b.quality.rawValue { return a.quality.rawValue > b.quality.rawValue }
-            return a.identifier < b.identifier
+        // BUILD 271 - "NICEST AVAILABLE" IS THE WRONG WORD FOR AVAILABLE.
+        //
+        // This sorted by quality DESCENDING and took the best: Premium first,
+        // then Enhanced, then Default. That reads as obviously right and is
+        // the likeliest reason he heard NOTHING today rather than the robot.
+        //
+        // speechVoices() lists Enhanced and Premium voices whether or not
+        // their audio assets have actually been downloaded to the phone.
+        // Speaking through one that has not been downloaded does not throw
+        // and does not fall back - the utterance is accepted, didFinish is
+        // reported on schedule, and no sound is produced. Silence that looks
+        // exactly like success.
+        //
+        // And the result was written to UserDefaults and reused FOREVER, so a
+        // single unlucky pin makes every future fallback silent across every
+        // launch. Nothing re-evaluated it. That is this file's signature bug
+        // - the silent-forever kind - in a function whose whole job is to be
+        // the thing that still works when everything else has failed.
+        //
+        // So: Default quality FIRST. It is the compact voice that ships in
+        // the OS image and is present on every device by definition. This
+        // voice only ever speaks when Chappy's real voice has already failed;
+        // trading a little polish for "it makes a sound" is not a close call.
+        //
+        // Only reachable for a language iOS says it has, so a nil return here
+        // still means genuinely nothing installed, exactly as before.
+        // REVIEW FIX - "PREFER .default" ALONE PICKS THE WORST VOICE ON THE
+        // PHONE, NOT THE SAFEST.
+        //
+        // My first cut tested only `quality == .default` and then tie-broke on
+        // identifier ascending. Quality .default also covers the Eloquence set
+        // (com.apple.eloquence.*) and the novelty voices, and those sort BEFORE
+        // com.apple.ttsbundle.* alphabetically - so the emergency voice would
+        // have pinned to a 1980s DECtalk-style Eloquence voice and written it
+        // to UserDefaults forever. That is not a hypothesised silence, it is a
+        // guaranteed regression, and it would have been my fault twice over.
+        //
+        // Rank on three keys, in order:
+        //   1. quality: default, then enhanced, then premium
+        //   2. shipped-in-the-OS bundle before anything else
+        //   3. identifier, purely so two launches never disagree
+        func rank(_ v: AVSpeechSynthesisVoice) -> (Int, Int, String) {
+            let q: Int
+            switch v.quality {
+            case .default:  q = 0
+            case .enhanced: q = 1
+            default:        q = 2      // .premium, and anything Apple adds later
+            }
+            let shipped = v.identifier.hasPrefix("com.apple.ttsbundle.") ? 0 : 1
+            return (q, shipped, v.identifier)
         }
+        let ranked = pool.sorted { rank($0) < rank($1) }
         guard let chosen = ranked.first else { return nil }
         UserDefaults.standard.set(chosen.identifier, forKey: key)
-        print("🔊 [TTS] Pinned fallback voice for \(language): \(chosen.name) (\(chosen.identifier))")
+        ChappyStandbyLog.note("🗣️ [TTS] Emergency voice for \(language) is \(chosen.name) (quality \(chosen.quality.rawValue))")
         return chosen
+    }
+
+    /// BUILD 271 - a way out of a bad pin without deleting the app.
+    ///
+    /// If the pinned identifier ever stops resolving - iOS drops a downloaded
+    /// voice on an update, or the wearer removes it in Accessibility - the
+    /// lookup above already falls through and re-picks. This is for the case
+    /// where it resolves but does not make a sound, which the phone cannot
+    /// detect and he can. Wired to the voice self-test.
+    static func forgetPinnedFallbackVoices() {
+        // REVIEW FIX - repinSystemVoices() already cleared exactly this
+        // keyspace and I wrote a byte-for-byte copy of it without looking.
+        // Two functions clearing the same defaults, called from different
+        // places, is how they drift apart later.
+        repinSystemVoices()
+        ChappyStandbyLog.note("🗣️ [TTS] Emergency voice pins cleared - will be re-chosen on the next fallback")
+    }
+
+    /// REVIEW FIX - THIS BUILD HAD TO REPAIR THE PHONE THAT ALREADY HAS THE
+    /// BUG, AND IT DID NOT.
+    ///
+    /// The lookup above returns any saved identifier that still resolves, and
+    /// a Premium voice with no downloaded asset resolves fine. So every fix in
+    /// this build would have sailed straight past the one device that reported
+    /// the fault: his pin was already written, and nothing re-evaluated it
+    /// unless he happened to press the voice self-test.
+    ///
+    /// One-shot, versioned, runs once per install. Cheap and it cannot loop.
+    static func migratePinnedVoicesIfNeeded() {
+        let d = UserDefaults.standard
+        let current = 271
+        guard d.integer(forKey: pinVersionKey) < current else { return }
+        repinSystemVoices()
+        d.set(current, forKey: pinVersionKey)
+        ChappyStandbyLog.note("🗣️ [TTS] Emergency voice re-chosen for build 271")
     }
 
     /// Gemini's prebuilt voices, split so the Apple fallback can match.
@@ -325,6 +705,36 @@ class TTSService: NSObject, ObservableObject {
     func runVoiceSelfTest() {
         Task { [weak self] in
             guard let self else { return }
+            // BUILD 271 - clear the emergency-voice pin FIRST, every time.
+            //
+            // "Test the voice" is the one button he presses when he cannot
+            // hear anything, so it is the right place to undo a bad pin. It
+            // costs one voice lookup and it means a silent Apple fallback can
+            // always be repaired from the phone, without a build from me.
+            Self.forgetPinnedFallbackVoices()
+            // Clears the five-minute streaming latch so the next REAL line
+            // gets a fresh attempt. The test itself renders whole-clip, so it
+            // does not prove streaming works - it only stops a stale latch
+            // outliving the problem that set it.
+            Self.streamingGaveUp = false
+
+            // REVIEW FIX (BUILD 272) - the self-test renders through Gemini
+            // whatever the provider, so on ElevenLabs it was about to announce
+            // "that was the Gemini voice, working fine" about a voice that is
+            // not the one speaking. Test what is actually in use.
+            if ChappyVoiceProvider.elevenReady {
+                // Through speak(), NOT straight into streamElevenLabsAudio.
+                // The renderer needs a speaking generation to own, and it is
+                // speak() that mints one - calling the renderer directly would
+                // mean inventing a generation number, which is how this file's
+                // barge-in ownership rules get quietly broken. Going through
+                // the front door also means the test exercises the REAL path,
+                // fallbacks included, which is the only thing worth testing.
+                self.speak("This is my real voice, on ElevenLabs. If you can hear this, the fast voice is working.",
+                           forceNetworkVoice: true)
+                return
+            }
+
             let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
             guard !key.isEmpty else {
                 self.speak("No Google key is set, so every voice falls back to this Apple one. Add the Gemini key in Settings.")
@@ -335,7 +745,7 @@ class TTSService: NSObject, ObservableObject {
                 let audio = try await self.requestGeminiAudio(
                     text: "This is my real voice, and it's working.",
                     model: self.ttsModels[0], apiKey: key)
-                VoiceCache.shared.save(audio, text: "This is my real voice, and it's working.", voice: self.voiceName)
+                VoiceCache.shared.save(audio, text: "This is my real voice, and it's working.", voice: self.geminiVoiceName)
                 let gen = self.beginSpeaking(estimatedCharacters: 40)
                 defer { Task { @MainActor in self.endSpeaking(gen) } }
                 try await self.playPCM(audio, gen: gen)
@@ -362,10 +772,18 @@ class TTSService: NSObject, ObservableObject {
     /// fallback re-matches the new one.
     static func repinSystemVoices() {
         let d = UserDefaults.standard
-        for (k, _) in d.dictionaryRepresentation() where k.hasPrefix("chappy_pinned_voice_") {
+        // REVIEW FIX - the migration marker is called
+        // chappy_pinned_voice_version, which matches this very prefix. Left
+        // alone, voiceChanged() and the self-test wiped the marker along with
+        // the pins, so a "one-shot" migration re-ran every time and logged
+        // "re-chosen for build 271" on a build that had already done it.
+        for (k, _) in d.dictionaryRepresentation()
+        where k.hasPrefix("chappy_pinned_voice_") && k != Self.pinVersionKey {
             d.removeObject(forKey: k)
         }
     }
+
+    private static let pinVersionKey = "chappy_pinned_voice_version"
 
     // Playback engine (24 kHz PCM16 from Gemini)
     private var playbackEngine: AVAudioEngine?
@@ -439,8 +857,46 @@ class TTSService: NSObject, ObservableObject {
     static var lastFallbackReason = ""
     static var lastFallbackAt: Date?
 
+    /// BUILD 274 (review fix). What ElevenLabs last refused with, so
+    /// voiceStatusLine can answer "why does it sound like Google" truthfully
+    /// rather than reading the settings back at him.
+    nonisolated(unsafe) static var lastElevenFailure: (code: Int, at: Date)?
+
     /// The honest status line, for the voice test and for asking out loud.
     static var voiceStatusLine: String {
+        // REVIEW FIX (BUILD 272) - THE THIRD PLACE THAT ONLY KNEW ABOUT GOOGLE.
+        //
+        // This is what Chappy SAYS OUT LOUD when asked why the voice sounds
+        // wrong. Left alone it would have answered "there's no Google key, so
+        // only Apple's voice is available" while ElevenLabs was speaking
+        // perfectly well without one - a confident, wrong answer to the exact
+        // question this line exists to answer honestly.
+        if ChappyVoiceProvider.current == .elevenLabs {
+            // REVIEW FIX - BOTH OF THE OLD TESTS WENT UNREACHABLE IN 274.
+            //
+            // With a key and a voice baked in, neither can be empty, so this
+            // used to answer "on ElevenLabs, working" no matter what - which
+            // is a confident wrong answer from the one function whose entire
+            // job is saying honestly why the voice sounds off. If the key is
+            // revoked or out of credit, every line quietly pays a failure and
+            // renders through Google, and this said nothing.
+            //
+            // Report what actually happened instead of what is configured.
+            if let f = lastElevenFailure, Date().timeIntervalSince(f.at) < 600 {
+                let why: String
+                switch f.code {
+                case 401: why = "the ElevenLabs key was rejected"
+                case 402: why = "the ElevenLabs account is out of characters"
+                case 404, 422: why = "that ElevenLabs voice isn't available on this account"
+                case 429: why = "ElevenLabs is rate limiting"
+                default:  why = "ElevenLabs returned an error (\(f.code))"
+                }
+                let ago = Int(Date().timeIntervalSince(f.at))
+                return "Chappy is on Google right now because \(why) — \(ago) seconds ago."
+            }
+            return "Chappy's voice is on ElevenLabs, with Google behind it and the phone's own voice behind that."
+        }
+
         let wantsSystem = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
         if wantsSystem {
             return "The voice is set to System in Settings — that's Apple's voice by choice, not a fault."
@@ -549,8 +1005,21 @@ class TTSService: NSObject, ObservableObject {
         guard previous != current else { return }
         UserDefaults.standard.set(current, forKey: key)
         guard previous != nil else { return }   // first run, nothing to clear
-        print("🔊 [TTS] Voice changed \(previous ?? "?") → \(current) — resetting cache and fallback")
-        VoiceCache.shared.clear()
+        print("🔊 [TTS] Voice changed \(previous ?? "?") → \(current) — repinning and rewarming")
+        // REVIEW FIX (BUILD 272) - AND THIS CLEAR WAS ALWAYS UNNECESSARY.
+        //
+        // The VOICE is part of the cache key. A line rendered in the old voice
+        // is unreachable the instant the voice changes - it cannot be served
+        // by mistake, which is the only thing a wipe protects against. Stale
+        // files are pruned by the 60 MB LRU budget in the normal way.
+        //
+        // It started to matter the moment ElevenLabs arrived: auditioning
+        // voices changes `voiceName` on every tap, so five taps meant five
+        // total cache wipes and five full 38-phrase re-warms over the network.
+        // It also made the note on `voiceName` a lie, which review caught.
+        //
+        // Contrast voiceChanged(), which DOES still clear: that one fires on a
+        // MODEL change, and the model is not in the key.
         Self.repinSystemVoices()
         Self.geminiVoiceGaveUp = false
         warmCache()
@@ -988,7 +1457,17 @@ class TTSService: NSObject, ObservableObject {
     /// and silent — it never plays a sound. Safe to call on every launch: once
     /// the set is on disk this does nothing at all.
     func warmCache() {
-        let voice = voiceName
+        // BUILD 272 — WARM THE PROVIDER THAT IS ACTUALLY SPEAKING.
+        //
+        // Rendering ahead through Google while ElevenLabs does the talking
+        // would write into a keyspace the live path never looks in: a Google
+        // call per line, bought and thrown away. See warmElevenLabs for why
+        // this dispatches rather than simply returning.
+        guard ChappyVoiceProvider.current == .gemini else {
+            warmElevenLabs(Self.warmPhrases)
+            return
+        }
+        let voice = geminiVoiceName   // a Gemini render, so a Gemini key
         guard voice != "System" else { return }
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty else { return }
@@ -1046,7 +1525,17 @@ class TTSService: NSObject, ObservableObject {
     /// cache in the background. By the time the wearer reaches turn one, the
     /// whole route speaks from disk — instant, offline-proof, in the ONE voice.
     func prerender(_ lines: [String]) {
-        let voice = voiceName
+        // BUILD 272 — WARM THE PROVIDER THAT IS ACTUALLY SPEAKING.
+        //
+        // Rendering ahead through Google while ElevenLabs does the talking
+        // would write into a keyspace the live path never looks in: a Google
+        // call per line, bought and thrown away. See warmElevenLabs for why
+        // this dispatches rather than simply returning.
+        guard ChappyVoiceProvider.current == .gemini else {
+            warmElevenLabs(lines, after: 8_000_000_000)
+            return
+        }
+        let voice = geminiVoiceName   // a Gemini render, so a Gemini key
         guard voice != "System" else { return }
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty else { return }
@@ -1119,8 +1608,9 @@ class TTSService: NSObject, ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        let wantsSystemVoice =
-            (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
+        // REVIEW FIX (BUILD 272) - provider-aware; see the note in speak().
+        let wantsSystemVoice = ChappyVoiceProvider.current == .gemini
+            && geminiVoiceName == "System"
 
         if !wantsSystemVoice, VoiceCache.shared.has(text: trimmed, voice: voiceName) {
             speak(trimmed, languageCode: languageCode)
@@ -1223,7 +1713,17 @@ class TTSService: NSObject, ObservableObject {
     /// Like prerender, but without the eight-second politeness delay —
     /// used when the lines are about to be spoken in the next breath.
     private func prerenderNow(_ lines: [String]) {
-        let voice = voiceName
+        // BUILD 272 — WARM THE PROVIDER THAT IS ACTUALLY SPEAKING.
+        //
+        // Rendering ahead through Google while ElevenLabs does the talking
+        // would write into a keyspace the live path never looks in: a Google
+        // call per line, bought and thrown away. See warmElevenLabs for why
+        // this dispatches rather than simply returning.
+        guard ChappyVoiceProvider.current == .gemini else {
+            warmElevenLabs(lines)
+            return
+        }
+        let voice = geminiVoiceName   // a Gemini render, so a Gemini key
         guard voice != "System" else { return }
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty else { return }
@@ -1326,9 +1826,30 @@ class TTSService: NSObject, ObservableObject {
             defer { Task { @MainActor in self.endSpeaking(gen) } }
 
             let googleKey = APIKeyManager.shared.getGoogleAPIKey() ?? ""
-            let wantsSystemVoice = (UserDefaults.standard.string(forKey: "chappy_tts_voice") ?? "Kore") == "System"
+            // REVIEW FIX (BUILD 272) - PROVIDER-AWARE, AND THIS ONE WOULD
+            // HAVE BEEN THE FIRST THING HE HIT.
+            //
+            // "System" is an entry in the GOOGLE voice list and this test knew
+            // nothing about providers. So picking ElevenLabs while "System"
+            // was still selected gave Apple's robot voice with Settings
+            // showing ElevenLabs as the provider - which is indistinguishable
+            // from "the new voice doesn't work", and unfalsifiable from the
+            // log.
+            let wantsSystemVoice = ChappyVoiceProvider.current == .gemini
+                && self.geminiVoiceName == "System"
 
             // BUILD 125 — ONE VOICE, ALWAYS.
+            //
+            // BUILD 274 QUALIFIES THIS, and the qualification should be here
+            // rather than only in the settings footer. Live AI and Live
+            // Translate speak through Gemini's realtime socket, which carries
+            // its own voice and knows nothing about providers. So with
+            // ElevenLabs selected the app genuinely does have two voices: the
+            // fast one for everything on this path, and the Google one inside
+            // a live session. There is no cheap fix - no ElevenLabs equivalent
+            // exists inside a realtime socket - so it is a deliberate trade,
+            // not an oversight, and the claim below is now "one voice on this
+            // path" rather than one voice in the app.
             //
             // The old code here split by LENGTH: anything under 90 characters
             // went to Apple's voice because Gemini is a network round trip and
@@ -1346,6 +1867,19 @@ class TTSService: NSObject, ObservableObject {
             // copy, and no network. When it does speak it speaks as ONE pinned
             // voice (see systemVoice) rather than whatever iOS picks that day.
             let voice = self.voiceName
+            // REVIEW FIX - THE ID IS SNAPSHOT HERE, BESIDE THE KEY IT MUST
+            // AGREE WITH.
+            //
+            // My first attempt put these two lines just above the ElevenLabs
+            // call, which review correctly called a no-op: there is no await
+            // between there and the render, so it was identical to reading the
+            // property inline. The window that actually matters is the
+            // corrupt-cache retry BELOW this line, which awaits playPCM twice
+            // and sleeps 400ms. Tap a different voice inside that window and
+            // the old code rendered voice B and filed it under voice A's key -
+            // cache poisoning that survives a restart.
+            let elevenVoice = ChappyVoiceProvider.elevenVoiceID
+            let elevenModel = ChappyVoiceProvider.elevenModel
 
             // 1. DISK. Instant, offline, right voice.
             if !wantsSystemVoice, !forceNetworkVoice,
@@ -1376,8 +1910,73 @@ class TTSService: NSObject, ObservableObject {
                 }
             }
 
+            // 1.5 THE FAST VOICE, IF HE HAS CHOSEN IT.
+            //
+            // Placed above Google and below the cache, which is the only
+            // position that is right: a cached line must never re-render, and
+            // a provider that answers in 75ms must never wait behind one that
+            // takes seconds.
+            //
+            // A failure here falls THROUGH to Google rather than out to the
+            // Apple voice. That is the whole argument for having two paid
+            // providers: they are on different companies, different keys and
+            // different quotas, so the failure that took Chappy's voice out on
+            // 18 August cannot take both. Three tiers now - ElevenLabs, then
+            // Google, then the device - and only the last one is robotic.
+            //
+            // No latch. The Gemini path has geminiVoiceGaveUp because a Gemini
+            // render used to cost twenty seconds, so repeating a doomed one
+            // was expensive. A Flash call that is going to fail fails in well
+            // under a second, and a latch here would keep him on the slow
+            // voice long after the blip had passed.
+            if !wantsSystemVoice, ChappyVoiceProvider.elevenReady,
+               let elevenKey = APIKeyManager.shared.getElevenLabsKey(), !elevenKey.isEmpty {
+                do {
+                    let audio = try await self.streamElevenLabsAudio(
+                        text: trimmed,
+                        voiceID: elevenVoice,
+                        model: elevenModel,
+                        apiKey: elevenKey, gen: gen)
+                    VoiceCache.shared.save(audio, text: trimmed, voice: voice)
+                    Self.lastElevenFailure = nil     // proof of life
+                    // REVIEW FIX - NOT CostMeter.addTTSChars. That bucket gets
+                    // multiplied by GOOGLE's per-character rate, so counting
+                    // ElevenLabs characters into it makes "Estimated today"
+                    // quietly wrong whenever the fast voice is in use. There
+                    // is a better number anyway: ElevenLabs reports his real
+                    // usage against his real plan, and the settings screen
+                    // reads it directly. An exact figure from the source beats
+                    // an estimate at the wrong rate.
+                    return
+                } catch is CancellationError {
+                    return                       // barged in on — normal
+                } catch {
+                    if Task.isCancelled { return }
+                    // Remember WHAT it refused with, so voiceStatusLine can
+                    // answer "why does it sound like Google" with a fact.
+                    if let te = error as? TTSError, case .httpError(let code) = te {
+                        Self.lastElevenFailure = (code, Date())
+                    } else {
+                        Self.lastElevenFailure = (0, Date())
+                    }
+                    ChappyStandbyLog.note("↩️ [11L] Failed (\(error.localizedDescription)) — Google for this line")
+                }
+            }
+
             // 2. NETWORK. Renders, plays, and keeps the audio for next time.
-            if !googleKey.isEmpty, !wantsSystemVoice, !Self.geminiVoiceGaveUp {
+            // REVIEW FIX - AND I BROKE THIS IN THE LAST ROUND.
+            //
+            // Making wantsSystemVoice provider-aware fixed one bug and opened
+            // another: with ElevenLabs selected it is always false, so a user
+            // whose GOOGLE voice is still set to "System" now falls into this
+            // branch and Chappy sends "voiceName": "System" to Google, which
+            // is a 400. Twice per line, 800ms apart, then a five-minute latch
+            // - where before he simply got the Apple voice instantly.
+            //
+            // "System" is not a Google voice under any provider, so the test
+            // belongs here as well and not only in wantsSystemVoice.
+            if !googleKey.isEmpty, !wantsSystemVoice,
+               self.geminiVoiceName != "System", !Self.geminiVoiceGaveUp {
                 do {
                     try await self.speakWithGemini(text: trimmed, apiKey: googleKey, gen: gen)
                     // Only charge for audio that genuinely reached the speaker.
@@ -1504,7 +2103,15 @@ class TTSService: NSObject, ObservableObject {
     private func speakWithGemini(text: String, apiKey: String, gen: Int) async throws {
         var lastError: Error = TTSError.unknown
 
-        for model in ttsModels {
+        // REVIEW FIX - snapshot the list ONCE.
+        //
+        // ttsModels is computed from UserDefaults now, and this loop runs on a
+        // background task while the picker that writes those defaults runs on
+        // the main one. Re-reading it for the bounds check and again for the
+        // subscript meant the count could drop to 1 between the two and index
+        // 1 would trap. Read it once; the whole call uses one list.
+        let models = ttsModels
+        for (modelIndex, model) in models.enumerated() {
             let audio: Data
             // BUILD 248 — WHERE THE TWENTY SECONDS GOES.
             //
@@ -1531,7 +2138,7 @@ class TTSService: NSObject, ObservableObject {
                                                                apiKey: apiKey, gen: gen)
                     let ms = Int(Date().timeIntervalSince(began) * 1000)
                     ChappyStandbyLog.note("⚡ [TTS] \(model) streamed \(text.count) characters, \(ms)ms end to end")
-                    VoiceCache.shared.save(streamed, text: text, voice: voiceName)
+                    VoiceCache.shared.save(streamed, text: text, voice: geminiVoiceName)
                     Self.geminiVoiceGaveUp = false
                     return
                 } catch is CancellationError {
@@ -1561,7 +2168,72 @@ class TTSService: NSObject, ObservableObject {
             } catch {
                 let ms = Int(Date().timeIntervalSince(began) * 1000)
                 ChappyStandbyLog.note("⚠️ [TTS] \(model) failed after \(ms)ms: \(error.localizedDescription)")
-                throw error          // a REAL service failure — the caller may latch
+
+                // BUILD 271 - THE FALLBACK MODEL WAS NEVER TRIED.
+                //
+                // This list has two models in it precisely so that a bad day
+                // on the first one lands on the second. Only a 404 ever
+                // reached the `continue` above; every other failure threw
+                // straight out of the loop, so gemini-2.5-flash-preview-tts
+                // has sat here unused since the day it was added.
+                //
+                // That matters most in the exact case he hit. A 429 on a
+                // PREVIEW model is the likeliest 429 there is, because Google
+                // puts its tightest caps there. What the second model buys is
+                // narrower than I first wrote: per-MODEL caps are separate, so
+                // it helps when the refusal was this model's own, and not at
+                // all when the whole project is capped. See the note on
+                // ChappyModels.ttsFallback - all three speech models Google
+                // offers are previews and there is no GA one to fall back to.
+                // Either way Chappy went mute with a candidate voice one line
+                // below it, untried.
+                //
+                // Retryable only, and only if there is another model left.
+                // A malformed request or a bad key will fail identically on
+                // the second model, and burning a round trip to prove it is
+                // just latency he pays for nothing.
+                // `error` is `any Error` here, so the enum case has to be
+                // reached through a cast - `if case TTSError.httpError(...)`
+                // straight off an existential does not compile.
+                // REVIEW FIX - a barge-in must not buy a second request.
+                // URLSession surfaces cancellation as NSURLErrorCancelled
+                // (-999), which my first cut classified as retryable, so
+                // interrupting Chappy mid-sentence fired a fresh render at the
+                // fallback model for a line he had already talked over.
+                if Task.isCancelled { throw error }
+
+                let ns = error as NSError
+                let retryable: Bool
+                if let te = error as? TTSError, case .httpError(let code) = te {
+                    retryable = code == 429 || code >= 500
+                } else {
+                    // REVIEW FIX - AND A TIMEOUT IS NOT RETRYABLE. THIS IS
+                    // BUILD 248's FINDING AND I NEARLY UNDID IT.
+                    //
+                    // The render timeout is 20 seconds. Treating a timeout as
+                    // retryable turned "stream 20s, whole-clip 20s, fall back"
+                    // into "stream 20s, whole-clip 20s, SECOND MODEL 20s, fall
+                    // back" - sixty seconds of silence where there were forty,
+                    // on exactly the bad-network case build 248 measured and
+                    // cut down. My own comment three lines below said not to
+                    // burn a round trip to prove a foregone conclusion, and
+                    // then this line burned one.
+                    //
+                    // A service that had twenty seconds and did not answer is
+                    // not going to answer the second model any faster.
+                    let deadEnds: Set<Int> = [NSURLErrorTimedOut,
+                                              NSURLErrorNetworkConnectionLost,
+                                              NSURLErrorNotConnectedToInternet,
+                                              NSURLErrorCancelled]
+                    retryable = ns.domain == NSURLErrorDomain
+                        && !deadEnds.contains(ns.code)
+                }
+                if retryable, modelIndex + 1 < models.count {
+                    ChappyStandbyLog.note("↩️ [TTS] Trying \(models[modelIndex + 1]) instead")
+                    lastError = error
+                    continue
+                }
+                throw error          // a REAL service failure - the caller may latch
             }
 
             // The render worked. From here on, nothing that goes wrong is
@@ -1570,7 +2242,23 @@ class TTSService: NSObject, ObservableObject {
             // The old 200-character limit meant long answers re-rendered from
             // scratch every time — more network, more chances to fail, and
             // the cache could never protect them.
-            VoiceCache.shared.save(audio, text: text, voice: voiceName)
+            // REVIEW FIX - DO NOT CACHE A RENDER FROM THE FALLBACK MODEL.
+            //
+            // VoiceCache's key is SHA256(voice|text) and the model is not in
+            // it - the reason every other render site in this file is pinned
+            // to index 0, spelled out in the BUILD 259 note above. Before this
+            // build only a 404 could reach index 1, so it never mattered. Now
+            // a 429 routinely does, and caching that line would write one 2.5
+            // rendering to disk to replay for ever among 3.1 lines. That is
+            // Chappy changing person mid-conversation, which is the fault
+            // builds 125 and 259 exist to prevent, arriving by the back door
+            // of the fix for a different fault.
+            //
+            // Play it, do not keep it. Next time the primary is healthy the
+            // line renders and caches properly.
+            if modelIndex == 0 {
+                VoiceCache.shared.save(audio, text: text, voice: geminiVoiceName)
+            }
             Self.geminiVoiceGaveUp = false   // proof of life, clears any latch
             print("🔊 [TTS] Gemini voice (\(voiceName)) speaking: \(text.prefix(50))…")
 
@@ -1627,6 +2315,310 @@ class TTSService: NSObject, ObservableObject {
     /// twice. An earlier draft of this comment claimed the function handled
     /// that by returning rather than throwing; it did not, and review caught
     /// the comment describing code that was never written.
+    /// BUILD 272 — A NON-PLAYING ELEVENLABS RENDER, FOR WARMING ONLY.
+    ///
+    /// The streaming function above renders AND plays; a warm-up must do
+    /// neither out loud. This is the plain endpoint (no /stream), same voice,
+    /// same pcm_24000, so the bytes it returns are interchangeable with the
+    /// streamed ones and land in the same cache under the same key.
+    private func renderElevenLabsClip(text: String, voiceID: String,
+                                      model: String, apiKey: String) async throws -> Data {
+        guard !voiceID.isEmpty else { throw TTSError.modelNotFound }
+        let urlString = "https://api.elevenlabs.io/v1/text-to-speech/\(voiceID)?output_format=pcm_24000"
+        guard let url = URL(string: urlString) else { throw TTSError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "text": text, "model_id": model
+        ])
+        request.timeoutInterval = 20
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
+        guard http.statusCode == 200 else { throw TTSError.httpError(http.statusCode) }
+        guard !data.isEmpty else { throw TTSError.noAudio }
+        return data
+    }
+
+    /// BUILD 272 — REVIEW FIX. THE OFFLINE-PROOFING HAD TO SURVIVE THE MOVE.
+    ///
+    /// My first cut simply returned early from all three warmers when the
+    /// provider was not Google, on the reasoning that a 75ms render makes
+    /// pre-rendering pointless. Review pointed at the doc comment twelve lines
+    /// above one of them: BUILD 132 wrote prerender because "the whole route
+    /// speaks from disk — instant, OFFLINE-PROOF, in the ONE voice", after a
+    /// render that failed in traffic latched the robot voice.
+    ///
+    /// Latency was never the only thing it bought. He rides a scooter with
+    /// patchy signal; a turn instruction that has to reach the network at the
+    /// moment he needs it is the exact failure build 132 removed. Silently
+    /// trading that away for the fast voice would have been a regression
+    /// dressed as a feature, and it would have shown up as "the new voice
+    /// drops turns" a week later, in traffic, with no way to connect it.
+    /// `after` mirrors the eight-second wait the Gemini nav pre-render uses.
+    /// The route summary is being spoken at that moment, and starting a batch
+    /// of renders over the same connection is what BUILD 135 diagnosed as the
+    /// cause of nav going robot. Cheaper here, but the reasoning is unchanged.
+    private func warmElevenLabs(_ lines: [String], after: UInt64 = 0,
+                                gapNanos: UInt64 = 350_000_000) {
+        let voice = voiceName
+        let id = ChappyVoiceProvider.elevenVoiceID
+        let model = ChappyVoiceProvider.elevenModel
+        guard !id.isEmpty,
+              let key = APIKeyManager.shared.getElevenLabsKey(), !key.isEmpty else { return }
+        let missing = lines.filter { !$0.isEmpty && !VoiceCache.shared.has(text: $0, voice: voice) }
+        guard !missing.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            if after > 0 { try? await Task.sleep(nanoseconds: after) }
+            for line in missing {
+                do {
+                    let audio = try await self.renderElevenLabsClip(
+                        text: line, voiceID: id, model: model, apiKey: key)
+                    VoiceCache.shared.save(audio, text: line, voice: voice)
+                } catch {
+                    // A warm-up is a nicety and must never cost the voice.
+                    print("🔊 [11L] Warm-up stopped: \(error.localizedDescription)")
+                    break
+                }
+                try? await Task.sleep(nanoseconds: gapNanos)
+            }
+        }
+    }
+
+    // BUILD 272 — THE FAST VOICE.
+    //
+    // Deliberately shaped like streamGeminiAudio, because that function has
+    // had five builds of bugs beaten out of it and every one of those lessons
+    // applies here: the generation-ownership rule, clearing the node before a
+    // fallback is allowed to start, the cancellation check before the caller
+    // is allowed to cache, and the exact-length completion ceiling.
+    //
+    // Simpler in one way: ElevenLabs streams RAW PCM. No SSE framing, no
+    // base64, no JSON per chunk - just bytes in the order they should be
+    // played. And no carry byte, because the accumulator below only ever
+    // flushes at an EVEN length, so a sample can never be split across two
+    // scheduled buffers. (Gemini needed the carry byte because its chunk
+    // boundaries fall wherever the encoder likes; getting that wrong reads
+    // PCM16 one byte out of phase, which is full-scale white noise.)
+    //
+    // Returns the whole clip so the caller can cache it, same contract.
+    private func streamElevenLabsAudio(text: String, voiceID: String,
+                                       model: String, apiKey: String,
+                                       gen: Int) async throws -> Data {
+        // An empty voice ID would build ".../text-to-speech//stream", which is
+        // a 404 that reads like an outage rather than like "you have not
+        // picked a voice". elevenReady already refuses this case, so reaching
+        // here means someone added a caller that skipped it - which is exactly
+        // when a silent guard is worth least. Say so, then fall through to
+        // Google.
+        guard !voiceID.isEmpty else {
+            ChappyStandbyLog.note("⚠️ [11L] No voice chosen yet — Settings, Chappy's voice, ElevenLabs")
+            throw TTSError.modelNotFound
+        }
+        let urlString = "https://api.elevenlabs.io/v1/text-to-speech/\(voiceID)/stream?output_format=pcm_24000"
+        guard let url = URL(string: urlString) else { throw TTSError.invalidURL }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "text": text,
+            "model_id": model
+        ])
+        // Fifteen, not the twenty this file uses for Gemini. Flash is quoted at
+        // 75ms to first audio; if fifteen seconds have passed something is
+        // badly wrong and the honest move is to fall through to Google while
+        // he can still be told something, rather than hold the route.
+        request.timeoutInterval = 15
+
+        let began = Date()
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
+        guard http.statusCode == 200 else {
+            var errBody = ""
+            for try await line in bytes.lines {
+                errBody += line
+                if errBody.count > 4096 { break }
+            }
+            // 401 is a bad key, 402 is out of credit, 422 is usually a voice
+            // ID his account cannot use - which is the specific trap this
+            // build exists to avoid, so it gets named rather than numbered.
+            let hint: String
+            switch http.statusCode {
+            case 401: hint = " - the key was rejected"
+            case 402: hint = " - out of characters for this billing period"
+            case 404, 422: hint = " - that voice is not available on this account"
+            case 429: hint = " - rate limited"
+            default: hint = ""
+            }
+            ChappyStandbyLog.note("⛔️ [11L] HTTP \(http.statusCode)\(hint). \(errBody.prefix(180))")
+            throw TTSError.httpError(http.statusCode)
+        }
+
+        configureAudioSession()
+        startPlaybackEngine()
+        guard let playbackEngine, playbackEngine.isRunning,
+              let fmt = playbackFormat,
+              let node = playerNode, node.engine != nil else {
+            scheduleEngineIdle()
+            throw TTSError.noAudio
+        }
+        node.play()
+
+        var whole = Data()
+        var pending = Data()
+        var lostNode = false
+        var scheduled = 0
+        var drained = 0
+        var streamEnded = false
+        var firstChunkAt: Date?
+        let tally = NSLock()
+        let gate = ResumeGate()
+
+        func settleIfDone() {
+            tally.lock()
+            let done = streamEnded && drained >= scheduled
+            tally.unlock()
+            if done { _ = gate.fire() }
+        }
+
+        // 2,400 bytes is 50ms of 24 kHz mono PCM16, and 9,600 is 200ms. Small
+        // first flush so sound starts as early as the bytes allow - that is
+        // the entire point of this provider - then larger ones so a long
+        // answer is not thousands of scheduleBuffer calls. Both even, so a
+        // sample is never split.
+        func flushThreshold() -> Int { firstChunkAt == nil ? 2_400 : 9_600 }
+
+        func flush(force: Bool) {
+            guard !pending.isEmpty else { return }
+            // REVIEW FIX - A LOST NODE MUST NOT LOOK LIKE SUCCESS.
+            //
+            // This used to `return` silently when the node had gone (a media
+            // services reset, which the Gemini path notes is most likely on
+            // exactly this code path). Every remaining byte then fell into the
+            // same silent return, the stream ran to completion, firstChunkAt
+            // was non-nil so the guard below passed, and the function returned
+            // the WHOLE clip as a success. He would hear the first fragment of
+            // a sentence, the rest would vanish, the Google fallback would
+            // never run, and nothing anywhere would say why.
+            guard node.engine != nil else { lostNode = true; return }
+            guard force || pending.count >= flushThreshold() else { return }
+            let usable = pending.count - (pending.count % 2)
+            guard usable > 0 else { return }
+            // Data(...) rather than the slice: a Data slice keeps its parent's
+            // indices, and this file has already been bitten once by
+            // `suffix(from:)` taking an INDEX while the variable held a
+            // LENGTH. Rebasing to 0 is what makes the two agree.
+            let piece = Data(pending.prefix(usable))
+            pending = usable < pending.count ? Data(pending.suffix(from: usable)) : Data()
+            // REVIEW FIX - same silent-success class as the lost node. This
+            // `return` dropped a piece that had ALREADY been removed from
+            // `pending`, so the audio was gone from playback while `whole`
+            // still contained it: a clip returned as a success, cached, and
+            // only partly heard.
+            guard let buf = createPCMBuffer(from: piece, format: fmt) else {
+                lostNode = true
+                return
+            }
+            if firstChunkAt == nil {
+                firstChunkAt = Date()
+                let ms = Int(Date().timeIntervalSince(began) * 1000)
+                ChappyStandbyLog.note("⚡ [11L] First audio in \(ms)ms")
+            }
+            tally.lock(); scheduled += 1; tally.unlock()
+            node.scheduleBuffer(buf) {
+                tally.lock(); drained += 1; tally.unlock()
+                settleIfDone()
+            }
+        }
+
+        do {
+            // REVIEW FIX - one Data append per CHUNK, not two per BYTE.
+            //
+            // Appending to two Data values for every byte is ~96,000 COW
+            // checks per second of speech on top of an AsyncBytes next() per
+            // byte. It would probably have held, and "probably held" is not
+            // good enough here: falling behind shows up as buffer underrun,
+            // which is gaps in the voice, which is the symptom class this file
+            // has already spent five builds on. An array with reserved
+            // capacity costs nothing and removes the question.
+            var scratch = [UInt8]()
+            scratch.reserveCapacity(16_384)
+            for try await byte in bytes {
+                if Task.isCancelled { break }
+                scratch.append(byte)
+                if scratch.count >= flushThreshold() {
+                    let block = Data(scratch)
+                    scratch.removeAll(keepingCapacity: true)
+                    pending.append(block)
+                    whole.append(block)
+                    flush(force: false)
+                }
+            }
+            if !scratch.isEmpty {
+                let block = Data(scratch)
+                pending.append(block)
+                whole.append(block)
+            }
+            if !Task.isCancelled { flush(force: true) }
+        } catch {
+            // Identical reasoning to the Gemini path: clear the node before
+            // any fallback is allowed to schedule behind it, but ONLY if this
+            // generation still owns the voice. A cancelled stream throws here
+            // milliseconds after a barge-in has already scheduled its
+            // replacement, and stopping the node then would discard the new
+            // line and leave him in silence with nothing logged.
+            let mine = generationIsCurrent(gen)
+            if mine {
+                if firstChunkAt != nil, node.engine != nil { node.stop(); node.reset() }
+                scheduleEngineIdle()
+            }
+            throw error
+        }
+        tally.lock(); streamEnded = true; tally.unlock()
+
+        guard firstChunkAt != nil else {
+            scheduleEngineIdle()
+            throw TTSError.noAudio
+        }
+        // See flush(). Throwing here rather than returning a clip that was
+        // only half played is what sends the caller on to Google.
+        // `|| node.engine == nil` because lostNode is only ever set INSIDE
+        // flush(): a node that dies after the final flush sets nothing, the
+        // drain count never completes, the gate falls through on its timeout
+        // and the whole clip is returned as a success. Ask the node directly.
+        if lostNode || node.engine == nil {
+            ChappyStandbyLog.note("⚠️ [11L] Lost the audio mid-line — Google for this one")
+            scheduleEngineIdle()
+            throw TTSError.noAudio
+        }
+
+        let seconds = Double(whole.count / 2) / fmt.sampleRate
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            gate.arm(c)
+            settleIfDone()
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds + 3.0) {
+                if gate.fire() {
+                    print("⏱️ [11L] Completion dropped — unparking after \(String(format: "%.1f", seconds + 3.0))s")
+                }
+            }
+        }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        // Before the caller is allowed to cache. A barge-in breaks the loop
+        // above holding a PARTIAL clip, and writing that to the cache would
+        // pin the truncated version on disk for ever.
+        try Task.checkCancellation()
+
+        if generationIsCurrent(gen) { scheduleEngineIdle() }
+        let total = Int(Date().timeIntervalSince(began) * 1000)
+        ChappyStandbyLog.note("⚡ [11L] \(text.count) characters, \(total)ms end to end")
+        return whole
+    }
+
     private func streamGeminiAudio(text: String, model: String,
                                    apiKey: String, gen: Int) async throws -> Data {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse"
@@ -1638,7 +2630,11 @@ class TTSService: NSObject, ObservableObject {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": [
                     "voiceConfig": [
-                        "prebuiltVoiceConfig": ["voiceName": voiceName]
+                        // BUILD 272: geminiVoiceName, NOT voiceName. voiceName
+                        // now carries a provider prefix so the cache keyspaces
+                        // stay disjoint, and sending "11l:JBFqn..." to Google
+                        // as a prebuilt voice name is a 400 on every render.
+                        "prebuiltVoiceConfig": ["voiceName": geminiVoiceName]
                     ]
                 ]
             ]
@@ -1663,7 +2659,32 @@ class TTSService: NSObject, ObservableObject {
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw TTSError.invalidResponse }
         if http.statusCode == 404 { throw TTSError.modelNotFound }
-        guard http.statusCode == 200 else { throw TTSError.httpError(http.statusCode) }
+        guard http.statusCode == 200 else {
+            // BUILD 271 - the streaming path threw the bare status code and
+            // dropped the body on the floor, so a 429 here said nothing about
+            // WHICH quota. bytes(for:) has already returned the headers; the
+            // error body is short, so draining it costs nothing.
+            // Named errBody, not body: this function already has a `body`
+            // (the request JSON) in the enclosing scope, and shadowing it
+            // here would compile and read like a bug forever after.
+            // REVIEW FIX - 800 characters was too small to be worth writing.
+            // A 429 body carrying quotaId also carries quotaMetric,
+            // quotaDimensions, RetryInfo and a help link, routinely past 1 KB.
+            // Truncating mid-object means JSONSerialization fails and
+            // quotaReason returns "" - the log line would have been identical
+            // to the one I was replacing. Append first, THEN test, so the last
+            // chunk is never discarded.
+            var errBody = ""
+            for try await line in bytes.lines {
+                errBody += line
+                if errBody.count > 8192 { break }
+            }
+            if http.statusCode == 429 || http.statusCode >= 500 {
+                let reason = Self.quotaReason(from: errBody)
+                ChappyStandbyLog.note("⛔️ [TTS] \(model) refused streaming with HTTP \(http.statusCode)\(reason)")
+            }
+            throw TTSError.httpError(http.statusCode)
+        }
 
         configureAudioSession()
         startPlaybackEngine()
@@ -1829,7 +2850,11 @@ class TTSService: NSObject, ObservableObject {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": [
                     "voiceConfig": [
-                        "prebuiltVoiceConfig": ["voiceName": voiceName]
+                        // BUILD 272: geminiVoiceName, NOT voiceName. voiceName
+                        // now carries a provider prefix so the cache keyspaces
+                        // stay disjoint, and sending "11l:JBFqn..." to Google
+                        // as a prebuilt voice name is a 400 on every render.
+                        "prebuiltVoiceConfig": ["voiceName": geminiVoiceName]
                     ]
                 ]
             ]
@@ -1869,6 +2894,18 @@ class TTSService: NSObject, ObservableObject {
         guard http.statusCode == 200 else {
             let msg = String(data: data, encoding: .utf8) ?? ""
             print("❌ [TTS] Gemini TTS HTTP \(http.statusCode): \(msg.prefix(200))")
+            // BUILD 271 - THE QUOTA MESSAGE WAS ONLY EVER IN XCODE.
+            //
+            // A 429 from Google names the exact quota it refused on, e.g.
+            // "GenerateRequestsPerDayPerProjectPerModel-FreeTier". That is
+            // the one string that separates "the voice model is capped" from
+            // "the whole project is capped because the brain is eating it" -
+            // and it went to print(), which he cannot read from a scooter.
+            // Onto the log he can actually copy.
+            if http.statusCode == 429 || http.statusCode >= 500 {
+                let reason = Self.quotaReason(from: msg)
+                ChappyStandbyLog.note("⛔️ [TTS] \(model) refused with HTTP \(http.statusCode)\(reason)")
+            }
             throw TTSError.httpError(http.statusCode)
         }
 
@@ -1994,6 +3031,25 @@ class TTSService: NSObject, ObservableObject {
     // MARK: - System TTS Fallback (offline)
 
     private func fallbackToSystemTTS(text: String, languageCode: String? = nil) async {
+        // REVIEW FIX - AND THIS IS A BETTER CANDIDATE FOR THE SILENCE THAN THE
+        // ONE I WENT LOOKING FOR.
+        //
+        // Every route into this function is a Gemini failure, and a Gemini
+        // failure leaves the shared AVAudioEngine RUNNING: scheduleEngineIdle()
+        // only stops it after four seconds, and only if nothing is speaking.
+        // So the usual case is an AVSpeechSynthesizer starting on top of a live
+        // AVAudioEngine holding the same audio session - which is a documented
+        // way to get an utterance that reports didFinish and produces no sound.
+        //
+        // That is precisely the two-players-one-route hazard BUILD 260 removed
+        // the short-line synthesizer to avoid. 260 removed the common path and
+        // left the rare one, and the rare one is the emergency voice - the
+        // single path that must work when everything else has failed.
+        //
+        // Hand the route over cleanly first. The engine restarts on demand.
+        stopPlaybackEngine()
+        engineIdleWork?.cancel()
+
         configureAudioSession()
 
         let synthesizer = AVSpeechSynthesizer()
@@ -2043,7 +3099,19 @@ class TTSService: NSObject, ObservableObject {
             ?? AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
 
-        print("🔊 [TTS] System TTS speaking (\(utterance.voice?.name ?? "?")): \(text.prefix(30))…")
+        // BUILD 271 - THIS LINE WAS ONLY EVER IN XCODE, AND IT IS THE LINE
+        // THAT ANSWERS "IS IT SILENT OR IS IT ROBOT?".
+        //
+        // Every failure ABOVE this point logs to ChappyStandbyLog, which he
+        // can read and copy on the phone. The moment the emergency voice
+        // takes over, logging switches to print() and he is blind. So when
+        // he said "nothing, silence", there was no way to tell whether the
+        // Apple voice had been tried and made no sound, or was never reached
+        // at all - two completely different bugs, and I had to ask him.
+        // I should not have to ask him.
+        let q = utterance.voice?.quality.rawValue ?? -1
+        ChappyStandbyLog.note("🔊 [TTS] Emergency voice speaking as \(utterance.voice?.name ?? "?") (quality \(q)): \(text.prefix(30))")
+        print("🔊 [TTS] System TTS speaking (\(utterance.voice?.name ?? "?")): \(text.prefix(30))")
 
         // SB-DEADLOCK FIX: the delegate callback is not guaranteed. If iOS
         // reconfigures the audio session under us — which is exactly what
@@ -2066,7 +3134,8 @@ class TTSService: NSObject, ObservableObject {
                 let ceiling = min(45.0, 6.0 + Double(text.count) / 6.0)
                 try? await Task.sleep(nanoseconds: UInt64(ceiling * 1_000_000_000))
                 guard !Task.isCancelled, let self else { return }
-                print("⏱️ [TTS] System voice never reported finishing — unparking")
+                ChappyStandbyLog.note("⏱️ [TTS] Emergency voice never reported finishing - unparking")
+                print("⏱️ [TTS] System voice never reported finishing - unparking")
                 self.resumeSystemContinuation()
             }
             await group.next()
