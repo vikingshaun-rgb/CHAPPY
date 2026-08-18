@@ -35,6 +35,7 @@
  */
 
 import Foundation
+import CoreLocation
 
 @MainActor
 final class ChappyConversation: ObservableObject {
@@ -43,6 +44,41 @@ final class ChappyConversation: ObservableObject {
 
     /// True while a session owns the wearer's speech. Standby checks this.
     @Published private(set) var isActive = false
+
+    // ============================================================
+    // BUILD 263 — CAN THIS BRAIN BE OPENED AT ALL?
+    //
+    // Asked BEFORE promoting a sentence here, not discovered after. The
+    // fall-through at the bottom of the ladder now hands everything it
+    // could not place to this session, and without this check a missing
+    // Anthropic key would turn every unmatched sentence into "No key
+    // configured" — replacing quickAsk, which needs the same key but at
+    // least fails as one line rather than as an opened-and-closed session.
+    // ============================================================
+    var canOpen: Bool { anthropicKey() != nil }
+
+    /// BUILD 263 — the screens this brain can open by name.
+    ///
+    /// Translate and Google Maps are deliberately ABSENT: they already have
+    /// their own tools, and translate's needs `handOff()` before the
+    /// notification or the recogniser and the translator fight over the
+    /// microphone. Two ways to do one thing is how that bug comes back.
+    private static let screens: [String: Notification.Name] = [
+        "flights":          .chappyOpenFlights,
+        "weather":          .chappyOpenWeather,
+        "travel_desk":      .chappyOpenTravel,
+        "visas":            .chappyOpenVisa,
+        "currency":         .chappyOpenFX,
+        "places":           .chappyOpenPlaces,
+        "search":           .chappyOpenSearch,
+        "memory":           .chappyOpenMemory,
+        "reminders":        .chappyOpenReminders,
+        "upcoming":         .chappyOpenUpcoming,
+        "atlas":            .chappyOpenAtlasMap,
+        "dictate":          .chappyOpenDictate,
+        "briefs":           .chappyOpenBriefs,
+        "close_everything": .chappyCloseEverything,
+    ]
 
     // MARK: - Tuning
 
@@ -233,7 +269,31 @@ final class ChappyConversation: ObservableObject {
                     results.append(toolResult(id, "Session closing."))
                     continue
                 }
+                let began = Date()
                 let out = await execute(tool: name, args: args)
+                // ============================================================
+                // BUILD 264 — THE SESSION LEFT NO TRACE, AT ALL.
+                //
+                // There was not one ChappyRouterLog call anywhere in this
+                // file's twenty-four tool handlers. "What Chappy did" recorded
+                // the session OPENING and then went blind for up to three
+                // minutes and up to a dollar twenty — and because the opening
+                // row is logged as a real decision, build 253's gap detector
+                // was satisfied and never flagged the silence.
+                //
+                // That screen is the only evidence behind every promotion
+                // decision left in this redesign. It cannot stop at the door.
+                //
+                // routeDecision: false — the routing decision was made when
+                // the session was opened. These are what it then did.
+                // ============================================================
+                ChappyRouterLog.shared.add(
+                    heard: name + (args.isEmpty ? "" : " " + args.map { "\($0.key)=\($0.value)" }
+                        .sorted().joined(separator: ", ")),
+                    tier: "tool", tool: name, confidence: nil,
+                    outcome: String(out.prefix(160)),
+                    ms: Int(Date().timeIntervalSince(began) * 1000),
+                    routeDecision: false)
                 results.append(toolResult(id, out))
             }
 
@@ -246,6 +306,20 @@ final class ChappyConversation: ObservableObject {
 
             appendHistory(["role": "user", "content": results])
             resetSilenceTimer()
+            // BUILD 264 — RE-ARM THE CEILING, NOT JUST THE SILENCE CLOCK.
+            //
+            // scheduleCeiling() was called once, from open(), and never
+            // again. resetSilenceTimer was re-armed here and on send; the
+            // three-minute ceiling was not. So a turn that legitimately
+            // takes minutes — which a web-search chain does, at the
+            // timeouts in this file — was guillotined mid-answer, and the
+            // reply he had waited for was discarded by the isActive guard
+            // above. He would experience it as Chappy thinking hard, saying
+            // "that's a few minutes", and then telling him nothing.
+            //
+            // The ceiling exists to stop a FORGOTTEN session sitting open,
+            // not to interrupt one that is working.
+            scheduleCeiling()
         }
 
         TTSService.shared.speak("That's as far as I got — say the word and I'll keep going.")
@@ -437,6 +511,251 @@ final class ChappyConversation: ObservableObject {
         case "get_context":
             return ContextEngine.shared.contextHeader()
 
+        // ============================================================
+        // BUILD 263 — THE HANDS. Everything below this line is new.
+        //
+        // Until this build the session's tool list was photo, navigate,
+        // translate, maps, reminders, lists, timers, recall and context.
+        // The file's OWN comments name what that left out — "no weather,
+        // no spend, no visa, no flight, no OCR, no web" — and that gap is
+        // the whole reason the keyword ladder could never be demoted: the
+        // brain that could understand him had no hands, and the hands had
+        // no brain.
+        //
+        // Every one of these calls an engine that has been in the app for
+        // dozens of builds and was reachable only by saying the exact
+        // right words. None of them is new capability. All of them are
+        // wiring.
+        // ============================================================
+
+        case "search_the_web":
+            let q = (args["query"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard q.count > 2 else { return "No query given." }
+            // The cap is his money, and the model must be told when it is
+            // spent rather than being handed an apology string it will read
+            // out as if it were the answer.
+            guard ChappySearch.shared.remainingToday > 0 else {
+                return "The daily web-search budget is spent. Say so plainly and answer from what you know, or offer to try again tomorrow."
+            }
+            return await ChappySearch.shared.ask(q, speak: false)
+
+        case "look_up":
+            let subject = (args["subject"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !subject.isEmpty else { return "No subject given." }
+            if let fact = await ChappyFacts.shared.look(up: subject) { return fact }
+            return "Nothing in the free encyclopaedia for \(subject). Use search_the_web if it matters, or answer from what you know."
+
+        case "weather":
+            let place = (args["place"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if place.isEmpty {
+                // CACHED ON WHERE, NOT ON WHETHER — and both halves of that
+                // were review findings against my own first two cuts.
+                //
+                // My first cut reused the reading whenever `now` was
+                // non-nil. ChappyWeather is ONE process-wide singleton whose
+                // location is whatever loadPlace last set, so after he asks
+                // about anywhere else `now` is never nil again and "what's
+                // it like outside" would read out Denpasar while he stands
+                // in Brisbane — stated as fact, because this build's own
+                // prompt tells the model to trust a tool over its memory.
+                //
+                // My second cut reloaded unconditionally, which fixed that
+                // and broke two other things: an Open-Meteo request has a
+                // twenty-second timeout, so on a bad connection every repeat
+                // question held his microphone for twenty seconds; and the
+                // Weather SCREEN observes this same object, so a screen he
+                // left showing Denpasar snapped to where he was standing.
+                //
+                // So: reuse only a reading taken in the last ten minutes
+                // within two kilometres of where he is now. fetchedAt is
+                // written only on success and coord is written per load, so
+                // this can never reuse a failed or wrong-place reading.
+                let wx = ChappyWeather.shared
+                let here = ContextEngine.shared.snapshot
+                var reusable = false
+                if let takenAt = wx.fetchedAt, Date().timeIntervalSince(takenAt) < 600,
+                   let was = wx.coord, let lat = here.latitude, let lon = here.longitude {
+                    reusable = CLLocation(latitude: was.latitude, longitude: was.longitude)
+                        .distance(from: CLLocation(latitude: lat, longitude: lon)) < 2000
+                }
+                if !reusable { await wx.loadHere() }
+            } else {
+                await ChappyWeather.shared.loadPlace(place)
+            }
+            // A FAILED LOAD MUST NOT ANSWER WITH THE LAST PLACE'S NUMBERS.
+            // Both loaders return early on no GPS fix or a geocoder miss —
+            // they set `error` and leave `now`, `days` and `placeName`
+            // exactly as they were. Nothing here read `error`, so the one
+            // moment this tool was most likely to be wrong was the moment it
+            // sounded most certain.
+            if let failed = ChappyWeather.shared.error, ChappyWeather.shared.now != nil {
+                return "The weather didn't load: \(failed) Say that to him. Do NOT give him numbers — anything still in memory is from somewhere else."
+            }
+            switch (args["span"] as? String ?? "now").lowercased() {
+            case "week":   return ChappyWeather.shared.spokenWeek()
+            case "rain":   return ChappyWeather.shared.spokenRain()
+            case "detail": return ChappyWeather.shared.spokenFull()
+            case "uv":
+                // The one thing neither spokenNow nor spokenFull will tell
+                // you: spokenNow mentions UV only at 6 or above, so "is it
+                // safe" and "there is no reading" are the same silence.
+                guard let n = ChappyWeather.shared.now else { return "No weather loaded." }
+                // Named, because unlike spokenNow this line carries no place
+                // of its own — and a bare "U V is 11, extreme" is exactly the
+                // kind of confident orphan sentence this build must not make.
+                var uvLine = "U V in \(ChappyWeather.shared.placeName) is \(Int(n.uv.rounded())), \(ChappyWeather.uvWord(n.uv))."
+                if n.uv >= 8 { uvLine += " Sunscreen and a hat, and off the beach in the middle of the day." }
+                else if n.uv >= 6 { uvLine += " Worth putting sunscreen on." }
+                else if n.uv < 3 { uvLine += " He'll be fine without." }
+                return uvLine
+            default:       return ChappyWeather.shared.spokenNow()
+            }
+
+        case "cheapest_flights":
+            guard ChappyFareSource.isConfigured else {
+                return "There is no fare key set, so there is no day-by-day price data at all. Tell him: Settings, Travel Desk, Fare data."
+            }
+            let toRaw = (args["to"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !toRaw.isEmpty else { return "No destination given." }
+            guard let dest = ChappyPorts.resolve(place: toRaw) else {
+                return "Couldn't work out which airport \(toRaw) means. Ask him for the city or the airport code."
+            }
+            let fromRaw = (args["from"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let origin = (fromRaw.isEmpty ? nil : ChappyPorts.resolve(place: fromRaw))
+                ?? ChappyPorts.byIATA(ChappyFlightsPrefs.origin)
+            // Split, because one message for two different failures sent him
+            // in a circle: home airport BNE plus "cheapest flights to
+            // Brisbane" resolved both ends to BNE, told him Chappy couldn't
+            // work out where he was flying from, and said exactly the same
+            // thing again when he answered "Brisbane".
+            guard let origin else {
+                return "Couldn't work out where he is flying FROM. Ask him."
+            }
+            guard origin.iata != dest.iata else {
+                return "That is the same airport both ends — \(dest.iata) to \(dest.iata). Ask him where he is actually starting from."
+            }
+            var monthKey = (args["month"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if monthKey.isEmpty { monthKey = ChappyFlightsPrefs.thisMonth }
+            // Validated rather than defaulted. Silently answering about the
+            // wrong month is worse than asking, because he cannot see it.
+            // The RANGE, not just the digits. A model that gets the arithmetic
+            // wrong sends 2026-13 or 2026-00; those passed, fetched nothing,
+            // and came back as "nobody has searched that route lately" — a
+            // confident wrong explanation of a malformed request it could
+            // simply have retried.
+            guard monthKey.count == 7, Array(monthKey)[4] == "-",
+                  Int(monthKey.prefix(4)) != nil,
+                  let mm = Int(monthKey.suffix(2)), (1...12).contains(mm) else {
+                return "The month must be yyyy-MM with a real month, like 2026-10. You know today's date — work it out and call again."
+            }
+            let days = await ChappyFareSource.shared.month(origin: origin.iata,
+                                                           dest: dest.iata,
+                                                           month: monthKey)
+            guard !days.isEmpty else {
+                return "No cached fares for \(origin.iata) to \(dest.iata) in \(monthKey). That means nobody has searched that route lately — it does NOT mean nothing flies. Say it that way."
+            }
+            let sorted = days.sorted { $0.price < $1.price }
+            let dayFmt = DateFormatter(); dayFmt.dateFormat = "EEEE d MMMM"
+            var named: [Double] = []
+            var picks: [String] = []
+            for d in sorted {
+                guard picks.count < 4 else { break }
+                // Skip anything within a couple of dollars of a day already
+                // named, or it reads out four near-identical numbers.
+                guard !named.contains(where: { abs($0 - d.price) < 3 }) else { continue }
+                named.append(d.price)
+                // ageNote is "" when the row carried no timestamp, which left
+                // a dangling comma — "Friday 3 October $412 direct, ; Tuesday
+                // 7 October" — spoken as a stumble.
+                picks.append("\(dayFmt.string(from: d.date)) \(ChappyFX.money(d.price, d.currency))"
+                             + (d.direct ? " direct" : " one stop")
+                             + (d.ageNote.isEmpty ? "" : ", \(d.ageNote)"))
+            }
+            let avg = sorted.map { $0.price }.reduce(0, +) / Double(sorted.count)
+            return "Cheapest \(origin.iata) to \(dest.iata) in \(monthKey): "
+                + picks.joined(separator: "; ")
+                + ". Month average \(ChappyFX.money(avg, sorted[0].currency))."
+                + " These are fares somebody's search returned and Chappy cached — not live quotes. Read him two or three, not all four."
+
+        case "save_place":
+            let placeName = (args["name"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let saved = TripRecorder.shared.rememberSpot(named: placeName)
+            if saved.lat == 0 {
+                return "Saved \(saved.name), but GPS hadn't settled so the pin may be off. Tell him that."
+            }
+            return "Saved \(saved.name)."
+
+        case "saved_places":
+            let wanted = (args["name"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let here = ContextEngine.shared.snapshot
+            if wanted.isEmpty {
+                let all = TripRecorder.shared.spots
+                guard !all.isEmpty else {
+                    return "No places saved yet. He can say: remember this spot, call it the blue warung."
+                }
+                let recent = all.reversed().prefix(10).map { $0.name }
+                return "\(all.count) saved. Most recent: \(recent.joined(separator: ", "))."
+            }
+            guard let spot = TripRecorder.savedSpot(matching: wanted,
+                                                    nearLat: here.latitude,
+                                                    nearLon: here.longitude) else {
+                let known = TripRecorder.shared.spots.reversed().prefix(8)
+                    .map { $0.name }.joined(separator: ", ")
+                return known.isEmpty
+                    ? "Nothing saved by that name, and nothing saved at all yet."
+                    : "Nothing saved matching that. What he has saved: \(known)."
+            }
+            var out = spot.name
+            if let street = spot.street { out += ", \(street)" }
+            if let city = spot.city, city != spot.street { out += ", \(city)" }
+            if let lat = here.latitude, let lon = here.longitude, spot.lat != 0 {
+                let metres = CLLocation(latitude: lat, longitude: lon)
+                    .distance(from: CLLocation(latitude: spot.lat, longitude: spot.lon))
+                out += metres < 1000
+                    ? ", about \(Int(metres)) metres away"
+                    : String(format: ", about %.1f km away", metres / 1000)
+            }
+            if let note = spot.note, !note.isEmpty { out += ". His note: \(note)" }
+            return out + ". To take him there call navigate with destination \"\(spot.name)\"."
+
+        case "convert_money":
+            let amount = (args["amount"] as? Double)
+                ?? (args["amount"] as? Int).map(Double.init)
+                ?? 0
+            let fromCode = (args["from"] as? String ?? "").uppercased()
+            let toCode = ((args["to"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                          ?? ChappyFX.shared.home).uppercased()
+            guard amount > 0, fromCode.count == 3, toCode.count == 3 else {
+                return "Need an amount and two three-letter currency codes, like AUD and IDR."
+            }
+            await ChappyFX.shared.refresh()
+            guard let converted = ChappyFX.shared.convert(amount, from: fromCode, to: toCode) else {
+                return "No rate known for \(fromCode) to \(toCode)."
+            }
+            return "\(ChappyFX.money(amount, fromCode)) is \(ChappyFX.money(converted, toCode))."
+                + ChappyFX.rateAge
+
+        case "open_screen":
+            let screenID = (args["screen"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let note = Self.screens[screenID] else {
+                return "No screen called that. The ones that exist: "
+                    + Self.screens.keys.sorted().joined(separator: ", ") + "."
+            }
+            NotificationCenter.default.post(name: note, object: nil)
+            if screenID == "close_everything" {
+                return "Closed everything that was up, including any camera, stream or translation. Tell him that, so he isn't surprised."
+            }
+            return "Opened \(screenID.replacingOccurrences(of: "_", with: " "))."
+
         default:
             return "Unknown tool: \(name)"
         }
@@ -554,9 +873,29 @@ final class ChappyConversation: ObservableObject {
         PLACE. "Call the office at three" is a reminder. "Grab milk" is a list item.
         Timers are for durations and clock times today. Reminders are for tomorrow and beyond.
 
+        WHAT TO REACH FOR
+        You have real hands now, and the whole point of them is that he should never have to \
+        say a magic word. If he asks something you cannot answer from what you already know, \
+        there is almost always a tool for it — use it rather than guessing or apologising.
+        Weather, fares, rates and anything about his own saved places must come from a tool. \
+        Never state a temperature, a fare, an exchange rate or where one of his places is from \
+        memory: you will be confidently wrong and he is wearing this on his face.
+        Cheapest before dearest: look_up before search_the_web, and neither if you simply know.
+        When he names somewhere personal — my gym, the hotel, that warung — call saved_places \
+        FIRST and pass the name it gives you to navigate. Otherwise you will route him to a \
+        stranger's gym.
+
+        WHEN YOU CANNOT DO SOMETHING
+        Say so in one short sentence and say what would fix it. "There's no fare key set, so I \
+        can't see prices" beats a vague apology. Never invent a capability, never promise to do \
+        something later, and never claim a tool worked when its result says it did not.
+
         ENDING
         Call finished when the job is done or he signs off. You can call it in the same breath \
         as another tool — finishing does not cancel the other work.
+        If you have answered him and there is plainly nothing more to do, call finished. A \
+        session left open owns his microphone for forty-five seconds, which is forty-five \
+        seconds he cannot talk to the rest of the app.
         """
     }
 
@@ -654,6 +993,61 @@ final class ChappyConversation: ObservableObject {
             t("get_context",
               "Fresh reading of location, time, weather and motion. The prompt already has a snapshot; only call this if he has clearly moved since.",
               [:], []),
+
+            // ============================================================
+            // BUILD 263 — THE HANDS, DECLARED.
+            // ============================================================
+
+            t("search_the_web",
+              "Search the live web and get a researched answer with sources. Use for anything that happened recently, any price, any opening hours, any 'is X still true', any news, and anything you are not certain of. Costs real money and is capped at 15 a day, so do NOT use it for something you already know or that look_up can answer.",
+              ["query": p("string", "The question, written out in full as you would type it into a search engine. Not his raw mumble — the actual question.")],
+              ["query"]),
+
+            t("look_up",
+              "Free encyclopaedia lookup — one paragraph on a person, place, thing or event. No cost, no cap, fast. TRY THIS BEFORE search_the_web for anything encyclopaedic. It knows nothing about the last year or two and nothing about prices, hours or news.",
+              ["subject": p("string", "Just the subject. 'Borobudur', not 'tell me about Borobudur'.")],
+              ["subject"]),
+
+            t("weather",
+              "Real forecast data for here or a named place. The prompt already carries a rough snapshot of the weather where he is standing; call this when he actually asks about weather, about another town, about rain, or about the days ahead.",
+              ["place": p("string", "Town or city. Leave out entirely for where he is now."),
+               "span": ["type": "string",
+                        "enum": ["now", "detail", "rain", "week", "uv"],
+                        "description": "now = temperature and conditions. detail = adds humidity, pressure, sunrise and sunset. rain = will it rain in the next twelve hours. week = five days. uv = the U V index and whether he needs sunscreen — use this for anything about sunburn, sunscreen or the sun's strength, because the other spans mention U V only when it is already high."]],
+              []),
+
+            t("cheapest_flights",
+              "Which days in a month are cheapest to fly a route. Returns cached fares that other people's searches have already returned — it is NOT a live quote and NOT a booking. Say so when you read it out.",
+              ["to": p("string", "Destination city or airport, in plain words. 'Bali', 'Denpasar', 'DPS'."),
+               "from": p("string", "Origin city or airport. Leave out to use his saved home airport."),
+               "month": p("string", "yyyy-MM, like 2026-10. You know today's date, so work it out from what he said. Leave out for this month.")],
+              ["to"]),
+
+            t("save_place",
+              "Save where he is standing right now, under a name, so he can say 'take me to the gym' later. Use for 'remember this spot', 'save this as the gym', 'this is my hotel'. Only works for HERE — it cannot save somewhere he is merely talking about.",
+              ["name": p("string", "What to call it, in his words. 'The gym', 'the blue warung'. Leave empty and it gets named after the time and street.")],
+              []),
+
+            t("saved_places",
+              "Look up a place he saved earlier, or list them. Use before navigate whenever he names somewhere personal — 'my gym', 'the hotel', 'that warung' — so you route to HIS one and not a search result.",
+              ["name": p("string", "The place he named. Leave out entirely to list what he has saved.")],
+              []),
+
+            t("convert_money",
+              "Convert between currencies at real cached rates. Use whenever a price in a foreign currency comes up, even if he did not ask — knowing 850,000 rupiah is eighty dollars is the point of the thing.",
+              ["amount": p("number", "How much."),
+               "from":   p("string", "Three-letter code of what he has: IDR, THB, AUD, USD."),
+               "to":     p("string", "Three-letter code to convert into. Leave out for his home currency.")],
+              ["amount", "from"]),
+
+            t("open_screen",
+              "Put one of Chappy's own screens up on the phone. Use when he asks to see, open, show or pull up something, and when an answer is long enough that he will want to look at it afterwards. Opening a screen does not answer his question — say the answer too.",
+              ["screen": ["type": "string",
+                          "enum": ["flights", "weather", "travel_desk", "visas", "currency",
+                                   "places", "search", "memory", "reminders", "upcoming",
+                                   "atlas", "dictate", "briefs", "close_everything"],
+                          "description": "Which screen. close_everything is not gentle — it also ends any live stream, camera session or translation that is running, so only call it when he has plainly asked to close, cancel or stop what is up."]],
+              ["screen"]),
 
             t("finished",
               "End the session. Call when the job is done, or he says thanks, bye, stop, or that's all. Safe to call alongside other tools.",

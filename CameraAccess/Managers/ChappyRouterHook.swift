@@ -68,7 +68,22 @@ enum ChappyRouterHook {
                 ChappyConversation.shared.close(sayBye: true)
                 return true
             }
-            if hasAModule(c) { return false }
+            // BUILD 263 — escapesSession, NOT hasAModule.
+            //
+            // These two tests used to be the same function, and after this
+            // build they must not be. hasAModule is also consulted by
+            // wantsThinking, which runs BEFORE the entire keyword ladder —
+            // shrinking it there would hand sentences to a session that have
+            // perfectly good free homes further down, which is the exact
+            // mistake build 253's note spends forty lines warning about.
+            //
+            // This test is the opposite situation: a session is ALREADY open
+            // and the only question is whether it should be ejected to reach
+            // an engine it cannot call itself. Build 263 gave it weather,
+            // fares, currency, search and saved places, so ejecting him for
+            // those words now costs him the conversation to reach a module
+            // his brain could already have used.
+            if escapesSession(c) { return false }
             // BUILD 253: logged. This is EVERY sentence after the first in
             // an open session — the most expensive path in the app — and
             // it wrote nothing at all. Worse, `send` answers from its own
@@ -348,9 +363,60 @@ enum ChappyRouterHook {
         // ============================================================
     }
 
+    /// BUILD 263 — what still has to leave an OPEN session.
+    ///
+    /// Short, and it shrinks as the session grows hands. What is left is
+    /// exactly the engines ChappyConversation has no tool for: the travel
+    /// desk's trip builder, accommodation, and the visa rules. Weather,
+    /// currency, fares, web search and saved places came off this list in
+    /// 263 because the session can now do all five itself.
+    ///
+    /// If you add a tool to ChappyConversation, delete its words from here
+    /// in the same build. A word left behind is a conversation broken in
+    /// half to reach something the conversation could already do.
+    private static func escapesSession(_ c: String) -> Bool {
+        let owned = [
+            "trip", "itinerary", "travel desk", "plan me", "plan a trip",
+            "plan my trip", "hotel", "airbnb",
+            "visa", "passport", "immigration", "how long can i stay",
+            // ============================================================
+            // BUILD 264 — PUT BACK. THIS WAS MY REGRESSION IN 263.
+            //
+            // I removed "flight" and "flights" on the reasoning that the new
+            // cheapest_flights tool covered them. It does not. Flight status,
+            // flight tracking, baggage rules, deals, the flight budget and
+            // the fare journal all live in the ladder and have no session
+            // tool — including the ONLY .spend memory write on the flights
+            // side. With a session open, all six became unreachable.
+            //
+            // NARROWED AFTER REVIEW, and the reviewer was right: putting
+            // bare "flight"/"flights" back makes the cheapest_flights tool
+            // 263 added unreachable from an open session — and "cheapest
+            // flight to Bali in October" is the exact sentence two other
+            // fixes in this same build exist to serve. Only the six engines
+            // that genuinely have no session tool escape.
+            //
+            // They come out the day those tools exist, and not before.
+            // ============================================================
+            "flight status", "flight is", "my flight", "track flight",
+            "track my flight", "baggage", "boarding pass", "log a fare",
+            "log fare", "flight budget", "flight brief",
+        ]
+        let padded = " " + c.replacingOccurrences(of: ",", with: " ")
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "?", with: " ") + " "
+        return owned.contains { padded.contains(" " + $0 + " ") || padded.contains(" " + $0 + "s ") }
+    }
+
     /// Does a real engine own this? Kept deliberately concrete: these are
     /// the words the keyword router matches on, so anything here has a
     /// better home than a chat session.
+    ///
+    /// BUILD 263: STILL CONSULTED BY wantsThinking ONLY, and deliberately
+    /// unchanged. wantsThinking runs before the whole ladder; this list is
+    /// what stops it stealing sentences that have cheaper homes. See
+    /// escapesSession above for the open-session case, which is a different
+    /// question with a different answer.
     private static func hasAModule(_ c: String) -> Bool {
         let owned = [
             // travel desk

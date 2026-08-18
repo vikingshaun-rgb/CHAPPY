@@ -3495,9 +3495,54 @@ final class ChappyStandby: NSObject, ObservableObject {
                      "photo", "look", "watch", "show", "open", "map", "log",
                      "note", "stop", "call", "head", "bring",
                      // BUILD 144: the asks that arrive third in a chain.
-                     "pull", "read", "tell", "check", "add", "set", "plan", "scan"]
+                     "pull", "read", "tell", "check", "add", "set", "plan", "scan",
+                     // ============================================================
+                     // BUILD 264 — THE WORDS THAT WERE ONE ENTRY AWAY.
+                     //
+                     // This array had "remember" and not "remind". "watch"
+                     // and not "keep". "open" and not "close". So none of
+                     // these split, and in each case the second half was
+                     // thrown away in silence:
+                     //
+                     //   "take me to the servo and remind me to get milk"
+                     //   "...to bangkok next month then keep an eye on it"
+                     //   "close everything and take me home"
+                     //
+                     // Three separate traces, three separate missing words,
+                     // one array.
+                     // ============================================================
+                     "remind", "keep", "close", "clear", "cancel", "end",
+                     "reset", "shut", "put", "make", "send", "email", "text",
+                     "book", "order", "grab", "pick", "start", "run", "give"]
         guard let first = t.split(separator: " ").first.map(String.init) else { return false }
-        return verbs.contains(first)
+        if verbs.contains(first) { return true }
+        // ============================================================
+        // BUILD 264 — TWO QUESTIONS ARE TWO COMMANDS.
+        //
+        // The test above only accepts an IMPERATIVE first word, so a
+        // compound made of two questions was never split:
+        //
+        //   "how far am i from the gym and do i need sunscreen"
+        //   "how long can i stay in indonesia and when does my passport expire"
+        //   "whats the cheapest way to bali and what will the weather be"
+        //
+        // In all three the FIRST half was discarded and the second answered
+        // confidently, with nothing to show the rest had been heard.
+        //
+        // Narrow on purpose: a question opener only counts when its half is
+        // at least three words. That keeps "fish and chips" and "black and
+        // white" safe — neither half is question-shaped — and a bare "what"
+        // stays a fragment rather than becoming half a compound.
+        // ============================================================
+        // COPULAS ARE OUT, and review is why. "is", "are", "am", "does",
+        // "did" and "will" head SUBORDINATE clauses as often as questions:
+        // "find me a warung that's cheap and is close to the beach" would
+        // have split at "and", and the relative clause would have routed as
+        // its own command — straight into navigation, because it names a
+        // beach. Interrogatives that can only begin a question stay.
+        let asks = ["how", "what", "whats", "what's", "when", "where", "why",
+                    "which", "who", "can", "could", "should", "would", "any"]
+        return asks.contains(first) && t.split(separator: " ").count >= 3
     }
 
     /// Keep whichever prompts are open alive a little longer.
@@ -3835,6 +3880,50 @@ final class ChappyStandby: NSObject, ObservableObject {
         "what is", "whats", "what's", "how much", "how far", "how long",
         "call it", "log this", "note this", "navigate me", "navigate us",
         "remind me", "look for", "search for", "book me", "order me",
+        // ============================================================
+        // BUILD 264 — THE SINGLE-WORD OPENERS. THE 66%.
+        //
+        // Every entry above is TWO words. Not one of them is a bare verb,
+        // and that is the hole his log fell through. From 104 real
+        // sentences, 69 of them untagged:
+        //
+        //   11:41:19  [untagged] "open"  (540ms)
+        //   11:41:11  [untagged] "open"  (526ms)
+        //   11:41:35  [untagged] "i just keep saying maps up maps"
+        //
+        // Bare "open" five times in one log, always around 530ms — which is
+        // the generic word-count window at the very bottom of
+        // debounceWindow. He was saying "open live ai". The word "open"
+        // fired on its own before "live" existed, matched nothing, and the
+        // tail arrived as a fresh fragment with no verb in front of it.
+        // "go" did the same thing twice and went to the PAID brain both
+        // times, 3.9s and 1.8s, to answer the word "go".
+        //
+        // This is build 258's "take me to" bug in a dozen other words. I
+        // found that one in his log and fixed it; these sat in the same
+        // log in the same shape and I read past them for six builds.
+        //
+        // WHY HERE AND NOT extendableCommands, which was my first instinct
+        // and was backwards: membership there makes looksUnfinished return
+        // FALSE — 0.6s, barely different from the 0.53s they get now.
+        // openerFragments returns TRUE, which is the 3.0s hesitation
+        // window, and 3.0s is what a man mid-sentence actually needs.
+        //
+        // DELIBERATELY ABSENT, each for a reason I checked:
+        //   close  — REASON CORRECTED AFTER REVIEW. I wrote that it was
+        //            already in terminalCommands. It is not; only "close
+        //            the map" and its siblings are. It stays out because
+        //            bare "close" IS a working command at the generic
+        //            close branch, and 3s of silence in front of a
+        //            working command is a new bug for an old one.
+        //   drive, walk — these are the ANSWER to "walk or drive?".
+        //            Three seconds of silence before every mode answer
+        //            would be a new bug traded for an old one.
+        // ============================================================
+        "open", "show", "find", "go", "take", "get", "bring", "put",
+        "add", "set", "send", "play", "look", "read", "start", "check",
+        "what", "what time", "how many", "is there",
+        "can i", "can you", "do i", "should i", "whats the", "what's the",
     ]
 
     /// THE HESITATION RULE (build 90, finally implemented).
@@ -3890,7 +3979,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         if extendableCommands.contains(text) { return false }
 
         if fillerWords.contains(text) { return true }
-        if openerFragments.contains(text) { return true }
+        if openerFragments.contains(text) {
+            // BUILD 264, AFTER REVIEW. On the translate screen a bare "start"
+            // or "go" is a COMPLETE command — it resumes a paused session,
+            // and the branch that handles it says so in its own comment.
+            // Three seconds of silence before a resume is the difference
+            // between catching the next sentence and missing it, which is
+            // the whole job of that screen.
+            if LiveTranslateIsOpen, text == "start" || text == "go" { return false }
+            return true
+        }
 
         let words = text.split(separator: " ").map(String.init)
         guard let last = words.last else { return false }
@@ -5528,6 +5626,28 @@ final class ChappyStandby: NSObject, ObservableObject {
         // the next sentence would have started a second one. Two paid calls,
         // two voices: verbatim the failure the AUDIT FIX note below prevents.
         let bare = raw.trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).lowercased()
+        // ============================================================
+        // BUILD 264 — CHAPPY PAID TO ANSWER HIS OWN VOICE.
+        //
+        // From his log, one line, and it is the whole self-transcription
+        // loop in a single row:
+        //
+        //   11:22:20  [ask] "i'm here" -> quickAsk : answered (4868ms)
+        //
+        // "I'm here." is ChappyPocket's own greeting. Chappy said it, the
+        // microphone on his face heard it, the recogniser transcribed it,
+        // and the router spent nearly five seconds and real money replying
+        // to itself. Two rows earlier the same thing swallowed "take me to
+        // the gym" — dropped, because Chappy was busy talking to itself.
+        //
+        // Anything Chappy has just said, arriving back within six seconds,
+        // is an echo. Hold the door and say nothing.
+        //
+        // SIX SECONDS, AND TYPED INPUT IS EXEMPT. A line spoken an hour ago
+        // must never block a genuine repeat, and nothing typed can be an
+        // echo. Compared on the first forty characters because the ear
+        // rarely returns a long line whole.
+        // ============================================================
         if !typed, Self.misheardNames.contains(bare) {
             ChappyStandbyLog.note("👂 [Standby] '\(bare)' is the name mis-heard — holding, not answering")
             awake = false
@@ -5616,6 +5736,45 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyStandbyLog.note("🤫 [Standby] Interrupt — killed in-flight work")
             resetRecognition()
             return
+        }
+        // ============================================================
+        // BUILD 264 — CHAPPY PAID TO ANSWER HIS OWN VOICE.
+        //
+        // From his log, one row, and it is the whole self-transcription
+        // loop:
+        //
+        //   11:22:20  [ask] "i'm here" -> quickAsk : answered (4868ms)
+        //
+        // "I'm here." is ChappyPocket's own greeting. Chappy said it, the
+        // microphone on his face heard it, and the router spent five
+        // seconds and real money replying to itself. Two rows earlier the
+        // same thing swallowed "take me to the gym" — dropped, because
+        // Chappy was busy talking to itself.
+        //
+        // BELOW THE INTERRUPT TEST, and review is why. My first cut put
+        // this above it, so an interrupt phrase that happened to echo
+        // would be discarded with no haptic and no log line — and the
+        // interrupt is the one command that exists to be used WHILE
+        // Chappy is talking, which is exactly when an echo is possible.
+        //
+        // FORWARD PREFIX ONLY, and review is why again. My first cut also
+        // accepted `bare.hasPrefix(said)`, so any short line Chappy speaks
+        // became a six-second blocklist prefix: it says "No worries." and
+        // then "no worries, open maps" is swallowed in silence — which is
+        // the verbatim sentence build 256 exists to handle. The real echo
+        // is the ear returning a PREFIX of what Chappy said, never more.
+        // ============================================================
+        if !typed, !bare.isEmpty, bare.count > 5 {
+            let said = TTSService.shared.lastSpokenLine
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-")).lowercased()
+            if Date().timeIntervalSince(TTSService.shared.lastSpokenAt) < 6,
+               said.count > 5, said.hasPrefix(String(bare.prefix(40))) {
+                ChappyStandbyLog.note("🪞 [Standby] My own voice coming back — ignoring: \(bare)")
+                awake = false
+                followUpUntil = max(followUpUntil, Date().addingTimeInterval(Self.followUpSeconds))
+                resetRecognition()
+                return
+            }
         }
         // BUILD 202 — BARGE-IN.
         //
@@ -6251,10 +6410,32 @@ final class ChappyStandby: NSObject, ObservableObject {
         let judgeWords = ["good price", "is that good", "is that cheap",
                           "is that dear", "is that expensive", "worth booking",
                           "should i book", "is that a deal", "is that a good fare"]
-        let fareContext = ["fare", "flight", "ticket", "airfare", "seat"]
+        // BUILD 264: widened as the money disjunct came out, so the
+        // phrasings a flight price actually carries still land — "eight
+        // forty return, is that a good price" has no fare noun at all.
+        let fareContext = ["fare", "flight", "ticket", "airfare", "seat",
+                           "return", "one way", "one-way", "each way", "return trip"]
+        // ============================================================
+        // BUILD 264 — THE DISJUNCT THAT DEFEATED THE COMMENT ABOVE IT.
+        //
+        // The note three lines up says this branch "only takes the sentence
+        // when something in it is actually about a fare". The
+        // `|| money != nil` alternative said the opposite: ANY number
+        // anywhere in the sentence was accepted as proof.
+        //
+        // And ChappySlots.parse(_:as:.money) is not a price detector — it
+        // filters every digit out of the whole sentence and concatenates
+        // them. So "how much is 850000 rupiah and is that a good price for
+        // a scooter for a week" matched, routeIn found no route, the saved
+        // BNE-DPS default was substituted in silence, and he was given a
+        // verdict on Brisbane-Denpasar AIRFARES, in dollars, filed in his
+        // log as a successful answer. The currency converter that could
+        // have answered him sits 764 lines further down and never ran.
+        //
+        // The fare-word test alone is the discipline the comment describes.
+        // ============================================================
         let asksAboutFare = judgeWords.contains(where: { c.contains($0) })
-            && (fareContext.contains(where: { c.contains($0) })
-                || ChappySlots.parse(c, as: .money) != nil)
+            && fareContext.contains(where: { c.contains($0) })
         if asksAboutFare {
             let (o, d) = routeIn(c)
             let oo = o ?? ChappyFlightsPrefs.origin
@@ -6357,7 +6538,10 @@ final class ChappyStandby: NSObject, ObservableObject {
             guard let best = days.min(by: { $0.price < $1.price }) else {
                 return "Nothing cached for \(oo) to \(dd) that month. That means nobody's searched it lately, not that nothing flies."
             }
-            let f = DateFormatter(); f.dateFormat = "EEEE the d"
+            // BUILD 264: "EEEE the d" never said WHICH month, so a
+            // wrong-month answer was inaudible — which is how the October
+            // bug survived 261 and 262. Say the month.
+            let f = DateFormatter(); f.dateFormat = "EEEE d MMMM"
             let avg = days.map { $0.price }.reduce(0, +) / Double(days.count)
             var line = "Cheapest is \(f.string(from: best.date)) at \(ChappyFX.money(best.price, best.currency))"
             line += best.direct ? ", direct. " : ", with a stop. "
@@ -7055,6 +7239,11 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c.contains("never mind") || c.contains("cancel that")
             || c.contains("shut up") || c.contains("be quiet")
             || c.hasSuffix("that's enough") || c == "enough" || c.contains("back to standby") {
+            // BUILD 264: logged. A stop answers with silence, which is
+            // correct, and left the backstop reporting that nothing happened.
+            ChappyRouterLog.shared.add(heard: c, tier: "flow", tool: "stop",
+                                       outcome: "stopped talking — silent by design",
+                                       ms: Self.msSinceRouteStart)
             TTSService.shared.stop(); ChappyHaptics.shared.straightStep(); return
         }
         // BUILD 136: "close maps" — kill Chappy's route and clear its map UI.
@@ -7356,6 +7545,12 @@ final class ChappyStandby: NSObject, ObservableObject {
             || c == "photo" || c == "take photo" || c == "snap" || c == "picture" {
             // Silent by design — see snapSilently(). A tone confirms it; there
             // is nothing to say about a photo taken to look at later.
+            // BUILD 264: logged, though. Silence was indistinguishable from
+            // nothing happening, and "take a photo" at 27ms is quoted in this
+            // build's own backstop comment as proof a command worked.
+            ChappyRouterLog.shared.add(heard: c, tier: "answer", tool: "photo",
+                                       outcome: "photo taken — silent by design",
+                                       ms: Self.msSinceRouteStart)
             snapSilently()
             return
         }
@@ -9274,24 +9469,48 @@ final class ChappyStandby: NSObject, ObservableObject {
             switch ChappyOrchestrator.band(top.confidence) {
 
             case .ask:
-                // §16: low confidence asks. It does not have a go.
-                ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: top.toolID,
-                                           confidence: top.confidence,
-                                           outcome: "too unsure — asked", ms: Self.msSinceRouteStart)
-                // BUILD 203: if something is parked, offering it costs one
-                // clause and is far more useful than admitting defeat into
-                // silence. This is also the only place parkedTitle is read —
-                // a property nothing consults is a promise, not a feature.
+                // ============================================================
+                // BUILD 264 — "SAY IT ANOTHER WAY" IS THE DEFINITION OF
+                // GIVING UP, AND IT SITS IN FRONT OF THE BRAIN THAT COULD
+                // HAVE ANSWERED.
+                //
+                // This band means the planner does not know. Until 263 that
+                // was the end of the road, so saying so was honest. It is not
+                // the end of the road any more: two hundred lines below this
+                // is a session with twenty-four tools that can go and find
+                // out, and build 263's own note claimed "there is no branch
+                // left to steal from". This was that branch. I wrote both.
+                //
+                // Low confidence now falls through. The parked-interview
+                // offer survives because it is genuinely useful — but it is
+                // an offer made on the way past, not a reason to stop.
+                // ============================================================
                 if let waiting = ChappyFlow.shared.parkedTitle {
+                    ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: top.toolID,
+                                               confidence: top.confidence,
+                                               outcome: "too unsure — offered the parked interview",
+                                               ms: Self.msSinceRouteStart)
                     speak("I'm not sure what you're after. We were mid-way through \(waiting.lowercased()) — carry on with that?")
-                } else {
-                    speak("I'm not sure what you're after there. Say it another way?")
+                    return
                 }
-                return
+                ChappyStandbyLog.note("🧭 [Standby] Planner unsure (\(String(format: "%.2f", top.confidence))) — passing it down to the brain")
+                break
 
             case .clarify:
                 // §16: medium confidence checks before acting. One
                 // question, answerable with a word.
+                //
+                // BUILD 264 — EXCEPT WHEN THE QUESTION HAS NO PURPOSE.
+                // "Did you mean search?" is not a clarification, it is a
+                // toll booth in front of an answer. His log: "clothes"
+                // -> attractions 0.60 : clarifying (4004ms), and "how many
+                // centimetric" -> search 0.70 : clarifying (4236ms). Four
+                // seconds to be asked a question about a garbled word.
+                // For the four tools the brain simply answers, step aside.
+                guard !ChappyOrchestrator.answeredBetterBySession.contains(top.toolID) else {
+                    ChappyStandbyLog.note("🧭 [Standby] Planner would clarify \(top.toolID) — the brain can just answer it")
+                    break
+                }
                 guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
                 ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
                                            confidence: top.confidence,
@@ -9330,6 +9549,19 @@ final class ChappyStandby: NSObject, ObservableObject {
                     if let p = plan.preamble { speak(p) }
                     await runPlan(plan, heard: c)
                     return
+                }
+                // BUILD 264 — "EXECUTING" DID NOT MEAN ANSWERED.
+                //
+                // runTool executes four of the registry's seventeen tools.
+                // For the other thirteen this line posts a screen and starts
+                // an INTERVIEW — so his "centimeters in a meter" -> search
+                // 0.95 : executing was Chappy opening the search form and
+                // asking him a question. Three times, four seconds each.
+                //
+                // The four the brain answers outright now go past.
+                guard !ChappyOrchestrator.answeredBetterBySession.contains(top.toolID) else {
+                    ChappyStandbyLog.note("🧭 [Standby] Planner would open the \(top.toolID) form — the brain can just answer it")
+                    break
                 }
                 guard let t = ChappyRegistry.tool(id: top.toolID) else { break }
                 ChappyRouterLog.shared.add(heard: c, tier: "plan", tool: t.id,
@@ -9437,13 +9669,51 @@ final class ChappyStandby: NSObject, ObservableObject {
         // purpose — a session latches for 45 s of silence afterwards, and
         // latching one behind "what time is it" would take the next
         // command off the router for no gain.
-        if Self.wantsHisOwnHistory(c) {
+        //
+        // ============================================================
+        // BUILD 263 — AND NOW EVERYTHING THAT REACHES HERE GOES TO IT.
+        //
+        // STAGE TWO OF THE ROUTER INVERSION. His words: "the AI runs
+        // first, and the other part is an assistant or a backup."
+        //
+        // This is that, done at the only place it is safe to do it. Every
+        // tier above has been offered this sentence and every tier has
+        // declined it. There is no branch left to steal from — this is
+        // the fall-through, and until this build the fall-through was
+        // quickAsk: one Claude call, a context header, and NO TOOLS AT
+        // ALL. So a sentence that got this far could be understood
+        // perfectly and still do nothing, because the thing answering it
+        // had no hands.
+        //
+        // 253's note directly above says exactly this, and drew the line
+        // narrowly on purpose: only questions about his own history were
+        // promoted, "because the session has a recall tool" and the
+        // ladder's other engines were out of its reach. Build 263 put
+        // eight of those engines INTO its reach — web search, the free
+        // encyclopaedia, weather, fares, saved places, currency, the
+        // screens — so the reason for the narrow line is gone.
+        //
+        // WHAT THIS DOES NOT DO, AND THAT IS THE POINT: it does not touch
+        // one branch above it. Every keyword he has learned still works,
+        // still instantly, still free. The trigger words stay, exactly as
+        // he asked. What changes is only what happens when none of them
+        // matched — which today is a confident guess, and after this is a
+        // brain that can go and find out.
+        //
+        // quickAsk survives below as the no-key fallback. It needs the
+        // same Anthropic key this session does, so when the key is
+        // missing neither works — but failing as one spoken line is
+        // better than opening a session to say "no key configured".
+        // ============================================================
+        if ChappyConversation.shared.canOpen {
             ChappyRouterLog.shared.add(
                 heard: c, tier: "model", tool: "conversation",
                 confidence: nil,
-                outcome: "Nothing matched, and it asks about his own history — session with recall",
+                outcome: Self.wantsHisOwnHistory(c)
+                    ? "Nothing matched, and it asks about his own history — session with recall"
+                    : "Nothing matched — handed to the brain with hands",
                 ms: Self.msSinceRouteStart)
-            ChappyStandbyLog.note("🧠 [Standby] Fall-through about his own history — opening a session with recall")
+            ChappyStandbyLog.note("🧠 [Standby] Fall-through — opening a session with tools")
             ChappyConversation.shared.open(carrying: c)
             return
         }
@@ -9546,14 +9816,43 @@ final class ChappyStandby: NSObject, ObservableObject {
                     ChappyStandbyLog.note("⏱️ [Standby] Handled in \(ms)ms")
                     return
                 }
+                // ============================================================
+                // BUILD 264 — "IT MAY STILL HAVE WORKED" IS NOT A DIAGNOSTIC.
+                //
+                // His log came back 69 untagged out of 104, every one
+                // carrying that same paragraph of maybe. Seventeen of the 69
+                // had fired in under a HUNDRED milliseconds — "open google
+                // maps" at 2ms, "open live ai" at 15ms, "take a photo" at
+                // 27ms. Nothing takes 2ms to fail. Those all worked; the
+                // branch that handled them simply never named itself.
+                //
+                // So the screen told him the same ambiguous thing about a
+                // command that worked instantly and a command that vanished,
+                // and he has spent weeks unable to tell which was which.
+                //
+                // Chappy speaking is the evidence, and it costs one
+                // timestamp: if a line was spoken after this sentence
+                // started routing, something answered him. That splits 69
+                // rows into "worked, badly logged" and "genuinely nothing
+                // happened" — and the second list is the only one I need.
+                //
+                // Not a claim that the answer was RIGHT. Only that there
+                // was one. Trace 4 answered a rupiah question with an
+                // airfare verdict, and that would land here as "answered".
+                // ============================================================
+                let spoke = lastRouterSpokeAt >= decidedAt
                 ChappyRouterLog.shared.add(
                     heard: part,
-                    tier: "untagged",
+                    tier: spoke ? "answered" : "untagged",
                     tool: nil,
                     confidence: nil,
-                    outcome: "No tier recorded a working decision for this one. It may still have worked — several tiers don't log yet — but if nothing happened, this is the sentence to look at.",
+                    outcome: spoke
+                        ? "Chappy spoke after this started routing, so something answered it — by a branch that doesn't name itself in the log yet."
+                        : "No tier claimed this and the router said nothing within eight seconds. Most of these did nothing. A few branches finish in silence on purpose — a photo, a stop, resuming translate — so this list is the place to look, not a verdict.",
                     ms: ms, routeDecision: false, at: decidedAt)
-                ChappyStandbyLog.note("❔ [Standby] NO TIER CLAIMED \u{201C}\(part)\u{201D} — \(ms)ms to the decision, nothing logged")
+                ChappyStandbyLog.note(spoke
+                    ? "🔉 [Standby] ANSWERED BUT UNTAGGED \u{201C}\(part)\u{201D} — \(ms)ms"
+                    : "❔ [Standby] NOTHING HAPPENED \u{201C}\(part)\u{201D} — \(ms)ms, no tier and no speech")
             }
         }
     }
@@ -10650,7 +10949,16 @@ final class ChappyStandby: NSObject, ObservableObject {
         }
     }
 
+    /// BUILD 264 — WHEN THE ROUTER LAST SPOKE, as opposed to when ANYTHING
+    /// last spoke. The backstop below needs the first and my first cut used
+    /// the second, which is the objection build 253 already recorded and I
+    /// re-introduced: turn-by-turn instructions, a brief and an expired
+    /// timer all go straight to TTSService, so during a live route every
+    /// unclaimed sentence would have been filed "answered".
+    nonisolated(unsafe) static var lastRouterSpokeAt: Date = .distantPast
+
     private func speak(_ text: String) {
+        Self.lastRouterSpokeAt = Date()
         // =================================================================
         // BUILD 254 — THE GUARD I PUT HERE, AND WHY I TOOK IT OUT AGAIN.
         //
@@ -12148,6 +12456,21 @@ final class NavEngine: NSObject, ObservableObject {
 
     /// Resolve a spoken destination and start guiding. Returns a summary for Chappy to speak.
     func navigate(to query: String, driving: Bool = false) async -> String {
+        // ============================================================
+        // BUILD 264 — THE WORST BUG IN THE APP, AND IT IS ONE LINE.
+        //
+        // spokenRouteSummary was set on success and NEVER cleared — not
+        // here, not in stop(). Six call sites read it as
+        // `NavEngine.shared.spokenRouteSummary ?? reply`. So after any
+        // successful route, every later FAILED navigation spoke the
+        // PREVIOUS journey's summary: the right voice, the right shape,
+        // the right confidence, and a completely different place.
+        //
+        // "Find me somewhere to eat near here and take me there" produced
+        // exactly this in trace 13 — a fluent route to wherever he had
+        // last been, for a restaurant that was never found.
+        // ============================================================
+        spokenRouteSummary = nil
         // BUILD 133 — "TAKE ME TO BRISBANE AIRPORT AND GET ME A COFFEE ON THE
         // WAY AND GET FUEL." One breath, three asks. The tail after the first
         // "and then"/"and get" is STOPS, not part of the place name — without
@@ -12394,6 +12717,10 @@ final class NavEngine: NSObject, ObservableObject {
     }
 
     func stop(announce: Bool = false) {
+        // BUILD 264 — and here too, for the same reason. A stopped route
+        // whose summary survives is a sentence waiting to be spoken about
+        // a journey that is over.
+        spokenRouteSummary = nil
         isNavigating = false
         ContextEngine.shared.setPrecision(navigating: false)
         steps = []
@@ -17911,6 +18238,44 @@ enum ChappyPocket {
     private static func weather(_ t: String) -> String? {
         guard t.contains("weather") || t.contains("how hot") || t.contains("how cold")
             || t.contains("temperature") else { return nil }
+        // ============================================================
+        // BUILD 264 — THIS ANSWERED FOR THE WRONG PLACE AND THE WRONG DAY.
+        //
+        // The snapshot holds one reading: here, now. This branch runs at the
+        // top of the ladder, above every real weather handler, and claimed
+        // any sentence containing the word "weather".
+        //
+        // So "whats the cheapest way to get to bali in october and what
+        // will the weather be like there" was answered "22 degrees and
+        // light rain" — today, in his own street. Bali ignored, October
+        // ignored, the flights half of the sentence ignored, and nothing
+        // logged to say so.
+        //
+        // Free and instant is the right answer to "what's the weather".
+        // It is the wrong answer to "what's the weather in Ubud on
+        // Thursday" — that one belongs to ChappyWeather, which can
+        // geocode and forecast, or to the brain, which can do both.
+        // Naming a place or a time now sends it on.
+        // ============================================================
+        // ANCHORED, and review is why — twice. My first cut used bare
+        // substrings, which took two ordinary here-and-now questions with
+        // it: " at " swallowed "what's the weather AT THE MOMENT", which
+        // then reached the place branch and had Chappy say "Checking the
+        // moment." out loud and geocode it. And "morning" swallowed
+        // "what's the weather like this morning", which is a question
+        // about NOW, and after this build's planner change that becomes a
+        // paid session turn instead of a free instant answer.
+        let deictic = ["at the moment", "at present", "right now", "in here",
+                       "out there", "at the minute"]
+        let elsewhere = [" in ", " at ", " on the ", " there", " over "]
+        let notNow = ["tomorrow", "tonight", "this week", "next week", "weekend",
+                      "monday", "tuesday", "wednesday", "thursday", "friday",
+                      "saturday", "sunday", "later", "in the morning",
+                      "this afternoon", "this evening", "tomorrow morning",
+                      "going to", "will it", "will the", "forecast", "next few"]
+        if !deictic.contains(where: { t.contains($0) }),
+           elsewhere.contains(where: { t.contains($0) })
+            || notNow.contains(where: { t.contains($0) }) { return nil }
         let s = ContextEngine.shared.snapshot
         guard let w = s.weather, let temp = s.temperatureC else { return nil } // no data → paid brain may know
         return "\(Int(temp.rounded())) degrees and \(w)."
@@ -36676,7 +37041,55 @@ enum ChappySlots {
                 || c.hasSuffix(" " + pair.key) || c.contains(" " + pair.key + " ")
         }) else { return nil }
         let month = hit.value
-        guard let day = dayNumber(in: c), day >= 1, day <= 31 else { return nil }
+        // ============================================================
+        // BUILD 264 — "IN OCTOBER" IS A DATE. THIS RETURNED NIL FOR IT.
+        //
+        // He asked, in his own words: "can you find the best cheapest
+        // flight in October to go to Bali, and it could not do that."
+        // I fixed the phrase list in 261 and the archive-breaker in 262.
+        // Neither touched the actual cause, which is this line.
+        //
+        // A month with no day number returned nil, so flightAnswer fell
+        // back to ChappyFlightsPrefs.thisMonth and quoted him THIS month's
+        // fares — and the spoken line formats as "Friday the 3rd", which
+        // never says which month, so he could not hear it go wrong.
+        //
+        // A bare month now means the first of it. Every caller on the
+        // fares path reads only the yyyy-MM prefix, so the day is a
+        // placeholder there; for a caller that wants a real date, the 1st
+        // is the only honest reading of "in October".
+        // ============================================================
+        guard let day = dayNumber(in: c), day >= 1, day <= 31 else {
+            // ONLY WHEN THE MONTH IS PLAINLY THE ANSWER, and review is why.
+            // Dropping the day requirement also dropped the guard that kept
+            // "may" from being a month. "may as well be soon" would have
+            // parsed as a date and short-circuited the smarter model parser
+            // that ChappyFlow falls back to. A bare month counts when it IS
+            // the whole answer, or when a date preposition introduces it.
+            let padded = " " + c + " "
+            let introduced = c == hit.key
+                || [" in ", " for ", " during ", " around ", " early ", " late ", " mid "]
+                    .contains(where: { padded.contains($0 + hit.key + " ") })
+            guard introduced else { return nil }
+            var monthOnly = DateComponents()
+            monthOnly.year = cal.component(.year, from: now)
+            monthOnly.month = month
+            monthOnly.day = 1
+            guard let firstOfMonth = cal.date(from: monthOnly) else { return nil }
+            // THE CURRENT MONTH IS NOT NEXT YEAR, and review caught me
+            // shipping exactly that. Today is the 18th, so the 1st is in the
+            // past — my first cut rolled "in August" forward to AUGUST 2027
+            // and searched fares for it, silently. That is worse than the
+            // nil it replaced. Only a month strictly BEHIND us rolls over.
+            let thisMonth = cal.component(.month, from: now)
+            if month < thisMonth {
+                monthOnly.year = (monthOnly.year ?? 2026) + 1
+                guard let next = cal.date(from: monthOnly) else { return nil }
+                return iso(next)
+            }
+            // The current month means from today, not from a date already gone.
+            return iso(max(firstOfMonth, cal.startOfDay(for: now)))
+        }
         var comps = DateComponents()
         comps.year = cal.component(.year, from: now)
         comps.month = month
@@ -38218,7 +38631,12 @@ final class ChappyRouterLog {
     /// reading back would have quietly halved during the one build whose
     /// entire purpose is reading it back. Doubling the cap keeps the reach
     /// the same and costs a few hundred kilobytes.
-    private static let cap = 1200
+    /// BUILD 264: 1200 -> 2400. Session tool calls are logged from this
+    /// build, and one long conversation can write fifteen or twenty rows.
+    /// At 1200 a single travel-planning session could evict most of a day
+    /// of routing history — including the untagged rows this whole
+    /// redesign exists to collect.
+    private static let cap = 2400
 
     private static let file = "chappy_routerlog.json"
 
@@ -38558,6 +38976,36 @@ enum ChappyOrchestrator {
         /// user informed when a task has stages.
         var preamble: String?
     }
+
+    // ============================================================
+    // BUILD 264 — THE TOOLS THE BRAIN ANSWERS AND THE LADDER ONLY ASKS ABOUT.
+    //
+    // From his own router log, three separate times:
+    //
+    //   [plan] "centimeters in a meter"        -> search 0.95 : executing (4114ms)
+    //   [plan] "how much centimeters in a meter" -> search 0.95 : executing (3273ms)
+    //   [plan] "champion how many centimes in a meter" -> search 0.95 : executing (4129ms)
+    //
+    // Four seconds, paid, three times, for a question a child answers. And
+    // "executing" does not mean answered: runTool can execute exactly four
+    // of the registry's seventeen tools — navigate, currency, food and
+    // attractions. `search` is not one of them, so `executing` here means
+    // "open the search screen and start an interview". He asked how many
+    // centimetres are in a metre and got a form.
+    //
+    // For these four the session is strictly better: it has look_up (free,
+    // Wikipedia), search_the_web, weather with a real forecast, recall over
+    // his own history, and convert_money at live rates. A "did you mean
+    // search?" in front of any of them is a question with no purpose.
+    //
+    // So for these four the plan tier steps aside at every confidence and
+    // lets the sentence reach the brain. Everything else — flights, travel,
+    // visas, options — keeps the interview, because for those the interview
+    // IS the answer.
+    // ============================================================
+    static let answeredBetterBySession: Set<String> = [
+        "search", "memory", "weather", "currency",
+    ]
 
     /// §16, verbatim: high executes, medium clarifies, low asks.
     enum Band { case execute, clarify, ask }
@@ -38957,7 +39405,14 @@ enum ChappySelfTest {
         // ---- dates: the ones that must REFUSE ---------------------
         // This is the most important test in the file. A search built on
         // a guessed date is worse than another question.
-        check("date refuses 'september'", ChappySlots.parse("september", as: .date), nil)
+        // BUILD 264: a bare month IS a date now — "cheapest flight in
+        // October" was answered with THIS month's fares for three builds
+        // because this returned nil. The invariant it was guarding
+        // ("never guess a day") still holds: an UNINTRODUCED month, and
+        // anything vaguer, is still refused.
+        check("date takes 'in september'",
+              ChappySlots.parse("in september", as: .date) == nil ? nil : "ok", "ok")
+        check("date refuses bare 'september'", ChappySlots.parse("september is nice", as: .date), nil)
         check("date refuses 'next month'", ChappySlots.parse("next month", as: .date), nil)
         check("date refuses 'sometime soon'", ChappySlots.parse("sometime soon", as: .date), nil)
 
