@@ -397,7 +397,7 @@ final class ChappyPulse: ObservableObject {
         // Small on purpose: a caption does not need pixels, and image tokens
         // scale with resolution.
         guard let jpeg = downscaled(image, to: 512).jpegData(compressionQuality: 0.5),
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flashLite):generateContent?key=\(key)")
         else { return nil }
 
         var req = URLRequest(url: url)

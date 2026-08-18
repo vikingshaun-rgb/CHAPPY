@@ -217,7 +217,7 @@ enum ChappyIntent {
     static func classify(_ text: String) async -> Result? {
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty, text.count > 2,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
 
         let body: [String: Any] = [
@@ -3264,7 +3264,7 @@ final class ChappyStandby: NSObject, ObservableObject {
             ChappyStandbyLog.note("📸 [Snap] No caption — the frame would not encode as JPEG")
             return nil
         }
-        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)") else {
+        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)") else {
             ChappyStandbyLog.note("📸 [Snap] No caption — bad URL")
             return nil
         }
@@ -4870,8 +4870,20 @@ final class ChappyStandby: NSObject, ObservableObject {
                             // asks, because on foot the spoken directions are
                             // usually enough and Maps is the interruption.
                             if drive {
-                                self.speak("Opening Google Maps.")
-                                NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                                // BUILD 266 — THIS LINE WAS THE BUG HE REPORTED.
+                                //
+                                // From his log: Chappy said "Opening Google
+                                // Maps", and nothing opened. iOS refuses an app
+                                // launch from a backgrounded app, silently, so
+                                // this spoke a promise the next line could not
+                                // keep. Say what is actually true instead, and
+                                // let the banner be the way in.
+                                if UIApplication.shared.applicationState == .active {
+                                    self.speak("Opening Google Maps.")
+                                    NotificationCenter.default.post(name: .chappyOpenGoogleMaps, object: nil)
+                                } else {
+                                    self.speak("Route's running - I'll talk you through it. There's a tap on your phone for Google Maps.")
+                                }
                             } else {
                                 self.offerGoogleMaps(driving: drive)
                             }
@@ -7310,6 +7322,15 @@ final class ChappyStandby: NSObject, ObservableObject {
         // weather snapshot — so it is safe to run before everything else,
         // and those questions now come back Meta-fast, offline, for free.
         if let pocket = ChappyPocket.answer(c) {
+            // BUILD 266: logged. This is the FREE tier and it answers a lot
+            // — the clock, conversions, arithmetic, and now days-until — and
+            // it has never written a router row. So every question it got
+            // right showed up on his screen as "no tier claimed this", which
+            // is how "how many centimeters in a meter" looked like a failure
+            // in a log where it had actually worked in 1169ms.
+            ChappyRouterLog.shared.add(heard: c, tier: "pocket", tool: "pocket",
+                                       outcome: "answered locally, free",
+                                       ms: Self.msSinceRouteStart)
             speak(pocket)
             return
         }
@@ -12557,6 +12578,28 @@ final class NavEngine: NSObject, ObservableObject {
         // Each turn then plays from disk in the real voice, instantly, even
         // if the network dies mid-drive.
         prerenderRouteVoice()
+        // ============================================================
+        // BUILD 266 — THE HAND-OFF HE ASKED FOR, AND WHY IT IS A TAP.
+        //
+        // His question, verbatim: "I should ask it while in pocket, hey
+        // Chappy navigate to Brisbane airport and then it will open up
+        // Google Maps right?" Then: "Can't you bring up Chappy then open
+        // Google Maps?"
+        //
+        // No — and this is a platform rule, not a Chappy bug. iOS has NO
+        // API for an app to bring itself to the foreground, and
+        // UIApplication.open() from the background silently does nothing.
+        // His log shows it exactly: "open google maps" fired in 14ms,
+        // Chappy SPOKE about it, and the launch was refused.
+        //
+        // The only things that foreground an app are HIS actions: tapping
+        // a notification, tapping the icon, or another foreground app
+        // handing off. So the notification IS the answer — one tap, and on
+        // that tap Chappy is foreground and CAN open Maps.
+        //
+        // Only when he cannot already see the screen. If the app is in
+        // front of him a banner is noise, and the route is already there.
+        ChappyNavHandoff.offer(name: destName, driving: driving)
         // BUILD 133: stops asked for in the same breath as the destination.
         if !stopTail.isEmpty {
             let wants = ChappyStandby.parseStopQueries(from: stopTail.lowercased())
@@ -12721,6 +12764,10 @@ final class NavEngine: NSObject, ObservableObject {
         // whose summary survives is a sentence waiting to be spoken about
         // a journey that is over.
         spokenRouteSummary = nil
+        // BUILD 266: forget which destination we offered the hand-off for, so
+        // driving to the same place again tomorrow offers it again. Without
+        // this the memory is per-launch and the second trip is silent.
+        ChappyNavHandoff.routeEnded()
         isNavigating = false
         ContextEngine.shared.setPrecision(navigating: false)
         steps = []
@@ -14434,7 +14481,7 @@ pruneOldDays()
 
     static func writeDaySummary(_ items: [Entry], dayName: String) async -> String? {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
         let df = DateFormatter(); df.dateFormat = "h:mm a"
         let lines = items.sorted { $0.at < $1.at }.prefix(120).map {
@@ -15063,7 +15110,7 @@ final class ChappyIngest: ObservableObject {
     /// One Flash call: frames + transcript + duration → one line.
     static func summariseVideo(frames: [UIImage], spoken: String, seconds: Double) async -> String? {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
 
         var parts: [[String: Any]] = [[
@@ -15413,7 +15460,7 @@ extension ChappyMemory {
     /// almost never what you want to search for later.
     static func extractFacts(from r: ConversationRecord) async -> [String] {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return [] }
 
         let text = transcript(of: r, limit: 12000)
@@ -16623,6 +16670,9 @@ extension ChappyReminders: UNUserNotificationCenterDelegate {
             defer { completionHandler() }
             // An informational one carries the screen it belongs to, so a tap
             // lands where the thing actually is rather than on the home screen.
+            // BUILD 266: the nav hand-off needs nothing here. It rides the
+            // chappyOpens path below with .chappyOpenGoogleMaps, which is the
+            // complete handoff and already correct.
             if let opens = response.notification.request.content
                 .userInfo["chappyOpens"] as? String {
                 NotificationCenter.default.post(name: Notification.Name(opens), object: nil)
@@ -16650,6 +16700,116 @@ extension ChappyReminders: UNUserNotificationCenterDelegate {
     }
 }
 
+
+// =====================================================================
+// MARK: - CHAPPY NAV HANDOFF (Build 266) — the tap iOS insists on
+// =====================================================================
+//
+// He asked for "hey Chappy navigate to Brisbane airport" from his pocket
+// to open Google Maps. iOS will not do it: there is no API for an app to
+// foreground itself, and UIApplication.open() from the background is a
+// silent no-op. The nearest honest thing is a notification whose tap
+// foregrounds Chappy and opens Maps in the same breath.
+//
+// Chappy also just talks him through it — speakNav has been firing
+// turn-by-turn since build 133 and works backgrounded, because the app
+// holds the audio background mode. Most of the time in a pocket that is
+// all he needs; this is for when he wants the screen.
+// =====================================================================
+// MARK: - CHAPPY MODELS (Build 267) — one place, because it was fourteen
+// =====================================================================
+//
+// He asked a fair question — "does Chappy use Gemini 3.7?" — and I could
+// not answer it. Fourteen call sites sent `gemini-flash-latest`, which is
+// an ALIAS: Google decides what it points at and hot-swaps it on two
+// weeks' notice. Their docs do not publish the current target and the API
+// response does not report which concrete model served the request, so
+// "which model am I actually on" was genuinely unanswerable from the code.
+//
+// An alias that tracks Google automatically sounded clever when it was
+// written. It cost him the one thing he wanted: knowing.
+//
+// Pinned now, and pinned in ONE place. Swapping models used to mean
+// editing fourteen URL strings, which is exactly how they drifted onto an
+// alias in the first place.
+//
+// The UserDefaults override is deliberate. If 3.7 turns out SLOWER than
+// whatever the alias was pointing at — and latency is the thing he feels
+// most — he can put it back without waiting for a build from me.
+enum ChappyModels {
+
+    /// The thinking tier: router, classifier, planner, day summaries,
+    /// translate. Pinned to 3.7 Flash (released 13 August 2026).
+    static var flash: String {
+        UserDefaults.standard.string(forKey: "chappy_model_flash") ?? "gemini-3.7-flash"
+    }
+
+    /// The bulk tier: photo captions and background passes that run in
+    /// their hundreds. Deliberately NOT moved to 3.7 — this work is high
+    /// volume and low judgement, which is what lite is for, and 3.7 Flash
+    /// costs several times more per token. Overridable if he disagrees.
+    static var flashLite: String {
+        UserDefaults.standard.string(forKey: "chappy_model_flash_lite") ?? "gemini-flash-lite-latest"
+    }
+
+    /// What to show on screen, so the answer to "which model is it on"
+    /// is one tap away instead of a question for me.
+    static var summaryLine: String {
+        "Thinking: \(flash)  ·  Bulk: \(flashLite)"
+    }
+}
+
+enum ChappyNavHandoff {
+
+    nonisolated(unsafe) private static var lastOfferedFor = ""
+
+    /// Returns true when a banner was posted, so the caller can stop
+    /// promising an app launch that iOS is about to refuse.
+    @MainActor @discardableResult
+    static func offer(name: String, driving: Bool) -> Bool {
+        // On screen already? Then the route IS the screen, and a banner over
+        // the top of it is noise.
+        guard UIApplication.shared.applicationState != .active else { return false }
+        // WALKING KEEPS THE SPOKEN OFFER. Build 219 settled this: on foot
+        // Chappy's own turn-by-turn is usually the better thing and Maps is
+        // the interruption. My first cut offered on every route and then
+        // opened DRIVING directions for a walk to the corner shop.
+        guard driving else { return false }
+        // KEYED ON THE DESTINATION, NOT THE CLOCK. My first cut used a
+        // 60-second window, which got both halves of its own comment wrong:
+        // an off-route recalculation every 70 seconds reposted it all drive,
+        // and changing your mind inside 60 seconds left the OLD banner on
+        // screen carrying the OLD coordinates — tap it and Google Maps
+        // drives you to Brisbane while Chappy guides you to the Gold Coast.
+        guard name != lastOfferedFor else { return false }
+        lastOfferedFor = name
+
+        // THROUGH ChappyNotify, NOT STRAIGHT TO UNUserNotificationCenter.
+        //
+        // My first cut went direct and lost three things review had to point
+        // out: the Navigation channel switch (a man who turned nav alerts
+        // off would still get this), the alert history (a banner missed in a
+        // pocket became unrecoverable), and the delivery error — which is
+        // verbatim the build 225 bug where "a refusal from iOS looked
+        // exactly like a delivery".
+        //
+        // And `opens:` is the whole trick. It puts the handoff on the tap
+        // through the existing chappyOpens path, so the tap runs the REAL
+        // Google Maps handoff — the one that stops Chappy's own voice first,
+        // carries a multi-stop URL, and picks two-wheeler over driving in
+        // Asia. My first cut reimplemented that badly and would have had two
+        // voices reading the same turns.
+        ChappyNotify.post(.nav,
+                          title: "Route to \(name)",
+                          body: "Chappy is guiding you. Tap for Google Maps.",
+                          opens: .chappyOpenGoogleMaps)
+        ChappyStandbyLog.note("🗺️ [Nav] Backgrounded — offered the Google Maps hand-off for \(name)")
+        return true
+    }
+
+    /// A new destination clears the memory, so the next route offers again.
+    @MainActor static func routeEnded() { lastOfferedFor = "" }
+}
 
 // =====================================================================
 // MARK: - CHAPPY NOTIFY (Phase 5.5 — the pocket channel)
@@ -18136,12 +18296,83 @@ enum ChappyPocket {
             .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
 
         if let s = timeOrDate(t) { return s }
+        if let s = daysUntil(t) { return s }
         if let s = smallTalk(t) { return s }
         if let s = weather(t) { return s }
         if let s = conversion(t) { return s }
         if let s = percentage(t) { return s }
         if let s = arithmetic(t) { return s }
         return nil
+    }
+
+    // MARK: days until
+    //
+    // ============================================================
+    // BUILD 266 — "HOW MANY DAYS TILL SEPTEMBER 5" HAD NO HANDLER AT ALL.
+    //
+    // From his log:
+    //
+    //   19:42:41 [plan] "how many days till september 5"
+    //                        -> search 0.85 : executing (3952ms)
+    //
+    // Nothing local claimed it, so it went to the planner, which mapped it
+    // onto the `search` tool, which cannot execute — so "executing" meant
+    // opening the Search screen and asking him a question. Four seconds and
+    // a network round trip to not answer a subtraction.
+    //
+    // It is arithmetic on a calendar. Free, offline, instant, and it is
+    // exactly the "knowledge base" behaviour he asked for.
+    //
+    // Deliberately narrow: it needs BOTH a days-question opener AND a date
+    // it can actually parse. "How long till we get there" has no date in
+    // it and falls through to something that knows about journeys.
+    // ============================================================
+    private static func daysUntil(_ t: String) -> String? {
+        let openers = ["how many days till", "how many days until", "how many days to",
+                       "how many sleeps till", "how many sleeps until",
+                       // "how long till" and "how long until" are DURATION
+                       // questions and they are out, because review ran them:
+                       // "how long till dark tonight" and "how long until
+                       // sunset today" both parsed the trailing "tonight" and
+                       // "today" as the date and answered "today is today" —
+                       // stealing the sentence from the sunset handler. Every
+                       // opener left contains "days" or "sleeps", which is
+                       // what makes them safe.
+                       "days till", "days until",
+                       "how many more days till", "how many more days until"]
+        guard let hit = openers.first(where: { t.contains($0) }),
+              let r = t.range(of: hit) else { return nil }
+        let tail = String(t[r.upperBound...])
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,.:;!?-"))
+        guard tail.count > 2 else { return nil }
+        // The date parser writes yyyy-MM-dd (see ChappySlots.iso), so read it
+        // back the same way. My first cut called a dateFromISO helper that
+        // does not exist — I wrote the call before checking the declaration,
+        // which is the one thing I am supposed to never do.
+        let inF = DateFormatter()
+        inF.locale = Locale(identifier: "en_US_POSIX")
+        inF.dateFormat = "yyyy-MM-dd"
+        guard let iso = ChappySlots.parse(tail, as: .date),
+              let target = inF.date(from: iso) else { return nil }
+
+        let cal = Calendar.current
+        let from = cal.startOfDay(for: Date())
+        let to = cal.startOfDay(for: target)
+        guard let days = cal.dateComponents([.day], from: from, to: to).day else { return nil }
+
+        let out = DateFormatter(); out.dateFormat = "EEEE d MMMM"
+        let when = out.string(from: target)
+        if days == 0 { return "\(when) is today." }
+        if days == 1 { return "One day — \(when) is tomorrow." }
+        if days < 0 { return "\(when) has already been, \(-days) days ago." }
+        // Weeks as well, past a fortnight — nobody thinks in 87 days.
+        if days >= 14 {
+            let weeks = days / 7, spare = days % 7
+            let wk = "\(weeks) week\(weeks == 1 ? "" : "s")"
+            let extra = spare == 0 ? "" : " and \(spare) day\(spare == 1 ? "" : "s")"
+            return "\(days) days — that's \(wk)\(extra), until \(when)."
+        }
+        return "\(days) days, until \(when)."
     }
 
     // MARK: time & date
@@ -18333,7 +18564,7 @@ enum ChappyPocket {
             value = Double(m.1); fromRaw = String(m.2); toRaw = String(m.3)
         } else if let m = t.firstMatch(of: #/how many\s+([a-z]+)\s+(?:in|is)\s+(-?\d+(?:\.\d+)?)\s*([a-z]+)/#) {
             value = Double(m.2); fromRaw = String(m.3); toRaw = String(m.1)
-        } else if let m = t.firstMatch(of: #/how many\s+([a-z]+)\s+(?:in|are in|to|make|make up)\s+(?:a|an|one)\s+([a-z]+)/#) {
+        } else if let m = t.firstMatch(of: #/how (?:many|much)\s+([a-z]+)\s+(?:in|are in|is in|to|make|make up)\s+(?:a|an|one)\s+([a-z]+)/#) {
             // BUILD 255 — THE ONE THAT MADE IT LOOK DUMB.
             //
             // Every regex above is anchored on \d. "How many centimetres in
@@ -18346,6 +18577,23 @@ enum ChappyPocket {
             // The unit table already had centimetres, inches, grams and the
             // rest in both spellings. The code never got as far as looking
             // one up.
+            value = 1; fromRaw = String(m.2); toRaw = String(m.1)
+        }
+        // BUILD 266 — THE BARE FRAGMENT, BECAUSE THE EAR DELIVERS IT.
+        //
+        // His log, twice, on the SAME question the branch above was built
+        // for:
+        //
+        //   [plan] "centimeters in a meter"       -> search 0.95 (4114ms)
+        //   [plan] "how much centimeters in a meter" -> search 0.95 (3273ms)
+        //
+        // The first lost "how many" to the wake-word scan; the second is
+        // "how MUCH", which the pattern above did not accept. Both are the
+        // same question, both went to a paid planner, and both came back as
+        // a form. "X in a Y" with two real units and no digits anywhere can
+        // only be a conversion — nothing else in English has that shape.
+        if value == nil,
+           let m = t.firstMatch(of: #/^([a-z]+)\s+(?:in|per)\s+(?:a|an|one)\s+([a-z]+)$/#) {
             value = 1; fromRaw = String(m.2); toRaw = String(m.1)
         }
         // NOTE: I also added a fourth pattern here for "what's 180
@@ -18416,6 +18664,16 @@ enum ChappyPocket {
     /// "70.86614" → "70.9", "12.0" → "12" — numbers as a person says them.
     private static func clean(_ v: Double) -> String {
         let rounded = (v * 10).rounded() / 10
+        // BUILD 266 — Int(Double) TRAPS, IT DOES NOT CLAMP.
+        //
+        // Review found this while hunting his crash. Every conversion,
+        // percentage, temperature and arithmetic answer comes through here,
+        // and "what's 9999999999 times 9999999999" produces a value outside
+        // Int64 — a hard crash, not a wrong answer. Not the crash he
+        // reported (that one is a different path), but the same shape, and
+        // it is one line to close.
+        guard rounded.isFinite else { return "a number I can't read" }
+        guard rounded.magnitude < 9e15 else { return String(format: "%.0f", rounded) }
         return rounded == rounded.rounded()
             ? String(Int(rounded))
             : String(format: "%.1f", rounded)
@@ -18658,7 +18916,7 @@ final class ChappyReader {
 
     private func translate(_ text: String) async -> String? {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flashLite):generateContent?key=\(key)")
         else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -19493,7 +19751,7 @@ final class ChappyClip {
 
     private func summarise(_ frames: [UIImage]) async -> String? {
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flashLite):generateContent?key=\(key)")
         else { return nil }
         var parts: [[String: Any]] = [[
             "text": "These are sequential frames from a short first-person video clip, in order. Narrate what happened across them as 2-3 vivid spoken sentences - what the place is, what changed, anything notable or readable. No preamble."
@@ -21380,6 +21638,52 @@ final class ChappyAtlas: ObservableObject {
                     shape.insert(from.coordinate, at: 0)
                     shape.append(to.coordinate)
                 }
+                // ============================================================
+                // BUILD 265 — THE STRAIGHT STREAKS ACROSS THE ATLAS.
+                //
+                // Visible in his own screenshot: a dozen long straight lines
+                // fanning out over Beerwah, several running clean off the
+                // edge of the map. They are not journeys. They are the gaps
+                // BETWEEN recorded points — the phone stops logging in a
+                // pocket, in a tunnel, on low power — drawn as if he had
+                // travelled in a perfect line through them.
+                //
+                // A ground leg is a chain of crumbs, so a jump of more than
+                // two kilometres between consecutive crumbs is missing data,
+                // not a road. Cut the leg there and let the trail show a
+                // break, which is the honest picture and a far more readable
+                // one. Flights are exempt: a flight IS one long straight
+                // line and always has been.
+                // ============================================================
+                if mode != .flight, shape.count > 2 {
+                    var runs: [[CLLocationCoordinate2D]] = []
+                    var run: [CLLocationCoordinate2D] = [shape[0]]
+                    for i in 1..<shape.count {
+                        let prev = CLLocation(latitude: shape[i - 1].latitude,
+                                              longitude: shape[i - 1].longitude)
+                        let next = CLLocation(latitude: shape[i].latitude,
+                                              longitude: shape[i].longitude)
+                        if next.distance(from: prev) > 2000 {
+                            if run.count > 1 { runs.append(run) }
+                            run = [shape[i]]
+                        } else {
+                            run.append(shape[i])
+                        }
+                    }
+                    if run.count > 1 { runs.append(run) }
+                    if runs.count > 1 {
+                        for piece in runs {
+                            legs.append(Leg(mode: mode, coords: piece, km: 0, at: b.arrive))
+                        }
+                        totalKm += km
+                        continue
+                    }
+                    // Every hop a gap means the whole leg is missing data —
+                    // review caught this falling through and drawing the very
+                    // streak the block exists to remove.
+                    if runs.isEmpty { totalKm += km; continue }
+                    if let only = runs.first { shape = only }
+                }
                 legs.append(Leg(mode: mode, coords: shape, km: km, at: b.arrive))
                 totalKm += km
             }
@@ -21842,7 +22146,7 @@ final class ChappyDictate: NSObject, ObservableObject {
         defer { isPolishing = false }
 
         guard let key = APIKeyManager.shared.getGoogleAPIKey(), !key.isEmpty,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else {
             // No key, no drama: cleaned-up-by-hand is better than nothing.
             polished = Self.localTidy(raw)
@@ -36912,7 +37216,11 @@ enum ChappySlots {
 
         case .money:
             let digits = c.filter { $0.isNumber || $0 == "." }
-            guard let v = Double(digits), v > 0 else { return nil }
+            // BUILD 266: this harvests every digit in the WHOLE sentence and
+            // concatenates them, so two ordinary numbers in one breath become
+            // one twenty-digit number — and String(Int(v)) below traps on it.
+            // Bounded at something no real price reaches.
+            guard let v = Double(digits), v > 0, v.isFinite, v < 1e12 else { return nil }
             // "five grand" and "5k" are how people actually say budgets.
             if c.contains("grand") || c.hasSuffix("k") { return String(Int(v * 1000)) }
             return String(Int(v))
@@ -36995,7 +37303,9 @@ enum ChappySlots {
 
     /// "two months" -> 60, "six weeks" -> 42, "ten days" -> 10.
     private static func nightsIn(_ c: String) -> Int? {
-        guard let n = firstNumber(in: c) else { return nil }
+        // BUILD 266: bounded before multiplying. firstNumber returns any Int
+        // that parses, and a huge one times 30 overflows and traps.
+        guard let n = firstNumber(in: c), n > 0, n <= 3650 else { return nil }
         if c.contains("month") { return n * 30 }
         if c.contains("week") { return n * 7 }
         if c.contains("night") || c.contains("day") { return n }
@@ -37145,7 +37455,7 @@ enum ChappySlots {
     static func modelParse(_ raw: String, as kind: Kind, question: String) async -> String? {
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty, raw.count > 1,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
 
         let want: String
@@ -38595,7 +38905,11 @@ final class ChappyRouterLog {
         //   untagged   — no tier recorded a decision; the LOG has a gap,
         //                which is not the same claim as "it failed"
         //   net        — a background network result, not a routing decision
-        //   pocket     — declared since build 198, never once written
+        //   pocket     — the free offline tier: clock, calendar, conversions,
+        //                arithmetic and days-until, answered on the phone.
+        //                BUILD 266 finally logs it; the note that used to sit
+        //                here said it was "never once written", which was
+        //                already stale and is now emphatically wrong.
         let tier: String
         let tool: String?
         let confidence: Double?
@@ -38621,6 +38935,65 @@ final class ChappyRouterLog {
     var entries: [Entry] {
         lock.lock(); defer { lock.unlock() }
         return store
+    }
+
+    // ============================================================
+    // BUILD 268 — CLEARING, AND CUTTING IT INTO DAYS.
+    //
+    // His words: "I want to be able to clear what Chappy does logs, or at
+    // least break it up in days so I don't send huge logs to you."
+    //
+    // Both, and the second one was already a bug. The screen formats every
+    // row as HH:mm:ss with NO DATE, so a log spanning several days reads as
+    // if time runs backwards — the last one he sent me jumped 17:43 to
+    // 09:09 to 17:50 to 23:57 with nothing to say those were four different
+    // days. I read it as one session for longer than I should have.
+    // ============================================================
+
+    /// The distinct days present, newest first, with a count for each.
+    /// Computed from the same snapshot the screen draws, so the two can
+    /// never disagree about what exists.
+    func daysPresent() -> [(day: Date, count: Int)] {
+        let cal = Calendar.current
+        var tally: [Date: Int] = [:]
+        for e in entries { tally[cal.startOfDay(for: e.at), default: 0] += 1 }
+        return tally.map { (day: $0.key, count: $0.value) }
+            .sorted { $0.day > $1.day }
+    }
+
+    /// Everything. Written through immediately rather than scheduled — a
+    /// clear that a crash could undo is not a clear.
+    func clearAll() {
+        lock.lock()
+        store = []
+        saveWork?.cancel(); saveWork = nil
+        lock.unlock()
+        writeNow([])
+        ChappyStandbyLog.note("🧹 [Route] Log cleared")
+    }
+
+    /// One day, keeping the rest. This is the one he will actually use:
+    /// send me today, then clear today, so tomorrow starts clean.
+    func clear(day: Date) {
+        let cal = Calendar.current
+        let target = cal.startOfDay(for: day)
+        lock.lock()
+        let kept = store.filter { cal.startOfDay(for: $0.at) != target }
+        let removed = store.count - kept.count
+        store = kept
+        saveWork?.cancel(); saveWork = nil
+        lock.unlock()
+        writeNow(kept)
+        ChappyStandbyLog.note("🧹 [Route] Cleared \(removed) rows from one day")
+    }
+
+    /// Synchronous write, used only by the two clears. Everything else goes
+    /// through the coalesced scheduleSave, which must not be disturbed.
+    private func writeNow(_ rows: [Entry]) {
+        guard let url else { return }
+        if let d = try? JSONEncoder().encode(rows) {
+            try? d.write(to: url, options: .atomic)
+        }
     }
     /// BUILD 221: 100 in memory was a display cap. On disk it can afford
     /// to be a real history without being a burden — a few hundred
@@ -39044,7 +39417,7 @@ enum ChappyOrchestrator {
     static func plan(_ utterance: String) async -> Plan? {
         let key = APIKeyManager.shared.getGoogleAPIKey() ?? ""
         guard !key.isEmpty, utterance.count > 3,
-              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=\(key)")
+              let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(ChappyModels.flash):generateContent?key=\(key)")
         else { return nil }
 
         let system = """
