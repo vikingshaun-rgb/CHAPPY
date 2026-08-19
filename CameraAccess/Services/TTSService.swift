@@ -203,21 +203,25 @@ enum ChappyVoiceProvider: String {
         if let p = ChappyVoiceProvider(rawValue: d.string(forKey: "chappy_voice_provider") ?? "") {
             return p
         }
-        // REVIEW FIX - AN UPGRADE MUST NOT UNDO A CHOICE HE ALREADY MADE.
+        // BUILD 275 — THIS GUARD WAS FAR TOO WIDE AND IT COST HIM THE BUILD.
         //
-        // chappy_voice_provider has never shipped, so EVERY existing install
-        // arrives here with it unset. Defaulting flatly to ElevenLabs would
-        // have moved a wearer who deliberately picked "System" - the free,
-        // offline, no-network Apple voice - onto a paid cloud provider on
-        // every line, without a tap, and voiceStatusLine's "Apple's voice by
-        // choice" branch would have become unreachable so he could not even
-        // ask why. That is the offline guarantee build 132 exists for, thrown
-        // away by a default.
+        // 274 protected a wearer who had deliberately chosen "System" - the
+        // free, offline Apple voice - from being moved onto a paid cloud
+        // provider by a changed default. That protection is right. What I
+        // wrote was "ANY stored Gemini voice is a choice", and that is a
+        // different and much bigger claim.
         //
-        // So: a stored Gemini voice IS a choice. Honour it, and let him move
-        // with the switch. A genuinely fresh install has neither key and gets
-        // the fast voice, which is the point.
-        if let chosen = d.string(forKey: "chappy_tts_voice"), !chosen.isEmpty {
+        // chappy_tts_voice has been written by the voice picker since build
+        // 125. Everyone who has ever opened that screen has one. So on his
+        // phone this returned .gemini, ElevenLabs was never attempted, and
+        // 274 shipped a feature that could not run - while the log filled
+        // with the exact Gemini 429s the whole thing exists to escape.
+        //
+        // Only "System" is a decision to refuse a cloud voice. Every other
+        // value is a leftover preference about WHICH Gemini voice, which says
+        // nothing about whether he wants a faster provider. Narrow it to the
+        // one case the protection was actually for.
+        if d.string(forKey: "chappy_tts_voice") == "System" {
             return .gemini
         }
         return .elevenLabs
@@ -861,6 +865,10 @@ class TTSService: NSObject, ObservableObject {
     /// voiceStatusLine can answer "why does it sound like Google" truthfully
     /// rather than reading the settings back at him.
     nonisolated(unsafe) static var lastElevenFailure: (code: Int, at: Date)?
+
+    /// BUILD 275. Last provider decision written to the log, so the line above
+    /// appears when something changes and stays quiet when nothing does.
+    nonisolated(unsafe) static var lastProviderStamp = ""
 
     /// The honest status line, for the voice test and for asking out loud.
     static var voiceStatusLine: String {
@@ -1929,6 +1937,33 @@ class TTSService: NSObject, ObservableObject {
             // was expensive. A Flash call that is going to fail fails in well
             // under a second, and a latch here would keep him on the slow
             // voice long after the blip had passed.
+            // BUILD 275 — SAY WHICH DOOR YOU WENT THROUGH.
+            //
+            // 274 shipped ElevenLabs and it never once ran on his phone, and
+            // NOTHING IN THE LOG SAID SO. All he could see was Gemini 429s -
+            // which look identical whether ElevenLabs was tried and failed,
+            // or was never reached at all. I had to read the source to find
+            // out, and that is the same blindness build 271 fixed for the
+            // emergency voice. Once per change, so it cannot go stale and
+            // cannot spam.
+            let providerNow = ChappyVoiceProvider.current
+            let ready = ChappyVoiceProvider.elevenReady
+            let stamp = "\(providerNow.rawValue)/\(ready)/\(wantsSystemVoice)"
+            if stamp != Self.lastProviderStamp {
+                Self.lastProviderStamp = stamp
+                if wantsSystemVoice {
+                    ChappyStandbyLog.note("🗣️ [TTS] Voice: the phone's own — 'System' is picked in Settings")
+                } else if providerNow == .elevenLabs, ready {
+                    ChappyStandbyLog.note("🗣️ [TTS] Voice: ElevenLabs, with Google behind it")
+                } else if providerNow == .elevenLabs {
+                    let noKey = (APIKeyManager.shared.getElevenLabsKey() ?? "").isEmpty
+                    ChappyStandbyLog.note("🗣️ [TTS] Voice: GOOGLE — ElevenLabs is selected but "
+                        + (noKey ? "there is no key" : "no voice is chosen"))
+                } else {
+                    ChappyStandbyLog.note("🗣️ [TTS] Voice: Google — ElevenLabs is not selected")
+                }
+            }
+
             if !wantsSystemVoice, ChappyVoiceProvider.elevenReady,
                let elevenKey = APIKeyManager.shared.getElevenLabsKey(), !elevenKey.isEmpty {
                 do {
